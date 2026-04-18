@@ -2059,21 +2059,44 @@ async def mouse_replay(path_json: str, speed: float = 1.0) -> str:
 # 21. ⭐⭐ AI VISION CAPTCHA SOLVER (unique differentiator)
 # ══════════════════════════════════════════════════════════════════════════
 #
-# For reCAPTCHA v2 image challenges ("select all images with X"), we use
-# Claude's vision API to identify which tiles match. No CapSolver needed.
-# Requires ANTHROPIC_API_KEY env var.
+# Solves reCAPTCHA v2 image challenges via vision-enabled LLM.
+# Supports BOTH Anthropic (Claude) AND any OpenAI-compatible API
+# (gpt-4o, gpt-5.x, Groq llama3.2-vision, patungin.id, local Ollama, etc).
+#
+# Provider auto-detected from env vars:
+#   - AI_VISION_BASE_URL + AI_VISION_API_KEY + AI_VISION_MODEL → OpenAI-compat
+#   - ANTHROPIC_API_KEY → Claude
+#   Caller can also override via solve_recaptcha_ai(provider=..., base_url=..., ...)
+
+
+_PROMPT_TEMPLATE = (
+    "This is a reCAPTCHA challenge grid ({grid}). "
+    "Identify which tiles contain: {target}.\n"
+    "Tiles are numbered 0-based, row-major (for 3x3: top-left=0, top-right=2, "
+    "bottom-left=6, bottom-right=8; for 4x4: top-left=0, top-right=3, bottom-right=15).\n\n"
+    "Respond with ONLY a JSON array of tile indices, like [0,3,5]. "
+    "If no tiles match, respond []."
+)
+
+
+def _parse_tile_indices(text: str) -> list[int]:
+    """Extract JSON array of ints from LLM response text."""
+    try:
+        import re as _re
+        match = _re.search(r"\[[\d\s,]*\]", text)
+        if not match:
+            return []
+        out = json.loads(match.group(0))
+        return [int(x) for x in out if isinstance(x, (int, float)) and 0 <= int(x) < 100]
+    except Exception:
+        return []
 
 
 async def _claude_vision_pick_tiles(
-    api_key: str,
-    target: str,
-    image_b64: str,
-    grid: str = "3x3",
+    api_key: str, target: str, image_b64: str,
+    grid: str = "3x3", model: str = "claude-opus-4-7",
 ) -> list[int]:
-    """Ask Claude vision which tiles in a grid match target category.
-
-    Returns list of tile indices (0-indexed, row-major: top-left=0).
-    """
+    """Anthropic Claude vision tile picker."""
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(
             "https://api.anthropic.com/v1/messages",
@@ -2083,43 +2106,107 @@ async def _claude_vision_pick_tiles(
                 "content-type": "application/json",
             },
             json={
-                "model": "claude-opus-4-7",
+                "model": model,
                 "max_tokens": 200,
                 "messages": [{
                     "role": "user",
                     "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/png",
-                                "data": image_b64,
-                            },
-                        },
-                        {
-                            "type": "text",
-                            "text": (
-                                f"This is a reCAPTCHA challenge grid ({grid}). "
-                                f"Identify which tiles contain: {target}.\n"
-                                f"Tiles are numbered 0-based, row-major (top-left=0, "
-                                f"top-right=2, bottom-left=6, bottom-right=8 for 3x3).\n\n"
-                                f"Respond with ONLY a JSON array of tile indices, "
-                                f"like [0,3,5]. If no tiles match, respond []."
-                            ),
-                        },
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": image_b64}},
+                        {"type": "text", "text": _PROMPT_TEMPLATE.format(grid=grid, target=target)},
                     ],
                 }],
             },
         )
         data = resp.json()
         text = (data.get("content", [{}])[0]).get("text", "[]").strip()
+        return _parse_tile_indices(text)
+
+
+async def _openai_compat_vision_pick_tiles(
+    api_key: str, base_url: str, model: str,
+    target: str, image_b64: str, grid: str = "3x3",
+) -> list[int]:
+    """OpenAI-compatible vision tile picker.
+
+    Works with: OpenAI (gpt-4o, gpt-5.x), Groq (llama3.2-vision),
+    Ollama (llava local), patungin.id, Together.ai, and any
+    /v1/chat/completions endpoint that supports image_url content.
+
+    base_url should NOT include the /chat/completions path — we append it.
+    """
+    url = base_url.rstrip("/") + "/chat/completions"
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "max_tokens": 200,
+                "temperature": 0,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": _PROMPT_TEMPLATE.format(grid=grid, target=target)},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
+                    ],
+                }],
+            },
+        )
+        data = resp.json()
         try:
-            # Extract first JSON array from response
-            import re as _re
-            match = _re.search(r"\[[\d\s,]*\]", text)
-            return json.loads(match.group(0)) if match else []
-        except Exception:
+            text = data["choices"][0]["message"]["content"]
+            if isinstance(text, list):  # some providers return content as array
+                text = "".join(c.get("text", "") for c in text if isinstance(c, dict))
+        except (KeyError, IndexError, TypeError):
             return []
+        return _parse_tile_indices(str(text))
+
+
+def _resolve_vision_provider(
+    provider: Optional[str] = None,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    model: Optional[str] = None,
+) -> tuple[str, str, str, str]:
+    """Resolve provider config from explicit args → env vars → defaults.
+
+    Returns (provider, base_url, api_key, model).
+    Raises ValueError if no key is available anywhere.
+    """
+    # Explicit provider arg wins
+    prov = (provider or os.environ.get("AI_VISION_PROVIDER", "")).lower().strip()
+
+    if not prov:
+        # Auto-detect from env
+        if os.environ.get("AI_VISION_BASE_URL") or os.environ.get("OPENAI_API_KEY"):
+            prov = "openai"
+        elif os.environ.get("ANTHROPIC_API_KEY"):
+            prov = "anthropic"
+
+    if prov in ("anthropic", "claude"):
+        key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+        if not key:
+            raise ValueError("ANTHROPIC_API_KEY not set and no api_key passed")
+        return ("anthropic",
+                base_url or "https://api.anthropic.com",
+                key,
+                model or os.environ.get("AI_VISION_MODEL", "claude-opus-4-7"))
+
+    if prov in ("openai", "openai-compat", "generic"):
+        key = api_key or os.environ.get("AI_VISION_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
+        url = base_url or os.environ.get("AI_VISION_BASE_URL", "https://api.openai.com/v1")
+        mdl = model or os.environ.get("AI_VISION_MODEL", "gpt-4o")
+        if not key:
+            raise ValueError("AI_VISION_API_KEY (or OPENAI_API_KEY) not set and no api_key passed")
+        return ("openai", url, key, mdl)
+
+    raise ValueError(
+        "no AI vision provider configured — set ANTHROPIC_API_KEY OR "
+        "(AI_VISION_BASE_URL + AI_VISION_API_KEY [+ AI_VISION_MODEL])"
+    )
 
 
 @mcp.tool()
@@ -2127,16 +2214,34 @@ async def solve_recaptcha_ai(
     api_key: Optional[str] = None,
     max_rounds: int = 3,
     wait_between: float = 2.5,
+    provider: Optional[str] = None,
+    base_url: Optional[str] = None,
+    model: Optional[str] = None,
 ) -> str:
-    """Solve reCAPTCHA v2 image challenge using Claude vision.
-    Auto workflow: find bframe iframe → screenshot tiles → ask Claude which match
-    target category → click tiles → click Verify → retry if new challenge.
+    """Solve reCAPTCHA v2 image challenge using a vision-enabled LLM.
 
-    Needs ANTHROPIC_API_KEY env var (or pass api_key). Cost ~$0.01-0.03/solve.
+    Supports Anthropic (Claude) OR any OpenAI-compatible API (gpt-4o, gpt-5.x,
+    Groq, local Ollama, patungin.id, Together.ai, etc).
+
+    Provider auto-detected from env, or pass explicitly:
+        provider="anthropic" | "openai"
+        base_url="https://ai.patungin.id/v1"   (for openai-compat)
+        api_key="..."
+        model="gpt-5.4" | "claude-opus-4-7" | ...
+
+    Env vars (checked if args omitted):
+        ANTHROPIC_API_KEY                       → Claude
+        AI_VISION_BASE_URL / AI_VISION_API_KEY  → OpenAI-compat
+        AI_VISION_MODEL                         → model override
+        OPENAI_API_KEY                          → OpenAI (default base_url)
+
+    Cost: varies by provider (~$0.005-0.03 per solve).
     """
-    api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        return err("ANTHROPIC_API_KEY env var not set (or pass api_key=...)")
+    try:
+        resolved_provider, resolved_base_url, resolved_key, resolved_model = \
+            _resolve_vision_provider(provider, base_url, api_key, model)
+    except ValueError as e:
+        return err(str(e))
     try:
         tab = BrowserState.active_tab()
         for round_num in range(1, max_rounds + 1):
@@ -2211,9 +2316,20 @@ async def solve_recaptcha_ai(
                 target = "the requested object (check challenge header visually)"
 
             # Step 4: ask Claude
-            tiles = await _claude_vision_pick_tiles(api_key, target, img_b64)
+            if resolved_provider == "anthropic":
+                tiles = await _claude_vision_pick_tiles(
+                    resolved_key, target, img_b64, model=resolved_model,
+                )
+            else:
+                tiles = await _openai_compat_vision_pick_tiles(
+                    resolved_key, resolved_base_url, resolved_model,
+                    target, img_b64,
+                )
             if not tiles:
-                return err(f"round {round_num}: Claude returned no tiles (target={target!r})")
+                return err(
+                    f"round {round_num}: {resolved_provider} ({resolved_model}) "
+                    f"returned no tiles for target={target!r}"
+                )
 
             # Step 5: click tiles (3x3 assumed — 9 cells)
             # Each tile is ~(width/3 by (height-verify_bar)/3)

@@ -102,21 +102,34 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
 
 ### Optional: API Keys for CAPTCHA Solvers
 
+`solve_recaptcha_ai` works with **Claude OR any OpenAI-compatible vision API** (gpt-4o, gpt-5.x, Groq, Ollama local, patungin.id, Together.ai, etc). Pick one:
+
+**Anthropic Claude:**
 ```json
-{
-  "mcpServers": {
-    "stealth-chrome": {
-      "command": "uvx",
-      "args": ["mcp-stealth-chrome@latest"],
-      "env": {
-        "CAPSOLVER_KEY": "CAP-xxxxx",
-        "ANTHROPIC_API_KEY": "sk-ant-xxxxx",
-        "BROWSER_IDLE_TIMEOUT": "900"
-      }
-    }
-  }
+"env": {
+  "ANTHROPIC_API_KEY": "sk-ant-xxxxx",
+  "CAPSOLVER_KEY": "CAP-xxxxx"
 }
 ```
+
+**OpenAI-compatible (any provider with `/v1/chat/completions`):**
+```json
+"env": {
+  "AI_VISION_BASE_URL": "https://ai.patungin.id/v1",
+  "AI_VISION_API_KEY":  "your-key-here",
+  "AI_VISION_MODEL":    "gpt-5.4"
+}
+```
+
+Or vanilla OpenAI (inherits default base URL):
+```json
+"env": {
+  "OPENAI_API_KEY": "sk-xxxxx",
+  "AI_VISION_MODEL": "gpt-4o"
+}
+```
+
+Provider priority: explicit args to tool > `AI_VISION_*` env > `OPENAI_API_KEY` > `ANTHROPIC_API_KEY`.
 
 ## Requirements
 
@@ -290,7 +303,12 @@ Data locations:
 | `BROWSER_IDLE_TIMEOUT` | `600` | Auto-close browsers after idle seconds (0 = never) |
 | `BROWSER_IDLE_REAPER_INTERVAL` | `60` | How often reaper checks idle state |
 | `CAPSOLVER_KEY` | — | Enable `solve_captcha` tool |
-| `ANTHROPIC_API_KEY` | — | Enable `solve_recaptcha_ai` tool |
+| `ANTHROPIC_API_KEY` | — | `solve_recaptcha_ai` via Claude |
+| `AI_VISION_BASE_URL` | — | `solve_recaptcha_ai` via OpenAI-compat API |
+| `AI_VISION_API_KEY` | — | API key for OpenAI-compat provider |
+| `AI_VISION_MODEL` | `claude-opus-4-7` or `gpt-4o` | Vision model name |
+| `AI_VISION_PROVIDER` | auto-detect | Force `anthropic` or `openai` |
+| `OPENAI_API_KEY` | — | Shortcut for OpenAI (default base URL) |
 
 ## Stealth Details
 
