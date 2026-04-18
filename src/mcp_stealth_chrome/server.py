@@ -2070,12 +2070,25 @@ async def mouse_replay(path_json: str, speed: float = 1.0) -> str:
 
 
 _PROMPT_TEMPLATE = (
-    "This is a reCAPTCHA challenge grid ({grid}). "
-    "Identify which tiles contain: {target}.\n"
-    "Tiles are numbered 0-based, row-major (for 3x3: top-left=0, top-right=2, "
-    "bottom-left=6, bottom-right=8; for 4x4: top-left=0, top-right=3, bottom-right=15).\n\n"
-    "Respond with ONLY a JSON array of tile indices, like [0,3,5]. "
-    "If no tiles match, respond []."
+    "You are solving a Google reCAPTCHA v2 image challenge.\n\n"
+    "The screenshot shows a web page. Somewhere in the image there is a\n"
+    "reCAPTCHA modal with:\n"
+    "  - a BLUE HEADER banner at the top reading 'Select all images with <CATEGORY>'\n"
+    "  - a {grid} grid of photo tiles below the header\n"
+    "  - a VERIFY button at the bottom right\n\n"
+    "YOUR TASK:\n"
+    "STEP 1: Locate the blue header and READ the target category name.\n"
+    "STEP 2: Examine every tile in the {grid} grid carefully.\n"
+    "STEP 3: Return the 0-based indices of ALL tiles containing the target.\n\n"
+    "Tile numbering (row-major):\n"
+    "  3x3:  [0 1 2 / 3 4 5 / 6 7 8]\n"
+    "  4x4:  [0 1 2 3 / 4 5 6 7 / 8 9 10 11 / 12 13 14 15]\n\n"
+    "CRITICAL RULES (Google rejects incomplete answers):\n"
+    "  - Include tiles with PARTIAL, SMALL, or DISTANT matches\n"
+    "  - When borderline, INCLUDE the tile (over-select is safer)\n"
+    "  - Only exclude tiles that clearly show NONE of the target\n\n"
+    "If you cannot see a reCAPTCHA challenge in the image, respond: []\n"
+    "Otherwise respond with ONLY a JSON array, e.g. [0,2,4,6]"
 )
 
 
@@ -2242,11 +2255,17 @@ async def solve_recaptcha_ai(
             _resolve_vision_provider(provider, base_url, api_key, model)
     except ValueError as e:
         return err(str(e))
+    def _unwrap(v):
+        """nodriver sometimes returns RemoteObject; extract .value if needed."""
+        if hasattr(v, "value") and not isinstance(v, (str, int, float, bool, list, dict)):
+            return v.value
+        return v
+
     try:
         tab = BrowserState.active_tab()
         for round_num in range(1, max_rounds + 1):
-            # Step 1: locate challenge iframe
-            frame_info = await tab.evaluate(
+            # Step 1: locate challenge iframe (bframe)
+            frame_info_raw = _unwrap(await tab.evaluate(
                 """
                 (() => {
                   const f = Array.from(document.querySelectorAll('iframe'))
@@ -2254,6 +2273,7 @@ async def solve_recaptcha_ai(
                                x.src.includes('recaptcha/enterprise/bframe'));
                   if (!f) return 'no_challenge';
                   const r = f.getBoundingClientRect();
+                  if (r.width < 50 || r.height < 50) return 'challenge_hidden';
                   return JSON.stringify({
                     left: Math.round(r.left), top: Math.round(r.top),
                     width: Math.round(r.width), height: Math.round(r.height),
@@ -2261,59 +2281,40 @@ async def solve_recaptcha_ai(
                 })()
                 """,
                 return_by_value=True,
-            )
-            if str(frame_info) == "no_challenge":
-                # No challenge iframe — maybe we already passed!
-                token_check = await tab.evaluate(
-                    '(() => { var t = document.querySelector("textarea[name=g-recaptcha-response]"); return t ? !!t.value : false; })()',
+            ))
+            frame_info = str(frame_info_raw) if frame_info_raw is not None else ""
+
+            if frame_info in ("no_challenge", "challenge_hidden", ""):
+                # No visible challenge — maybe already solved!
+                token_raw = _unwrap(await tab.evaluate(
+                    '(() => { var t = document.querySelector("textarea[name=g-recaptcha-response]"); return t && t.value ? t.value.length : 0; })()',
                     return_by_value=True,
-                )
-                if token_check:
-                    return ok(f"solved on round {round_num} (token present)")
-                return err("no reCAPTCHA challenge iframe found")
+                ))
+                if isinstance(token_raw, (int, float)) and token_raw > 0:
+                    return ok(f"solved on round {round_num} (token length={int(token_raw)})")
+                return err(f"no reCAPTCHA challenge iframe visible (state: {frame_info!r})")
 
             finfo = parse_json(frame_info, {})
-            # Step 2: screenshot page, crop challenge area
+            if not finfo or finfo.get("width", 0) < 50:
+                return err(f"bframe too small to screenshot: {finfo}")
+
+            # Step 2: full-page screenshot — vision model sees ENTIRE page including
+            # the floating image challenge modal. Avoids cross-origin crop issues.
             ensure_dirs()
             shot_path = SCREENSHOT_DIR / ts_filename(f"recaptcha-r{round_num}", "png")
-            await tab.save_screenshot(filename=str(shot_path))
-            try:
-                import cv2
-            except ImportError:
-                return err("opencv-python required for cropping")
-            full = cv2.imread(str(shot_path))
-            # Retina: screenshot is 2x CSS
-            scale = 2
-            x0 = finfo["left"] * scale
-            y0 = finfo["top"] * scale
-            x1 = x0 + finfo["width"] * scale
-            y1 = y0 + finfo["height"] * scale
-            cropped = full[y0:y1, x0:x1]
-            crop_path = str(shot_path).replace(".png", "-crop.png")
-            cv2.imwrite(crop_path, cropped)
+            await tab.save_screenshot(filename=str(shot_path), format="png")
             import base64 as _b64
-            img_b64 = _b64.b64encode(open(crop_path, "rb").read()).decode()
+            try:
+                img_bytes = open(str(shot_path), "rb").read()
+                if not img_bytes:
+                    return err(f"screenshot file empty: {shot_path}")
+                img_b64 = _b64.b64encode(img_bytes).decode()
+            except Exception as e:
+                return err(f"screenshot read failed: {e}")
 
-            # Step 3: ask for target category from the challenge header
-            target_raw = await tab.evaluate(
-                """
-                (() => {
-                  const f = Array.from(document.querySelectorAll('iframe'))
-                    .find(x => x.src.includes('bframe'));
-                  if (!f) return '';
-                  try {
-                    const doc = f.contentDocument || f.contentWindow.document;
-                    const strong = doc.querySelector('.rc-imageselect-desc-wrapper strong') ||
-                                   doc.querySelector('strong');
-                    return strong ? strong.textContent.trim() : '';
-                  } catch (e) { return 'cross-origin'; }
-                })()
-                """,
-                return_by_value=True,
-            )
-            target = str(target_raw).strip()
-            if not target or target == "cross-origin":
-                target = "the requested object (check challenge header visually)"
+            # Step 3: target — skip cross-origin DOM read (unreliable across origins).
+            # Prompt tells vision model to READ target from the challenge header itself.
+            target = "the category shown in the blue header banner of the reCAPTCHA modal"
 
             # Step 4: ask Claude
             if resolved_provider == "anthropic":
@@ -2362,17 +2363,23 @@ async def solve_recaptcha_ai(
             await tab.mouse_click(verify_x, verify_y)
             await asyncio.sleep(wait_between)
 
-            # Check if solved
-            solved = await tab.evaluate(
-                '(() => { var t = document.querySelector("textarea[name=g-recaptcha-response]"); return t ? (t.value||"").length > 0 : false; })()',
+            # Check if solved — properly unwrap RemoteObject
+            token_len_raw = _unwrap(await tab.evaluate(
+                '(() => { var t = document.querySelector("textarea[name=g-recaptcha-response]"); return t && t.value ? t.value.length : 0; })()',
                 return_by_value=True,
-            )
-            if solved:
-                return ok(
-                    f"solved on round {round_num}: picked tiles {clicked} for {target!r}"
-                )
+            ))
+            try:
+                token_len = int(token_len_raw) if token_len_raw is not None else 0
+            except (TypeError, ValueError):
+                token_len = 0
 
-        return err(f"not solved after {max_rounds} rounds")
+            if token_len > 0:
+                return ok(
+                    f"solved on round {round_num}: picked tiles {clicked}, token={token_len}ch"
+                )
+            # Not solved — loop retries with fresh challenge
+
+        return err(f"not solved after {max_rounds} rounds (last picked: {clicked})")
     except Exception as e:
         return err(str(e))
 
