@@ -35,3 +35,7 @@ test-*.log
 
 # Generated data (user-specific, shouldn't be in repo)
 # Note: ~/.mcp-stealth/ lives outside repo so no pattern needed
+
+# Local-only docs (per user preference — not pushed to repo)
+CLAUDE.md
+AGENTS.md
