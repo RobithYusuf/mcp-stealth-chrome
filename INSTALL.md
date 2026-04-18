@@ -117,7 +117,7 @@ Edit `~/.config/Claude/claude_desktop_config.json` (same JSON as above).
 In Claude Desktop chat, ask:
 > "What MCP tools do you have access to from stealth-chrome?"
 
-Expected: list of 94 tools including `browser_launch`, `click_turnstile`, etc.
+Expected: list of 96 tools including `browser_launch`, `click_turnstile`, etc.
 
 ---
 
@@ -325,7 +325,7 @@ Common causes:
 
 After installing, verify in Claude:
 
-- [ ] "List all tools from stealth-chrome" → should show 94 tools
+- [ ] "List all tools from stealth-chrome" → should show 96 tools
 - [ ] "Launch browser and navigate to bot.sannysoft.com" → Chrome opens, no "bot detected" warnings
 - [ ] "Take a screenshot and save as test.png" → file saved to `~/.mcp-stealth/screenshots/`
 - [ ] "Close browser" → Chrome window closes cleanly

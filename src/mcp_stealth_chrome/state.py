@@ -95,6 +95,48 @@ def chrome_install_hint() -> str:
     return "Install Chrome or Chromium from https://www.google.com/chrome/"
 
 
+def chrome_user_data_root() -> Optional[Path]:
+    """Find where Chrome stores user profiles. Returns None if no Chrome installed."""
+    import sys
+    home = Path.home()
+    candidates: list[Path] = []
+    if sys.platform == "darwin":
+        candidates = [
+            home / "Library" / "Application Support" / "Google" / "Chrome",
+            home / "Library" / "Application Support" / "Chromium",
+            home / "Library" / "Application Support" / "Microsoft Edge",
+            home / "Library" / "Application Support" / "BraveSoftware" / "Brave-Browser",
+        ]
+    elif sys.platform.startswith("linux"):
+        candidates = [
+            home / ".config" / "google-chrome",
+            home / ".config" / "chromium",
+            home / ".config" / "microsoft-edge",
+            home / ".config" / "BraveSoftware" / "Brave-Browser",
+        ]
+    elif sys.platform == "win32":
+        local = Path(os.environ.get("LOCALAPPDATA", home / "AppData" / "Local"))
+        candidates = [
+            local / "Google" / "Chrome" / "User Data",
+            local / "Chromium" / "User Data",
+            local / "Microsoft" / "Edge" / "User Data",
+            local / "BraveSoftware" / "Brave-Browser" / "User Data",
+        ]
+    for c in candidates:
+        if c.exists() and (c / "Local State").exists():
+            return c
+    return None
+
+
+def is_chrome_profile_locked(profile_path: Path) -> bool:
+    """Check if Chrome is currently using a profile (via SingletonLock)."""
+    lock = profile_path / "SingletonLock"
+    try:
+        return lock.exists() or lock.is_symlink()
+    except OSError:
+        return False
+
+
 def ensure_dirs() -> None:
     for d in (PROFILE_DIR, PROFILES_ROOT, SCREENSHOT_DIR, EXPORT_DIR, STORAGE_STATE_DIR):
         d.mkdir(parents=True, exist_ok=True)

@@ -48,9 +48,11 @@ from .state import (
     BrowserState,
     InstanceSnapshot,
     chrome_install_hint,
+    chrome_user_data_root,
     clean_profile_state,
     ensure_dirs,
     find_chrome_binary,
+    is_chrome_profile_locked,
 )
 
 mcp = FastMCP("stealth-chrome")
@@ -3126,6 +3128,211 @@ async def close_all_instances() -> str:
         closed.append(BrowserState.current_instance_id)
     BrowserState.reset()
     return ok(f"closed {len(closed)} instance(s): {closed}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 24. ⭐ CHROME PROFILE INTEGRATION (list / clone existing profiles)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Let user start from their existing Chrome profile (with all logins, cookies,
+# extensions) instead of a fresh one. Three patterns:
+#
+#   1. list_chrome_profiles()                           — detect what's on system
+#   2. clone_chrome_profile(source, instance_id)        — safe: copy to isolated dir
+#   3. spawn_browser(profile_dir=<chrome path>, ...)    — direct: uses profile as-is
+#                                                         (requires Chrome desktop closed)
+
+
+@mcp.tool()
+async def list_chrome_profiles() -> str:
+    """List all Chrome/Chromium/Edge/Brave profiles found on this system.
+
+    Reads browser 'Local State' JSON (read-only). Returns profile name, user email,
+    path, whether in-use (Chrome currently running on it), and whether it exists.
+    """
+    root = chrome_user_data_root()
+    if root is None:
+        return err(
+            "No Chrome-family browser profile directory found. "
+            "Install Chrome/Chromium/Edge/Brave and launch it once to create profiles."
+        )
+    local_state = root / "Local State"
+    try:
+        data = json.loads(local_state.read_text())
+    except Exception as e:
+        return err(f"failed to parse Local State at {local_state}: {e}")
+
+    info_cache = data.get("profile", {}).get("info_cache", {})
+    profiles_order = data.get("profile", {}).get("profiles_order", [])
+    seen = set(profiles_order)
+    # Ensure we also include profiles not in profiles_order
+    for k in info_cache.keys():
+        if k not in seen:
+            profiles_order.append(k)
+
+    out = []
+    for name in profiles_order:
+        info = info_cache.get(name, {})
+        pdir = root / name
+        out.append({
+            "profile_dir_name": name,
+            "display_name": info.get("name", name),
+            "email": info.get("user_name", ""),
+            "path": str(pdir),
+            "exists": pdir.exists(),
+            "in_use": is_chrome_profile_locked(pdir) if pdir.exists() else False,
+            "last_active_time": info.get("last_active_time", 0),
+        })
+    return ok(json.dumps({
+        "browser_root": str(root),
+        "browser_running": is_chrome_profile_locked(root),
+        "profile_count": len(out),
+        "profiles": out,
+        "usage_hint": (
+            "clone_chrome_profile(source_profile='Default', target_instance_id='my_clone') "
+            "→ then spawn_browser(instance_id='my_clone') to use it"
+        ),
+    }, indent=2, default=str))
+
+
+@mcp.tool()
+async def clone_chrome_profile(
+    source_profile: str = "Default",
+    target_instance_id: str = "chrome_clone",
+    skip_cache: bool = True,
+    overwrite: bool = False,
+) -> str:
+    """Clone an existing Chrome profile into isolated mcp-stealth location.
+
+    SAFE: reads source profile without modification, copies to
+    ~/.mcp-stealth/profiles/<target_instance_id>/Default/
+
+    Chrome desktop MUST be closed for source profile (we check SingletonLock).
+    Preserves: cookies, history, bookmarks, saved passwords, extensions state.
+    Skips (if skip_cache=True): Cache, Code Cache, GPUCache, Media Cache,
+    Service Worker, IndexedDB (regenerable, saves 500MB+).
+
+    Args:
+        source_profile: Chrome profile dir name ("Default", "Profile 1", etc).
+                        Use list_chrome_profiles() to see options.
+        target_instance_id: Name for the cloned instance (becomes folder name).
+        skip_cache: Exclude cache dirs for fast + smaller copy (default True).
+        overwrite: Delete target if exists before copying (default False).
+
+    After clone, launch with:
+        spawn_browser(instance_id='<target_instance_id>')
+    """
+    import shutil
+
+    root = chrome_user_data_root()
+    if root is None:
+        return err("No Chrome profile root found. Install Chrome first.")
+    source_path = root / source_profile
+    if not source_path.exists():
+        return err(
+            f"Source profile not found: {source_path}\n"
+            f"Run list_chrome_profiles() to see available profiles."
+        )
+    if is_chrome_profile_locked(source_path) or is_chrome_profile_locked(root):
+        return err(
+            f"Chrome is currently using this profile (lock file present). "
+            f"Close Chrome desktop FULLY (Cmd+Q on macOS, not just window close), "
+            f"then retry.\n"
+            f"Lock: {source_path / 'SingletonLock'}"
+        )
+
+    ensure_dirs()
+    target_root = PROFILES_ROOT / target_instance_id
+    target_default = target_root / "Default"
+
+    if target_root.exists():
+        if not overwrite:
+            return err(
+                f"Target instance already exists: {target_root}\n"
+                f"Pass overwrite=true to replace, or use different target_instance_id."
+            )
+        try:
+            shutil.rmtree(target_root)
+        except Exception as e:
+            return err(f"failed to remove existing target: {e}")
+
+    target_default.mkdir(parents=True, exist_ok=True)
+
+    # Cache-like directories to skip (regenerable, big, Chrome rebuilds them)
+    cache_dirs = {
+        "cache", "code cache", "gpucache", "dawnwebgpucache", "dawngraphitecache",
+        "graphitedawncache", "grshadercache", "media cache", "service worker",
+        "indexeddb", "file system", "downloadedupdates", "downloads",
+        "safe browsing", "componentupdater", "extensions_crx_cache",
+        "component_crx_cache", "gpupersistentcache", "shared dictionary",
+    }
+    # Files that might cause issues if copied (locks, logs)
+    skip_files = {
+        "singletonlock", "singletoncookie", "singletonsocket",
+        "lock", "lockfile",
+    }
+
+    copied_count = 0
+    skipped_cache_bytes = 0
+    errors: list[str] = []
+
+    for item in source_path.iterdir():
+        name_lower = item.name.lower()
+        try:
+            if item.is_file():
+                if skip_cache and name_lower in skip_files:
+                    continue
+                # Also skip -journal WAL sidecars
+                if name_lower.endswith("-journal"):
+                    continue
+                shutil.copy2(item, target_default / item.name)
+                copied_count += 1
+            elif item.is_dir():
+                if skip_cache and name_lower in cache_dirs:
+                    try:
+                        skipped_cache_bytes += sum(
+                            f.stat().st_size for f in item.rglob("*") if f.is_file()
+                        )
+                    except Exception:
+                        pass
+                    continue
+                shutil.copytree(
+                    item, target_default / item.name,
+                    dirs_exist_ok=True,
+                    ignore_dangling_symlinks=True,
+                )
+                copied_count += 1
+        except Exception as e:
+            errors.append(f"{item.name}: {type(e).__name__}")
+            continue
+
+    # Copy Local State (shared across profiles, needed for Chrome to recognize profile)
+    local_state_src = root / "Local State"
+    if local_state_src.exists():
+        try:
+            shutil.copy2(local_state_src, target_root / "Local State")
+        except Exception as e:
+            errors.append(f"Local State: {e}")
+
+    # Compute target size
+    try:
+        total_size = sum(f.stat().st_size for f in target_root.rglob("*") if f.is_file())
+    except Exception:
+        total_size = 0
+
+    result = {
+        "source": str(source_path),
+        "target": str(target_root),
+        "copied_items": copied_count,
+        "target_size_mb": round(total_size / 1024 / 1024, 1),
+        "cache_skipped_mb": round(skipped_cache_bytes / 1024 / 1024, 1),
+        "errors": errors[:10],  # cap error list
+        "next_step": (
+            f"spawn_browser(instance_id='{target_instance_id}', "
+            f"url='https://example.com', headless=False)"
+        ),
+    }
+    return ok(json.dumps(result, indent=2, default=str))
 
 
 # ══════════════════════════════════════════════════════════════════════════
