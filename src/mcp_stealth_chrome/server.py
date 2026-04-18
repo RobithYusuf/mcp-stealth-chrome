@@ -2070,30 +2070,26 @@ async def mouse_replay(path_json: str, speed: float = 1.0) -> str:
 
 
 _PROMPT_TEMPLATE = (
-    "You are solving a Google reCAPTCHA v2 image challenge.\n\n"
-    "The screenshot shows a web page. Somewhere in the image there is a\n"
-    "reCAPTCHA modal with:\n"
-    "  - a BLUE HEADER banner at the top reading 'Select all images with <CATEGORY>'\n"
-    "  - a {grid} grid of photo tiles below the header\n"
-    "  - a VERIFY button at the bottom right\n\n"
-    "YOUR TASK:\n"
-    "STEP 1: Locate the blue header and READ the target category name.\n"
-    "STEP 2: Examine every tile in the {grid} grid carefully.\n"
-    "STEP 3: Return the 0-based indices of ALL tiles containing the target.\n\n"
-    "Tile numbering (row-major):\n"
-    "  3x3:  [0 1 2 / 3 4 5 / 6 7 8]\n"
-    "  4x4:  [0 1 2 3 / 4 5 6 7 / 8 9 10 11 / 12 13 14 15]\n\n"
-    "CRITICAL RULES (Google rejects incomplete answers):\n"
-    "  - Include tiles with PARTIAL, SMALL, or DISTANT matches\n"
-    "  - When borderline, INCLUDE the tile (over-select is safer)\n"
-    "  - Only exclude tiles that clearly show NONE of the target\n\n"
-    "If you cannot see a reCAPTCHA challenge in the image, respond: []\n"
-    "Otherwise respond with ONLY a JSON array, e.g. [0,2,4,6]"
+    "Image analysis task. The screenshot contains a tile grid overlay.\n"
+    "At the top a blue banner states the target category.\n\n"
+    "Two possible layouts:\n"
+    "  3x3 layout — 9 separate photos (banner says 'all IMAGES with <X>')\n"
+    "  4x4 layout — 16 segments of one photo (banner says 'all SQUARES with <X>')\n\n"
+    "Identify the layout and return indices of every tile that visibly contains\n"
+    "the target category. Include partial/edge matches.\n\n"
+    "Tile indexing (row-major, 0-based, top-left = 0):\n"
+    "  3x3: 0 1 2 / 3 4 5 / 6 7 8\n"
+    "  4x4: 0 1 2 3 / 4 5 6 7 / 8 9 10 11 / 12 13 14 15\n\n"
+    "Respond with ONLY this JSON (no explanation):\n"
+    '  {\"grid\":\"3x3\",\"tiles\":[0,2,4]}\n'
+    "  or\n"
+    '  {\"grid\":\"4x4\",\"tiles\":[5,6,9,10]}\n\n'
+    'If no grid overlay is visible: {\"grid\":\"unknown\",\"tiles\":[]}'
 )
 
 
 def _parse_tile_indices(text: str) -> list[int]:
-    """Extract JSON array of ints from LLM response text."""
+    """Legacy: extract JSON array of ints from response (kept for compat)."""
     try:
         import re as _re
         match = _re.search(r"\[[\d\s,]*\]", text)
@@ -2105,11 +2101,39 @@ def _parse_tile_indices(text: str) -> list[int]:
         return []
 
 
+def _parse_vision_response(text: str) -> tuple[str, list[int]]:
+    """Parse {'grid': '3x3'|'4x4', 'tiles': [...]} from LLM response text.
+
+    Returns (grid, tiles). Falls back to legacy array-only parse assuming 3x3.
+    """
+    import re as _re
+    # Try JSON object first
+    obj_match = _re.search(r'\{[^{}]*"grid"[^{}]*"tiles"[^{}]*\}', text)
+    if not obj_match:
+        obj_match = _re.search(r'\{[^{}]*"tiles"[^{}]*"grid"[^{}]*\}', text)
+    if obj_match:
+        try:
+            parsed = json.loads(obj_match.group(0))
+            grid = str(parsed.get("grid", "3x3")).lower().strip()
+            if grid not in ("3x3", "4x4"):
+                grid = "3x3"
+            tiles_raw = parsed.get("tiles", [])
+            max_idx = 9 if grid == "3x3" else 16
+            tiles = [int(x) for x in tiles_raw
+                     if isinstance(x, (int, float)) and 0 <= int(x) < max_idx]
+            return grid, tiles
+        except Exception:
+            pass
+    # Fallback: bare array → assume 3x3
+    tiles = _parse_tile_indices(text)
+    return "3x3", tiles
+
+
 async def _claude_vision_pick_tiles(
     api_key: str, target: str, image_b64: str,
     grid: str = "3x3", model: str = "claude-opus-4-7",
-) -> list[int]:
-    """Anthropic Claude vision tile picker."""
+) -> tuple[str, list[int]]:
+    """Anthropic Claude vision tile picker. Returns (grid_detected, tiles)."""
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(
             "https://api.anthropic.com/v1/messages",
@@ -2120,32 +2144,30 @@ async def _claude_vision_pick_tiles(
             },
             json={
                 "model": model,
-                "max_tokens": 200,
+                "max_tokens": 300,
                 "messages": [{
                     "role": "user",
                     "content": [
                         {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": image_b64}},
-                        {"type": "text", "text": _PROMPT_TEMPLATE.format(grid=grid, target=target)},
+                        {"type": "text", "text": _PROMPT_TEMPLATE},
                     ],
                 }],
             },
         )
         data = resp.json()
         text = (data.get("content", [{}])[0]).get("text", "[]").strip()
-        return _parse_tile_indices(text)
+        return _parse_vision_response(text)
 
 
 async def _openai_compat_vision_pick_tiles(
     api_key: str, base_url: str, model: str,
     target: str, image_b64: str, grid: str = "3x3",
-) -> list[int]:
-    """OpenAI-compatible vision tile picker.
+) -> tuple[str, list[int]]:
+    """OpenAI-compatible vision tile picker. Returns (grid_detected, tiles).
 
     Works with: OpenAI (gpt-4o, gpt-5.x), Groq (llama3.2-vision),
-    Ollama (llava local), patungin.id, Together.ai, and any
-    /v1/chat/completions endpoint that supports image_url content.
-
-    base_url should NOT include the /chat/completions path — we append it.
+    Ollama (llava local), patungin.id, Together.ai, any /v1/chat/completions
+    endpoint that supports image_url content.
     """
     url = base_url.rstrip("/") + "/chat/completions"
     async with httpx.AsyncClient(timeout=60.0) as client:
@@ -2157,12 +2179,12 @@ async def _openai_compat_vision_pick_tiles(
             },
             json={
                 "model": model,
-                "max_tokens": 200,
+                "max_tokens": 300,
                 "temperature": 0,
                 "messages": [{
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": _PROMPT_TEMPLATE.format(grid=grid, target=target)},
+                        {"type": "text", "text": _PROMPT_TEMPLATE},
                         {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
                     ],
                 }],
@@ -2171,11 +2193,11 @@ async def _openai_compat_vision_pick_tiles(
         data = resp.json()
         try:
             text = data["choices"][0]["message"]["content"]
-            if isinstance(text, list):  # some providers return content as array
+            if isinstance(text, list):
                 text = "".join(c.get("text", "") for c in text if isinstance(c, dict))
         except (KeyError, IndexError, TypeError):
-            return []
-        return _parse_tile_indices(str(text))
+            return "3x3", []
+        return _parse_vision_response(str(text))
 
 
 def _resolve_vision_provider(
@@ -2316,37 +2338,37 @@ async def solve_recaptcha_ai(
             # Prompt tells vision model to READ target from the challenge header itself.
             target = "the category shown in the blue header banner of the reCAPTCHA modal"
 
-            # Step 4: ask Claude
+            # Step 4: ask vision model (returns grid + tile indices)
             if resolved_provider == "anthropic":
-                tiles = await _claude_vision_pick_tiles(
+                grid_detected, tiles = await _claude_vision_pick_tiles(
                     resolved_key, target, img_b64, model=resolved_model,
                 )
             else:
-                tiles = await _openai_compat_vision_pick_tiles(
+                grid_detected, tiles = await _openai_compat_vision_pick_tiles(
                     resolved_key, resolved_base_url, resolved_model,
                     target, img_b64,
                 )
             if not tiles:
                 return err(
                     f"round {round_num}: {resolved_provider} ({resolved_model}) "
-                    f"returned no tiles for target={target!r}"
+                    f"returned no tiles (grid={grid_detected!r})"
                 )
 
-            # Step 5: click tiles (3x3 assumed — 9 cells)
-            # Each tile is ~(width/3 by (height-verify_bar)/3)
-            # Challenge iframe: top part = header (~120px), middle = tiles, bottom = buttons (~60px)
+            # Step 5: dynamic grid math (supports 3x3 images OR 4x4 squares)
+            n = 4 if grid_detected == "4x4" else 3
+            max_valid = n * n
             grid_top = finfo["top"] + 120
             grid_bottom = finfo["top"] + finfo["height"] - 70
             grid_left = finfo["left"] + 10
             grid_right = finfo["left"] + finfo["width"] - 10
-            tile_w = (grid_right - grid_left) / 3
-            tile_h = (grid_bottom - grid_top) / 3
+            tile_w = (grid_right - grid_left) / n
+            tile_h = (grid_bottom - grid_top) / n
 
             clicked = []
             for idx in tiles:
-                if not isinstance(idx, int) or idx < 0 or idx > 8:
+                if not isinstance(idx, int) or idx < 0 or idx >= max_valid:
                     continue
-                row, col = idx // 3, idx % 3
+                row, col = idx // n, idx % n
                 cx = int(grid_left + tile_w * col + tile_w / 2)
                 cy = int(grid_top + tile_h * row + tile_h / 2)
                 await humanized_move(tab, cx + 80, cy - 60, cx, cy)
