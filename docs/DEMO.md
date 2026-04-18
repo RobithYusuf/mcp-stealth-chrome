@@ -187,7 +187,7 @@ Supported signatures:
 
 **Target**: `https://www.google.com/recaptcha/api2/demo` — Google's official reCAPTCHA v2 demo.
 
-**Method**: `solve_recaptcha_ai()` with gpt-5.4 via patungin.id (OpenAI-compatible).
+**Method**: `solve_recaptcha_ai()` with a vision-capable LLM via OpenAI-compatible API.
 
 ### Benchmark: 5 Consecutive Runs
 
@@ -241,7 +241,7 @@ solve_recaptcha_ai(max_rounds=3, wait_between=3.0)
 
 Any vision-enabled LLM with `/v1/chat/completions`:
 - **OpenAI**: gpt-4o, gpt-5.x (most expensive, most accurate)
-- **patungin.id** (tested): gpt-5.4 (~$0.01-0.03 per solve)
+- **Custom gateways / aggregators**: any /v1/chat/completions endpoint (~$0.005-0.03 per solve)
 - **Anthropic**: claude-opus-4-7 via ANTHROPIC_API_KEY
 - **Groq**: llama-3.2-vision (fast + cheap)
 - **Local Ollama**: llava (free but slower)

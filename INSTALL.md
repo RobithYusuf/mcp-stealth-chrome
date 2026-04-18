@@ -170,13 +170,13 @@ For premium features, set environment variables in the `env` block:
 |----------|----------------|---------|
 | `CAPSOLVER_KEY` | `solve_captcha` tool (Turnstile, reCAPTCHA, hCaptcha) | [capsolver.com](https://capsolver.com) |
 | `ANTHROPIC_API_KEY` | `solve_recaptcha_ai` via Claude vision | [console.anthropic.com](https://console.anthropic.com) |
-| `AI_VISION_BASE_URL` + `AI_VISION_API_KEY` + `AI_VISION_MODEL` | `solve_recaptcha_ai` via OpenAI-compatible API (gpt-4o, gpt-5.x, Groq, local Ollama, patungin.id) | Your provider |
+| `AI_VISION_BASE_URL` + `AI_VISION_API_KEY` + `AI_VISION_MODEL` | `solve_recaptcha_ai` via any OpenAI-compatible API (Groq, Together, Fireworks, local Ollama, custom gateway) | Your provider |
 | `OPENAI_API_KEY` | Shortcut for OpenAI cloud (defaults base URL) | [platform.openai.com](https://platform.openai.com) |
 | `AI_VISION_PROVIDER` | Force provider (`anthropic` or `openai`) when both keys present | — |
 | `BROWSER_IDLE_TIMEOUT` | Auto-close idle browsers after N seconds (default 600) | — |
 | `BROWSER_IDLE_REAPER_INTERVAL` | Reaper check frequency (default 60) | — |
 
-### Example: OpenAI-compatible provider (e.g. patungin.id)
+### Example: OpenAI-compatible provider (any /v1/chat/completions endpoint)
 
 ```json
 {
@@ -185,14 +185,17 @@ For premium features, set environment variables in the `env` block:
       "command": "uvx",
       "args": ["mcp-stealth-chrome@latest"],
       "env": {
-        "AI_VISION_BASE_URL": "https://ai.patungin.id/v1",
+        "AI_VISION_BASE_URL": "https://your-provider.example.com/v1",
         "AI_VISION_API_KEY":  "your-key-here",
-        "AI_VISION_MODEL":    "gpt-5.4"
+        "AI_VISION_MODEL":    "model-name-with-vision"
       }
     }
   }
 }
 ```
+
+Works with any provider — Groq, Together.ai, Fireworks, DeepInfra,
+Anyscale, custom LLM gateways, self-hosted vLLM/Ollama, etc.
 
 ### Example: Local Ollama with llava vision
 

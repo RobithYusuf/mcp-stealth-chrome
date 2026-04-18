@@ -2063,7 +2063,7 @@ async def mouse_replay(path_json: str, speed: float = 1.0) -> str:
 #
 # Solves reCAPTCHA v2 image challenges via vision-enabled LLM.
 # Supports BOTH Anthropic (Claude) AND any OpenAI-compatible API
-# (gpt-4o, gpt-5.x, Groq llama3.2-vision, patungin.id, local Ollama, etc).
+# (gpt-4o, gpt-5.x, Groq llama3.2-vision, local Ollama, custom gateways, etc).
 #
 # Provider auto-detected from env vars:
 #   - AI_VISION_BASE_URL + AI_VISION_API_KEY + AI_VISION_MODEL → OpenAI-compat
@@ -2168,7 +2168,7 @@ async def _openai_compat_vision_pick_tiles(
     """OpenAI-compatible vision tile picker. Returns (grid_detected, tiles).
 
     Works with: OpenAI (gpt-4o, gpt-5.x), Groq (llama3.2-vision),
-    Ollama (llava local), patungin.id, Together.ai, any /v1/chat/completions
+    Ollama (llava local), Together.ai, custom LLM gateways — any /v1/chat/completions
     endpoint that supports image_url content.
     """
     url = base_url.rstrip("/") + "/chat/completions"
@@ -2258,11 +2258,11 @@ async def solve_recaptcha_ai(
     """Solve reCAPTCHA v2 image challenge using a vision-enabled LLM.
 
     Supports Anthropic (Claude) OR any OpenAI-compatible API (gpt-4o, gpt-5.x,
-    Groq, local Ollama, patungin.id, Together.ai, etc).
+    Groq, local Ollama, Together.ai, Fireworks, custom gateways, etc).
 
     Provider auto-detected from env, or pass explicitly:
         provider="anthropic" | "openai"
-        base_url="https://ai.patungin.id/v1"   (for openai-compat)
+        base_url="https://your-provider.example.com/v1"   (for openai-compat)
         api_key="..."
         model="gpt-5.4" | "claude-opus-4-7" | ...
 

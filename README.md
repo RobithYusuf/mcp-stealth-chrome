@@ -34,7 +34,7 @@ claude mcp add stealth-chrome -- uvx mcp-stealth-chrome@latest
 
 ### 🏆 reCAPTCHA v2 Benchmark (5 consecutive runs)
 
-Fresh profile + mouse drift warmup + gpt-5.4 via patungin.id (OpenAI-compat):
+Fresh profile + mouse drift warmup + an OpenAI-compatible vision model:
 
 ```
 Run 1: ✅ 2169ch token, tiles=[3,4,7],         146s
@@ -98,16 +98,18 @@ claude mcp add stealth-chrome --scope user -- uvx mcp-stealth-chrome@latest
 
 No Chrome? Server gives a friendly error with install instructions before failing.
 
-See [INSTALL.md](INSTALL.md) for detailed per-client setup (Claude Code / Desktop / Cursor). TL;DR below:
+See [INSTALL.md](INSTALL.md) for detailed per-client setup + troubleshooting. Per-client snippets below:
 
 <details>
-<summary><b>Claude Code CLI</b></summary>
+<summary><b>Claude Code</b></summary>
 
+**Global** (available in all projects):
 ```bash
-# Global (available in all projects):
 claude mcp add stealth-chrome --scope user -- uvx mcp-stealth-chrome@latest
+```
 
-# Project only:
+**Project only** (current project):
+```bash
 claude mcp add stealth-chrome -- uvx mcp-stealth-chrome@latest
 ```
 </details>
@@ -115,7 +117,31 @@ claude mcp add stealth-chrome -- uvx mcp-stealth-chrome@latest
 <details>
 <summary><b>Claude Desktop</b></summary>
 
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS):
+**Global** — add to config file:
+- **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
+- **Linux:** `~/.config/Claude/claude_desktop_config.json`
+
+```json
+{
+  "mcpServers": {
+    "stealth-chrome": {
+      "command": "uvx",
+      "args": ["mcp-stealth-chrome@latest"]
+    }
+  }
+}
+```
+
+> Claude Desktop is always global — no project-level config.
+</details>
+
+<details>
+<summary><b>Cursor</b></summary>
+
+**Global** — Preferences > Features > MCP, or `~/.cursor/mcp.json`:
+
+**Project** — `.cursor/mcp.json` in project root:
 
 ```json
 {
@@ -130,9 +156,30 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
 </details>
 
 <details>
-<summary><b>Cursor</b></summary>
+<summary><b>Windsurf</b></summary>
 
-`~/.cursor/mcp.json`:
+**Global** — `~/.windsurf/mcp.json`:
+
+**Project** — `.windsurf/mcp.json` in project root:
+
+```json
+{
+  "servers": {
+    "stealth-chrome": {
+      "command": "uvx",
+      "args": ["mcp-stealth-chrome@latest"]
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary><b>VS Code (Continue / Cline / Kilo Code)</b></summary>
+
+**Global** — VS Code settings or `~/.continue/config.json`:
+
+**Project** — `.vscode/mcp.json` in project root:
 
 ```json
 {
@@ -146,36 +193,122 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
 ```
 </details>
 
-### Optional: API Keys for CAPTCHA Solvers
+<details>
+<summary><b>Zed</b></summary>
 
-`solve_recaptcha_ai` works with **Claude OR any OpenAI-compatible vision API** (gpt-4o, gpt-5.x, Groq, Ollama local, patungin.id, Together.ai, etc). Pick one:
+Settings → Extensions → MCP Servers, or edit `~/.config/zed/settings.json`:
 
-**Anthropic Claude:**
 ```json
-"env": {
-  "ANTHROPIC_API_KEY": "sk-ant-xxxxx",
-  "CAPSOLVER_KEY": "CAP-xxxxx"
+{
+  "context_servers": {
+    "stealth-chrome": {
+      "command": {
+        "path": "uvx",
+        "args": ["mcp-stealth-chrome@latest"]
+      }
+    }
+  }
+}
+```
+</details>
+
+---
+
+## 🔑 BYOK (Bring Your Own Key) — Optional
+
+`mcp-stealth-chrome` is **fully functional without any API key** — 94 of 94 tools work out of the box, including `click_turnstile` (Cloudflare Turnstile bypass), TLS-perfect HTTP, multi-instance, and all scraping tools.
+
+**API keys are optional — only needed for 2 specific CAPTCHA solver tools:**
+
+| Tool | Purpose | Required key |
+|------|---------|--------------|
+| `solve_recaptcha_ai` | reCAPTCHA v2 image challenges via AI vision | Any vision-capable LLM |
+| `solve_captcha` | Turnstile/reCAPTCHA/hCaptcha via paid solver | CapSolver only |
+
+Everything else (click_turnstile, verify_cf, storage_state, http_request, etc.) works 100% **without any key**.
+
+### When BYOK Matters
+
+Only if you want to auto-solve reCAPTCHA v2 image challenges ("select all images with cars"). Add your preferred provider's key to the MCP `env` block:
+
+<details>
+<summary><b>Option 1 — Anthropic Claude</b></summary>
+
+```json
+{
+  "mcpServers": {
+    "stealth-chrome": {
+      "command": "uvx",
+      "args": ["mcp-stealth-chrome@latest"],
+      "env": {
+        "ANTHROPIC_API_KEY": "sk-ant-xxxxx"
+      }
+    }
+  }
 }
 ```
 
-**OpenAI-compatible (any provider with `/v1/chat/completions`):**
-```json
-"env": {
-  "AI_VISION_BASE_URL": "https://ai.patungin.id/v1",
-  "AI_VISION_API_KEY":  "your-key-here",
-  "AI_VISION_MODEL":    "gpt-5.4"
-}
-```
+Get key at [console.anthropic.com](https://console.anthropic.com/).
+</details>
 
-Or vanilla OpenAI (inherits default base URL):
+<details>
+<summary><b>Option 2 — OpenAI (gpt-4o, gpt-5.x)</b></summary>
+
 ```json
 "env": {
-  "OPENAI_API_KEY": "sk-xxxxx",
+  "OPENAI_API_KEY":  "sk-proj-xxxxx",
   "AI_VISION_MODEL": "gpt-4o"
 }
 ```
 
-Provider priority: explicit args to tool > `AI_VISION_*` env > `OPENAI_API_KEY` > `ANTHROPIC_API_KEY`.
+Get key at [platform.openai.com](https://platform.openai.com/api-keys).
+</details>
+
+<details>
+<summary><b>Option 3 — Any OpenAI-compatible API (Groq, Together, Fireworks, self-hosted, etc.)</b></summary>
+
+```json
+"env": {
+  "AI_VISION_BASE_URL": "https://your-provider.example.com/v1",
+  "AI_VISION_API_KEY":  "your-api-key",
+  "AI_VISION_MODEL":    "model-name-with-vision"
+}
+```
+
+Works with any provider exposing `/v1/chat/completions` with `image_url` content support.
+</details>
+
+<details>
+<summary><b>Option 4 — Local Ollama (free, no API key)</b></summary>
+
+```bash
+ollama pull llava
+```
+
+```json
+"env": {
+  "AI_VISION_BASE_URL": "http://localhost:11434/v1",
+  "AI_VISION_API_KEY":  "ollama",
+  "AI_VISION_MODEL":    "llava:latest"
+}
+```
+
+Fully offline, no cost. Accuracy varies by model.
+</details>
+
+<details>
+<summary><b>Option 5 — CapSolver (paid, no AI needed)</b></summary>
+
+```json
+"env": {
+  "CAPSOLVER_KEY": "CAP-xxxxxxxxxxxxx"
+}
+```
+
+Enables `solve_captcha` tool. ~$0.80/1000 solves for Turnstile. Get key at [capsolver.com](https://capsolver.com).
+</details>
+
+**Provider resolution priority**: explicit args to tool > `AI_VISION_*` env vars > `OPENAI_API_KEY` > `ANTHROPIC_API_KEY`.
 
 ## Requirements
 
