@@ -2338,20 +2338,48 @@ async def solve_recaptcha_ai(
             # Prompt tells vision model to READ target from the challenge header itself.
             target = "the category shown in the blue header banner of the reCAPTCHA modal"
 
-            # Step 4: ask vision model (returns grid + tile indices)
-            if resolved_provider == "anthropic":
-                grid_detected, tiles = await _claude_vision_pick_tiles(
-                    resolved_key, target, img_b64, model=resolved_model,
-                )
-            else:
-                grid_detected, tiles = await _openai_compat_vision_pick_tiles(
-                    resolved_key, resolved_base_url, resolved_model,
-                    target, img_b64,
-                )
+            # Step 4: ask vision model (returns grid + tile indices).
+            # If empty, try refreshing the challenge up to max_refresh times —
+            # model may refuse / under-identify ambiguous ones but next challenge works.
+            grid_detected, tiles = "3x3", []
+            max_refresh = 3
+            for refresh_attempt in range(max_refresh + 1):
+                if resolved_provider == "anthropic":
+                    grid_detected, tiles = await _claude_vision_pick_tiles(
+                        resolved_key, target, img_b64, model=resolved_model,
+                    )
+                else:
+                    grid_detected, tiles = await _openai_compat_vision_pick_tiles(
+                        resolved_key, resolved_base_url, resolved_model,
+                        target, img_b64,
+                    )
+                if tiles:
+                    break  # got valid picks, proceed
+                if refresh_attempt < max_refresh:
+                    # Click the reload (↻) icon — typically bottom-left of bframe
+                    # Position: ~25px from left, ~30px from bottom of iframe
+                    reload_x = int(finfo["left"] + 25)
+                    reload_y = int(finfo["top"] + finfo["height"] - 30)
+                    await humanized_move(tab, reload_x + 60, reload_y - 40, reload_x, reload_y)
+                    await asyncio.sleep(0.2)
+                    await tab.mouse_click(reload_x, reload_y)
+                    await asyncio.sleep(2.5)  # wait for new challenge to load
+                    # Re-screenshot after refresh
+                    shot_path = SCREENSHOT_DIR / ts_filename(
+                        f"recaptcha-r{round_num}-refresh{refresh_attempt+1}", "png"
+                    )
+                    await tab.save_screenshot(filename=str(shot_path), format="png")
+                    try:
+                        img_bytes = open(str(shot_path), "rb").read()
+                        img_b64 = _b64.b64encode(img_bytes).decode()
+                    except Exception:
+                        pass  # keep previous img_b64
+
             if not tiles:
                 return err(
                     f"round {round_num}: {resolved_provider} ({resolved_model}) "
-                    f"returned no tiles (grid={grid_detected!r})"
+                    f"returned no tiles after {max_refresh} refresh attempts "
+                    f"(grid={grid_detected!r})"
                 )
 
             # Step 5: dynamic grid math (supports 3x3 images OR 4x4 squares)
