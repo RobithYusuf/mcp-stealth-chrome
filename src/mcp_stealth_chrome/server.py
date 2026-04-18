@@ -47,8 +47,10 @@ from .state import (
     STORAGE_STATE_DIR,
     BrowserState,
     InstanceSnapshot,
+    chrome_install_hint,
     clean_profile_state,
     ensure_dirs,
+    find_chrome_binary,
 )
 
 mcp = FastMCP("stealth-chrome")
@@ -2838,6 +2840,15 @@ async def _launch_browser_instance(
 
     Returns (success, message).
     """
+    # Pre-flight: ensure Chrome is installed before calling nodriver
+    chrome_path = find_chrome_binary()
+    if chrome_path is None:
+        return False, (
+            "Chrome/Chromium not found on this system.\n"
+            + chrome_install_hint()
+            + "\n\nAfter installing, re-launch the MCP server."
+        )
+
     ensure_dirs()
 
     # Determine profile dir per instance

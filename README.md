@@ -73,9 +73,32 @@ Compared to the leading Python stealth MCP ([vibheksoni/stealth-browser-mcp](htt
 
 **Different niches**: we focus on anti-bot bypass, they focus on UI reverse-engineering. Both MCPs work great together.
 
-## Quick Install
+## Quick Install (3 commands per OS)
 
-See [INSTALL.md](INSTALL.md) for detailed per-client setup. TL;DR:
+**macOS:**
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh        # install uv
+brew install --cask google-chrome                       # install Chrome (skip if already installed)
+claude mcp add stealth-chrome --scope user -- uvx mcp-stealth-chrome@latest
+```
+
+**Linux (Ubuntu/Debian):**
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+sudo apt install -y google-chrome-stable                # or chromium-browser
+claude mcp add stealth-chrome --scope user -- uvx mcp-stealth-chrome@latest
+```
+
+**Windows (PowerShell):**
+```powershell
+powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+winget install Google.Chrome
+claude mcp add stealth-chrome --scope user -- uvx mcp-stealth-chrome@latest
+```
+
+No Chrome? Server gives a friendly error with install instructions before failing.
+
+See [INSTALL.md](INSTALL.md) for detailed per-client setup (Claude Code / Desktop / Cursor). TL;DR below:
 
 <details>
 <summary><b>Claude Code CLI</b></summary>

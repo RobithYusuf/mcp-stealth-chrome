@@ -29,6 +29,72 @@ DEFAULT_IDLE_TIMEOUT = int(os.environ.get("BROWSER_IDLE_TIMEOUT", "600"))  # 10 
 IDLE_REAPER_INTERVAL = int(os.environ.get("BROWSER_IDLE_REAPER_INTERVAL", "60"))
 
 
+def find_chrome_binary() -> Optional[str]:
+    """Locate Chrome/Chromium on this system. Returns path or None."""
+    import sys
+    candidates: list[str] = []
+    if sys.platform == "darwin":
+        candidates = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+            "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+        ]
+    elif sys.platform.startswith("linux"):
+        candidates = [
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/snap/bin/chromium",
+            "/usr/bin/microsoft-edge",
+            "/usr/bin/brave-browser",
+        ]
+    elif sys.platform == "win32":
+        pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+        pfx86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+        localappdata = os.environ.get("LOCALAPPDATA", "")
+        candidates = [
+            rf"{pf}\Google\Chrome\Application\chrome.exe",
+            rf"{pfx86}\Google\Chrome\Application\chrome.exe",
+            rf"{localappdata}\Google\Chrome\Application\chrome.exe",
+            rf"{pf}\Microsoft\Edge\Application\msedge.exe",
+            rf"{pfx86}\Microsoft\Edge\Application\msedge.exe",
+            rf"{pf}\Chromium\Application\chromium.exe",
+        ]
+    for path in candidates:
+        if path and Path(path).exists():
+            return path
+    return None
+
+
+CHROME_INSTALL_HINT = {
+    "darwin": (
+        "Install Chrome from https://www.google.com/chrome/\n"
+        "  or via Homebrew: brew install --cask google-chrome"
+    ),
+    "linux": (
+        "Install Chrome:\n"
+        "  Ubuntu/Debian: sudo apt install -y google-chrome-stable  (add Google's APT repo first)\n"
+        "  Or Chromium:  sudo apt install -y chromium-browser\n"
+        "  Fedora:       sudo dnf install -y chromium"
+    ),
+    "win32": (
+        "Install Chrome from https://www.google.com/chrome/\n"
+        "  or via winget: winget install Google.Chrome"
+    ),
+}
+
+
+def chrome_install_hint() -> str:
+    import sys
+    for key, hint in CHROME_INSTALL_HINT.items():
+        if sys.platform.startswith(key) or sys.platform == key:
+            return hint
+    return "Install Chrome or Chromium from https://www.google.com/chrome/"
+
+
 def ensure_dirs() -> None:
     for d in (PROFILE_DIR, PROFILES_ROOT, SCREENSHOT_DIR, EXPORT_DIR, STORAGE_STATE_DIR):
         d.mkdir(parents=True, exist_ok=True)
