@@ -1,0 +1,62 @@
+[project]
+name = "mcp-stealth-chrome"
+version = "0.1.0"
+description = "Stealth Chrome MCP server — nodriver + Chromium + 80+ tools with Cloudflare/Turnstile bypass, CapSolver, storage-state reuse"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "RobithYusuf", email = "robithdev@gmail.com" }
+]
+keywords = [
+    "mcp",
+    "model-context-protocol",
+    "nodriver",
+    "stealth",
+    "anti-detection",
+    "cloudflare-bypass",
+    "turnstile",
+    "browser-automation",
+    "chromium",
+    "chrome",
+    "claude",
+    "captcha",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Internet :: WWW/HTTP :: Browsers",
+]
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.2.0",
+    "nodriver>=0.40",
+    "pydantic>=2.5",
+    "httpx>=0.27",
+    "opencv-python>=4.8",
+    "curl-cffi>=0.7",
+]
+
+[project.urls]
+Homepage = "https://github.com/RobithYusuf/mcp-stealth-chrome"
+Repository = "https://github.com/RobithYusuf/mcp-stealth-chrome"
+Issues = "https://github.com/RobithYusuf/mcp-stealth-chrome/issues"
+
+[project.scripts]
+mcp-stealth-chrome = "mcp_stealth_chrome.server:main"
+
+[build-system]
+requires = ["uv_build>=0.11.3,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]

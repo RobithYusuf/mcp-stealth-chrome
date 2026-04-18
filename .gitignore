@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# uv
+.uv-cache/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Environment
+.env
+.env.local
+
+# Testing / temp
+/tmp/
+*.log
+smoke-*.log
+test-*.log
+
+# Generated data (user-specific, shouldn't be in repo)
+# Note: ~/.mcp-stealth/ lives outside repo so no pattern needed
