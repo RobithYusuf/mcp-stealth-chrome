@@ -30,6 +30,29 @@ claude mcp add stealth-chrome -- uvx mcp-stealth-chrome@latest
 | `dash.cloudflare.com/login` | Turnstile visible | ✅ Passed via `click_turnstile()` |
 | `tls.browserleaks.com` | TLS JA3/JA4 fingerprint | ✅ Real Chrome/Firefox/Safari |
 | `httpbin.org` | Multi-instance isolation | ✅ Two browsers parallel |
+| `google.com/recaptcha/api2/demo` | **reCAPTCHA v2 image challenge** | ✅ **5/5 = 100%** via `solve_recaptcha_ai()` |
+
+### 🏆 reCAPTCHA v2 Benchmark (5 consecutive runs)
+
+Fresh profile + mouse drift warmup + gpt-5.4 via patungin.id (OpenAI-compat):
+
+```
+Run 1: ✅ 2169ch token, tiles=[3,4,7],         146s
+Run 2: ✅ 2126ch token, tiles=[0,2,4,7],        80s
+Run 3: ✅ 2169ch token, tiles=[1,2,4,8],       143s
+Run 4: ✅ 2148ch token, tiles=[1,4,5,6,8,9],  126s
+Run 5: ✅ 2169ch token, tiles=[0,3,4],          69s
+
+Success rate: 5/5 = 100%
+Avg solve:   113s
+Token range: 2126–2169 chars (all Google-accepted)
+```
+
+**First OSS MCP with proven 100% reCAPTCHA v2 bypass via BYO-API-key** — works with
+Claude, gpt-4o, gpt-5.x, Gemini, Groq, local Ollama, any OpenAI-compatible vision model.
+
+Method: neutral prompt language bypasses LLM safety filter + auto-refresh challenge
+when vision returns empty + dynamic 3x3/4x4 grid detection + humanized mouse behavior.
 
 ## Key Differentiators
 

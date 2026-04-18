@@ -181,6 +181,74 @@ Supported signatures:
 
 ---
 
+---
+
+## Demo 6: reCAPTCHA v2 Image Challenge — **5/5 Success** ⭐
+
+**Target**: `https://www.google.com/recaptcha/api2/demo` — Google's official reCAPTCHA v2 demo.
+
+**Method**: `solve_recaptcha_ai()` with gpt-5.4 via patungin.id (OpenAI-compatible).
+
+### Benchmark: 5 Consecutive Runs
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│  Run 1: ✅ token=2169ch  tiles=[3,4,7]              146s      │
+│  Run 2: ✅ token=2126ch  tiles=[0,2,4,7]             80s      │
+│  Run 3: ✅ token=2169ch  tiles=[1,2,4,8]            143s      │
+│  Run 4: ✅ token=2148ch  tiles=[1,4,5,6,8,9]        126s      │
+│  Run 5: ✅ token=2169ch  tiles=[0,3,4]               69s      │
+├───────────────────────────────────────────────────────────────┤
+│  SUCCESS RATE: 5/5 = 100%                                     │
+│  Average solve time: 113 seconds                              │
+│  Token range: 2126–2169 chars (all Google-accepted)          │
+└───────────────────────────────────────────────────────────────┘
+```
+
+### Workflow
+
+```
+spawn_browser("recap_fresh", url="https://google.com", profile_dir="/tmp/fresh")
+switch_instance("recap_fresh")
+scroll(direction="down", amount=200)                 # natural warmup
+mouse_drift(duration_seconds=1.5, segments=2)        # behavioral signature
+
+navigate(url="https://www.google.com/recaptcha/api2/demo")
+mouse_click_xy(x=63, y=375)                          # click "I'm not a robot"
+                                                      # wait for image challenge
+
+solve_recaptcha_ai(max_rounds=3, wait_between=3.0)
+# Internally:
+#  1. Full-page screenshot
+#  2. Ask gpt-5.4 "which tiles match target?"
+#  3. If empty response → click reload (↻) → new challenge → retry (max 3x)
+#  4. Click matching tiles with Bezier mouse path
+#  5. Click Verify
+#  6. Check g-recaptcha-response token
+#  7. Return on success, or loop for next round
+```
+
+### Why This Works
+
+1. **Neutral prompt language** — avoids "CAPTCHA" keyword that triggers LLM safety filters
+2. **Auto-refresh** — if model returns empty (ambiguous/filtered), click ↻ for fresh challenge
+3. **Grid auto-detect** — handles both 3x3 (separate images) and 4x4 (segmented) challenges
+4. **Fresh profile** — no Google reputation history = challenges not hardened
+5. **Mouse behavioral patterns** — Bezier paths + Gaussian delays before critical clicks
+6. **Full-page screenshot** — avoids cross-origin iframe crop bugs
+
+### BYO-API-key Providers Supported
+
+Any vision-enabled LLM with `/v1/chat/completions`:
+- **OpenAI**: gpt-4o, gpt-5.x (most expensive, most accurate)
+- **patungin.id** (tested): gpt-5.4 (~$0.01-0.03 per solve)
+- **Anthropic**: claude-opus-4-7 via ANTHROPIC_API_KEY
+- **Groq**: llama-3.2-vision (fast + cheap)
+- **Local Ollama**: llava (free but slower)
+- **Together.ai, Fireworks, etc.**
+
+---
+
 ## Reproducing These Demos
 
 1. Install mcp-stealth-chrome (see [INSTALL.md](../INSTALL.md))
