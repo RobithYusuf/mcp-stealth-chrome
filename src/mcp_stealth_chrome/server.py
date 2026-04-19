@@ -11,6 +11,7 @@ import asyncio
 import base64
 import json
 import os
+import random
 import re
 import time
 from pathlib import Path
@@ -35,7 +36,7 @@ from .helpers import (
     resolve_ref,
     ts_filename,
 )
-from .humanize import humanized_click, humanized_move, humanized_type
+from .humanize import humanized_click, humanized_move, humanized_scroll, humanized_type
 from .snapshot import SNAPSHOT_JS, format_snapshot
 from .state import (
     DEFAULT_IDLE_TIMEOUT,
@@ -1173,19 +1174,84 @@ async def set_viewport_size(width: int, height: int) -> str:
 
 
 @mcp.tool()
-async def scroll(direction: str = "down", amount: int = 500) -> str:
-    """Scroll page by pixel amount. Directions: up|down|top|bottom."""
+async def scroll(
+    direction: str = "down",
+    amount: int = 500,
+    humanize: bool = True,
+) -> str:
+    """Scroll page via REAL mouseWheel CDP events (not JS scrollBy).
+
+    humanize=True (default): variable chunks 50-150px + micro-pauses + 20%
+    reading-pause chance — bypasses DataDome/PerimeterX behavioral detection.
+    humanize=False: instant scroll (faster, less stealthy).
+
+    Directions: up | down | top | bottom
+    """
     try:
         tab = BrowserState.active_tab()
         if direction == "top":
             await tab.evaluate("window.scrollTo(0,0)", return_by_value=True)
-        elif direction == "bottom":
-            await tab.evaluate("window.scrollTo(0, document.body.scrollHeight)",
-                                return_by_value=True)
+            return ok("scrolled to top")
+        if direction == "bottom":
+            await tab.evaluate(
+                "window.scrollTo(0, document.body.scrollHeight)",
+                return_by_value=True,
+            )
+            return ok("scrolled to bottom")
+
+        dy = amount if direction == "down" else -amount
+        if humanize:
+            actual = await humanized_scroll(tab, dy)
+            return ok(f"scrolled {direction} {actual}px (humanized wheel events)")
+        # Instant mode — single wheel dispatch (still real event)
+        from nodriver.cdp import input_ as cdp_input
+        await tab.send(cdp_input.dispatch_mouse_event(
+            type_="mouseWheel", x=500, y=400, delta_x=0, delta_y=dy,
+        ))
+        return ok(f"scrolled {direction} {amount}px (instant wheel)")
+    except Exception as e:
+        return err(str(e))
+
+
+@mcp.tool()
+async def scroll_to(
+    ref: Optional[str] = None,
+    selector: Optional[str] = None,
+    block: str = "center",
+    smooth: bool = True,
+) -> str:
+    """Smooth-scroll a specific element into viewport.
+
+    Args:
+        ref: snapshot ref (e.g. "e7") from browser_snapshot
+        selector: CSS selector alternative
+        block: "start" | "center" | "end" | "nearest" — vertical alignment
+        smooth: CSS smooth scroll (default) vs instant jump
+
+    Works even if element is far off-screen (pages of scroll away).
+    """
+    if not ref and not selector:
+        return err("ref or selector required")
+    try:
+        tab = BrowserState.active_tab()
+        if ref:
+            target_sel = f'[data-mcp-ref="{ref}"]'
         else:
-            dy = amount if direction == "down" else -amount
-            await tab.evaluate(f"window.scrollBy(0, {dy})", return_by_value=True)
-        return ok(f"scrolled {direction}")
+            target_sel = selector
+        behavior = "smooth" if smooth else "auto"
+        js = (
+            f"(() => {{ var el = document.querySelector({json.dumps(target_sel)}); "
+            f"if (!el) return 'not_found'; "
+            f"el.scrollIntoView({{block:{json.dumps(block)}, behavior:{json.dumps(behavior)}}}); "
+            f"return 'ok'; }})()"
+        )
+        res = await tab.evaluate(js, return_by_value=True)
+        if str(res) == "not_found":
+            return err(f"element not found: {target_sel}")
+        # Wait for smooth scroll to complete
+        if smooth:
+            await asyncio.sleep(random.uniform(0.4, 0.8))
+        return ok(f"scrolled element into view (block={block})")
     except Exception as e:
         return err(str(e))
 

@@ -219,6 +219,10 @@ class BrowserState:
     current_last_active: float = time.time()
     current_created_at: float = time.time()
 
+    # Last mouse position — enables realistic cursor continuation (no teleports).
+    # Updated by tools that move the mouse.
+    last_mouse_xy: dict[str, Optional[int]] = {"x": None, "y": None}
+
     instances: dict[str, InstanceSnapshot] = {}  # does NOT include current
     _reaper_task = None  # asyncio.Task
 
