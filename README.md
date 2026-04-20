@@ -36,25 +36,25 @@ claude mcp add stealth-chrome -- uvx mcp-stealth-chrome@latest
 
 ### 🎯 click_turnstile → Cloudflare Turnstile Bypass
 
-![Cloudflare Turnstile solved](docs/images/turnstile.jpg)
+<img src="docs/images/turnstile.jpg" alt="Cloudflare Turnstile solved" width="500">
 
 **One-liner bypass.** `click_turnstile()` → checkbox switches from "Verify you are human" ☐ to **"Success!" ✅**. Proven on `2captcha.com/demo/cloudflare-turnstile`.
 
 ### 🧪 bot.sannysoft.com → All Fingerprint Tests Pass
 
-![Fingerprint tests all passed](docs/images/sannysoft.jpg)
+<img src="docs/images/sannysoft.jpg" alt="Fingerprint tests all passed" width="500">
 
 `navigator.webdriver` missing, WebDriver Advanced passed, Chrome present, Plugins detected correctly, PHANTOM_* probes all ok, WebGL shows real `Apple M1 Pro` GPU — nodriver's CDP-direct approach leaves zero automation traces.
 
 ### 🤖 areyouheadless → Headless Chrome Detection
 
-![areyouheadless pass](docs/images/areyouheadless.jpg)
+<img src="docs/images/areyouheadless.jpg" alt="areyouheadless pass" width="500">
 
 Antoine Vastel's public headless-detection test says **"You are not Chrome headless"** — even though we run Chrome controlled programmatically.
 
 ### 🔍 browserscan.net/bot-detection → All Categories Normal
 
-![browserscan all normal](docs/images/browserscan.jpg)
+<img src="docs/images/browserscan.jpg" alt="browserscan all normal" width="500">
 
 14 signals checked (WebDriver, WebDriver Advance, Selenium, NightmareJS, PhantomJS, Awesomium, Cef, CefSharp, Coaches, FMiner, Born, Phantomas, Rhino, Webdriverio, Headless Chrome, CDP, Dev Tool, Native Navigator) — every one returns **"Normal"**.
 
@@ -73,7 +73,7 @@ Each impersonation produces **authentic browser JA3/JA4** — Cloudflare, DataDo
 
 ### 🏆 reCAPTCHA v2 Benchmark (5 consecutive runs)
 
-![reCAPTCHA v2 solved](docs/images/recaptcha.jpg)
+<img src="docs/images/recaptcha.jpg" alt="reCAPTCHA v2 solved" width="350">
 
 Fresh profile + mouse drift warmup + an OpenAI-compatible vision model:
 
