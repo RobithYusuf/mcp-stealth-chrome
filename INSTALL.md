@@ -328,6 +328,41 @@ Common causes:
 - Port conflict → nodriver picks free port automatically, retry
 - Corrupted venv → `rm -rf ~/.cache/uv && uvx mcp-stealth-chrome@latest` (forces fresh install)
 
+### MCP client says "Connected" but no tools appear in session
+
+Happens on first install or after cache clear: `uvx mcp-stealth-chrome@latest` needs
+to download ~200MB of deps (nodriver, curl_cffi, opencv-python) on cold start, which
+can exceed the MCP client's default 30 s handshake timeout. The health check passes
+later but the session already gave up on tool discovery.
+
+Three fixes, pick one:
+
+**1. Raise the timeout** (simplest):
+```bash
+# Add to ~/.zshrc / ~/.bashrc, then restart your MCP client:
+export MCP_TIMEOUT=90000
+```
+
+**2. Drop `@latest`** (skips PyPI version check, ~2× faster startup once cached):
+```json
+"args": ["mcp-stealth-chrome"]        // instead of ["mcp-stealth-chrome@latest"]
+```
+
+**3. Warm the cache before the client starts** (once):
+```bash
+echo '' | uvx mcp-stealth-chrome@latest   # downloads + caches, exits on EOF
+```
+Subsequent session starts are ~1 s.
+
+### `click_turnstile` returns "widget not found"
+
+Since v0.1.7 `click_turnstile` auto-falls-back to OpenCV template matching when
+selectors miss (handles out-of-process iframes — e.g. nopecha demos). If you're on
+an older version, upgrade or call `verify_cf()` directly. For Cloudflare managed-mode
+interstitials ("Just a moment..." full-page), neither tool helps — use
+`solve_captcha(kind="turnstile", ...)` with a CAPSOLVER_KEY, or reuse a session via
+`storage_state_load`.
+
 ---
 
 ## Verification Checklist

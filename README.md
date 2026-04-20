@@ -38,7 +38,11 @@ claude mcp add stealth-chrome -- uvx mcp-stealth-chrome@latest
 
 <img src="docs/images/turnstile.jpg" alt="Cloudflare Turnstile solved" width="500">
 
-**One-liner bypass.** `click_turnstile()` → checkbox switches from "Verify you are human" ☐ to **"Success!" ✅**. Proven on `2captcha.com/demo/cloudflare-turnstile`.
+**One-liner bypass** on supported widget shapes. `click_turnstile()` → checkbox switches from "Verify you are human" ☐ to **"Success!" ✅**.
+
+**✅ Works on:** `2captcha.com/demo/cloudflare-turnstile`, `dash.cloudflare.com` login, `nopecha.com/captcha/turnstile` (via template-match fallback since v0.1.7), any page embedding the standard CF Turnstile widget with `[data-sitekey]` / `.cf-turnstile` / `challenges.cloudflare.com` iframe.
+
+**❌ Does NOT work on:** Cloudflare **managed-mode interstitials** — the "Just a moment..." full-page challenge (e.g. `nopecha.com/demo/cloudflare`). CF scores the click as non-human and resets the Ray ID. For those pages use [`solve_captcha`](#solve_captcha) with a CAPSOLVER_KEY, or `storage_state_load` with a pre-warmed session.
 
 ### 🧪 bot.sannysoft.com → All Fingerprint Tests Pass
 
@@ -102,7 +106,7 @@ Compared to the leading Python stealth MCP ([vibheksoni/stealth-browser-mcp](htt
 | Feature | mcp-stealth-chrome | vibheksoni |
 |---------|:-------------------:|:-----------:|
 | Tools | **94** | 90 |
-| `click_turnstile` one-liner | ✅ **Proven bypass** | ❌ |
+| `click_turnstile` one-liner | ✅ Embed widgets + template fallback | ❌ |
 | Dual-mode HTTP (curl_cffi TLS) | ✅ **Unique** | ❌ |
 | AI Vision reCAPTCHA solver (Claude) | ✅ **Unique** | ❌ |
 | Precision Mouse Kit (11 tools) | ✅ **Unique** | ❌ |
@@ -407,7 +411,7 @@ Legacy `AI_VISION_*` env still work but emit `DeprecationWarning`. Migrate to `O
 ### ⭐⭐ Precision Mouse Kit (unique)
 | Tool | Purpose |
 |------|---------|
-| `click_turnstile` | One-liner CF Turnstile bypass (proven) |
+| `click_turnstile` | CF Turnstile bypass for embed widgets + template-match fallback |
 | `click_element_offset` | Click at % position inside element (not center) |
 | `click_at_corner` | Click top-left/right/bottom-left/right of element |
 | `find_by_image` | OpenCV template match → coordinates |
@@ -459,14 +463,19 @@ Legacy `AI_VISION_*` env still work but emit `DeprecationWarning`. Migrate to `O
 
 ## Example Workflows
 
-### One-liner Cloudflare Turnstile bypass
+### One-liner Cloudflare Turnstile bypass (embed widget)
 
 ```
 browser_launch(url="https://site-with-turnstile.com")
 mouse_drift(duration_seconds=2)                    # natural behavior
-click_turnstile()                                  # ✅ proven bypass
+click_turnstile()                                  # works on embedded widgets
 # Login button now enabled, fill form, submit
 ```
+
+Works on pages that embed the CF Turnstile widget (`.cf-turnstile`, `[data-sitekey]`,
+or a `challenges.cloudflare.com` iframe). For **managed-mode interstitials** ("Just
+a moment..." full-page challenges), this tool cannot bypass — use `solve_captcha`
+or `storage_state_load` instead.
 
 ### Bypass Turnstile via saved session (most reliable)
 

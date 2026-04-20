@@ -1812,14 +1812,28 @@ async def humanize_type(text: str, mean_delay: float = 0.12) -> str:
 
 
 @mcp.tool()
-async def click_turnstile(offset_x: int = 30, offset_y: Optional[int] = None) -> str:
+async def click_turnstile(
+    offset_x: int = 30,
+    offset_y: Optional[int] = None,
+    fallback_template: bool = True,
+) -> str:
     """Auto-find and click the Cloudflare Turnstile checkbox.
-    Searches iframes and challenge-widget containers, clicks at offset_x from the
-    left edge (where checkbox renders). Proven bypass on dash.cloudflare.com login.
+
+    Three-tier detection strategy:
+      1. Primary selectors: iframe[src*=challenges.cloudflare.com], [data-sitekey], .cf-turnstile
+      2. Secondary: .turnstile, input[name=cf-turnstile-response] → nearest sized container
+      3. Fallback (if fallback_template=True): OpenCV template match via verify_cf
+         — covers out-of-process iframe cases (e.g. nopecha.com/captcha/turnstile)
 
     Args:
-        offset_x: pixels from widget left edge (default 30, calibrated for CF)
-        offset_y: vertical offset (default = center)
+        offset_x: pixels from widget left edge (default 30, calibrated for CF checkbox)
+        offset_y: vertical offset (default = container center)
+        fallback_template: if selectors fail, try OpenCV template click (default True)
+
+    Known to work on: 2captcha.com/demo/cloudflare-turnstile, dash.cloudflare.com login,
+    nopecha.com/captcha/turnstile (via template fallback).
+    Does NOT work on: Cloudflare managed-mode interstitials ("Just a moment..." full-page
+    challenges) — use solve_captcha or storage_state_load for those.
     """
     try:
         tab = BrowserState.active_tab()
@@ -1828,7 +1842,8 @@ async def click_turnstile(offset_x: int = 30, offset_y: Optional[int] = None) ->
         coords_raw = await tab.evaluate(
             """
             (() => {
-              const candidates = [
+              // Tier 1: standard CF attributes
+              const primary = [
                 'iframe[src*="challenges.cloudflare.com"]',
                 'iframe[src*="turnstile"]',
                 '[data-testid*="challenge-widget"]',
@@ -1836,18 +1851,50 @@ async def click_turnstile(offset_x: int = 30, offset_y: Optional[int] = None) ->
                 '[data-sitekey]',
                 '.cf-turnstile',
               ];
-              for (const sel of candidates) {
-                const el = document.querySelector(sel);
-                if (!el) continue;
-                const r = el.getBoundingClientRect();
-                if (r.width < 50 || r.height < 20) continue;
-                return JSON.stringify({
-                  found: sel,
-                  left: Math.round(r.left),
-                  top: Math.round(r.top),
-                  width: Math.round(r.width),
-                  height: Math.round(r.height),
-                });
+              // Tier 2: common non-standard wrappers (nopecha, custom demos)
+              const secondary = [
+                '.turnstile',
+                '[id*="turnstile" i]',
+                '[id*="cf-chl"]',
+                '[class*="turnstile" i]',
+              ];
+              const tryPick = (selectors, tier) => {
+                for (const sel of selectors) {
+                  const els = document.querySelectorAll(sel);
+                  for (const el of els) {
+                    const r = el.getBoundingClientRect();
+                    if (r.width < 50 || r.height < 20) continue;
+                    return {
+                      tier, found: sel,
+                      left: Math.round(r.left),
+                      top: Math.round(r.top),
+                      width: Math.round(r.width),
+                      height: Math.round(r.height),
+                    };
+                  }
+                }
+                return null;
+              };
+              let hit = tryPick(primary, 'primary') || tryPick(secondary, 'secondary');
+              if (hit) return JSON.stringify(hit);
+              // Tier 2b: find hidden cf-turnstile-response input → walk up to sized ancestor
+              const inp = document.querySelector('input[name="cf-turnstile-response"]');
+              if (inp) {
+                let el = inp.parentElement;
+                while (el && el !== document.body) {
+                  const r = el.getBoundingClientRect();
+                  if (r.width >= 80 && r.height >= 30) {
+                    return JSON.stringify({
+                      tier: 'response-input-ancestor',
+                      found: 'input[name="cf-turnstile-response"]→ancestor',
+                      left: Math.round(r.left),
+                      top: Math.round(r.top),
+                      width: Math.round(r.width),
+                      height: Math.round(r.height),
+                    });
+                  }
+                  el = el.parentElement;
+                }
               }
               return 'not_found';
             })()
@@ -1855,19 +1902,32 @@ async def click_turnstile(offset_x: int = 30, offset_y: Optional[int] = None) ->
             return_by_value=True,
         )
         data = parse_json(coords_raw, None)
-        if not isinstance(data, dict):
-            return err(f"Turnstile widget not found on page ({coords_raw})")
-        target_x = data["left"] + offset_x
-        target_y = data["top"] + (offset_y if offset_y is not None else data["height"] // 2)
-        # Humanize the approach
-        start_x = target_x + 180
-        start_y = target_y - 80
-        await humanized_move(tab, start_x, start_y, target_x, target_y)
-        await asyncio.sleep(0.15)
-        await tab.mouse_click(target_x, target_y)
-        return ok(
-            f"clicked Turnstile at ({target_x},{target_y}) — widget found via {data['found']}"
-        )
+        if isinstance(data, dict):
+            target_x = data["left"] + offset_x
+            target_y = data["top"] + (offset_y if offset_y is not None else data["height"] // 2)
+            start_x = target_x + 180
+            start_y = target_y - 80
+            await humanized_move(tab, start_x, start_y, target_x, target_y)
+            await asyncio.sleep(0.15)
+            await tab.mouse_click(target_x, target_y)
+            return ok(
+                f"clicked Turnstile at ({target_x},{target_y}) — "
+                f"found via {data['found']} [tier={data.get('tier','primary')}]"
+            )
+        # Tier 3: fallback to OpenCV template matching (nodriver built-in)
+        if fallback_template:
+            try:
+                await tab.verify_cf(flash=False)
+                return ok(
+                    "clicked Turnstile via template-matching fallback "
+                    "(selector tiers exhausted — out-of-process iframe likely)"
+                )
+            except Exception as tpl_err:
+                return err(
+                    f"Turnstile widget not found via selectors ({coords_raw}); "
+                    f"template fallback also failed: {tpl_err}"
+                )
+        return err(f"Turnstile widget not found on page ({coords_raw})")
     except Exception as e:
         return err(str(e))
 
