@@ -3472,8 +3472,24 @@ async def clone_chrome_profile(
 
 
 def main() -> None:
-    """Stdio MCP entry point."""
-    mcp.run()
+    """Stdio MCP entry point.
+
+    Wraps mcp.run() with:
+    - KeyboardInterrupt / SIGINT: clean browser shutdown before exit.
+    - BrokenPipeError: Claude Code closed stdio pipe — exit cleanly to avoid
+      leaving orphan process that shows up as zombie in `ps`.
+    """
+    try:
+        mcp.run()
+    except (KeyboardInterrupt, BrokenPipeError):
+        pass
+    finally:
+        # Best-effort browser cleanup on exit (prevents Chrome orphans + profile locks).
+        try:
+            if BrowserState.browser and not getattr(BrowserState.browser, "stopped", False):
+                BrowserState.browser.stop()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

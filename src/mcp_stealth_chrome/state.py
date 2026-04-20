@@ -230,10 +230,23 @@ class BrowserState:
 
     @classmethod
     def is_up(cls) -> bool:
-        return cls.browser is not None and len(cls.tabs) > 0
+        if cls.browser is None or len(cls.tabs) == 0:
+            return False
+        # Check if browser process died (websocket dead, Chrome crashed, user closed window).
+        # Without this check, stale references cause confusing "HTTP 500" on every subsequent call.
+        if getattr(cls.browser, "stopped", False):
+            cls.reset()
+            return False
+        return True
 
     @classmethod
     def active_tab(cls) -> Tab:
+        if cls.browser is not None and getattr(cls.browser, "stopped", False):
+            cls.reset()
+            raise RuntimeError(
+                "Browser died (Chrome closed or CDP websocket lost). State auto-reset — "
+                "call browser_launch to start a fresh session."
+            )
         if not cls.is_up():
             raise RuntimeError("Browser not running. Call browser_launch first.")
         cls.current_last_active = time.time()
