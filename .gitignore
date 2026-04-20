@@ -39,3 +39,5 @@ test-*.log
 # Local-only docs (per user preference — not pushed to repo)
 CLAUDE.md
 AGENTS.md
+.pypi-token
+*.token
