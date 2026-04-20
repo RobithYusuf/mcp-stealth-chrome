@@ -1,6 +1,6 @@
 [project]
 name = "mcp-stealth-chrome"
-version = "0.1.4"
+version = "0.1.5"
 description = "Stealth Chrome MCP server — nodriver + Chromium + 80+ tools with Cloudflare/Turnstile bypass, CapSolver, storage-state reuse"
 readme = "README.md"
 license = { text = "MIT" }
