@@ -32,7 +32,7 @@ claude mcp add stealth-chrome -- uvx mcp-stealth-chrome@latest
 | `browserscan.net/bot-detection` | WebDriver/Selenium/CDP/Headless | ✅ All categories "Normal" ([proof](docs/images/browserscan.jpg)) |
 | `tls.browserleaks.com` | TLS JA3/JA4 fingerprint | ✅ Real Chrome/Firefox/Safari JA3 hashes ([see output below](#tls-fingerprint-proof)) |
 | `httpbin.org` | Multi-instance isolation | ✅ Two browsers parallel |
-| `google.com/recaptcha/api2/demo` | **reCAPTCHA v2 image challenge** | ✅ **5/5 = 100%** via `solve_recaptcha_ai()` |
+| `google.com/recaptcha/api2/demo` | **reCAPTCHA v2 image challenge** | ✅ **5/5 = 100%** via `solve_recaptcha_ai()` ([proof](docs/images/recaptcha.jpg)) |
 
 ### 🎯 click_turnstile → Cloudflare Turnstile Bypass
 
@@ -72,6 +72,8 @@ Safari impersonate:  JA3: ecdf4f49dd59effc439639da29186671   UA: Safari/605.1.15
 Each impersonation produces **authentic browser JA3/JA4** — Cloudflare, DataDome, and Akamai cannot distinguish our HTTP requests from real browsers.
 
 ### 🏆 reCAPTCHA v2 Benchmark (5 consecutive runs)
+
+![reCAPTCHA v2 solved](docs/images/recaptcha.jpg)
 
 Fresh profile + mouse drift warmup + an OpenAI-compatible vision model:
 
