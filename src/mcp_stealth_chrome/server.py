@@ -2133,10 +2133,14 @@ async def mouse_replay(path_json: str, speed: float = 1.0) -> str:
 # Supports BOTH Anthropic (Claude) AND any OpenAI-compatible API
 # (gpt-4o, gpt-5.x, Groq llama3.2-vision, local Ollama, custom gateways, etc).
 #
-# Provider auto-detected from env vars:
-#   - AI_VISION_BASE_URL + AI_VISION_API_KEY + AI_VISION_MODEL → OpenAI-compat
-#   - ANTHROPIC_API_KEY → Claude
+# Provider auto-detected from env vars (standard OpenAI SDK convention):
+#   - OPENAI_API_KEY + OPENAI_BASE_URL + OPENAI_MODEL    → OpenAI-compat
+#   - ANTHROPIC_API_KEY + ANTHROPIC_MODEL                → Claude
+#   - AI_VISION_* (legacy, deprecated — removed in v0.2.0)
 #   Caller can also override via solve_recaptcha_ai(provider=..., base_url=..., ...)
+#
+# ⚠️ MODEL MUST BE MULTIMODAL (vision-capable): gpt-4o, claude-opus-4-7,
+#    llava, llama-3.2-90b-vision-preview, etc.
 
 
 _PROMPT_TEMPLATE = (
@@ -2278,39 +2282,97 @@ def _resolve_vision_provider(
 ) -> tuple[str, str, str, str]:
     """Resolve provider config from explicit args → env vars → defaults.
 
+    Resolution priority:
+      1. Explicit args to solve_recaptcha_ai(provider=, base_url=, api_key=, model=)
+      2. OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL         (standard — OpenAI SDK convention)
+      3. AI_VISION_API_KEY / AI_VISION_BASE_URL / AI_VISION_MODEL (DEPRECATED — removed in v0.2.0)
+      4. ANTHROPIC_API_KEY / ANTHROPIC_MODEL                      (Claude)
+
+    ⚠️ Model MUST be multimodal (vision-capable):
+      - OpenAI: gpt-4o, gpt-4o-mini, gpt-4-vision-preview, gpt-5.x
+      - Anthropic: claude-opus-4-7, claude-sonnet-*
+      - Local Ollama: llava, llava-llama3, bakllava, llama3.2-vision
+      - Groq: llama-3.2-90b-vision-preview
+
     Returns (provider, base_url, api_key, model).
     Raises ValueError if no key is available anywhere.
     """
-    # Explicit provider arg wins
-    prov = (provider or os.environ.get("AI_VISION_PROVIDER", "")).lower().strip()
+    import warnings
+
+    # Emit deprecation notice if legacy AI_VISION_* env set
+    legacy_key = os.environ.get("AI_VISION_API_KEY")
+    legacy_url = os.environ.get("AI_VISION_BASE_URL")
+    legacy_model = os.environ.get("AI_VISION_MODEL")
+    legacy_prov = os.environ.get("AI_VISION_PROVIDER")
+    if any([legacy_key, legacy_url, legacy_model, legacy_prov]) and not os.environ.get("OPENAI_API_KEY"):
+        warnings.warn(
+            "AI_VISION_* env vars are deprecated in v0.1.4 — migrate to "
+            "OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL "
+            "(OpenAI SDK standard). Legacy vars still work but will be "
+            "removed in v0.2.0.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
+    # Explicit provider arg wins (accept legacy AI_VISION_PROVIDER too)
+    prov = (provider or legacy_prov or "").lower().strip()
 
     if not prov:
-        # Auto-detect from env
-        if os.environ.get("AI_VISION_BASE_URL") or os.environ.get("OPENAI_API_KEY"):
+        # Auto-detect from env (new vars take priority over legacy)
+        has_openai = os.environ.get("OPENAI_API_KEY") or legacy_key or os.environ.get("OPENAI_BASE_URL") or legacy_url
+        has_anthropic = os.environ.get("ANTHROPIC_API_KEY")
+        if has_openai:
             prov = "openai"
-        elif os.environ.get("ANTHROPIC_API_KEY"):
+        elif has_anthropic:
             prov = "anthropic"
 
     if prov in ("anthropic", "claude"):
         key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
         if not key:
             raise ValueError("ANTHROPIC_API_KEY not set and no api_key passed")
+        resolved_model = (
+            model
+            or os.environ.get("ANTHROPIC_MODEL")
+            or legacy_model
+            or "claude-opus-4-7"
+        )
         return ("anthropic",
                 base_url or "https://api.anthropic.com",
                 key,
-                model or os.environ.get("AI_VISION_MODEL", "claude-opus-4-7"))
+                resolved_model)
 
     if prov in ("openai", "openai-compat", "generic"):
-        key = api_key or os.environ.get("AI_VISION_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
-        url = base_url or os.environ.get("AI_VISION_BASE_URL", "https://api.openai.com/v1")
-        mdl = model or os.environ.get("AI_VISION_MODEL", "gpt-4o")
+        # New standard → legacy fallback → implicit default
+        key = (
+            api_key
+            or os.environ.get("OPENAI_API_KEY")
+            or legacy_key
+            or ""
+        )
+        url = (
+            base_url
+            or os.environ.get("OPENAI_BASE_URL")
+            or legacy_url
+            or "https://api.openai.com/v1"
+        )
+        mdl = (
+            model
+            or os.environ.get("OPENAI_MODEL")
+            or legacy_model
+            or "gpt-4o"
+        )
         if not key:
-            raise ValueError("AI_VISION_API_KEY (or OPENAI_API_KEY) not set and no api_key passed")
+            raise ValueError(
+                "No API key found. Set OPENAI_API_KEY (standard) or "
+                "ANTHROPIC_API_KEY, or pass api_key= to the tool."
+            )
         return ("openai", url, key, mdl)
 
     raise ValueError(
-        "no AI vision provider configured — set ANTHROPIC_API_KEY OR "
-        "(AI_VISION_BASE_URL + AI_VISION_API_KEY [+ AI_VISION_MODEL])"
+        "No vision provider configured. Set one of:\n"
+        "  • OPENAI_API_KEY (+ optional OPENAI_BASE_URL, OPENAI_MODEL) — OpenAI-compat\n"
+        "  • ANTHROPIC_API_KEY (+ optional ANTHROPIC_MODEL) — Claude\n"
+        "Model must support multimodal/vision input (gpt-4o, claude-opus-4-7, llava, etc.)"
     )
 
 
@@ -2326,19 +2388,22 @@ async def solve_recaptcha_ai(
     """Solve reCAPTCHA v2 image challenge using a vision-enabled LLM.
 
     Supports Anthropic (Claude) OR any OpenAI-compatible API (gpt-4o, gpt-5.x,
-    Groq, local Ollama, Together.ai, Fireworks, custom gateways, etc).
+    Groq llama3.2-vision, local Ollama llava, Together.ai, Fireworks, etc).
 
-    Provider auto-detected from env, or pass explicitly:
+    ⚠️ MODEL MUST BE MULTIMODAL (vision-capable) — text-only models fail silently.
+    ✅ Supported: gpt-4o, gpt-5.x, claude-opus-4-7, llava, llama-3.2-90b-vision-preview
+    ❌ NOT: gpt-3.5-turbo, llama3 (non-vision), claude-3-haiku
+
+    Env vars (OpenAI SDK standard — priority checked if args omitted):
+        OPENAI_API_KEY + OPENAI_BASE_URL + OPENAI_MODEL  → OpenAI-compat
+        ANTHROPIC_API_KEY + ANTHROPIC_MODEL              → Claude
+        AI_VISION_* (legacy, DEPRECATED — removed v0.2.0) → backward-compat
+
+    Explicit override:
         provider="anthropic" | "openai"
-        base_url="https://your-provider.example.com/v1"   (for openai-compat)
+        base_url="https://your-provider.example.com/v1"
         api_key="..."
-        model="gpt-5.4" | "claude-opus-4-7" | ...
-
-    Env vars (checked if args omitted):
-        ANTHROPIC_API_KEY                       → Claude
-        AI_VISION_BASE_URL / AI_VISION_API_KEY  → OpenAI-compat
-        AI_VISION_MODEL                         → model override
-        OPENAI_API_KEY                          → OpenAI (default base_url)
+        model="gpt-4o" | "claude-opus-4-7" | ...
 
     Cost: varies by provider (~$0.005-0.03 per solve).
     """

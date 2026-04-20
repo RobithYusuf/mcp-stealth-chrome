@@ -169,14 +169,22 @@ For premium features, set environment variables in the `env` block:
 | Variable | What it enables | Get key |
 |----------|----------------|---------|
 | `CAPSOLVER_KEY` | `solve_captcha` tool (Turnstile, reCAPTCHA, hCaptcha) | [capsolver.com](https://capsolver.com) |
-| `ANTHROPIC_API_KEY` | `solve_recaptcha_ai` via Claude vision | [console.anthropic.com](https://console.anthropic.com) |
-| `AI_VISION_BASE_URL` + `AI_VISION_API_KEY` + `AI_VISION_MODEL` | `solve_recaptcha_ai` via any OpenAI-compatible API (Groq, Together, Fireworks, local Ollama, custom gateway) | Your provider |
-| `OPENAI_API_KEY` | Shortcut for OpenAI cloud (defaults base URL) | [platform.openai.com](https://platform.openai.com) |
-| `AI_VISION_PROVIDER` | Force provider (`anthropic` or `openai`) when both keys present | — |
+| `OPENAI_API_KEY` | `solve_recaptcha_ai` via OpenAI or any OpenAI-compatible API | [platform.openai.com](https://platform.openai.com) |
+| `OPENAI_BASE_URL` | Custom endpoint for OpenAI-compat providers (Groq, Together, Ollama, custom gateway) | Your provider |
+| `OPENAI_MODEL` | Vision-capable model name (see "multimodal required" note below) | — |
+| `ANTHROPIC_API_KEY` | `solve_recaptcha_ai` via Claude | [console.anthropic.com](https://console.anthropic.com) |
+| `ANTHROPIC_MODEL` | Claude model name (default `claude-opus-4-7`) | — |
 | `BROWSER_IDLE_TIMEOUT` | Auto-close idle browsers after N seconds (default 600) | — |
 | `BROWSER_IDLE_REAPER_INTERVAL` | Reaper check frequency (default 60) | — |
 
-### Example: OpenAI-compatible provider (any /v1/chat/completions endpoint)
+### ⚠️ Model Must Support Multimodal (Vision)
+
+`OPENAI_MODEL` and `ANTHROPIC_MODEL` must be **vision-capable** — text-only models will fail silently.
+
+✅ Examples: `gpt-4o`, `gpt-5.x`, `claude-opus-4-7`, `llava`, `llama-3.2-90b-vision-preview`
+❌ Won't work: `gpt-3.5-turbo`, `llama3` (non-vision), `claude-3-haiku`
+
+### Example: OpenAI-compatible provider (any /v1/chat/completions)
 
 ```json
 {
@@ -185,9 +193,9 @@ For premium features, set environment variables in the `env` block:
       "command": "uvx",
       "args": ["mcp-stealth-chrome@latest"],
       "env": {
-        "AI_VISION_BASE_URL": "https://your-provider.example.com/v1",
-        "AI_VISION_API_KEY":  "your-key-here",
-        "AI_VISION_MODEL":    "model-name-with-vision"
+        "OPENAI_BASE_URL": "https://your-provider.example.com/v1",
+        "OPENAI_API_KEY":  "your-key-here",
+        "OPENAI_MODEL":    "model-name-with-vision"
       }
     }
   }
@@ -195,15 +203,16 @@ For premium features, set environment variables in the `env` block:
 ```
 
 Works with any provider — Groq, Together.ai, Fireworks, DeepInfra,
-Anyscale, custom LLM gateways, self-hosted vLLM/Ollama, etc.
+Anyscale, custom LLM gateways, self-hosted vLLM/Ollama, etc. Uses OpenAI
+SDK standard env convention (`OPENAI_API_KEY`, `OPENAI_BASE_URL`).
 
-### Example: Local Ollama with llava vision
+### Example: Local Ollama with llava vision (free, offline)
 
 ```json
 "env": {
-  "AI_VISION_BASE_URL": "http://localhost:11434/v1",
-  "AI_VISION_API_KEY":  "ollama",
-  "AI_VISION_MODEL":    "llava:latest"
+  "OPENAI_BASE_URL": "http://localhost:11434/v1",
+  "OPENAI_API_KEY":  "ollama",
+  "OPENAI_MODEL":    "llava:latest"
 }
 ```
 

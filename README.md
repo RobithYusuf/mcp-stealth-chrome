@@ -229,10 +229,26 @@ Everything else (click_turnstile, verify_cf, storage_state, http_request, etc.) 
 
 ### When BYOK Matters
 
-Only if you want to auto-solve reCAPTCHA v2 image challenges ("select all images with cars"). Add your preferred provider's key to the MCP `env` block:
+Only if you want to auto-solve reCAPTCHA v2 image challenges ("select all images with cars"). Add your preferred provider's key to the MCP `env` block.
+
+#### ⚠️ Model Must Be Multimodal (Vision-Capable)
+
+`solve_recaptcha_ai` sends a screenshot + text prompt to the model — text-only models will fail silently.
+
+✅ **Vision-capable (supported):**
+- **OpenAI**: `gpt-4o`, `gpt-4o-mini`, `gpt-4-vision-preview`, `gpt-5.x`
+- **Anthropic**: `claude-opus-4-7`, `claude-sonnet-4-*`
+- **Local Ollama**: `llava`, `llava-llama3`, `bakllava`, `llama3.2-vision`
+- **Groq**: `llama-3.2-90b-vision-preview`
+- **Custom**: any model documented as "multimodal" / "vision"
+
+❌ **Text-only (NOT supported):**
+- `gpt-3.5-turbo`, `llama3` (non-vision variant), `claude-3-haiku` (limited)
+
+#### Config Options
 
 <details>
-<summary><b>Option 1 — Anthropic Claude</b></summary>
+<summary><b>Option 1 — Anthropic Claude (vision-native)</b></summary>
 
 ```json
 {
@@ -241,7 +257,8 @@ Only if you want to auto-solve reCAPTCHA v2 image challenges ("select all images
       "command": "uvx",
       "args": ["mcp-stealth-chrome@latest"],
       "env": {
-        "ANTHROPIC_API_KEY": "sk-ant-xxxxx"
+        "ANTHROPIC_API_KEY": "sk-ant-xxxxx",
+        "ANTHROPIC_MODEL":   "claude-opus-4-7"
       }
     }
   }
@@ -256,8 +273,8 @@ Get key at [console.anthropic.com](https://console.anthropic.com/).
 
 ```json
 "env": {
-  "OPENAI_API_KEY":  "sk-proj-xxxxx",
-  "AI_VISION_MODEL": "gpt-4o"
+  "OPENAI_API_KEY": "sk-proj-xxxxx",
+  "OPENAI_MODEL":   "gpt-4o"
 }
 ```
 
@@ -265,21 +282,31 @@ Get key at [platform.openai.com](https://platform.openai.com/api-keys).
 </details>
 
 <details>
-<summary><b>Option 3 — Any OpenAI-compatible API (Groq, Together, Fireworks, self-hosted, etc.)</b></summary>
+<summary><b>Option 3 — Any OpenAI-compatible API (Groq, Together, Fireworks, self-hosted, custom gateway)</b></summary>
 
 ```json
 "env": {
-  "AI_VISION_BASE_URL": "https://your-provider.example.com/v1",
-  "AI_VISION_API_KEY":  "your-api-key",
-  "AI_VISION_MODEL":    "model-name-with-vision"
+  "OPENAI_BASE_URL": "https://your-provider.example.com/v1",
+  "OPENAI_API_KEY":  "your-api-key",
+  "OPENAI_MODEL":    "model-name-that-supports-vision"
 }
 ```
 
+Uses OpenAI SDK standard env names (`OPENAI_API_KEY`, `OPENAI_BASE_URL`).
 Works with any provider exposing `/v1/chat/completions` with `image_url` content support.
+
+**Example — Groq:**
+```json
+"env": {
+  "OPENAI_BASE_URL": "https://api.groq.com/openai/v1",
+  "OPENAI_API_KEY":  "gsk_xxxxx",
+  "OPENAI_MODEL":    "llama-3.2-90b-vision-preview"
+}
+```
 </details>
 
 <details>
-<summary><b>Option 4 — Local Ollama (free, no API key)</b></summary>
+<summary><b>Option 4 — Local Ollama (free, offline, no API key)</b></summary>
 
 ```bash
 ollama pull llava
@@ -287,9 +314,9 @@ ollama pull llava
 
 ```json
 "env": {
-  "AI_VISION_BASE_URL": "http://localhost:11434/v1",
-  "AI_VISION_API_KEY":  "ollama",
-  "AI_VISION_MODEL":    "llava:latest"
+  "OPENAI_BASE_URL": "http://localhost:11434/v1",
+  "OPENAI_API_KEY":  "ollama",
+  "OPENAI_MODEL":    "llava:latest"
 }
 ```
 
@@ -297,7 +324,7 @@ Fully offline, no cost. Accuracy varies by model.
 </details>
 
 <details>
-<summary><b>Option 5 — CapSolver (paid, no AI needed)</b></summary>
+<summary><b>Option 5 — CapSolver (paid solver, no AI needed)</b></summary>
 
 ```json
 "env": {
@@ -308,7 +335,14 @@ Fully offline, no cost. Accuracy varies by model.
 Enables `solve_captcha` tool. ~$0.80/1000 solves for Turnstile. Get key at [capsolver.com](https://capsolver.com).
 </details>
 
-**Provider resolution priority**: explicit args to tool > `AI_VISION_*` env vars > `OPENAI_API_KEY` > `ANTHROPIC_API_KEY`.
+#### Provider Resolution Priority
+
+1. Explicit args to `solve_recaptcha_ai(provider=, base_url=, api_key=, model=)`
+2. `OPENAI_API_KEY` + `OPENAI_BASE_URL` + `OPENAI_MODEL` — **standard** (OpenAI SDK convention)
+3. `AI_VISION_API_KEY` + `AI_VISION_BASE_URL` + `AI_VISION_MODEL` — deprecated (removed in v0.2.0)
+4. `ANTHROPIC_API_KEY` + `ANTHROPIC_MODEL` — Claude
+
+Legacy `AI_VISION_*` env still work but emit `DeprecationWarning`. Migrate to `OPENAI_*` standard for future compatibility.
 
 ## Requirements
 
@@ -482,12 +516,14 @@ Data locations:
 | `BROWSER_IDLE_TIMEOUT` | `600` | Auto-close browsers after idle seconds (0 = never) |
 | `BROWSER_IDLE_REAPER_INTERVAL` | `60` | How often reaper checks idle state |
 | `CAPSOLVER_KEY` | — | Enable `solve_captcha` tool |
-| `ANTHROPIC_API_KEY` | — | `solve_recaptcha_ai` via Claude |
-| `AI_VISION_BASE_URL` | — | `solve_recaptcha_ai` via OpenAI-compat API |
-| `AI_VISION_API_KEY` | — | API key for OpenAI-compat provider |
-| `AI_VISION_MODEL` | `claude-opus-4-7` or `gpt-4o` | Vision model name |
-| `AI_VISION_PROVIDER` | auto-detect | Force `anthropic` or `openai` |
-| `OPENAI_API_KEY` | — | Shortcut for OpenAI (default base URL) |
+| `OPENAI_API_KEY` | — | OpenAI-compat `solve_recaptcha_ai` (standard) |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Custom endpoint (Groq, Together, Ollama, etc.) |
+| `OPENAI_MODEL` | `gpt-4o` | Vision-capable model name (required multimodal) |
+| `ANTHROPIC_API_KEY` | — | Claude `solve_recaptcha_ai` |
+| `ANTHROPIC_MODEL` | `claude-opus-4-7` | Claude model name |
+
+**Deprecated** (still work but emit `DeprecationWarning` — migrate to OpenAI standards above):
+`AI_VISION_BASE_URL`, `AI_VISION_API_KEY`, `AI_VISION_MODEL`, `AI_VISION_PROVIDER`
 
 ## Stealth Details
 
