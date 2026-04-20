@@ -26,17 +26,17 @@ claude mcp add stealth-chrome -- uvx mcp-stealth-chrome@latest
 
 | Site | Challenge | Result |
 |------|-----------|--------|
-| `bot.sannysoft.com` | All fingerprint tests | ✅ 100% pass ([proof](docs/images/sannysoft.jpg)) |
-| `2captcha.com/demo/cloudflare-turnstile` | Turnstile visible | ✅ Passed via `click_turnstile()` ([proof](docs/images/turnstile.jpg)) |
-| `arh.antoinevastel.com/.../areyouheadless` | Headless-chrome detection | ✅ "You are not Chrome headless" ([proof](docs/images/areyouheadless.jpg)) |
-| `browserscan.net/bot-detection` | WebDriver/Selenium/CDP/Headless | ✅ All categories "Normal" ([proof](docs/images/browserscan.jpg)) |
+| `bot.sannysoft.com` | All fingerprint tests | ✅ 100% pass ([proof](https://raw.githubusercontent.com/RobithYusuf/mcp-stealth-chrome/main/docs/images/sannysoft.jpg)) |
+| `2captcha.com/demo/cloudflare-turnstile` | Turnstile visible | ✅ Passed via `click_turnstile()` ([proof](https://raw.githubusercontent.com/RobithYusuf/mcp-stealth-chrome/main/docs/images/turnstile.jpg)) |
+| `arh.antoinevastel.com/.../areyouheadless` | Headless-chrome detection | ✅ "You are not Chrome headless" ([proof](https://raw.githubusercontent.com/RobithYusuf/mcp-stealth-chrome/main/docs/images/areyouheadless.jpg)) |
+| `browserscan.net/bot-detection` | WebDriver/Selenium/CDP/Headless | ✅ All categories "Normal" ([proof](https://raw.githubusercontent.com/RobithYusuf/mcp-stealth-chrome/main/docs/images/browserscan.jpg)) |
 | `tls.browserleaks.com` | TLS JA3/JA4 fingerprint | ✅ Real Chrome/Firefox/Safari JA3 hashes ([see output below](#tls-fingerprint-proof)) |
 | `httpbin.org` | Multi-instance isolation | ✅ Two browsers parallel |
-| `google.com/recaptcha/api2/demo` | **reCAPTCHA v2 image challenge** | ✅ **5/5 = 100%** via `solve_recaptcha_ai()` ([proof](docs/images/recaptcha.jpg)) |
+| `google.com/recaptcha/api2/demo` | **reCAPTCHA v2 image challenge** | ✅ **5/5 = 100%** via `solve_recaptcha_ai()` ([proof](https://raw.githubusercontent.com/RobithYusuf/mcp-stealth-chrome/main/docs/images/recaptcha.jpg)) |
 
 ### 🎯 click_turnstile → Cloudflare Turnstile Bypass
 
-<img src="docs/images/turnstile.jpg" alt="Cloudflare Turnstile solved" width="500">
+<img src="https://raw.githubusercontent.com/RobithYusuf/mcp-stealth-chrome/main/docs/images/turnstile.jpg" alt="Cloudflare Turnstile solved" width="500">
 
 **One-liner bypass** on supported widget shapes. `click_turnstile()` → checkbox switches from "Verify you are human" ☐ to **"Success!" ✅**.
 
@@ -46,19 +46,19 @@ claude mcp add stealth-chrome -- uvx mcp-stealth-chrome@latest
 
 ### 🧪 bot.sannysoft.com → All Fingerprint Tests Pass
 
-<img src="docs/images/sannysoft.jpg" alt="Fingerprint tests all passed" width="500">
+<img src="https://raw.githubusercontent.com/RobithYusuf/mcp-stealth-chrome/main/docs/images/sannysoft.jpg" alt="Fingerprint tests all passed" width="500">
 
 `navigator.webdriver` missing, WebDriver Advanced passed, Chrome present, Plugins detected correctly, PHANTOM_* probes all ok, WebGL shows real `Apple M1 Pro` GPU — nodriver's CDP-direct approach leaves zero automation traces.
 
 ### 🤖 areyouheadless → Headless Chrome Detection
 
-<img src="docs/images/areyouheadless.jpg" alt="areyouheadless pass" width="500">
+<img src="https://raw.githubusercontent.com/RobithYusuf/mcp-stealth-chrome/main/docs/images/areyouheadless.jpg" alt="areyouheadless pass" width="500">
 
 Antoine Vastel's public headless-detection test says **"You are not Chrome headless"** — even though we run Chrome controlled programmatically.
 
 ### 🔍 browserscan.net/bot-detection → All Categories Normal
 
-<img src="docs/images/browserscan.jpg" alt="browserscan all normal" width="500">
+<img src="https://raw.githubusercontent.com/RobithYusuf/mcp-stealth-chrome/main/docs/images/browserscan.jpg" alt="browserscan all normal" width="500">
 
 14 signals checked (WebDriver, WebDriver Advance, Selenium, NightmareJS, PhantomJS, Awesomium, Cef, CefSharp, Coaches, FMiner, Born, Phantomas, Rhino, Webdriverio, Headless Chrome, CDP, Dev Tool, Native Navigator) — every one returns **"Normal"**.
 
@@ -77,7 +77,7 @@ Each impersonation produces **authentic browser JA3/JA4** — Cloudflare, DataDo
 
 ### 🏆 reCAPTCHA v2 Benchmark (5 consecutive runs)
 
-<img src="docs/images/recaptcha.jpg" alt="reCAPTCHA v2 solved" width="350">
+<img src="https://raw.githubusercontent.com/RobithYusuf/mcp-stealth-chrome/main/docs/images/recaptcha.jpg" alt="reCAPTCHA v2 solved" width="350">
 
 Fresh profile + mouse drift warmup + an OpenAI-compatible vision model:
 
