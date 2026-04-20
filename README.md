@@ -26,11 +26,36 @@ claude mcp add stealth-chrome -- uvx mcp-stealth-chrome@latest
 
 | Site | Challenge | Result |
 |------|-----------|--------|
-| `bot.sannysoft.com` | All fingerprint tests | ✅ 100% pass |
-| `dash.cloudflare.com/login` | Turnstile visible | ✅ Passed via `click_turnstile()` |
-| `tls.browserleaks.com` | TLS JA3/JA4 fingerprint | ✅ Real Chrome/Firefox/Safari |
+| `bot.sannysoft.com` | All fingerprint tests | ✅ 100% pass ([proof](docs/images/proof-01-sannysoft.png)) |
+| `dash.cloudflare.com/login` | Turnstile visible | ✅ Passed via `click_turnstile()` ([proof](docs/images/turnstile-success.png)) |
+| `tls.browserleaks.com` | TLS JA3/JA4 fingerprint | ✅ Real Chrome/Firefox/Safari JA3 hashes ([see output below](#tls-fingerprint-proof)) |
 | `httpbin.org` | Multi-instance isolation | ✅ Two browsers parallel |
 | `google.com/recaptcha/api2/demo` | **reCAPTCHA v2 image challenge** | ✅ **5/5 = 100%** via `solve_recaptcha_ai()` |
+
+### 🎯 click_turnstile → Cloudflare Turnstile Bypass
+
+![Cloudflare Turnstile solved](docs/images/turnstile-success.png)
+
+**One-liner bypass.** `click_turnstile()` → checkbox switches from "Verify you are human" ☐ to **"Success!" ✅** → Log in button activates. Proven on `dash.cloudflare.com/login`.
+
+### 🧪 bot.sannysoft.com → All Fingerprint Tests Pass
+
+![Fingerprint tests all passed](docs/images/proof-01-sannysoft.png)
+
+`navigator.webdriver` missing, WebDriver Advanced passed, Chrome present, Plugins detected correctly, PHANTOM_* probes all ok, WebGL shows real `Apple M1 Pro` GPU — nodriver's CDP-direct approach leaves zero automation traces.
+
+### 🔐 TLS Fingerprint Proof
+
+```
+http_request(impersonate="chrome") vs vanilla Python httpx — tls.browserleaks.com:
+
+Vanilla httpx:       JA3: 37f7d09ced1a845dc48872abc1a29d7b   UA: python-httpx/0.28.1    ❌ BOT
+Chrome impersonate:  JA3: f830262a93191fd695c65531282d5657   UA: Chrome/146.0.0.0         ✅ real Chrome
+Firefox impersonate: JA3: 6f7889b9fb1a62a9577e685c1fcfa919   UA: Firefox/147.0            ✅ real Firefox
+Safari impersonate:  JA3: ecdf4f49dd59effc439639da29186671   UA: Safari/605.1.15          ✅ real Safari
+```
+
+Each impersonation produces **authentic browser JA3/JA4** — Cloudflare, DataDome, and Akamai cannot distinguish our HTTP requests from real browsers.
 
 ### 🏆 reCAPTCHA v2 Benchmark (5 consecutive runs)
 
@@ -216,20 +241,23 @@ Settings → Extensions → MCP Servers, or edit `~/.config/zed/settings.json`:
 
 ## 🔑 BYOK (Bring Your Own Key) — Optional
 
-`mcp-stealth-chrome` is **fully functional without any API key** — 96 of 97 tools work out of the box, including `click_turnstile` (Cloudflare Turnstile bypass), TLS-perfect HTTP, multi-instance, and all scraping tools.
+`mcp-stealth-chrome` is **fully functional without any API key** — 95 of 97 tools work out of the box, including `click_turnstile` (Cloudflare Turnstile bypass), TLS-perfect HTTP, multi-instance, and all scraping tools.
 
 **API keys are optional — only needed for 2 specific CAPTCHA solver tools:**
 
-| Tool | Purpose | Required key |
-|------|---------|--------------|
-| `solve_recaptcha_ai` | reCAPTCHA v2 image challenges via AI vision | Any vision-capable LLM |
-| `solve_captcha` | Turnstile/reCAPTCHA/hCaptcha via paid solver | CapSolver only |
+| Tool | Purpose | Required key | Cost |
+|------|---------|--------------|------|
+| `solve_recaptcha_ai` | reCAPTCHA v2 image challenges via AI vision | Any vision-capable LLM (OpenAI-compat / Claude / Ollama) | ~$0.005-0.03 per solve |
+| `solve_captcha` | **Turnstile, reCAPTCHA v2, reCAPTCHA v3, hCaptcha** via paid solver | CapSolver API | ~$0.80-1.00 per 1000 |
 
-Everything else (click_turnstile, verify_cf, storage_state, http_request, etc.) works 100% **without any key**.
+Everything else (click_turnstile, verify_cf, storage_state, http_request, detect_anti_bot, clone_chrome_profile, etc.) works 100% **without any key**.
 
 ### When BYOK Matters
 
-Only if you want to auto-solve reCAPTCHA v2 image challenges ("select all images with cars"). Add your preferred provider's key to the MCP `env` block.
+- **`solve_recaptcha_ai`** → auto-solve reCAPTCHA v2 image challenges ("select all images with cars") via vision LLM. Best for: low-volume automation where you want self-hosted / BYO-key.
+- **`solve_captcha`** → solve via CapSolver's dedicated captcha-solving service. Best for: production reliability, high success rate (95%+), handles multiple types (Turnstile + reCAPTCHA v2 + v3 + hCaptcha + more).
+
+You can use **either one or both** depending on your budget and reliability needs. Add to the MCP `env` block.
 
 #### ⚠️ Model Must Be Multimodal (Vision-Capable)
 
