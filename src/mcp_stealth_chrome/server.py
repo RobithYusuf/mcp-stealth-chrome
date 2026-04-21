@@ -191,6 +191,12 @@ async def browser_close() -> str:
     except Exception as e:
         return err(f"close failed: {e}")
     BrowserState.reset()
+    # Clear transient caches that key off tab identity (id() can be reused)
+    _SNAPSHOT_CACHE.clear()
+    _TRACE_ACTIVE.update({"tab_id": None, "started_at": 0.0, "categories": "",
+                           "handler": None})
+    _TRACE_BUFFER.clear()
+    _COVERAGE_ACTIVE.update({"tab_id": None, "js": False, "css": False})
     # Mark profile as cleanly exited so next launch skips restore dialog
     clean_profile_state(PROFILE_DIR)
     return ok("Browser closed.")
@@ -3686,11 +3692,16 @@ _NETWORK_PRESETS: dict[str, dict] = {
     "no-throttle": {"offline": False, "latency": 0, "download": -1, "upload": -1},
 }
 
-# Single global trace session (CDP Tracing can only have one at a time)
+# Single global trace session (CDP Tracing can only have one at a time).
+# Holds a reference to the DataCollected handler so we can remove it on stop
+# (avoids leaking closures if user starts/stops traces repeatedly).
 _TRACE_BUFFER: list[Any] = []
-_TRACE_ACTIVE: dict[str, Any] = {"tab_id": None, "started_at": 0.0, "categories": ""}
+_TRACE_ACTIVE: dict[str, Any] = {
+    "tab_id": None, "started_at": 0.0, "categories": "", "handler": None,
+}
 
-# Coverage session state
+# Coverage session state — single active session, tagged with tab id so we can
+# reject a stop() call that came from a different tab than the start().
 _COVERAGE_ACTIVE: dict[str, Any] = {"tab_id": None, "js": False, "css": False}
 
 
@@ -3742,6 +3753,7 @@ async def performance_trace_start(
             "tab_id": id(tab),
             "started_at": time.time(),
             "categories": cats,
+            "handler": on_data,
         })
         return ok(f"trace started (categories: {len(cats.split(','))})")
     except Exception as e:
@@ -3757,12 +3769,39 @@ async def performance_trace_stop(filename: Optional[str] = None) -> str:
     """
     if _TRACE_ACTIVE["tab_id"] is None:
         return err("no trace active — call performance_trace_start first")
+    from nodriver.cdp import tracing as cdp_tracing
+    handler = _TRACE_ACTIVE.get("handler")
     try:
         tab = BrowserState.active_tab()
-        from nodriver.cdp import tracing as cdp_tracing
+        if id(tab) != _TRACE_ACTIVE["tab_id"]:
+            return err(
+                "active tab is not the one trace was started on — "
+                "switch back with switch_instance / tab_select before stop"
+            )
+        # Event-based drain: listen for TracingComplete instead of sleep() —
+        # reliable on slow machines and large traces.
+        complete = asyncio.Event()
+
+        def on_complete(_event):
+            complete.set()
+
+        tab.add_handler(cdp_tracing.TracingComplete, on_complete)
         await tab.send(cdp_tracing.end())
-        # Drain — DataCollected events flush asynchronously; wait briefly
-        await asyncio.sleep(0.4)
+        try:
+            await asyncio.wait_for(complete.wait(), timeout=10.0)
+        except asyncio.TimeoutError:
+            # Fall through with whatever events we've received so far
+            pass
+        finally:
+            try:
+                tab.remove_handler(cdp_tracing.TracingComplete, on_complete)
+            except Exception:
+                pass
+            if handler is not None:
+                try:
+                    tab.remove_handler(cdp_tracing.DataCollected, handler)
+                except Exception:
+                    pass
         fname = filename or ts_filename("trace", "json")
         path = EXPORT_DIR / fname
         ensure_dirs()
@@ -3771,13 +3810,15 @@ async def performance_trace_stop(filename: Optional[str] = None) -> str:
         event_count = len(_TRACE_BUFFER)
         duration = time.time() - _TRACE_ACTIVE["started_at"]
         _TRACE_BUFFER.clear()
-        _TRACE_ACTIVE.update({"tab_id": None, "started_at": 0.0, "categories": ""})
+        _TRACE_ACTIVE.update({"tab_id": None, "started_at": 0.0,
+                               "categories": "", "handler": None})
         return ok(
             f"{path}\ntrace: {event_count} events over {duration:.2f}s "
             f"(drop into chrome://tracing or DevTools Performance panel)"
         )
     except Exception as e:
-        _TRACE_ACTIVE.update({"tab_id": None, "started_at": 0.0, "categories": ""})
+        _TRACE_ACTIVE.update({"tab_id": None, "started_at": 0.0,
+                               "categories": "", "handler": None})
         return err(str(e))
 
 
@@ -4056,6 +4097,11 @@ async def coverage_stop() -> str:
         return err("no coverage session — call coverage_start first")
     try:
         tab = BrowserState.active_tab()
+        if id(tab) != _COVERAGE_ACTIVE["tab_id"]:
+            return err(
+                "active tab is not the one coverage was started on — "
+                "switch back before calling coverage_stop"
+            )
         lines = ["Coverage report:"]
         if _COVERAGE_ACTIVE["js"]:
             from nodriver.cdp import profiler as cdp_prof
@@ -4118,22 +4164,34 @@ async def coverage_stop() -> str:
 
 
 @mcp.tool()
-async def memory_heap_snapshot(filename: Optional[str] = None) -> str:
+async def memory_heap_snapshot(
+    filename: Optional[str] = None,
+    stable_ms: int = 400,
+    max_wait: float = 30.0,
+) -> str:
     """Capture a V8 heap snapshot (.heapsnapshot) — drag into DevTools Memory panel.
 
     Large pages produce 50-200MB snapshots. Saved to ~/.mcp-stealth/exports/.
+
+    Args:
+        filename: output name (default timestamped)
+        stable_ms: consider snapshot complete after no new chunks for this many ms
+        max_wait: hard cap on wait even if chunks keep arriving
     """
+    from nodriver.cdp import heap_profiler as cdp_heap
+    chunks: list[str] = []
+    last_chunk_at = [time.time()]
+
+    def on_chunk(ev):
+        try:
+            chunks.append(ev.chunk)
+            last_chunk_at[0] = time.time()
+        except Exception:
+            pass
+
+    tab = None
     try:
         tab = BrowserState.active_tab()
-        from nodriver.cdp import heap_profiler as cdp_heap
-        chunks: list[str] = []
-
-        def on_chunk(ev):
-            try:
-                chunks.append(ev.chunk)
-            except Exception:
-                pass
-
         tab.add_handler(cdp_heap.AddHeapSnapshotChunk, on_chunk)
         await tab.send(cdp_heap.enable())
         await tab.send(cdp_heap.collect_garbage())
@@ -4142,18 +4200,30 @@ async def memory_heap_snapshot(filename: Optional[str] = None) -> str:
             treat_global_objects_as_roots=True,
             capture_numeric_value=False,
         ))
-        # Drain: chunks arrive asynchronously
-        await asyncio.sleep(0.8)
+        # Drain: wait for no new chunks for `stable_ms` (or hit max_wait).
+        deadline = time.time() + max_wait
+        while time.time() < deadline:
+            idle_ms = (time.time() - last_chunk_at[0]) * 1000
+            if chunks and idle_ms >= stable_ms:
+                break
+            await asyncio.sleep(0.05)
         fname = filename or ts_filename("heap", "heapsnapshot")
         path = EXPORT_DIR / fname
         ensure_dirs()
         path.write_text("".join(chunks))
         size_mb = path.stat().st_size / 1024 / 1024
         return ok(
-            f"{path}\nsize: {size_mb:.1f}MB (drag into DevTools → Memory → Load)"
+            f"{path}\nsize: {size_mb:.1f}MB ({len(chunks)} chunks) — "
+            f"drag into DevTools → Memory → Load"
         )
     except Exception as e:
         return err(str(e))
+    finally:
+        if tab is not None:
+            try:
+                tab.remove_handler(cdp_heap.AddHeapSnapshotChunk, on_chunk)
+            except Exception:
+                pass
 
 
 @mcp.tool()
@@ -4169,7 +4239,8 @@ async def wait_for_network_idle(
     """
     try:
         tab = BrowserState.active_tab()
-        # Install per-tab tracker (idempotent)
+        # Install per-tab tracker (idempotent). Uses a per-XHR flag so
+        # reused XHR instances (axios, jQuery) don't register duplicate listeners.
         await tab.evaluate(
             r"""
             (() => {
@@ -4183,15 +4254,16 @@ async def wait_for_network_idle(
                   tracker.active--; tracker.last_active = performance.now();
                 });
               };
-              const origOpen = XMLHttpRequest.prototype.open;
               const origSend = XMLHttpRequest.prototype.send;
-              XMLHttpRequest.prototype.open = function(...args) {
-                this.addEventListener('loadend', () => {
-                  tracker.active--; tracker.last_active = performance.now();
-                });
-                return origOpen.apply(this, args);
-              };
               XMLHttpRequest.prototype.send = function(...args) {
+                // Attach loadend listener exactly once per XHR instance
+                // (reused instances would otherwise get N listeners after N opens).
+                if (!this.__mcp_netidle_tracked) {
+                  this.__mcp_netidle_tracked = true;
+                  this.addEventListener('loadend', () => {
+                    tracker.active--; tracker.last_active = performance.now();
+                  });
+                }
                 tracker.active++; tracker.last_active = performance.now();
                 return origSend.apply(this, args);
               };
