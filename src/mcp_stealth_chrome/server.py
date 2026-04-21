@@ -315,6 +315,7 @@ async def screenshot(
     format: Literal["auto", "png", "jpeg"] = "auto",
     quality: Optional[int] = None,
     region: Optional[dict] = None,
+    max_dimension: int = 1920,
 ) -> str:
     """Screenshot active tab. Saves to ~/.mcp-stealth/screenshots/.
 
@@ -326,6 +327,11 @@ async def screenshot(
         quality: JPEG quality 1-100 (default 80) — ignored for PNG
         region: clip to {x, y, width, height} — uses CDP Page.captureScreenshot clip
                 (skips full-viewport paint, 2-5× faster for small crops)
+        max_dimension: if either width or height exceeds this (px), the image is
+            resized proportionally via OpenCV INTER_AREA. Default 1920 keeps output
+            under the 2000 px per-side limit that LLM image tools (Claude/GPT) enforce
+            — prevents "image exceeds dimension limit" failures on long full_page
+            captures or hi-DPR device emulation. Pass 0 to disable resizing.
     """
     try:
         tab = BrowserState.active_tab()
@@ -363,10 +369,36 @@ async def screenshot(
             if fmt == "jpeg" and quality is not None:
                 save_kwargs["quality"] = int(quality)
             await tab.save_screenshot(**save_kwargs)
+
+        # Auto-downscale if either dimension exceeds max_dimension.
+        # Uses cv2 (already a dep via opencv-python). INTER_AREA = best for shrinking.
+        resized_info = ""
+        if max_dimension and max_dimension > 0:
+            try:
+                import cv2
+                img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+                if img is not None:
+                    h, w = img.shape[:2]
+                    longest = max(h, w)
+                    if longest > max_dimension:
+                        scale = max_dimension / longest
+                        new_w = int(round(w * scale))
+                        new_h = int(round(h * scale))
+                        resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                        if fmt == "jpeg":
+                            cv2.imwrite(str(path), resized,
+                                        [cv2.IMWRITE_JPEG_QUALITY, int(quality or 85)])
+                        else:
+                            cv2.imwrite(str(path), resized)
+                        resized_info = f" [resized {w}×{h} → {new_w}×{new_h}]"
+            except Exception:
+                # Resizing is best-effort; original file is already saved.
+                pass
+
         if return_base64:
             data = path.read_bytes()
-            return ok(f"{path}\n---base64---\n{base64.b64encode(data).decode()}")
-        return ok(str(path))
+            return ok(f"{path}{resized_info}\n---base64---\n{base64.b64encode(data).decode()}")
+        return ok(f"{path}{resized_info}")
     except Exception as e:
         return err(str(e))
 
