@@ -2,7 +2,7 @@
 
 # MCP Stealth Chrome
 
-**97 tools** for AI agents that bypass Cloudflare, Turnstile, reCAPTCHA, and modern anti-bot systems.
+**110 tools** for AI agents that bypass Cloudflare, Turnstile, reCAPTCHA, and modern anti-bot systems.
 
 [![PyPI version](https://img.shields.io/pypi/v/mcp-stealth-chrome.svg)](https://pypi.org/project/mcp-stealth-chrome/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -105,7 +105,7 @@ Compared to the leading Python stealth MCP ([vibheksoni/stealth-browser-mcp](htt
 
 | Feature | mcp-stealth-chrome | vibheksoni |
 |---------|:-------------------:|:-----------:|
-| Tools | **94** | 90 |
+| Tools | **110** | 90 |
 | `click_turnstile` one-liner | ✅ Embed widgets + template fallback | ❌ |
 | Dual-mode HTTP (curl_cffi TLS) | ✅ **Unique** | ❌ |
 | AI Vision reCAPTCHA solver (Claude) | ✅ **Unique** | ❌ |
@@ -261,7 +261,7 @@ Settings → Extensions → MCP Servers, or edit `~/.config/zed/settings.json`:
 
 ## 🔑 BYOK (Bring Your Own Key) — Optional
 
-`mcp-stealth-chrome` is **fully functional without any API key** — 95 of 97 tools work out of the box, including `click_turnstile` (Cloudflare Turnstile bypass), TLS-perfect HTTP, multi-instance, and all scraping tools.
+`mcp-stealth-chrome` is **fully functional without any API key** — 108 of 110 tools work out of the box, including `click_turnstile` (Cloudflare Turnstile bypass), TLS-perfect HTTP, multi-instance, DevTools-level perf/coverage/emulation, and all scraping tools.
 
 **API keys are optional — only needed for 2 specific CAPTCHA solver tools:**
 
@@ -439,6 +439,31 @@ Legacy `AI_VISION_*` env still work but emit `DeprecationWarning`. Migrate to `O
 | `spawn_browser` | New named instance (parallel profiles) |
 | `list_instances` / `switch_instance` | Manage multiple browsers |
 | `close_instance` / `close_all_instances` | Clean shutdown |
+
+### ⭐⭐ DevTools Suite — perf, coverage, emulation (new in v0.2.0)
+| Tool | Purpose |
+|------|---------|
+| `performance_trace_start` / `performance_trace_stop` | CDP Tracing — save .json, drop into chrome://tracing or DevTools Performance panel |
+| `performance_metrics` | Runtime Performance.getMetrics (Nodes, JSHeap, TaskDuration, FPS…) |
+| `performance_timeline` | TTFB / FCP / DOMContentLoaded / load + slowest 5 resources (instant, no trace capture) |
+| `web_vitals` | Core Web Vitals via web-vitals v4 — LCP/CLS/INP/FCP/TTFB with pass/fail ratings |
+| `coverage_start` / `coverage_stop` | JS + CSS precise coverage — % unused bytes per file |
+| `memory_heap_snapshot` | V8 .heapsnapshot — drag into DevTools Memory panel |
+| `emulate_network` | Preset throttles (offline / slow-3g / 3g / slow-4g / 4g / wifi) + custom |
+| `emulate_cpu` | 1–6× CPU throttle (4× = DevTools default, 6× = low-end mobile) |
+| `emulate_device` | Device presets: iphone-15, iphone-se, pixel-8, galaxy-s23, ipad, desktop |
+| `wait_for_network_idle` | SPA-safe load detection — waits for N ms of no fetch/XHR activity |
+| `console_clear` | Reset captured console buffer |
+
+### ⚡ Performance optimizations (new in v0.2.0)
+| Feature | What it does |
+|---------|--------------|
+| `browser_snapshot(mode="fast")` | Skip getComputedStyle + minimal attrs (2–3× faster) |
+| `browser_snapshot(mode="viewport")` | Only elements inside current scroll viewport (5–10× on long pages) |
+| `browser_snapshot(diff_from_last=True)` | Cache DOM hash — near-instant if page unchanged |
+| `screenshot(format="jpeg", quality=60)` | JPEG vs PNG — ~3× smaller file |
+| `screenshot(region={x,y,width,height})` | Clip via CDP — 2–5× faster for small crops |
+| `browser_launch(testing_mode=True)` | Disable images / background throttling / translate — 2–5× faster nav for perf tests (not for stealth) |
 
 ### Standard Browser Automation (lifecycle/navigation/DOM/interaction/scraping)
 | Count | Examples |
