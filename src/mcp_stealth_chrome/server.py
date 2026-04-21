@@ -923,6 +923,101 @@ async def cookie_delete(name: str, domain: Optional[str] = None) -> str:
         return err(str(e))
 
 
+@mcp.tool()
+async def cookie_import(
+    cookies: Optional[list[dict]] = None,
+    file_path: Optional[str] = None,
+    clear_first: bool = False,
+) -> str:
+    """Bulk-import cookies. Accepts either an inline list or a JSON file path.
+
+    Expected shape per cookie (matches DevTools / EditThisCookie export):
+      {"name": "...", "value": "...", "domain": ".example.com",
+       "path": "/", "expires": 1234567890, "secure": true,
+       "httpOnly": false, "sameSite": "Lax"}
+
+    Args:
+        cookies: inline array of dicts
+        file_path: path to JSON file containing a list of cookie dicts
+                   (file can also be a full storage_state export — {"cookies": [...]})
+        clear_first: wipe all existing cookies before importing (default False)
+
+    Use for portable sessions from browser extensions. For full
+    cookies+localStorage+sessionStorage restore, prefer storage_state_load.
+    """
+    try:
+        if not BrowserState.browser:
+            return err("browser not running")
+        if cookies is None and not file_path:
+            return err("pass either cookies=[...] or file_path='...'")
+        if file_path:
+            raw = Path(file_path).read_text()
+            parsed = json.loads(raw)
+            # Accept either [...] or {"cookies": [...]}
+            if isinstance(parsed, dict) and "cookies" in parsed:
+                cookies = parsed["cookies"]
+            elif isinstance(parsed, list):
+                cookies = parsed
+            else:
+                return err("file content must be a list or {cookies: [...]}")
+        if not isinstance(cookies, list) or not cookies:
+            return err("no cookies to import")
+        from nodriver.cdp import network as cdp_network
+        tab = BrowserState.active_tab()
+        if clear_first:
+            await tab.send(cdp_network.clear_browser_cookies())
+        # Map extension export field names → CDP param names
+        params: list = []
+        for c in cookies:
+            if not isinstance(c, dict) or "name" not in c or "value" not in c:
+                continue
+            kwargs = {"name": c["name"], "value": c["value"]}
+            for src, dst in (
+                ("domain", "domain"), ("path", "path"), ("secure", "secure"),
+                ("httpOnly", "http_only"), ("http_only", "http_only"),
+                ("sameSite", "same_site"), ("same_site", "same_site"),
+                ("expires", "expires"), ("url", "url"),
+            ):
+                if src in c and c[src] is not None:
+                    kwargs[dst] = c[src]
+            params.append(cdp_network.CookieParam(**kwargs))
+        if not params:
+            return err("no valid cookies (need at least name + value each)")
+        await tab.send(cdp_network.set_cookies(cookies=params))
+        return ok(f"imported {len(params)} cookies (clear_first={clear_first})")
+    except Exception as e:
+        return err(str(e))
+
+
+@mcp.tool()
+async def cookie_export(filename: Optional[str] = None,
+                         url: Optional[str] = None) -> str:
+    """Export cookies to a JSON file. Cookies-only (use storage_state_save for full session).
+
+    Output is a plain JSON array compatible with cookie_import / EditThisCookie /
+    Playwright cookies format. Saved to ~/.mcp-stealth/storage-states/.
+    """
+    try:
+        if not BrowserState.browser:
+            return err("browser not running")
+        cookies = await BrowserState.browser.cookies.get_all()
+        if url:
+            cookies = [c for c in cookies if url in (c.domain or "")]
+        data = [{
+            "name": c.name, "value": c.value, "domain": c.domain,
+            "path": c.path, "expires": c.expires,
+            "httpOnly": c.http_only, "secure": c.secure,
+            "sameSite": getattr(c, "same_site", None),
+        } for c in cookies]
+        ensure_dirs()
+        fname = filename or ts_filename("cookies", "json")
+        path = STORAGE_STATE_DIR / fname
+        path.write_text(json.dumps(data, indent=2, default=str))
+        return ok(f"{path}\nexported {len(data)} cookies")
+    except Exception as e:
+        return err(str(e))
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # 9. STORAGE (local + session)
 # ══════════════════════════════════════════════════════════════════════════
@@ -999,6 +1094,83 @@ async def sessionstorage_set(key: str, value: str) -> str:
             return_by_value=True,
         )
         return ok("set")
+    except Exception as e:
+        return err(str(e))
+
+
+@mcp.tool()
+async def sessionstorage_clear() -> str:
+    """Clear all sessionStorage for current origin (parity with localstorage_clear)."""
+    try:
+        tab = BrowserState.active_tab()
+        await tab.evaluate("sessionStorage.clear()", return_by_value=True)
+        return ok("cleared")
+    except Exception as e:
+        return err(str(e))
+
+
+@mcp.tool()
+async def cache_clear() -> str:
+    """Clear the browser HTTP cache (CDP Network.clearBrowserCache).
+
+    Mirrors DevTools → Application → Clear storage → Clear site data (cache).
+    Does NOT touch cookies, localStorage, or IndexedDB — use dedicated tools
+    or browser_launch(persistent=False) for a full wipe.
+    """
+    try:
+        tab = BrowserState.active_tab()
+        from nodriver.cdp import network as cdp_network
+        await tab.send(cdp_network.clear_browser_cache())
+        return ok("browser HTTP cache cleared")
+    except Exception as e:
+        return err(str(e))
+
+
+@mcp.tool()
+async def indexeddb_list() -> str:
+    """List IndexedDB databases for the current origin.
+
+    Reads via CDP IndexedDB.requestDatabaseNames. Use indexeddb_delete(name)
+    to drop one. Useful for clearing SPA state (many PWAs store auth / drafts
+    in IndexedDB rather than localStorage).
+    """
+    try:
+        tab = BrowserState.active_tab()
+        url = await get_url(tab)
+        from urllib.parse import urlparse
+        p = urlparse(url)
+        origin = f"{p.scheme}://{p.netloc}" if p.scheme and p.netloc else None
+        if not origin:
+            return err(f"cannot derive origin from URL: {url}")
+        from nodriver.cdp import indexed_db as cdp_idb
+        await tab.send(cdp_idb.enable())
+        names = await tab.send(cdp_idb.request_database_names(security_origin=origin))
+        if not names:
+            return ok(f"no IndexedDB databases for {origin}")
+        lines = [f"IndexedDB databases for {origin}:"]
+        for n in names:
+            lines.append(f"  {n}")
+        return ok("\n".join(lines))
+    except Exception as e:
+        return err(str(e))
+
+
+@mcp.tool()
+async def indexeddb_delete(database_name: str) -> str:
+    """Delete an IndexedDB database by name (scoped to current origin)."""
+    try:
+        tab = BrowserState.active_tab()
+        url = await get_url(tab)
+        from urllib.parse import urlparse
+        p = urlparse(url)
+        origin = f"{p.scheme}://{p.netloc}" if p.scheme and p.netloc else None
+        if not origin:
+            return err(f"cannot derive origin from URL: {url}")
+        from nodriver.cdp import indexed_db as cdp_idb
+        await tab.send(cdp_idb.delete_database(
+            database_name=database_name, security_origin=origin,
+        ))
+        return ok(f"deleted IndexedDB '{database_name}' for {origin}")
     except Exception as e:
         return err(str(e))
 
