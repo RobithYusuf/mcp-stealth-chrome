@@ -108,7 +108,9 @@ _TURNSTILE_FIND_JS = """
     'iframe[src*="turnstile"]',
     '[data-testid*="challenge-widget"]',
     '[data-testid*="turnstile"]',
-    '[data-sitekey]',
+    // [data-sitekey] alone matches reCAPTCHA/hCaptcha too — scope to CF
+    // sitekey format (always starts with "0x") to avoid false positives.
+    '[data-sitekey^="0x"]',
     '.cf-turnstile',
   ];
   const secondary = [
@@ -196,12 +198,15 @@ _CF_CHALLENGE_PROBE_INITIAL_JS = """
   const phrases = ['performing security verification', 'just a moment',
     'checking your browser', 'verify you are human', 'verifying you are human'];
   const cfText = phrases.some(p => txt.includes(p));
-  // Broad detection — includes the loader script + host containers so we can
-  // detect a challenge before the widget actually renders.
+  // Turnstile-specific markers ONLY. We deliberately exclude the bare
+  // [data-sitekey] selector — it matches reCAPTCHA / hCaptcha hosts too,
+  // and clicking those checkboxes opens unsolvable image grids. The CF
+  // Turnstile sitekey format always starts with "0x", so we keep scoped
+  // [data-sitekey^="0x"] which is unambiguous.
   const cfDom = !!document.querySelector(
     'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"], ' +
     '.cf-turnstile, .turnstile, [class*="turnstile" i], [id*="turnstile" i], ' +
-    '[data-sitekey], input[name="cf-turnstile-response"], ' +
+    '[data-sitekey^="0x"], input[name="cf-turnstile-response"], ' +
     'script[src*="challenges.cloudflare.com"]'
   );
   return cfText || cfDom;
