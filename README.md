@@ -2,7 +2,7 @@
 
 # MCP Stealth Chrome
 
-**110 tools** for AI agents that bypass Cloudflare, Turnstile, reCAPTCHA, and modern anti-bot systems.
+**133 tools** for AI agents that bypass Cloudflare, Turnstile, reCAPTCHA, and modern anti-bot systems — with an LLM-optimized action kit (`describe_page`, `smart_fill`, `workflow_run`, vision-LLM element locator) layered on top of standard automation.
 
 [![PyPI version](https://img.shields.io/pypi/v/mcp-stealth-chrome.svg)](https://pypi.org/project/mcp-stealth-chrome/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -105,7 +105,9 @@ Compared to the leading Python stealth MCP ([vibheksoni/stealth-browser-mcp](htt
 
 | Feature | mcp-stealth-chrome | vibheksoni |
 |---------|:-------------------:|:-----------:|
-| Tools | **110** | 90 |
+| Tools | **133** | 90 |
+| LLM-optimized kit (describe_page, smart_fill, vision_locate, workflow_run, assert_*) | ✅ **Unique** | ❌ |
+| Network body capture + session-bridged HTTP | ✅ **Unique** | ❌ |
 | `click_turnstile` one-liner | ✅ Embed widgets + template fallback | ❌ |
 | Dual-mode HTTP (curl_cffi TLS) | ✅ **Unique** | ❌ |
 | AI Vision reCAPTCHA solver (Claude) | ✅ **Unique** | ❌ |
@@ -261,13 +263,14 @@ Settings → Extensions → MCP Servers, or edit `~/.config/zed/settings.json`:
 
 ## 🔑 BYOK (Bring Your Own Key) — Optional
 
-`mcp-stealth-chrome` is **fully functional without any API key** — 108 of 110 tools work out of the box, including `click_turnstile` (Cloudflare Turnstile bypass), TLS-perfect HTTP, multi-instance, DevTools-level perf/coverage/emulation, and all scraping tools.
+`mcp-stealth-chrome` is **fully functional without any API key** — 130 of 133 tools work out of the box, including `click_turnstile` (Cloudflare Turnstile bypass), TLS-perfect HTTP, multi-instance, DevTools-level perf/coverage/emulation, the full LLM-optimized kit (`describe_page` / `smart_fill` / `workflow_run`), and all scraping tools.
 
-**API keys are optional — only needed for 2 specific CAPTCHA solver tools:**
+**API keys are optional — only needed for 3 vision/solver tools:**
 
 | Tool | Purpose | Required key | Cost |
 |------|---------|--------------|------|
 | `solve_recaptcha_ai` | reCAPTCHA v2 image challenges via AI vision | Any vision-capable LLM (OpenAI-compat / Claude / Ollama) | ~$0.005-0.03 per solve |
+| `vision_locate` | Find DOM element by natural-language description (`"the red Create button at bottom right"`) | Same vision provider as `solve_recaptcha_ai` | ~$0.001-0.01 per call |
 | `solve_captcha` | **Turnstile, reCAPTCHA v2, reCAPTCHA v3, hCaptcha** via paid solver | CapSolver API | ~$0.80-1.00 per 1000 |
 
 Everything else (click_turnstile, verify_cf, storage_state, http_request, detect_anti_bot, clone_chrome_profile, etc.) works 100% **without any key**.
@@ -398,7 +401,7 @@ Legacy `AI_VISION_*` env still work but emit `DeprecationWarning`. Migrate to `O
 - `uv` installed: `curl -LsSf https://astral.sh/uv/install.sh | sh`
 - Chrome or Chromium browser (auto-detected by nodriver)
 
-## Tool Categories (94)
+## Tool Categories (133)
 
 ### ⭐⭐⭐ Dual-Mode HTTP (unique)
 | Tool | Purpose |
@@ -422,7 +425,34 @@ Legacy `AI_VISION_*` env still work but emit `DeprecationWarning`. Migrate to `O
 ### ⭐⭐ AI Vision Solver (unique)
 | Tool | Purpose |
 |------|---------|
-| `solve_recaptcha_ai` | Claude vision picks matching tiles — solve image challenges |
+| `solve_recaptcha_ai` | Vision LLM picks matching tiles — solve image challenges (auto-clicks anchor checkbox in v0.2.10+) |
+| `vision_locate` | NL → element coordinates: `"the red Create button at bottom right"` (optional `click=True`) |
+
+### ⭐⭐⭐ AI-Agent Action Kit (LLM-optimized, new in v0.3.0)
+Designed for LLM-driven workflows — token-efficient page summaries, label-fuzzy form filling, verification primitives, resumable orchestration.
+
+| Tool | Purpose |
+|------|---------|
+| `describe_page` | Compact JSON summary (title/url/headings/fields/actions/errors/navigation) — ~10× fewer tokens than `accessibility_snapshot`. `wait_stable=True` waits for SPA hydration via MutationObserver |
+| `smart_fill` | Fill form by label text (fuzzy match: exact > prefix > substring > token); native value setter for React/Vue. Returns `did_you_mean` candidates on miss |
+| `paste_text` | Full paste-event sequence (ClipboardEvent + DataTransfer + beforeinput inputType:'insertFromPaste') for SolidJS/Svelte 5/Qwik forms that ignore plain `dispatchEvent('input')` |
+| `assert_text_present` / `assert_url_matches` / `assert_element_visible` | Verification primitives with internal poll-loop |
+| `click_and_wait` | Click + observe one of navigation / url / text / selector / request / network_idle. Distinguishes real submit from silent invalid-form click |
+| `form_introspect` | Per-field detail (label, framework binding react/vue/solid/lit, validation state, pattern/length constraints, aria-invalid) |
+| `workflow_run` | Sequential tool runner with resumable `start_at` index and `stop_on_error`. Failure response includes `failure_context` and `resume_with` hint |
+| `storage_snapshot` / `storage_diff` | Snapshot cookies + localStorage + sessionStorage + url to a named slot, then diff after an action — debug "what did this click actually change?" |
+| `detect_and_bypass` | One-shot: detect anti-bot wall (CF / DataDome / PX / Akamai / Imperva / Kasada) and apply best bypass we have |
+
+### ⭐⭐ Network + Auth Bridge (new in v0.4.0)
+Network capture with response bodies, plus a bridge from browser session into TLS-perfect HTTP for authenticated API debugging.
+
+| Tool | Purpose |
+|------|---------|
+| `network_start(capture_bodies=True)` + `network_get(include_body=True)` | Index every request by request_id and lazy-fetch response bodies via CDP `Network.getResponseBody` (truncated, configurable) |
+| `auth_capture` | Intercept the next N requests matching a URL pattern and return their headers (Authorization, Cookie, X-CSRF-*) — for SPAs that hold bearer tokens in JS memory |
+| `http_request_with_session` | Authenticated curl_cffi request that piggybacks on browser cookies + auto-extracts most recent same-host bearer from `network_index` |
+| `wait_for_request` | Block until a request matching `url_pattern` is observed (+ optional method filter, + optional response wait) — replaces `setTimeout` polling |
+| `dialog_auto_handle` | Persistent native-dialog handler with type filter (alert / confirm / prompt / beforeunload). Update action without re-arming. Idempotent per tab |
 
 ### ⭐ Stealth Toolkit
 | Tool | Purpose |
@@ -455,7 +485,7 @@ Legacy `AI_VISION_*` env still work but emit `DeprecationWarning`. Migrate to `O
 | `wait_for_network_idle` | SPA-safe load detection — waits for N ms of no fetch/XHR activity |
 | `console_clear` | Reset captured console buffer |
 
-### ⚡ Performance optimizations (new in v0.2.0)
+### ⚡ Performance optimizations
 | Feature | What it does |
 |---------|--------------|
 | `browser_snapshot(mode="fast")` | Skip getComputedStyle + minimal attrs (2–3× faster) |
@@ -474,17 +504,21 @@ Legacy `AI_VISION_*` env still work but emit `DeprecationWarning`. Migrate to `O
 | Interaction: 9 | click, click_text, click_role, hover, fill, select_option, check, uncheck, upload_file |
 | Keyboard: 2 | type_text, press_key |
 | Mouse: 3 | mouse_click_xy, mouse_move, drag_and_drop |
-| Wait: 4 | wait_for, wait_for_navigation, wait_for_url, wait_for_response |
+| Wait: 5 | wait_for, wait_for_navigation, wait_for_url, wait_for_response, wait_for_request |
 | Tabs: 4 | tab_list, tab_new, tab_select, tab_close |
-| Cookies/Storage: 8 | cookie_list/set/delete, localstorage_get/set/clear, sessionstorage_get/set |
+| Cookies: 5 | cookie_list/set/delete, cookie_import (+ raw_text auto-detect), cookie_export |
+| Storage: 9 | localstorage_get/set/clear, sessionstorage_get/set/clear, cache_clear, indexeddb_list/delete |
 | JavaScript: 2 | evaluate, inject_init_script |
 | Inspection: 4 | inspect_element, get_attribute, query_selector_all, get_links |
 | Frames: 2 | list_frames, frame_evaluate |
 | Batch: 3 | batch_actions, fill_form, navigate_and_snapshot |
-| Viewport/Scroll/Dialog/A11y: 5 | get/set_viewport_size, scroll, dialog_handle, accessibility_snapshot |
+| Viewport/Scroll: 4 | get/set_viewport_size, scroll, scroll_to |
+| Dialog: 2 | dialog_handle, dialog_auto_handle |
+| A11y: 1 | accessibility_snapshot |
 | Console/Network: 4 | console_start/get, network_start/get |
 | Debug: 3 | server_status, get_page_errors, export_har |
 | Scraping: 4 | detect_content_pattern, extract_structured, extract_table, scrape_page |
+| Chrome profile integration: 2 | list_chrome_profiles, clone_chrome_profile |
 
 ## Example Workflows
 
