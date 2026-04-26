@@ -1280,6 +1280,90 @@ async def cookie_list(url: Optional[str] = None) -> str:
 
 
 @mcp.tool()
+def _active_tab_host() -> Optional[str]:
+    """Best-effort hostname of the active tab — used as default cookie domain
+    when raw_text doesn't include one."""
+    try:
+        if not BrowserState.browser or not BrowserState.tabs:
+            return None
+        url = getattr(BrowserState.tabs[BrowserState.active_tab_index], "url", "")
+        if not url:
+            return None
+        from urllib.parse import urlparse
+        host = urlparse(url).hostname
+        return f".{host}" if host and "." in host else host
+    except Exception:
+        return None
+
+
+def _parse_cookie_text(text: str, default_domain: Optional[str]) -> list[dict]:
+    """Auto-detect cookie text format and return list of cookie dicts.
+
+    Handles:
+      - JSON array: [{...}]
+      - JSON object with cookies key: {"cookies": [...]} (storage_state)
+      - Header string: "a=1; b=2" or "Cookie: a=1; b=2"
+      - curl --cookie value (same as header)
+      - Netscape cookies.txt (tab-separated, 7 columns)
+    """
+    text = text.strip()
+    if not text:
+        return []
+    # 1. JSON
+    if text.startswith("[") or text.startswith("{"):
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict) and "cookies" in data:
+                data = data["cookies"]
+            if isinstance(data, list):
+                return [c for c in data if isinstance(c, dict)]
+        except Exception:
+            pass  # fall through to text parsing
+    # 2. Netscape cookies.txt — tab-separated, lines may have leading "# "
+    lines = [ln for ln in text.splitlines() if ln.strip() and not ln.startswith("#")]
+    if lines and "\t" in lines[0]:
+        out: list[dict] = []
+        for ln in lines:
+            parts = ln.split("\t")
+            if len(parts) < 7:
+                continue
+            domain, _, path, secure, expires, name, value = parts[:7]
+            try:
+                exp = int(expires)
+            except ValueError:
+                exp = 0
+            out.append({
+                "name": name, "value": value,
+                "domain": domain, "path": path,
+                "secure": secure.lower() == "true",
+                "expires": exp,
+            })
+        if out:
+            return out
+    # 3. Header / curl format: "name=val; name=val2" (optional "Cookie:" prefix)
+    s = text
+    if ":" in s.split(";", 1)[0]:
+        # "Cookie: a=1; b=2" → strip header name
+        head, rest = s.split(":", 1)
+        if head.strip().lower() in ("cookie", "set-cookie"):
+            s = rest
+    out = []
+    for pair in s.split(";"):
+        pair = pair.strip()
+        if not pair or "=" not in pair:
+            continue
+        name, _, value = pair.partition("=")
+        name = name.strip()
+        value = value.strip().strip('"')
+        if not name:
+            continue
+        c: dict = {"name": name, "value": value}
+        if default_domain:
+            c["domain"] = default_domain
+        out.append(c)
+    return out
+
+
 async def cookie_set(name: str, value: str, domain: str, path: str = "/",
                      secure: bool = False, http_only: bool = False) -> str:
     """Set a cookie on the browser."""
@@ -1318,29 +1402,47 @@ async def cookie_delete(name: str, domain: Optional[str] = None) -> str:
 async def cookie_import(
     cookies: Optional[list[dict]] = None,
     file_path: Optional[str] = None,
+    raw_text: Optional[str] = None,
+    default_domain: Optional[str] = None,
     clear_first: bool = False,
 ) -> str:
-    """Bulk-import cookies. Accepts either an inline list or a JSON file path.
+    """Bulk-import cookies. Three input modes — pick whichever is easiest:
 
-    Expected shape per cookie (matches DevTools / EditThisCookie export):
-      {"name": "...", "value": "...", "domain": ".example.com",
-       "path": "/", "expires": 1234567890, "secure": true,
-       "httpOnly": false, "sameSite": "Lax"}
+    1. cookies=[{...}]            inline array of dicts (DevTools / EditThisCookie shape)
+    2. file_path="..."            JSON file (array OR storage_state {"cookies":[...]})
+    3. raw_text="..."             paste any of these and we auto-parse:
+                                    • JSON array / object (same shapes as 1+2)
+                                    • Header string: "name=val; name2=val2" or
+                                      "Cookie: name=val; name2=val2"
+                                    • Netscape cookies.txt (tab-separated)
+                                    • curl --cookie / -b argument string
+       NOTE: header / netscape formats lack domain — pass default_domain=".example.com"
+       (or call this AFTER navigate so the active tab's URL provides it).
+
+    Per-cookie fields (when JSON):
+      {"name":"...", "value":"...", "domain":".example.com", "path":"/",
+       "expires":1234567890, "secure":true, "httpOnly":false, "sameSite":"Lax"}
 
     Args:
-        cookies: inline array of dicts
-        file_path: path to JSON file containing a list of cookie dicts
-                   (file can also be a full storage_state export — {"cookies": [...]})
-        clear_first: wipe all existing cookies before importing (default False)
+        cookies: inline array
+        file_path: JSON file
+        raw_text: any cookie text — format auto-detected
+        default_domain: fallback domain for header / netscape cookies (or auto-uses
+            current tab URL's host)
+        clear_first: wipe all existing cookies before import (default False)
 
-    Use for portable sessions from browser extensions. For full
-    cookies+localStorage+sessionStorage restore, prefer storage_state_load.
+    For full cookies + localStorage + sessionStorage restore, use storage_state_load.
     """
     try:
         if not BrowserState.browser:
             return err("browser not running")
-        if cookies is None and not file_path:
-            return err("pass either cookies=[...] or file_path='...'")
+        if cookies is None and not file_path and not raw_text:
+            return err("pass cookies=[...], file_path='...', or raw_text='...'")
+        # raw_text → cookies list (auto-detect)
+        if raw_text and not cookies and not file_path:
+            cookies = _parse_cookie_text(raw_text, default_domain or _active_tab_host())
+            if not cookies:
+                return err("could not parse raw_text — got 0 cookies")
         if file_path:
             raw = Path(file_path).read_text()
             parsed = json.loads(raw)
@@ -1357,25 +1459,77 @@ async def cookie_import(
         tab = BrowserState.active_tab()
         if clear_first:
             await tab.send(cdp_network.clear_browser_cookies())
-        # Map extension export field names → CDP param names
+
+        # CDP type coercion — required because CookieParam.to_json() iterates
+        # fields and calls .to_json() on each, which crashes for plain strings
+        # in enum-typed fields (sameSite) and ints where floats are expected.
+        def _coerce_same_site(v):
+            if v is None or v == "":
+                return None
+            # Already a CookieSameSite enum?
+            try:
+                from enum import Enum
+                if isinstance(v, Enum):
+                    return v
+            except Exception:
+                pass
+            # Map common strings to the enum (case-insensitive). "Unspecified"
+            # → None (not a CDP value, will let Chrome decide).
+            sv = str(v).strip().lower()
+            mapping = {"strict": "Strict", "lax": "Lax", "none": "None"}
+            canonical = mapping.get(sv)
+            if canonical is None:
+                return None
+            try:
+                return cdp_network.CookieSameSite(canonical)
+            except Exception:
+                return None
+
         params: list = []
+        skipped = 0
         for c in cookies:
             if not isinstance(c, dict) or "name" not in c or "value" not in c:
+                skipped += 1
                 continue
-            kwargs = {"name": c["name"], "value": c["value"]}
+            kwargs: dict = {"name": str(c["name"]), "value": str(c["value"])}
+            # Plain string fields
             for src, dst in (
-                ("domain", "domain"), ("path", "path"), ("secure", "secure"),
-                ("httpOnly", "http_only"), ("http_only", "http_only"),
-                ("sameSite", "same_site"), ("same_site", "same_site"),
-                ("expires", "expires"), ("url", "url"),
+                ("domain", "domain"), ("path", "path"), ("url", "url"),
             ):
                 if src in c and c[src] is not None:
-                    kwargs[dst] = c[src]
-            params.append(cdp_network.CookieParam(**kwargs))
+                    kwargs[dst] = str(c[src])
+            # Bool fields
+            for src, dst in (
+                ("secure", "secure"),
+                ("httpOnly", "http_only"), ("http_only", "http_only"),
+            ):
+                if src in c and c[src] is not None:
+                    kwargs[dst] = bool(c[src])
+            # Float fields — CDP TimeSinceEpoch is a float; reject session
+            # cookies (expires=-1 / "Session" / 0) since they don't map.
+            if "expires" in c and c["expires"] is not None:
+                try:
+                    exp = float(c["expires"])
+                    if exp > 0:
+                        kwargs["expires"] = exp
+                except (TypeError, ValueError):
+                    pass
+            # Enum field
+            if "sameSite" in c or "same_site" in c:
+                ss = _coerce_same_site(c.get("sameSite", c.get("same_site")))
+                if ss is not None:
+                    kwargs["same_site"] = ss
+            try:
+                params.append(cdp_network.CookieParam(**kwargs))
+            except Exception:
+                skipped += 1
         if not params:
-            return err("no valid cookies (need at least name + value each)")
+            return err(f"no valid cookies (skipped {skipped} entries)")
         await tab.send(cdp_network.set_cookies(cookies=params))
-        return ok(f"imported {len(params)} cookies (clear_first={clear_first})")
+        msg = f"imported {len(params)} cookies (clear_first={clear_first})"
+        if skipped:
+            msg += f", skipped {skipped} invalid"
+        return ok(msg)
     except Exception as e:
         return err(str(e))
 
