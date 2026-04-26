@@ -191,24 +191,46 @@ async def _attempt_turnstile_click(tab: Tab, offset_x: int = 30) -> Optional[tup
 
 async def _auto_verify_cf(tab: Tab, max_attempts: int = 2) -> str:
     """Run on the tab right after load. Detects CF challenge + attempts click.
-    Caps at max_attempts; never loops or blocks beyond ~6s total. Returns
+    Caps at max_attempts; never loops or blocks beyond ~12s total. Returns
     a short suffix to append to the caller's status line, or '' if no
-    challenge was seen."""
+    challenge was seen.
+
+    Strategy:
+      1. Brief wait so the Turnstile iframe has time to render.
+      2. DOM-based click via response-input ancestor (works on full-page
+         interstitials).
+      3. If still on challenge, OpenCV template match via tab.verify_cf —
+         covers shadow-DOM / out-of-process iframe widgets where the
+         visible checkbox isn't reachable from response-input parents.
+    """
+    # 1. Let widget initialize
+    await asyncio.sleep(1.0)
     if not await _has_cf_challenge(tab):
         return ""
-    clicked: Optional[tuple[int, int]] = None
+
+    actions: list[str] = []
     for _ in range(max(1, max_attempts)):
-        attempt = await _attempt_turnstile_click(tab)
-        if attempt is not None:
-            clicked = attempt
+        # 2. DOM tier
+        clicked = await _attempt_turnstile_click(tab)
+        if clicked is not None:
+            actions.append(f"DOM@{clicked}")
             await asyncio.sleep(2.5)
             if not await _has_cf_challenge(tab):
                 break
-        else:
-            break
-    if clicked is None:
-        return " [auto-verify: CF detected but widget not clickable]"
-    return f" [auto-verify: clicked CF widget at {clicked}]"
+
+        # 3. OpenCV template tier — handles shadow-DOM / cross-origin iframes
+        try:
+            await asyncio.wait_for(tab.verify_cf(flash=False), timeout=4.0)
+            actions.append("template")
+            await asyncio.sleep(2.5)
+            if not await _has_cf_challenge(tab):
+                break
+        except Exception:
+            pass
+
+    if not actions:
+        return " [auto-verify: CF detected but no clickable widget found]"
+    return f" [auto-verify: {' → '.join(actions)}]"
 
 mcp = FastMCP("stealth-chrome")
 
@@ -387,7 +409,7 @@ async def browser_launch(
         verify_suffix = ""
         if auto_verify:
             try:
-                verify_suffix = await asyncio.wait_for(_auto_verify_cf(main), timeout=12.0)
+                verify_suffix = await asyncio.wait_for(_auto_verify_cf(main), timeout=18.0)
             except (asyncio.TimeoutError, Exception):
                 verify_suffix = ""
         return ok(
@@ -441,7 +463,7 @@ async def navigate(url: str, wait_until: str = "load", auto_verify: bool = True)
         verify_suffix = ""
         if auto_verify:
             try:
-                verify_suffix = await asyncio.wait_for(_auto_verify_cf(tab), timeout=12.0)
+                verify_suffix = await asyncio.wait_for(_auto_verify_cf(tab), timeout=18.0)
             except (asyncio.TimeoutError, Exception):
                 verify_suffix = ""
         return ok(f"Navigated to {await get_url(tab)}{verify_suffix}")
