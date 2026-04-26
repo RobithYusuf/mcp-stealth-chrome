@@ -5273,11 +5273,46 @@ _DESCRIBE_PAGE_JS = """
 """
 
 
+_WAIT_DOM_STABLE_JS = """
+((max_ms, stable_ms) => new Promise((resolve) => {
+  const start = Date.now();
+  let last = start;
+  let obs;
+  try {
+    obs = new MutationObserver(() => { last = Date.now(); });
+    obs.observe(document.documentElement, {
+      childList: true, subtree: true, attributes: true, characterData: true,
+    });
+  } catch (e) { resolve('observer_failed'); return; }
+  const tick = () => {
+    const now = Date.now();
+    if (now - last >= stable_ms) { obs.disconnect(); resolve('stable'); }
+    else if (now - start >= max_ms) { obs.disconnect(); resolve('timeout'); }
+    else setTimeout(tick, 80);
+  };
+  setTimeout(tick, 80);
+}))
+"""
+
+
 @mcp.tool()
-async def describe_page() -> str:
+async def describe_page(
+    wait_stable: bool = False,
+    max_wait: float = 2.5,
+    stable_ms: int = 400,
+) -> str:
     """⭐ Compact AI-friendly page summary — replaces accessibility_snapshot
     for LLM workflows. Returns JSON with the page's intent + interactable
     surface in ~10× fewer tokens than a full a11y dump.
+
+    Args:
+        wait_stable: if True, install a MutationObserver and wait until the
+            DOM has been quiet for `stable_ms` before snapshotting (max
+            `max_wait` seconds). Use on SPA / lazy-rendered pages so the
+            LLM sees the final state, not a half-hydrated render. Cheap
+            (~50-200ms typical, capped at max_wait).
+        max_wait: outer cap for stability wait (default 2.5s)
+        stable_ms: required quiet window in ms (default 400)
 
     Output shape:
       {
@@ -5287,13 +5322,29 @@ async def describe_page() -> str:
         "fields": [{"label":"...","type":"text|email|...","required":bool,"value":"...","name":"...","id":"..."}],
         "actions": [{"text":"Submit","kind":"button","disabled":false}],
         "errors": ["..."],
-        "navigation": ["Dashboard","Settings",...]
+        "navigation": ["Dashboard","Settings",...],
+        "stability": "stable|timeout|skipped"  (only present if wait_stable=True)
       }
 
     Use this BEFORE smart_fill so the LLM knows which labels exist.
     """
     try:
         tab = BrowserState.active_tab()
+        stability = "skipped"
+        if wait_stable:
+            try:
+                stab_raw = await _wait(
+                    tab.evaluate(
+                        f"{_WAIT_DOM_STABLE_JS}({int(max_wait * 1000)}, {int(stable_ms)})",
+                        await_promise=True, return_by_value=True,
+                    ),
+                    timeout=max_wait + 2.0,
+                    what="describe_page wait_stable",
+                )
+                stability = str(stab_raw.value if hasattr(stab_raw, "value")
+                                 and not isinstance(stab_raw, str) else stab_raw) or "stable"
+            except Exception:
+                stability = "wait_failed"
         raw = await _wait(
             tab.evaluate(_DESCRIBE_PAGE_JS, return_by_value=True),
             what="describe_page",
@@ -5302,6 +5353,8 @@ async def describe_page() -> str:
         data = parse_json(str(text), {})
         if not isinstance(data, dict):
             return err("describe_page: failed to parse page summary")
+        if wait_stable:
+            data["stability"] = stability
         return ok(json.dumps(data, indent=2, ensure_ascii=False))
     except Exception as e:
         return err(str(e))
