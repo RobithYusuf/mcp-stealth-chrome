@@ -11,4 +11,4 @@ Differentiators vs existing Python stealth MCPs:
 - Auto Cloudflare verify via nodriver's verify_cf
 """
 
-__version__ = "0.2.11"
+__version__ = "0.2.12"

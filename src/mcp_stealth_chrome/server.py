@@ -68,6 +68,23 @@ from .state import (
 # Chrome subprocess hangs the entire MCP session. Override via env var.
 BROWSER_LAUNCH_TIMEOUT = int(os.environ.get("BROWSER_LAUNCH_TIMEOUT", "45"))
 BROWSER_NAV_TIMEOUT = int(os.environ.get("BROWSER_NAV_TIMEOUT", "20"))
+# Per-tool CDP action ceiling. Pages with stuck JS / blocked service workers
+# can keep CDP commands waiting indefinitely otherwise — this ensures each
+# tool call either succeeds or returns a clean timeout error within N seconds.
+TOOL_ACTION_TIMEOUT = int(os.environ.get("TOOL_ACTION_TIMEOUT", "30"))
+
+
+async def _wait(coro, timeout: Optional[float] = None, what: str = "operation"):
+    """Wrap a CDP coroutine with a hard timeout — surfaces a clean error
+    instead of letting a stuck page freeze the whole tool call. Re-raises
+    asyncio.TimeoutError as a regular exception with a useful message."""
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout or TOOL_ACTION_TIMEOUT)
+    except asyncio.TimeoutError:
+        raise TimeoutError(
+            f"{what} timed out after {timeout or TOOL_ACTION_TIMEOUT}s — "
+            f"page JS may be stuck or blocked. Try reload, or close+launch."
+        )
 
 # Serialize concurrent launches inside ONE MCP process. Cross-process collision
 # is handled separately by `resolve_default_profile()` (per-PID fallback).
@@ -645,7 +662,7 @@ async def browser_snapshot(
             "fast": SNAPSHOT_JS_FAST,
             "viewport": SNAPSHOT_JS_VIEWPORT,
         }.get(mode, SNAPSHOT_JS)
-        raw = await tab.evaluate(js, return_by_value=True)
+        raw = await _wait(tab.evaluate(js, return_by_value=True), what="browser_snapshot")
         elements = parse_json(raw, [])
         if not isinstance(elements, list):
             elements = []
@@ -715,7 +732,8 @@ async def screenshot(
             kwargs: dict[str, Any] = {"format_": fmt, "clip": clip, "capture_beyond_viewport": True}
             if fmt == "jpeg" and quality is not None:
                 kwargs["quality"] = int(quality)
-            b64 = await tab.send(cdp_page.capture_screenshot(**kwargs))
+            b64 = await _wait(tab.send(cdp_page.capture_screenshot(**kwargs)),
+                              what="screenshot (region)")
             data = base64.b64decode(b64)
             path.write_bytes(data)
         else:
@@ -727,7 +745,7 @@ async def screenshot(
             }
             if fmt == "jpeg" and quality is not None:
                 save_kwargs["quality"] = int(quality)
-            await tab.save_screenshot(**save_kwargs)
+            await _wait(tab.save_screenshot(**save_kwargs), what="screenshot")
 
         # Auto-downscale if either dimension exceeds max_dimension.
         # Uses cv2 (already a dep via opencv-python). INTER_AREA = best for shrinking.
@@ -1730,7 +1748,7 @@ async def evaluate(expression: str) -> str:
     """Execute arbitrary JS expression in page context. Returns stringified result."""
     try:
         tab = BrowserState.active_tab()
-        result = await tab.evaluate(expression, return_by_value=True)
+        result = await _wait(tab.evaluate(expression, return_by_value=True), what="evaluate")
         # Unwrap nodriver RemoteObject if returned (happens for some primitives)
         if hasattr(result, "value") and not isinstance(result, (str, int, float, bool, list, dict)):
             result = result.value
@@ -2109,7 +2127,7 @@ async def accessibility_snapshot(interesting_only: bool = True) -> str:
     try:
         tab = BrowserState.active_tab()
         from nodriver.cdp import accessibility as cdp_a11y
-        result = await tab.send(cdp_a11y.get_full_ax_tree())
+        result = await _wait(tab.send(cdp_a11y.get_full_ax_tree()), what="accessibility_snapshot")
         # Filter to meaningful nodes
         nodes = result if isinstance(result, list) else []
         filtered = []
