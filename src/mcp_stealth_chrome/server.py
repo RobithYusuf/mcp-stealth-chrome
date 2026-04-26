@@ -84,6 +84,132 @@ async def _safe_stop_browser(browser: Optional[Browser]) -> None:
     except Exception:
         pass
 
+
+# ── Auto-verify for Cloudflare/Turnstile challenges ─────────────────────────
+# Triggers naturally after navigation. Max 2 click attempts then gives up
+# silently — we never block the caller longer than ~6 seconds for verification.
+
+_TURNSTILE_FIND_JS = """
+(() => {
+  const primary = [
+    'iframe[src*="challenges.cloudflare.com"]',
+    'iframe[src*="turnstile"]',
+    '[data-testid*="challenge-widget"]',
+    '[data-testid*="turnstile"]',
+    '[data-sitekey]',
+    '.cf-turnstile',
+  ];
+  const secondary = [
+    '.turnstile',
+    '[id*="turnstile" i]',
+    '[id*="cf-chl"]',
+    '[class*="turnstile" i]',
+  ];
+  const tryPick = (sels, tier) => {
+    for (const sel of sels) {
+      for (const el of document.querySelectorAll(sel)) {
+        const r = el.getBoundingClientRect();
+        if (r.width < 50 || r.height < 20) continue;
+        return { tier, found: sel,
+          left: Math.round(r.left), top: Math.round(r.top),
+          width: Math.round(r.width), height: Math.round(r.height) };
+      }
+    }
+    return null;
+  };
+  let hit = tryPick(primary, 'primary') || tryPick(secondary, 'secondary');
+  if (hit) return JSON.stringify(hit);
+  const inp = document.querySelector('input[name="cf-turnstile-response"]');
+  if (inp) {
+    let el = inp.parentElement;
+    while (el && el !== document.body) {
+      const r = el.getBoundingClientRect();
+      if (r.width >= 80 && r.height >= 30) {
+        return JSON.stringify({ tier: 'response-input-ancestor',
+          found: 'input[name="cf-turnstile-response"]→ancestor',
+          left: Math.round(r.left), top: Math.round(r.top),
+          width: Math.round(r.width), height: Math.round(r.height) });
+      }
+      el = el.parentElement;
+    }
+  }
+  return 'not_found';
+})()
+"""
+
+_CF_CHALLENGE_PROBE_JS = """
+(() => {
+  const txt = (document.body && document.body.innerText || '').toLowerCase();
+  const phrases = ['performing security verification', 'just a moment',
+    'checking your browser', 'verify you are human', 'verifying you are human'];
+  const cfText = phrases.some(p => txt.includes(p));
+  const cfDom = !!document.querySelector(
+    'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"], ' +
+    '.cf-turnstile, [data-sitekey], input[name="cf-turnstile-response"]'
+  );
+  return cfText || cfDom;
+})()
+"""
+
+
+async def _has_cf_challenge(tab: Tab) -> bool:
+    try:
+        v = await asyncio.wait_for(
+            tab.evaluate(_CF_CHALLENGE_PROBE_JS, return_by_value=True),
+            timeout=3.0,
+        )
+        return bool(v.value if hasattr(v, "value") else v)
+    except Exception:
+        return False
+
+
+async def _attempt_turnstile_click(tab: Tab, offset_x: int = 30) -> Optional[tuple[int, int]]:
+    """Find Turnstile widget + dispatch a CDP-level click at its checkbox.
+    Returns (x, y) clicked or None. CDP click works for out-of-process
+    iframes where DOM-level events don't propagate."""
+    try:
+        raw = await asyncio.wait_for(
+            tab.evaluate(_TURNSTILE_FIND_JS, return_by_value=True), timeout=3.0
+        )
+    except Exception:
+        return None
+    data = parse_json(raw, None)
+    if not isinstance(data, dict):
+        return None
+    target_x = data["left"] + offset_x
+    target_y = data["top"] + data["height"] // 2
+    start_x = target_x + 180
+    start_y = target_y - 80
+    try:
+        await humanized_move(tab, start_x, start_y, target_x, target_y)
+        await asyncio.sleep(0.15)
+        await tab.mouse_click(target_x, target_y)
+        return (target_x, target_y)
+    except Exception:
+        return None
+
+
+async def _auto_verify_cf(tab: Tab, max_attempts: int = 2) -> str:
+    """Run on the tab right after load. Detects CF challenge + attempts click.
+    Caps at max_attempts; never loops or blocks beyond ~6s total. Returns
+    a short suffix to append to the caller's status line, or '' if no
+    challenge was seen."""
+    if not await _has_cf_challenge(tab):
+        return ""
+    clicked: Optional[tuple[int, int]] = None
+    for _ in range(max(1, max_attempts)):
+        attempt = await _attempt_turnstile_click(tab)
+        if attempt is not None:
+            clicked = attempt
+            await asyncio.sleep(2.5)
+            if not await _has_cf_challenge(tab):
+                break
+        else:
+            break
+    if clicked is None:
+        return " [auto-verify: CF detected but widget not clickable]"
+    return f" [auto-verify: clicked CF widget at {clicked}]"
+
 mcp = FastMCP("stealth-chrome")
 
 
@@ -113,6 +239,7 @@ async def browser_launch(
     extra_args: Optional[list[str]] = None,
     storage_state_path: Optional[str] = None,
     testing_mode: bool = False,
+    auto_verify: bool = True,
 ) -> str:
     """Launch stealth Chrome via nodriver. Creates persistent profile by default.
 
@@ -130,6 +257,10 @@ async def browser_launch(
             disables image loading, background throttling dampers, translate,
             notifications, media autoplay. WARNING: reduces stealth — not for
             anti-bot work (sites can detect missing images as automation signal).
+        auto_verify: if True (default), automatically detect Cloudflare /
+            Turnstile challenges after the initial load and dispatch a
+            CDP-level click on the checkbox. Caps at 2 attempts ~6s total —
+            never loops. Set False to opt out.
     """
     if BrowserState.is_up():
         return ok(f"Browser already running with {len(BrowserState.tabs)} tab(s).")
@@ -253,9 +384,15 @@ async def browser_launch(
             f"by another Chrome]"
             if used_fallback else ""
         )
+        verify_suffix = ""
+        if auto_verify:
+            try:
+                verify_suffix = await asyncio.wait_for(_auto_verify_cf(main), timeout=12.0)
+            except (asyncio.TimeoutError, Exception):
+                verify_suffix = ""
         return ok(
             f"Browser launched (headless={headless}, persistent={persistent}). "
-            f"Loaded {url}{suffix}"
+            f"Loaded {url}{suffix}{verify_suffix}"
         )
 
 
@@ -287,8 +424,13 @@ async def browser_close() -> str:
 
 
 @mcp.tool()
-async def navigate(url: str, wait_until: str = "load") -> str:
-    """Navigate the active tab to url. wait_until: load|domcontentloaded|none."""
+async def navigate(url: str, wait_until: str = "load", auto_verify: bool = True) -> str:
+    """Navigate the active tab to url. wait_until: load|domcontentloaded|none.
+
+    auto_verify: if True (default), automatically detect Cloudflare /
+    Turnstile challenges after load and click the checkbox naturally
+    (CDP-level click, max 2 attempts). Set False to opt out.
+    """
     if not BrowserState.is_up():
         return err("Browser not running. Call browser_launch first.")
     tab = BrowserState.active_tab()
@@ -296,7 +438,13 @@ async def navigate(url: str, wait_until: str = "load") -> str:
         await tab.get(url)
         if wait_until != "none":
             await tab.wait()
-        return ok(f"Navigated to {await get_url(tab)}")
+        verify_suffix = ""
+        if auto_verify:
+            try:
+                verify_suffix = await asyncio.wait_for(_auto_verify_cf(tab), timeout=12.0)
+            except (asyncio.TimeoutError, Exception):
+                verify_suffix = ""
+        return ok(f"Navigated to {await get_url(tab)}{verify_suffix}")
     except Exception as e:
         return err(str(e))
 
