@@ -562,6 +562,12 @@ async def browser_close() -> str:
                            "handler": None})
     _TRACE_BUFFER.clear()
     _COVERAGE_ACTIVE.update({"tab_id": None, "js": False, "css": False})
+    # Drop registered dialog handler tab IDs so a new tab with a recycled
+    # id() doesn't get skipped on re-arm.
+    try:
+        _DIALOG_AUTO_CFG["_registered_tab_ids"].clear()
+    except Exception:
+        pass
     # Mark profile as cleanly exited so next launch skips restore dialog
     clean_profile_state(PROFILE_DIR)
     return ok("Browser closed.")
@@ -2117,6 +2123,96 @@ async def dialog_handle(action: str = "accept", text: Optional[str] = None) -> s
 
         tab.add_handler(cdp_page.JavascriptDialogOpening, handle)
         return ok(f"dialog handler armed ({action})")
+    except Exception as e:
+        return err(str(e))
+
+
+# ── dialog_auto_handle (persistent, type-filterable) ──────────────────────
+# Read-at-fire-time config so the LLM can update action/types without
+# re-registering the handler. Keyed by tab id() to avoid duplicate handlers
+# on the same tab.
+_DIALOG_AUTO_CFG: dict = {
+    "enabled": False, "action": "accept", "text": "",
+    "types": None,  # None=all; or set like {"beforeunload"}
+    "_registered_tab_ids": set(),
+}
+
+
+@mcp.tool()
+async def dialog_auto_handle(
+    action: str = "accept",
+    enabled: bool = True,
+    types: Optional[list[str]] = None,
+    text: str = "",
+) -> str:
+    """⭐ Install a PERSISTENT auto-handler for native browser dialogs.
+    Unlike dialog_handle (one-shot, action baked in at arm time), this
+    one stays armed across many dialogs and reads its config at fire
+    time — call again with new action/types to update without re-arming.
+
+    Args:
+        action: "accept" (Leave / OK) or "dismiss" (Cancel / Stay)
+        enabled: True to arm, False to disable (config preserved)
+        types: optional list to scope handling — any of:
+               ["alert", "confirm", "prompt", "beforeunload"]
+               None (default) = handle all types.
+        text: prompt response when action="accept" on prompt() dialogs;
+              also basic-auth "user:pass" for HTTP 401.
+
+    Common patterns:
+        # Form pages with "unsaved changes" guard — auto-leave forever
+        dialog_auto_handle(action="accept", types=["beforeunload"])
+
+        # Pages that spam alert() — auto-OK
+        dialog_auto_handle(action="accept", types=["alert"])
+
+        # Disable when done
+        dialog_auto_handle(enabled=False)
+
+    Native dialogs only (Chrome's own card UI). HTML/CSS modal overlays
+    are regular DOM — use click_text("Cancel") / click_role for those.
+    """
+    _DIALOG_AUTO_CFG["enabled"] = bool(enabled)
+    _DIALOG_AUTO_CFG["action"] = action
+    _DIALOG_AUTO_CFG["text"] = text or ""
+    _DIALOG_AUTO_CFG["types"] = set(types) if types else None
+
+    if not enabled:
+        return ok("dialog auto-handle disabled (config preserved — re-enable to resume)")
+
+    try:
+        tab = BrowserState.active_tab()
+        tab_id = id(tab)
+        if tab_id in _DIALOG_AUTO_CFG["_registered_tab_ids"]:
+            return ok(
+                f"auto-handle config updated (action={action}, "
+                f"types={list(types) if types else 'all'}); already armed on this tab"
+            )
+
+        from nodriver.cdp import page as cdp_page
+
+        async def auto_handler(event):
+            cfg = _DIALOG_AUTO_CFG
+            if not cfg["enabled"]:
+                return
+            ev_type = getattr(event, "type_", None) or getattr(event, "type", None)
+            type_str = getattr(ev_type, "value", str(ev_type)) if ev_type else ""
+            if cfg["types"] and type_str not in cfg["types"]:
+                return
+            try:
+                await tab.send(cdp_page.handle_java_script_dialog(
+                    accept=(cfg["action"] == "accept"),
+                    prompt_text=cfg["text"] or "",
+                ))
+            except Exception:
+                pass
+
+        tab.add_handler(cdp_page.JavascriptDialogOpening, auto_handler)
+        _DIALOG_AUTO_CFG["_registered_tab_ids"].add(tab_id)
+        return ok(
+            f"dialog auto-handle armed (action={action}, "
+            f"types={list(types) if types else 'all'})"
+        )
     except Exception as e:
         return err(str(e))
 
