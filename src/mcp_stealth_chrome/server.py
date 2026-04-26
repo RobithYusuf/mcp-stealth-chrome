@@ -91,6 +91,18 @@ async def _safe_stop_browser(browser: Optional[Browser]) -> None:
 
 _TURNSTILE_FIND_JS = """
 (() => {
+  // Strategy: prefer containers that ACTUALLY hold the rendered widget
+  // (response-input + visible iframe) over generic .turnstile-class
+  // wrappers that may just be layout cells.
+  const inp = document.querySelector('input[name="cf-turnstile-response"]');
+  const responseAncestors = new Set();
+  if (inp) {
+    let el = inp.parentElement;
+    while (el && el !== document.body) {
+      responseAncestors.add(el);
+      el = el.parentElement;
+    }
+  }
   const primary = [
     'iframe[src*="challenges.cloudflare.com"]',
     'iframe[src*="turnstile"]',
@@ -105,30 +117,67 @@ _TURNSTILE_FIND_JS = """
     '[id*="cf-chl"]',
     '[class*="turnstile" i]',
   ];
+  // Standard Turnstile widget renders at ~300×65 (compact) or larger. We
+  // prefer matches whose dimensions look like an actual widget (not a tiny
+  // empty cell, not a giant page-wide layout wrapper).
+  const isWidgetSized = (r) =>
+    r.width >= 200 && r.width <= 800 && r.height >= 50 && r.height <= 250;
   const tryPick = (sels, tier) => {
+    let bestWidget = null;       // matches isWidgetSized
+    let bestContaining = null;   // contains response input
+    let bestOther = null;        // any other valid hit
     for (const sel of sels) {
       for (const el of document.querySelectorAll(sel)) {
         const r = el.getBoundingClientRect();
         if (r.width < 50 || r.height < 20) continue;
-        return { tier, found: sel,
+        const containsAnyInput = [...document.querySelectorAll('input[name="cf-turnstile-response"]')].some(i => el.contains(i));
+        const area = r.width * r.height;
+        const widgetSized = isWidgetSized(r);
+        const entry = { tier, found: sel, containsInput: containsAnyInput,
+          widgetSized, area,
           left: Math.round(r.left), top: Math.round(r.top),
           width: Math.round(r.width), height: Math.round(r.height) };
+        if (widgetSized && containsAnyInput) {
+          if (!bestWidget || area > bestWidget.area) bestWidget = entry;
+        } else if (containsAnyInput) {
+          if (!bestContaining || area < bestContaining.area) bestContaining = entry;
+        } else {
+          if (!bestOther || area > bestOther.area) bestOther = entry;
+        }
       }
     }
-    return null;
+    return bestWidget || bestContaining || bestOther;
+  };
+  // After picking the best container, account for CSS padding so the click
+  // lands on actual widget content, not in dead padding space.
+  const annotate = (entry, sel) => {
+    if (!entry) return entry;
+    const el = [...document.querySelectorAll(sel)].find(e => {
+      const r = e.getBoundingClientRect();
+      return Math.round(r.left) === entry.left && Math.round(r.top) === entry.top;
+    });
+    if (el) {
+      const cs = getComputedStyle(el);
+      entry.padLeft = parseFloat(cs.paddingLeft) || 0;
+      entry.padTop = parseFloat(cs.paddingTop) || 0;
+    }
+    return entry;
   };
   let hit = tryPick(primary, 'primary') || tryPick(secondary, 'secondary');
-  if (hit) return JSON.stringify(hit);
-  const inp = document.querySelector('input[name="cf-turnstile-response"]');
+  if (hit) return JSON.stringify(annotate(hit, hit.found));
+  // Last resort: walk up from response-input to first sized ancestor
   if (inp) {
     let el = inp.parentElement;
     while (el && el !== document.body) {
       const r = el.getBoundingClientRect();
       if (r.width >= 80 && r.height >= 30) {
+        const cs = getComputedStyle(el);
         return JSON.stringify({ tier: 'response-input-ancestor',
           found: 'input[name="cf-turnstile-response"]→ancestor',
           left: Math.round(r.left), top: Math.round(r.top),
-          width: Math.round(r.width), height: Math.round(r.height) });
+          width: Math.round(r.width), height: Math.round(r.height),
+          padLeft: parseFloat(cs.paddingLeft) || 0,
+          padTop: parseFloat(cs.paddingTop) || 0 });
       }
       el = el.parentElement;
     }
@@ -137,26 +186,66 @@ _TURNSTILE_FIND_JS = """
 })()
 """
 
-_CF_CHALLENGE_PROBE_JS = """
+_CF_CHALLENGE_PROBE_INITIAL_JS = """
 (() => {
+  const responseInputs = document.querySelectorAll('input[name="cf-turnstile-response"]');
+  for (const inp of responseInputs) {
+    if (inp.value && inp.value.length > 5) return false;  // already solved
+  }
   const txt = (document.body && document.body.innerText || '').toLowerCase();
   const phrases = ['performing security verification', 'just a moment',
     'checking your browser', 'verify you are human', 'verifying you are human'];
   const cfText = phrases.some(p => txt.includes(p));
+  // Broad detection — includes the loader script + host containers so we can
+  // detect a challenge before the widget actually renders.
   const cfDom = !!document.querySelector(
     'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"], ' +
-    '.cf-turnstile, [data-sitekey], input[name="cf-turnstile-response"]'
+    '.cf-turnstile, .turnstile, [class*="turnstile" i], [id*="turnstile" i], ' +
+    '[data-sitekey], input[name="cf-turnstile-response"], ' +
+    'script[src*="challenges.cloudflare.com"]'
   );
   return cfText || cfDom;
 })()
 """
 
+_CF_CHALLENGE_PROBE_ACTIVE_JS = """
+(() => {
+  // Stricter "still active" check used BETWEEN click attempts. Excludes the
+  // loader script (which persists after solve) and host-container CSS classes
+  // (which also persist after solve, just dormant). True only when the visible
+  // challenge UI is actually present.
+  const inps = document.querySelectorAll('input[name="cf-turnstile-response"]');
+  if (inps.length > 0) {
+    let anyEmpty = false;
+    for (const inp of inps) {
+      if (!inp.value || inp.value.length <= 5) { anyEmpty = true; break; }
+    }
+    if (!anyEmpty) return false;  // every input has a token → solved
+  }
+  const txt = (document.body && document.body.innerText || '').toLowerCase();
+  const phrases = ['performing security verification', 'just a moment',
+    'checking your browser', 'verify you are human', 'verifying you are human'];
+  if (phrases.some(p => txt.includes(p))) return true;
+  return !!document.querySelector(
+    'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]'
+  );
+})()
+"""
 
-async def _has_cf_challenge(tab: Tab) -> bool:
+
+async def _has_cf_challenge(tab: Tab, *, active: bool = False) -> bool:
+    """Detect a Cloudflare/Turnstile challenge.
+
+    active=False (default): broad detection used BEFORE attempting any click.
+        Matches loader script and host containers so we don't miss a
+        widget that hasn't fully rendered yet.
+    active=True: strict detection used BETWEEN click attempts. Returns True
+        only when visible challenge UI is still on the page (not just the
+        post-solve dormant markers)."""
+    js = _CF_CHALLENGE_PROBE_ACTIVE_JS if active else _CF_CHALLENGE_PROBE_INITIAL_JS
     try:
         v = await asyncio.wait_for(
-            tab.evaluate(_CF_CHALLENGE_PROBE_JS, return_by_value=True),
-            timeout=3.0,
+            tab.evaluate(js, return_by_value=True), timeout=3.0
         )
         return bool(v.value if hasattr(v, "value") else v)
     except Exception:
@@ -166,7 +255,12 @@ async def _has_cf_challenge(tab: Tab) -> bool:
 async def _attempt_turnstile_click(tab: Tab, offset_x: int = 30) -> Optional[tuple[int, int]]:
     """Find Turnstile widget + dispatch a CDP-level click at its checkbox.
     Returns (x, y) clicked or None. CDP click works for out-of-process
-    iframes where DOM-level events don't propagate."""
+    iframes where DOM-level events don't propagate.
+
+    Click target = container.left + padding + offset_x, container.top +
+    padding + half of inner-height. CSS padding is honored so clicks on
+    padded host containers (.turnstile { padding: 48px 64px; }) land
+    inside the widget content rather than in dead padding space."""
     try:
         raw = await asyncio.wait_for(
             tab.evaluate(_TURNSTILE_FIND_JS, return_by_value=True), timeout=3.0
@@ -176,8 +270,13 @@ async def _attempt_turnstile_click(tab: Tab, offset_x: int = 30) -> Optional[tup
     data = parse_json(raw, None)
     if not isinstance(data, dict):
         return None
-    target_x = data["left"] + offset_x
-    target_y = data["top"] + data["height"] // 2
+    pad_left = int(data.get("padLeft", 0))
+    pad_top = int(data.get("padTop", 0))
+    inner_left = data["left"] + pad_left
+    inner_top = data["top"] + pad_top
+    inner_height = max(20, data["height"] - 2 * pad_top)
+    target_x = inner_left + offset_x
+    target_y = inner_top + inner_height // 2
     start_x = target_x + 180
     start_y = target_y - 80
     try:
@@ -203,10 +302,16 @@ async def _auto_verify_cf(tab: Tab, max_attempts: int = 2) -> str:
          covers shadow-DOM / out-of-process iframe widgets where the
          visible checkbox isn't reachable from response-input parents.
     """
-    # 1. Let widget initialize
-    await asyncio.sleep(1.0)
+    # 1. Let widget initialize. Some pages load the Turnstile script async
+    #    and the checkbox iframe needs ~1.5-2s to render before any click
+    #    target (DOM or pixel) is reachable.
     if not await _has_cf_challenge(tab):
-        return ""
+        await asyncio.sleep(0.6)
+        if not await _has_cf_challenge(tab):
+            return ""
+    # Challenge present — give the widget another beat to paint its checkbox
+    # so OpenCV template match has something to find.
+    await asyncio.sleep(2.0)
 
     actions: list[str] = []
     for _ in range(max(1, max_attempts)):
@@ -215,7 +320,7 @@ async def _auto_verify_cf(tab: Tab, max_attempts: int = 2) -> str:
         if clicked is not None:
             actions.append(f"DOM@{clicked}")
             await asyncio.sleep(2.5)
-            if not await _has_cf_challenge(tab):
+            if not await _has_cf_challenge(tab, active=True):
                 break
 
         # 3. OpenCV template tier — handles shadow-DOM / cross-origin iframes
@@ -223,7 +328,7 @@ async def _auto_verify_cf(tab: Tab, max_attempts: int = 2) -> str:
             await asyncio.wait_for(tab.verify_cf(flash=False), timeout=4.0)
             actions.append("template")
             await asyncio.sleep(2.5)
-            if not await _has_cf_challenge(tab):
+            if not await _has_cf_challenge(tab, active=True):
                 break
         except Exception:
             pass
@@ -409,7 +514,7 @@ async def browser_launch(
         verify_suffix = ""
         if auto_verify:
             try:
-                verify_suffix = await asyncio.wait_for(_auto_verify_cf(main), timeout=18.0)
+                verify_suffix = await asyncio.wait_for(_auto_verify_cf(main), timeout=25.0)
             except (asyncio.TimeoutError, Exception):
                 verify_suffix = ""
         return ok(
@@ -463,7 +568,7 @@ async def navigate(url: str, wait_until: str = "load", auto_verify: bool = True)
         verify_suffix = ""
         if auto_verify:
             try:
-                verify_suffix = await asyncio.wait_for(_auto_verify_cf(tab), timeout=18.0)
+                verify_suffix = await asyncio.wait_for(_auto_verify_cf(tab), timeout=25.0)
             except (asyncio.TimeoutError, Exception):
                 verify_suffix = ""
         return ok(f"Navigated to {await get_url(tab)}{verify_suffix}")
