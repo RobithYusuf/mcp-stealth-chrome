@@ -5144,6 +5144,915 @@ async def console_clear() -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# 25. ⭐⭐⭐ LLM-OPTIMIZED ACTION KIT
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Tools designed for AI-agent workflows: token-efficient page summaries,
+# label-fuzzy form filling, NL vision targeting, verification primitives,
+# state-diff debugging, resumable workflows, and one-shot detect+bypass.
+
+# ── describe_page ──────────────────────────────────────────────────────────
+
+_DESCRIBE_PAGE_JS = """
+(() => {
+  const visible = (el) => {
+    if (!el || !el.getBoundingClientRect) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    const cs = getComputedStyle(el);
+    if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') return false;
+    return true;
+  };
+  // Best-effort label resolution: <label for=ID>, wrapping <label>, aria-label,
+  // aria-labelledby, placeholder, name attribute. Returns first non-empty.
+  const labelOf = (el) => {
+    if (!el) return '';
+    const id = el.id;
+    if (id) {
+      const lbl = document.querySelector('label[for="' + CSS.escape(id) + '"]');
+      if (lbl && lbl.innerText.trim()) return lbl.innerText.trim();
+    }
+    let p = el.parentElement;
+    for (let i = 0; i < 4 && p; i++, p = p.parentElement) {
+      if (p.tagName === 'LABEL' && p.innerText.trim()) return p.innerText.trim();
+    }
+    if (el.getAttribute) {
+      const al = el.getAttribute('aria-label');
+      if (al) return al.trim();
+      const alb = el.getAttribute('aria-labelledby');
+      if (alb) {
+        const ref = document.getElementById(alb);
+        if (ref && ref.innerText) return ref.innerText.trim();
+      }
+      const ph = el.getAttribute('placeholder');
+      if (ph) return ph.trim();
+      const nm = el.getAttribute('name');
+      if (nm) return nm.trim();
+    }
+    return '';
+  };
+  const fieldType = (el) => {
+    const tag = el.tagName.toLowerCase();
+    if (tag === 'textarea') return 'textarea';
+    if (tag === 'select') return 'select';
+    if (tag !== 'input') return tag;
+    const t = (el.type || 'text').toLowerCase();
+    return t;
+  };
+  // Form fields
+  const fields = [];
+  const inputs = [...document.querySelectorAll('input,textarea,select')]
+    .filter(el => visible(el) && el.type !== 'hidden');
+  for (const el of inputs.slice(0, 60)) {
+    const type = fieldType(el);
+    let value;
+    if (type === 'checkbox' || type === 'radio') value = !!el.checked;
+    else if (type === 'select') value = el.value;
+    else value = el.value || '';
+    fields.push({
+      label: labelOf(el),
+      type,
+      required: !!el.required,
+      value: typeof value === 'string' ? value.slice(0, 200) : value,
+      name: el.name || null,
+      id: el.id || null,
+    });
+  }
+  // Buttons + submit-like actions
+  const actions = [];
+  const btns = [...document.querySelectorAll(
+    'button, [role=button], input[type=submit], input[type=button], a[href][role=button]'
+  )].filter(visible);
+  for (const el of btns.slice(0, 30)) {
+    const txt = (el.innerText || el.value || el.getAttribute('aria-label') || '').trim();
+    if (txt) actions.push({
+      text: txt.slice(0, 80),
+      kind: el.tagName.toLowerCase(),
+      disabled: !!el.disabled,
+    });
+  }
+  // Headings (page intent signal)
+  const headings = [...document.querySelectorAll('h1,h2,h3')]
+    .filter(visible).slice(0, 10)
+    .map(h => ({level: h.tagName.toLowerCase(), text: h.innerText.trim().slice(0, 120)}));
+  // Visible error messages — common patterns
+  const errors = [];
+  const errorEls = [...document.querySelectorAll(
+    '[role=alert], .error, .alert-error, .field-error, [class*="error" i]:not(button), [aria-invalid=true]'
+  )].filter(visible).slice(0, 10);
+  for (const el of errorEls) {
+    const t = (el.innerText || '').trim();
+    if (t && t.length < 300) errors.push(t);
+  }
+  // Top-level navigation links (max 12, same-origin only)
+  const origin = location.origin;
+  const navLinks = [];
+  const navContainer = document.querySelector('nav, header, [role=navigation]');
+  if (navContainer) {
+    for (const a of navContainer.querySelectorAll('a[href]')) {
+      if (!visible(a)) continue;
+      const t = (a.innerText || '').trim();
+      if (!t) continue;
+      try {
+        const u = new URL(a.href, origin);
+        if (u.origin === origin) navLinks.push(t.slice(0, 60));
+      } catch {}
+      if (navLinks.length >= 12) break;
+    }
+  }
+  return JSON.stringify({
+    title: document.title || '',
+    url: location.href,
+    headings,
+    fields,
+    actions,
+    errors,
+    navigation: [...new Set(navLinks)],
+  });
+})()
+"""
+
+
+@mcp.tool()
+async def describe_page() -> str:
+    """⭐ Compact AI-friendly page summary — replaces accessibility_snapshot
+    for LLM workflows. Returns JSON with the page's intent + interactable
+    surface in ~10× fewer tokens than a full a11y dump.
+
+    Output shape:
+      {
+        "title": "...",
+        "url": "...",
+        "headings": [{"level":"h1","text":"..."}],
+        "fields": [{"label":"...","type":"text|email|...","required":bool,"value":"...","name":"...","id":"..."}],
+        "actions": [{"text":"Submit","kind":"button","disabled":false}],
+        "errors": ["..."],
+        "navigation": ["Dashboard","Settings",...]
+      }
+
+    Use this BEFORE smart_fill so the LLM knows which labels exist.
+    """
+    try:
+        tab = BrowserState.active_tab()
+        raw = await _wait(
+            tab.evaluate(_DESCRIBE_PAGE_JS, return_by_value=True),
+            what="describe_page",
+        )
+        text = raw.value if hasattr(raw, "value") and not isinstance(raw, str) else raw
+        data = parse_json(str(text), {})
+        if not isinstance(data, dict):
+            return err("describe_page: failed to parse page summary")
+        return ok(json.dumps(data, indent=2, ensure_ascii=False))
+    except Exception as e:
+        return err(str(e))
+
+
+# ── smart_fill ─────────────────────────────────────────────────────────────
+
+_SMART_FILL_FIND_JS = """
+(label_query) => {
+  const visible = (el) => {
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    const cs = getComputedStyle(el);
+    return cs.display !== 'none' && cs.visibility !== 'hidden' && cs.opacity !== '0';
+  };
+  const labelOf = (el) => {
+    if (!el) return '';
+    const id = el.id;
+    if (id) {
+      const lbl = document.querySelector('label[for="' + CSS.escape(id) + '"]');
+      if (lbl && lbl.innerText.trim()) return lbl.innerText.trim();
+    }
+    let p = el.parentElement;
+    for (let i = 0; i < 4 && p; i++, p = p.parentElement) {
+      if (p.tagName === 'LABEL' && p.innerText.trim()) return p.innerText.trim();
+    }
+    const al = el.getAttribute && el.getAttribute('aria-label');
+    if (al) return al.trim();
+    const alb = el.getAttribute && el.getAttribute('aria-labelledby');
+    if (alb) {
+      const ref = document.getElementById(alb);
+      if (ref && ref.innerText) return ref.innerText.trim();
+    }
+    const ph = el.getAttribute && el.getAttribute('placeholder');
+    if (ph) return ph.trim();
+    const nm = el.getAttribute && el.getAttribute('name');
+    if (nm) return nm.trim();
+    return '';
+  };
+  const norm = (s) => (s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  const want = norm(label_query);
+  // Score candidates: exact > prefix > substring > token-overlap
+  const inputs = [...document.querySelectorAll('input,textarea,select')]
+    .filter(el => visible(el) && el.type !== 'hidden' && !el.disabled && !el.readOnly);
+  const scored = [];
+  const candidates = [];
+  for (const el of inputs) {
+    const lbl = labelOf(el);
+    const lblN = norm(lbl);
+    candidates.push(lbl);
+    if (!lblN) continue;
+    let score = 0;
+    if (lblN === want) score = 1000;
+    else if (lblN.startsWith(want)) score = 700;
+    else if (lblN.includes(want)) score = 500;
+    else {
+      const tw = want.split(' ').filter(Boolean);
+      const lw = lblN.split(' ').filter(Boolean);
+      const overlap = tw.filter(t => lw.includes(t)).length;
+      if (overlap > 0) score = 100 + overlap * 50;
+    }
+    if (score > 0) {
+      // Tag input with marker so we can re-query it server-side without
+      // sending the element across CDP boundary.
+      const marker = '__mcp_smart_' + Math.random().toString(36).slice(2, 10);
+      el.setAttribute('data-mcp-smart', marker);
+      const rect = el.getBoundingClientRect();
+      scored.push({score, label: lbl, marker, type: el.tagName.toLowerCase(),
+        input_type: (el.type || '').toLowerCase(),
+        x: Math.round(rect.left + rect.width / 2),
+        y: Math.round(rect.top + rect.height / 2)});
+    }
+  }
+  scored.sort((a, b) => b.score - a.score);
+  return JSON.stringify({best: scored[0] || null, candidates: [...new Set(candidates)].filter(Boolean).slice(0, 30)});
+}
+"""
+
+
+@mcp.tool()
+async def smart_fill(fields: dict, submit_label: Optional[str] = None) -> str:
+    """⭐ Fill form fields by label text (fuzzy match). LLM-friendly alt to
+    fill_form which requires DOM refs.
+
+    Args:
+        fields: {"Label": "value", ...} — keys match form field labels
+            (case-insensitive, fuzzy: exact > prefix > substring > token).
+            Labels resolved from <label>, aria-label, placeholder, name.
+        submit_label: optional button text to click after filling
+            (e.g., "Create", "Sign in"). Fuzzy-matched on action button text.
+
+    Behavior:
+        - Each field: locates input → focus → clear → type value
+        - Returns per-field result + list of available labels if missing
+        - On miss: error includes candidates so the LLM can retry with
+          the correct label name.
+    """
+    try:
+        tab = BrowserState.active_tab()
+        if not isinstance(fields, dict):
+            return err("smart_fill: fields must be a dict {label: value}")
+        results: list[dict] = []
+        for label, value in fields.items():
+            if not isinstance(label, str):
+                continue
+            raw = await _wait(
+                tab.evaluate(
+                    f"({_SMART_FILL_FIND_JS})({json.dumps(label)})",
+                    return_by_value=True,
+                ),
+                what=f"smart_fill find '{label}'",
+            )
+            text = raw.value if hasattr(raw, "value") and not isinstance(raw, str) else raw
+            data = parse_json(str(text), {})
+            best = data.get("best") if isinstance(data, dict) else None
+            candidates = data.get("candidates", []) if isinstance(data, dict) else []
+            if not best:
+                results.append({
+                    "label": label, "ok": False,
+                    "error": "no field matched",
+                    "did_you_mean": candidates[:10],
+                })
+                continue
+            # Click into the field then type. Using mouse_click + JS fill is
+            # more reliable than .focus() across React/Vue components that
+            # listen for native events.
+            try:
+                await tab.mouse_click(int(best["x"]), int(best["y"]))
+                await asyncio.sleep(0.1)
+                # Native value setter so React/Vue see the change
+                await _wait(tab.evaluate(
+                    f"""
+                    (() => {{
+                      const el = document.querySelector('[data-mcp-smart="{best['marker']}"]');
+                      if (!el) return false;
+                      const setter = Object.getOwnPropertyDescriptor(
+                        el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype,
+                        'value'
+                      ).set;
+                      setter.call(el, {json.dumps(str(value))});
+                      el.dispatchEvent(new Event('input', {{bubbles: true}}));
+                      el.dispatchEvent(new Event('change', {{bubbles: true}}));
+                      return true;
+                    }})()
+                    """,
+                    return_by_value=True,
+                ), what=f"smart_fill set '{label}'")
+                results.append({"label": label, "matched": best["label"], "ok": True})
+            except Exception as e:
+                results.append({"label": label, "ok": False, "error": str(e)})
+        # Optional submit
+        submit_result = None
+        if submit_label:
+            try:
+                # Reuse click_text fuzzy logic
+                r = await click_text(submit_label, exact=False)
+                submit_result = str(r)[:200]
+            except Exception as e:
+                submit_result = f"submit failed: {e}"
+        out = {"results": results}
+        if submit_result is not None:
+            out["submit"] = submit_result
+        any_failed = any(not r.get("ok") for r in results)
+        return (err if any_failed else ok)(json.dumps(out, indent=2, ensure_ascii=False))
+    except Exception as e:
+        return err(str(e))
+
+
+# ── assert_* primitives ────────────────────────────────────────────────────
+
+
+@mcp.tool()
+async def assert_text_present(text: str, timeout: float = 5.0) -> str:
+    """⭐ Verify text appears anywhere on page within timeout.
+    Returns ok(found) or err(not found + sample of body text)."""
+    try:
+        tab = BrowserState.active_tab()
+        deadline = asyncio.get_event_loop().time() + max(0.5, timeout)
+        last_body = ""
+        while asyncio.get_event_loop().time() < deadline:
+            raw = await _wait(tab.evaluate(
+                f"(() => {{ const t = (document.body && document.body.innerText) || ''; "
+                f"return JSON.stringify({{found: t.includes({json.dumps(text)}), sample: t.slice(0, 500)}}); }})()",
+                return_by_value=True,
+            ), what="assert_text_present")
+            txt = raw.value if hasattr(raw, "value") and not isinstance(raw, str) else raw
+            data = parse_json(str(txt), {})
+            if isinstance(data, dict):
+                if data.get("found"):
+                    return ok(f"text present: {text!r}")
+                last_body = data.get("sample", "")
+            await asyncio.sleep(0.4)
+        return err(
+            f"text not found within {timeout}s: {text!r}\nbody sample: {last_body[:300]}"
+        )
+    except Exception as e:
+        return err(str(e))
+
+
+@mcp.tool()
+async def assert_url_matches(pattern: str, timeout: float = 5.0) -> str:
+    """⭐ Verify current URL matches regex within timeout.
+    Returns ok(current_url) or err(timeout + last_url)."""
+    import re as _re
+    try:
+        tab = BrowserState.active_tab()
+        try:
+            rx = _re.compile(pattern)
+        except _re.error as e:
+            return err(f"invalid regex: {e}")
+        deadline = asyncio.get_event_loop().time() + max(0.5, timeout)
+        last_url = ""
+        while asyncio.get_event_loop().time() < deadline:
+            last_url = await get_url(tab)
+            if rx.search(last_url):
+                return ok(f"url matches {pattern!r}: {last_url}")
+            await asyncio.sleep(0.3)
+        return err(f"url did not match {pattern!r} within {timeout}s. last: {last_url}")
+    except Exception as e:
+        return err(str(e))
+
+
+@mcp.tool()
+async def assert_element_visible(
+    selector: Optional[str] = None,
+    text: Optional[str] = None,
+    timeout: float = 5.0,
+) -> str:
+    """⭐ Verify an element is visible (rendered, non-zero size, not hidden).
+    Pass selector OR text — text uses fuzzy contains match.
+    Returns ok(rect) or err(timeout)."""
+    if not selector and not text:
+        return err("pass selector= or text=")
+    try:
+        tab = BrowserState.active_tab()
+        deadline = asyncio.get_event_loop().time() + max(0.5, timeout)
+        last_state = "not found"
+        while asyncio.get_event_loop().time() < deadline:
+            if selector:
+                expr = f"""
+                (() => {{
+                  const el = document.querySelector({json.dumps(selector)});
+                  if (!el) return JSON.stringify({{state: 'not_found'}});
+                  const r = el.getBoundingClientRect();
+                  const cs = getComputedStyle(el);
+                  const visible = r.width > 0 && r.height > 0 &&
+                    cs.display !== 'none' && cs.visibility !== 'hidden' && cs.opacity !== '0';
+                  return JSON.stringify({{state: visible ? 'visible' : 'hidden',
+                    rect: {{x: Math.round(r.left), y: Math.round(r.top),
+                            width: Math.round(r.width), height: Math.round(r.height)}}}});
+                }})()
+                """
+            else:
+                expr = f"""
+                (() => {{
+                  const want = {json.dumps(text)}.toLowerCase();
+                  const candidates = [...document.querySelectorAll('button, a, [role=button], h1,h2,h3, span, div, label, p')];
+                  for (const el of candidates) {{
+                    const t = (el.innerText || '').toLowerCase().trim();
+                    if (!t.includes(want)) continue;
+                    const r = el.getBoundingClientRect();
+                    const cs = getComputedStyle(el);
+                    const visible = r.width > 0 && r.height > 0 &&
+                      cs.display !== 'none' && cs.visibility !== 'hidden' && cs.opacity !== '0';
+                    if (visible) return JSON.stringify({{state: 'visible', tag: el.tagName.toLowerCase(),
+                      rect: {{x: Math.round(r.left), y: Math.round(r.top),
+                              width: Math.round(r.width), height: Math.round(r.height)}}}});
+                  }}
+                  return JSON.stringify({{state: 'not_found'}});
+                }})()
+                """
+            raw = await _wait(tab.evaluate(expr, return_by_value=True),
+                              what="assert_element_visible")
+            txt = raw.value if hasattr(raw, "value") and not isinstance(raw, str) else raw
+            data = parse_json(str(txt), {})
+            if isinstance(data, dict):
+                last_state = data.get("state", "not found")
+                if last_state == "visible":
+                    return ok(json.dumps(data, ensure_ascii=False))
+            await asyncio.sleep(0.3)
+        return err(f"element not visible within {timeout}s (last_state={last_state})")
+    except Exception as e:
+        return err(str(e))
+
+
+# ── vision_locate ──────────────────────────────────────────────────────────
+
+_VISION_LOCATE_PROMPT = (
+    "You are an image locator. The screenshot shows a webpage at {viewport_w}x{viewport_h} pixels.\n"
+    "Find the element best matching this description: {description}\n\n"
+    "Reply with ONLY this JSON (no explanation):\n"
+    '  {{"found": true, "x": 540, "y": 320, "confidence": "high"}}\n'
+    "  or\n"
+    '  {{"found": false}}\n\n'
+    "Coordinates are pixel positions of the element CENTER in the screenshot. "
+    "If multiple match, pick the most prominent / topmost. Confidence is "
+    "'high' (clear single match), 'medium' (multiple plausible), or 'low' "
+    "(uncertain)."
+)
+
+
+@mcp.tool()
+async def vision_locate(
+    description: str,
+    click: bool = False,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+) -> str:
+    """⭐ Find an element by natural-language description using a vision LLM.
+
+    Uses the same provider as solve_recaptcha_ai (OPENAI_* / ANTHROPIC_* env).
+    Reuses solve_recaptcha_ai's vision plumbing so any vision-capable model
+    works (gpt-4o, gpt-5.x, claude, llava, llama-3.2-vision).
+
+    Args:
+        description: NL description, e.g. "the red Create button at bottom right"
+        click: if True, also dispatches a CDP mouse_click at the located point
+        api_key/base_url/model/provider: explicit overrides (else from env)
+
+    Returns JSON: {"found":true/false, "x":int, "y":int, "confidence":"high|medium|low"}.
+    Use when CSS selectors are unreliable (visual-only differentiator, dynamic IDs).
+    """
+    try:
+        tab = BrowserState.active_tab()
+        try:
+            resolved_provider, resolved_base_url, resolved_key, resolved_model = \
+                _resolve_vision_provider(provider, base_url, api_key, model)
+        except ValueError as e:
+            return err(str(e))
+        # Get viewport for prompt context
+        vp_raw = await _wait(tab.evaluate(
+            "JSON.stringify({w: innerWidth, h: innerHeight})",
+            return_by_value=True,
+        ), what="vision_locate viewport")
+        vp = parse_json(str(vp_raw.value if hasattr(vp_raw, "value") else vp_raw), {"w": 1280, "h": 800})
+        # Take screenshot
+        ensure_dirs()
+        shot_path = SCREENSHOT_DIR / ts_filename("vision-locate", "png")
+        await _wait(tab.save_screenshot(filename=str(shot_path), format="png"),
+                    what="vision_locate screenshot")
+        import base64 as _b64
+        img_b64 = _b64.b64encode(Path(str(shot_path)).read_bytes()).decode()
+        prompt = _VISION_LOCATE_PROMPT.format(
+            viewport_w=vp.get("w", 1280),
+            viewport_h=vp.get("h", 800),
+            description=description,
+        )
+        # Send to vision API
+        if resolved_provider == "anthropic":
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={
+                        "x-api-key": resolved_key,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json",
+                    },
+                    json={
+                        "model": resolved_model,
+                        "max_tokens": 600,
+                        "messages": [{"role": "user", "content": [
+                            {"type": "image", "source": {"type": "base64",
+                                "media_type": "image/png", "data": img_b64}},
+                            {"type": "text", "text": prompt},
+                        ]}],
+                    },
+                )
+                data = resp.json()
+                response_text = (data.get("content", [{}])[0]).get("text", "").strip()
+        else:
+            url = resolved_base_url.rstrip("/") + "/chat/completions"
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(
+                    url,
+                    headers={"Authorization": f"Bearer {resolved_key}",
+                             "Content-Type": "application/json"},
+                    json={
+                        "model": resolved_model,
+                        "max_tokens": 1500,
+                        "temperature": 0,
+                        "messages": [{"role": "user", "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {
+                                "url": f"data:image/png;base64,{img_b64}"}},
+                        ]}],
+                    },
+                )
+                data = resp.json()
+                try:
+                    response_text = data["choices"][0]["message"]["content"]
+                    if isinstance(response_text, list):
+                        response_text = "".join(c.get("text", "") for c in response_text
+                                                 if isinstance(c, dict))
+                except (KeyError, IndexError, TypeError):
+                    response_text = ""
+        # Parse response — extract JSON from possibly-wrapped text
+        import re as _re
+        m = _re.search(r'\{[^{}]*"found"[^{}]*\}', str(response_text))
+        if not m:
+            return err(f"vision model returned no JSON: {str(response_text)[:200]}")
+        result = parse_json(m.group(0), {})
+        if not isinstance(result, dict) or not result.get("found"):
+            return err(f"element not found: {description!r}")
+        try:
+            x = int(result["x"])
+            y = int(result["y"])
+        except (KeyError, TypeError, ValueError):
+            return err(f"vision response missing coords: {result}")
+        # Optionally click
+        if click:
+            try:
+                await tab.mouse_click(x, y)
+                BrowserState.last_mouse_xy = {"x": x, "y": y}
+            except Exception as e:
+                return err(f"located ({x},{y}) but click failed: {e}")
+        result["clicked"] = bool(click)
+        return ok(json.dumps(result, ensure_ascii=False))
+    except Exception as e:
+        return err(str(e))
+
+
+# ── storage_diff ───────────────────────────────────────────────────────────
+
+# In-memory snapshots keyed by user-supplied name. Lives only for current
+# MCP session (not persisted across launches — use storage_state_save for that).
+_STORAGE_SNAPSHOTS: dict[str, dict] = {}
+
+
+async def _take_storage_snapshot(tab) -> dict:
+    """Capture cookies + localStorage + sessionStorage + url + title."""
+    snap: dict = {"url": "", "title": "", "cookies": [],
+                   "localStorage": {}, "sessionStorage": {}}
+    try:
+        snap["url"] = await get_url(tab)
+        snap["title"] = await get_title(tab)
+    except Exception:
+        pass
+    try:
+        from nodriver.cdp import network as cdp_network
+        cookies = await _wait(tab.send(cdp_network.get_cookies()),
+                              what="storage_snapshot cookies")
+        snap["cookies"] = [{
+            "name": getattr(c, "name", ""),
+            "value": getattr(c, "value", ""),
+            "domain": getattr(c, "domain", ""),
+            "path": getattr(c, "path", "/"),
+        } for c in (cookies or [])]
+    except Exception:
+        pass
+    try:
+        ls_raw = await _wait(tab.evaluate(
+            "JSON.stringify(Object.fromEntries(Object.entries(localStorage)))",
+            return_by_value=True,
+        ), what="storage_snapshot localStorage")
+        snap["localStorage"] = parse_json(
+            str(ls_raw.value if hasattr(ls_raw, "value") else ls_raw), {}) or {}
+    except Exception:
+        pass
+    try:
+        ss_raw = await _wait(tab.evaluate(
+            "JSON.stringify(Object.fromEntries(Object.entries(sessionStorage)))",
+            return_by_value=True,
+        ), what="storage_snapshot sessionStorage")
+        snap["sessionStorage"] = parse_json(
+            str(ss_raw.value if hasattr(ss_raw, "value") else ss_raw), {}) or {}
+    except Exception:
+        pass
+    return snap
+
+
+@mcp.tool()
+async def storage_snapshot(name: str = "default") -> str:
+    """⭐ Capture cookies + localStorage + sessionStorage + URL into named slot
+    for later diffing. Use BEFORE an action you want to inspect."""
+    try:
+        tab = BrowserState.active_tab()
+        snap = await _take_storage_snapshot(tab)
+        _STORAGE_SNAPSHOTS[name] = snap
+        return ok(
+            f"snapshot '{name}': {len(snap['cookies'])} cookies, "
+            f"{len(snap['localStorage'])} localStorage, "
+            f"{len(snap['sessionStorage'])} sessionStorage at {snap['url']}"
+        )
+    except Exception as e:
+        return err(str(e))
+
+
+@mcp.tool()
+async def storage_diff(name: str = "default") -> str:
+    """⭐ Compare current state vs an earlier storage_snapshot. Returns JSON
+    showing what changed (added/removed/modified per area + url change).
+
+    Pattern:
+      storage_snapshot("before")
+      <do an action e.g. click login>
+      storage_diff("before")  → returns what the action actually changed
+    """
+    try:
+        if name not in _STORAGE_SNAPSHOTS:
+            return err(
+                f"no snapshot named {name!r}. Available: "
+                f"{list(_STORAGE_SNAPSHOTS.keys()) or '(none)'}"
+            )
+        tab = BrowserState.active_tab()
+        before = _STORAGE_SNAPSHOTS[name]
+        after = await _take_storage_snapshot(tab)
+
+        def _kvdiff(b: dict, a: dict) -> dict:
+            keys_b, keys_a = set(b), set(a)
+            return {
+                "added": {k: a[k][:200] if isinstance(a[k], str) else a[k]
+                           for k in keys_a - keys_b},
+                "removed": list(keys_b - keys_a),
+                "modified": {k: {"before": (b[k][:200] if isinstance(b[k], str) else b[k]),
+                                  "after": (a[k][:200] if isinstance(a[k], str) else a[k])}
+                              for k in keys_b & keys_a if b[k] != a[k]},
+            }
+
+        # Cookies — by (name, domain) tuple
+        b_cookies = {(c["name"], c["domain"]): c["value"] for c in before["cookies"]}
+        a_cookies = {(c["name"], c["domain"]): c["value"] for c in after["cookies"]}
+        cookie_diff = {
+            "added": [{"name": n, "domain": d, "value": (a_cookies[(n, d)][:60] if a_cookies[(n, d)] else "")}
+                       for (n, d) in set(a_cookies) - set(b_cookies)],
+            "removed": [{"name": n, "domain": d} for (n, d) in set(b_cookies) - set(a_cookies)],
+            "modified": [{"name": n, "domain": d}
+                          for (n, d) in set(b_cookies) & set(a_cookies)
+                          if b_cookies[(n, d)] != a_cookies[(n, d)]],
+        }
+
+        diff = {
+            "url_changed": (before["url"] != after["url"]),
+            "url_before": before["url"],
+            "url_after": after["url"],
+            "title_changed": (before["title"] != after["title"]),
+            "cookies": cookie_diff,
+            "localStorage": _kvdiff(before["localStorage"], after["localStorage"]),
+            "sessionStorage": _kvdiff(before["sessionStorage"], after["sessionStorage"]),
+        }
+        return ok(json.dumps(diff, indent=2, ensure_ascii=False))
+    except Exception as e:
+        return err(str(e))
+
+
+# ── workflow_run (resumable) ───────────────────────────────────────────────
+
+# Map of tool-name → function ref for workflow_run dispatch. Only a curated
+# subset is exposed (the ones useful for sequencing — read-only inspectors
+# like get_text are intentionally excluded since the workflow output already
+# captures step results).
+_WORKFLOW_TOOLS: dict[str, Any] = {}
+
+
+def _register_workflow_tools() -> None:
+    """Late-bound registration so all tool defs above this point exist.
+    Called lazily on first workflow_run call."""
+    global _WORKFLOW_TOOLS
+    if _WORKFLOW_TOOLS:
+        return
+    g = globals()
+    for name in (
+        "navigate", "reload", "go_back", "go_forward",
+        "click", "click_text", "click_role", "fill", "type_text", "press_key",
+        "select_option", "check", "uncheck",
+        "wait_for", "wait_for_navigation", "wait_for_url", "wait_for_response",
+        "screenshot", "scroll", "scroll_to",
+        "smart_fill", "vision_locate",
+        "assert_text_present", "assert_url_matches", "assert_element_visible",
+        "storage_snapshot", "storage_diff",
+        "cookie_import", "storage_state_load",
+        "evaluate", "mouse_click_xy",
+    ):
+        if name in g and callable(g[name]):
+            # FastMCP wraps tools — unwrap to the underlying coroutine fn
+            fn = g[name]
+            _WORKFLOW_TOOLS[name] = getattr(fn, "fn", fn) if hasattr(fn, "fn") else fn
+
+
+@mcp.tool()
+async def workflow_run(
+    steps: list[dict],
+    start_at: int = 0,
+    stop_on_error: bool = True,
+) -> str:
+    """⭐ Execute a list of tool steps sequentially. Resumable — pass
+    start_at=N to skip the first N steps.
+
+    Each step: {"tool": "<name>", "args": {...}, "label": "optional"}
+
+    Args:
+        steps: list of step dicts
+        start_at: index to begin from (for resume after a fix)
+        stop_on_error: abort on first failure (default True). If False,
+            continue and collect all results.
+
+    Returns JSON:
+      {
+        "completed": [
+          {"index": 0, "tool": "navigate", "ok": true, "result": "..."},
+          ...
+        ],
+        "failed_at": 3,                # index of failure (omitted on success)
+        "failure_context": {...},      # last step's input + error (for LLM debug)
+        "resume_with": "workflow_run(steps=..., start_at=4)"  # hint
+      }
+
+    Allowed tools (curated for sequencing): navigate, reload, go_back/forward,
+    click, click_text, click_role, fill, type_text, press_key, select_option,
+    check, uncheck, wait_for*, screenshot, scroll, scroll_to, smart_fill,
+    vision_locate, assert_*, storage_*, cookie_import, storage_state_load,
+    evaluate, mouse_click_xy.
+    """
+    _register_workflow_tools()
+    if not isinstance(steps, list):
+        return err("steps must be a list of dicts")
+    completed: list[dict] = []
+    for i in range(start_at, len(steps)):
+        step = steps[i]
+        if not isinstance(step, dict) or "tool" not in step:
+            entry = {"index": i, "ok": False, "error": "step must have 'tool' key"}
+            completed.append(entry)
+            if stop_on_error:
+                return err(json.dumps({
+                    "completed": completed, "failed_at": i,
+                    "failure_context": {"step": step, "error": "malformed"},
+                    "resume_with": f"workflow_run(steps=..., start_at={i + 1})",
+                }, indent=2, ensure_ascii=False))
+            continue
+        tool_name = step["tool"]
+        args = step.get("args", {}) or {}
+        label = step.get("label", "")
+        if tool_name not in _WORKFLOW_TOOLS:
+            entry = {"index": i, "tool": tool_name, "ok": False,
+                     "error": f"unknown or non-allowlisted tool: {tool_name}",
+                     "available": sorted(_WORKFLOW_TOOLS.keys())[:20]}
+            completed.append(entry)
+            if stop_on_error:
+                return err(json.dumps({
+                    "completed": completed, "failed_at": i,
+                    "failure_context": entry,
+                    "resume_with": f"workflow_run(steps=..., start_at={i + 1})",
+                }, indent=2, ensure_ascii=False))
+            continue
+        try:
+            fn = _WORKFLOW_TOOLS[tool_name]
+            if not isinstance(args, dict):
+                raise ValueError(f"args must be a dict, got {type(args).__name__}")
+            res = await fn(**args)
+            res_str = str(res)
+            is_err = res_str.startswith("Error:")
+            entry = {"index": i, "tool": tool_name, "label": label,
+                     "ok": not is_err, "result": res_str[:500]}
+            completed.append(entry)
+            if is_err and stop_on_error:
+                return err(json.dumps({
+                    "completed": completed, "failed_at": i,
+                    "failure_context": {"step": step, "result": res_str},
+                    "resume_with": f"workflow_run(steps=..., start_at={i})",
+                    "hint": "fix the underlying issue then re-run with start_at unchanged "
+                            "(retry same step) or start_at+1 (skip).",
+                }, indent=2, ensure_ascii=False))
+        except Exception as e:
+            entry = {"index": i, "tool": tool_name, "label": label,
+                     "ok": False, "error": str(e)}
+            completed.append(entry)
+            if stop_on_error:
+                return err(json.dumps({
+                    "completed": completed, "failed_at": i,
+                    "failure_context": {"step": step, "error": str(e)},
+                    "resume_with": f"workflow_run(steps=..., start_at={i})",
+                }, indent=2, ensure_ascii=False))
+    return ok(json.dumps({"completed": completed, "total": len(steps)},
+                          indent=2, ensure_ascii=False))
+
+
+# ── detect_and_bypass ──────────────────────────────────────────────────────
+
+
+@mcp.tool()
+async def detect_and_bypass() -> str:
+    """⭐ One-shot: detect anti-bot wall on current page and apply the best
+    bypass we have. Returns JSON with detection + bypass result.
+
+    Bypass routing:
+      - Cloudflare Turnstile / interstitial → _auto_verify_cf (DOM + OpenCV)
+      - Other walls (DataDome, PerimeterX, Akamai, Imperva, Kasada) →
+        return detection + recommended-action list (no auto-bypass since
+        those need session reuse / proxies / paid solvers).
+      - No wall detected → returns ok with empty bypass.
+    """
+    try:
+        if not BrowserState.is_up():
+            return err("browser_launch first")
+        tab = BrowserState.active_tab()
+        # Reuse detect_anti_bot's classification
+        det_str = await detect_anti_bot()
+        det_text = str(det_str)
+        # Strip the "ok: " prefix if present
+        if det_text.startswith("Error:"):
+            return det_text  # propagate
+        # Detect specific systems by inspecting the response text — cheaper
+        # than re-running the JS probes.
+        det_lower = det_text.lower()
+        result: dict = {"detection": det_text[:1000], "bypassed": False, "method": None,
+                         "next_steps": []}
+        if "cloudflare" in det_lower:
+            # Try our automated CF Turnstile flow.
+            verify = await _auto_verify_cf(tab, max_attempts=2)
+            if verify and "auto-verify" in verify:
+                result["bypassed"] = True
+                result["method"] = "auto_verify_cf"
+                result["details"] = verify.strip()
+            else:
+                result["next_steps"].append(
+                    "If still blocked: solve_captcha(kind='turnstile', ...) with CAPSOLVER_KEY, "
+                    "or storage_state_load a previously-saved session."
+                )
+        if "datadome" in det_lower:
+            result["next_steps"].append(
+                "DataDome: no automated bypass. Use mouse_record→mouse_replay of a real session, "
+                "session_warmup, residential proxy, and storage_state reuse."
+            )
+        if "perimeterx" in det_lower or "human" in det_lower:
+            result["next_steps"].append(
+                "PerimeterX/HUMAN: storage_state_load is most reliable. New sessions need "
+                "mobile proxy + humanize_click."
+            )
+        if "akamai" in det_lower:
+            result["next_steps"].append(
+                "Akamai: requires _abck cookie sensor data — solve_captcha(kind='akamai', ...) "
+                "if your provider supports it, or session reuse."
+            )
+        if "imperva" in det_lower or "kasada" in det_lower:
+            result["next_steps"].append(
+                "Imperva/Kasada: paid solver via solve_captcha or session reuse."
+            )
+        if "(no anti-bot system detected)" in det_lower or "none detected" in det_lower:
+            return ok(json.dumps(
+                {"detection": "no anti-bot detected", "bypassed": True,
+                 "method": "n/a", "next_steps": []},
+                indent=2, ensure_ascii=False,
+            ))
+        return ok(json.dumps(result, indent=2, ensure_ascii=False))
+    except Exception as e:
+        return err(str(e))
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════
 
