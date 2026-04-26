@@ -2940,7 +2940,7 @@ async def _claude_vision_pick_tiles(
             },
             json={
                 "model": model,
-                "max_tokens": 300,
+                "max_tokens": 1500,
                 "messages": [{
                     "role": "user",
                     "content": [
@@ -2975,7 +2975,7 @@ async def _openai_compat_vision_pick_tiles(
             },
             json={
                 "model": model,
-                "max_tokens": 300,
+                "max_tokens": 1500,
                 "temperature": 0,
                 "messages": [{
                     "role": "user",
@@ -3142,43 +3142,100 @@ async def solve_recaptcha_ai(
 
     try:
         tab = BrowserState.active_tab()
+        # Pre-flight: detect quota-exhausted reCAPTCHA pages so we fail fast
+        # instead of burning 3 model calls on empty grids.
+        quota_msg = _unwrap(await tab.evaluate(
+            "(() => { const t = (document.body && document.body.innerText || '').toLowerCase(); "
+            "return t.includes('exceeding') && t.includes('quota') ? 'quota_exhausted' : ''; })()",
+            return_by_value=True,
+        ))
+        if quota_msg == "quota_exhausted":
+            return err(
+                "reCAPTCHA quota exhausted on this page (Google Enterprise free tier). "
+                "Test on a real protected site, not a rate-limited demo."
+            )
+
         for round_num in range(1, max_rounds + 1):
-            # Step 1: locate challenge iframe (bframe)
-            frame_info_raw = _unwrap(await tab.evaluate(
-                """
-                (() => {
-                  const f = Array.from(document.querySelectorAll('iframe'))
-                    .find(x => x.src.includes('recaptcha/api2/bframe') ||
-                               x.src.includes('recaptcha/enterprise/bframe'));
-                  if (!f) return 'no_challenge';
-                  const r = f.getBoundingClientRect();
-                  if (r.width < 50 || r.height < 50) return 'challenge_hidden';
-                  return JSON.stringify({
-                    left: Math.round(r.left), top: Math.round(r.top),
-                    width: Math.round(r.width), height: Math.round(r.height),
-                  });
-                })()
-                """,
-                return_by_value=True,
-            ))
-            frame_info = str(frame_info_raw) if frame_info_raw is not None else ""
+            # Step 1: locate challenge iframe (bframe). If hidden, auto-click
+            # the anchor checkbox first so callers don't need a separate
+            # mouse_click_xy step before invoking solve_recaptcha_ai.
+            async def _find_bframe():
+                return _unwrap(await tab.evaluate(
+                    """
+                    (() => {
+                      const f = Array.from(document.querySelectorAll('iframe'))
+                        .find(x => x.src.includes('recaptcha/api2/bframe') ||
+                                   x.src.includes('recaptcha/enterprise/bframe'));
+                      if (!f) return 'no_challenge';
+                      const r = f.getBoundingClientRect();
+                      // Hidden = too small OR positioned off-screen. reCAPTCHA
+                      // parks the bframe at top:-9999 / left:-9999 before the
+                      // user clicks the anchor checkbox.
+                      if (r.width < 50 || r.height < 50) return 'challenge_hidden';
+                      if (r.top < -1000 || r.left < -1000) return 'challenge_hidden';
+                      if (r.bottom < 0 || r.right < 0) return 'challenge_hidden';
+                      return JSON.stringify({
+                        left: Math.round(r.left), top: Math.round(r.top),
+                        width: Math.round(r.width), height: Math.round(r.height),
+                      });
+                    })()
+                    """,
+                    return_by_value=True,
+                ))
+
+            frame_info = str(await _find_bframe() or "")
+
+            if frame_info == "challenge_hidden":
+                # Auto-click the "I'm not a robot" anchor checkbox to open the
+                # image challenge. The checkbox is a fixed offset inside the
+                # anchor iframe (left+30, top+40 — calibrated for v2 default).
+                anchor_raw = _unwrap(await tab.evaluate(
+                    """
+                    (() => {
+                      const f = Array.from(document.querySelectorAll('iframe'))
+                        .find(x => x.src.includes('recaptcha/api2/anchor') ||
+                                   x.src.includes('recaptcha/enterprise/anchor'));
+                      if (!f) return 'no_anchor';
+                      const r = f.getBoundingClientRect();
+                      return JSON.stringify({
+                        left: Math.round(r.left), top: Math.round(r.top),
+                        width: Math.round(r.width), height: Math.round(r.height),
+                      });
+                    })()
+                    """,
+                    return_by_value=True,
+                ))
+                anchor_info = parse_json(str(anchor_raw or ""), None)
+                if not isinstance(anchor_info, dict):
+                    return err("challenge hidden and no anchor iframe found")
+                ax = int(anchor_info["left"] + 30)
+                ay = int(anchor_info["top"] + anchor_info["height"] // 2)
+                # Direct CDP click (no humanize) — humanize_move + mouse_click
+                # races with the anchor iframe's load state in some sessions,
+                # ending up registered as no-click. Raw mouse_click is reliable.
+                await tab.mouse_click(ax, ay)
+                await asyncio.sleep(wait_between)
+                # Re-probe — challenge should now be visible
+                frame_info = str(await _find_bframe() or "")
 
             if frame_info in ("no_challenge", "challenge_hidden", ""):
-                # No visible challenge — maybe already solved!
                 token_raw = _unwrap(await tab.evaluate(
                     '(() => { var t = document.querySelector("textarea[name=g-recaptcha-response]"); return t && t.value ? t.value.length : 0; })()',
                     return_by_value=True,
                 ))
                 if isinstance(token_raw, (int, float)) and token_raw > 0:
-                    return ok(f"solved on round {round_num} (token length={int(token_raw)})")
+                    return ok(f"solved on round {round_num} (token length={int(token_raw)}, no challenge needed)")
                 return err(f"no reCAPTCHA challenge iframe visible (state: {frame_info!r})")
 
             finfo = parse_json(frame_info, {})
             if not finfo or finfo.get("width", 0) < 50:
                 return err(f"bframe too small to screenshot: {finfo}")
 
-            # Step 2: full-page screenshot — vision model sees ENTIRE page including
-            # the floating image challenge modal. Avoids cross-origin crop issues.
+            # Step 2: full-page screenshot. (Tried CDP clip-cropping in 0.2.10-dev
+            # but the bframe's reported rect is unreliable right after click —
+            # ends up clipping a 300×150 white box instead of the 480×580
+            # challenge. Full-page screenshot is reliable; the model handles
+            # the surrounding page content fine.)
             ensure_dirs()
             shot_path = SCREENSHOT_DIR / ts_filename(f"recaptcha-r{round_num}", "png")
             await tab.save_screenshot(filename=str(shot_path), format="png")
@@ -3213,15 +3270,12 @@ async def solve_recaptcha_ai(
                 if tiles:
                     break  # got valid picks, proceed
                 if refresh_attempt < max_refresh:
-                    # Click the reload (↻) icon — typically bottom-left of bframe
-                    # Position: ~25px from left, ~30px from bottom of iframe
                     reload_x = int(finfo["left"] + 25)
                     reload_y = int(finfo["top"] + finfo["height"] - 30)
                     await humanized_move(tab, reload_x + 60, reload_y - 40, reload_x, reload_y)
                     await asyncio.sleep(0.2)
                     await tab.mouse_click(reload_x, reload_y)
-                    await asyncio.sleep(2.5)  # wait for new challenge to load
-                    # Re-screenshot after refresh
+                    await asyncio.sleep(2.5)
                     shot_path = SCREENSHOT_DIR / ts_filename(
                         f"recaptcha-r{round_num}-refresh{refresh_attempt+1}", "png"
                     )
@@ -3249,18 +3303,32 @@ async def solve_recaptcha_ai(
             tile_w = (grid_right - grid_left) / n
             tile_h = (grid_bottom - grid_top) / n
 
+            # Filter invalid indices (model may overshoot when it thinks grid
+            # is 4x4 but actual is 3x3 — index 9 in a 3x3 doesn't exist).
+            valid_tiles = [
+                idx for idx in tiles
+                if isinstance(idx, int) and 0 <= idx < max_valid
+            ]
+            if not valid_tiles:
+                # Model gave only invalid indices — likely misclassified grid.
+                # Fall through to verify click and let Google's response steer
+                # the next round.
+                pass
             clicked = []
-            for idx in tiles:
-                if not isinstance(idx, int) or idx < 0 or idx >= max_valid:
-                    continue
+            for idx in valid_tiles:
                 row, col = idx // n, idx % n
                 cx = int(grid_left + tile_w * col + tile_w / 2)
                 cy = int(grid_top + tile_h * row + tile_h / 2)
-                await humanized_move(tab, cx + 80, cy - 60, cx, cy)
-                await asyncio.sleep(0.15)
+                # Direct mouse_click without humanize_move — humanize was
+                # racing with reCAPTCHA's per-tile fade-in animation, causing
+                # some clicks to land in boundary regions which Google
+                # treats as "click outside grid = clear selection".
                 await tab.mouse_click(cx, cy)
                 clicked.append(idx)
-                await asyncio.sleep(0.4)
+                # 700ms pause: long enough for reCAPTCHA's tile-selected
+                # animation to finalize before the next click — too fast and
+                # adjacent clicks can deselect previous picks.
+                await asyncio.sleep(0.7)
 
             # Step 6: click Verify (bottom-right of iframe)
             verify_x = int(finfo["left"] + finfo["width"] - 50)
