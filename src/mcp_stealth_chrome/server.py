@@ -2281,39 +2281,141 @@ async def console_get(limit: int = 100) -> str:
 
 
 @mcp.tool()
-async def network_start() -> str:
-    """Begin capturing network requests."""
+async def network_start(capture_bodies: bool = True) -> str:
+    """Begin capturing network requests + responses with full headers.
+
+    Args:
+        capture_bodies: if True (default), also indexes by request_id so
+            network_get(include_body=True) can fetch response bodies on
+            demand via CDP Network.getResponseBody.
+    """
     try:
         tab = BrowserState.active_tab()
         BrowserState.network_logs = []
+        BrowserState.network_index = {}
         BrowserState.capture_network = True
         from nodriver.cdp import network as cdp_network
 
+        # Enable Network domain so getResponseBody works later
+        try:
+            await tab.send(cdp_network.enable())
+        except Exception:
+            pass
+
         async def on_req(event):
-            BrowserState.network_logs.append({
-                "type": "request",
-                "url": event.request.url,
-                "method": event.request.method,
-            })
+            try:
+                rid = str(event.request_id)
+                req = event.request
+                req_headers = dict(getattr(req, "headers", None) or {})
+                entry = {
+                    "request_id": rid,
+                    "url": getattr(req, "url", ""),
+                    "method": getattr(req, "method", ""),
+                    "type": str(getattr(event, "type_", "") or getattr(event, "type", "")),
+                    "request_headers": req_headers,
+                    "request_body": getattr(req, "post_data", None),
+                    "status": None,
+                    "response_headers": None,
+                    "mime": None,
+                    "size": None,
+                    "timestamp": getattr(event, "timestamp", None),
+                }
+                if capture_bodies:
+                    BrowserState.network_index[rid] = entry
+                BrowserState.network_logs.append({
+                    "type": "request", "request_id": rid,
+                    "url": entry["url"], "method": entry["method"],
+                })
+            except Exception:
+                pass
 
         async def on_res(event):
-            BrowserState.network_logs.append({
-                "type": "response",
-                "url": event.response.url,
-                "status": event.response.status,
-                "mime": event.response.mime_type,
-            })
+            try:
+                rid = str(event.request_id)
+                resp = event.response
+                resp_headers = dict(getattr(resp, "headers", None) or {})
+                if rid in BrowserState.network_index:
+                    e = BrowserState.network_index[rid]
+                    e["status"] = getattr(resp, "status", None)
+                    e["response_headers"] = resp_headers
+                    e["mime"] = getattr(resp, "mime_type", None)
+                    e["size"] = getattr(resp, "encoded_data_length", None)
+                BrowserState.network_logs.append({
+                    "type": "response", "request_id": rid,
+                    "url": getattr(resp, "url", ""),
+                    "status": getattr(resp, "status", None),
+                    "mime": getattr(resp, "mime_type", None),
+                })
+            except Exception:
+                pass
 
         tab.add_handler(cdp_network.RequestWillBeSent, on_req)
         tab.add_handler(cdp_network.ResponseReceived, on_res)
-        return ok("network capture started")
+        return ok(f"network capture started (capture_bodies={capture_bodies})")
     except Exception as e:
         return err(str(e))
 
 
 @mcp.tool()
-async def network_get(limit: int = 100, filter_url: Optional[str] = None) -> str:
-    """Retrieve captured network events."""
+async def network_get(
+    limit: int = 100,
+    filter_url: Optional[str] = None,
+    include_body: bool = False,
+    max_body_bytes: int = 10000,
+    full: bool = False,
+) -> str:
+    """Retrieve captured network events.
+
+    Args:
+        limit: max entries returned (most recent first)
+        filter_url: substring filter on URL
+        include_body: fetch response bodies via CDP Network.getResponseBody
+            for each matching entry. Bodies are truncated to max_body_bytes.
+            Requires network_start(capture_bodies=True) (default).
+        max_body_bytes: cap per-body length (default 10000)
+        full: if True, return entries with full headers + body fields
+            from network_index (use this once you've called network_start).
+            Default False = legacy flat event stream (backward compat).
+    """
+    if full or include_body:
+        entries = list(BrowserState.network_index.values())
+        if filter_url:
+            entries = [e for e in entries if filter_url in e.get("url", "")]
+        entries = entries[-limit:]
+        if include_body and entries:
+            try:
+                tab = BrowserState.active_tab()
+                from nodriver.cdp import network as cdp_network
+                for e in entries:
+                    if e.get("response_body") is not None:
+                        continue
+                    rid = e.get("request_id")
+                    if not rid:
+                        continue
+                    try:
+                        result = await asyncio.wait_for(
+                            tab.send(cdp_network.get_response_body(
+                                request_id=cdp_network.RequestId(rid)
+                            )),
+                            timeout=5.0,
+                        )
+                        body = getattr(result, "body", None)
+                        if body is None and isinstance(result, tuple):
+                            body = result[0]
+                        body_str = str(body) if body is not None else ""
+                        if len(body_str) > max_body_bytes:
+                            body_str = body_str[:max_body_bytes] + (
+                                f"... [truncated, original {len(body)} chars]"
+                            )
+                        e["response_body"] = body_str
+                    except asyncio.TimeoutError:
+                        e["response_body"] = "<getResponseBody timeout>"
+                    except Exception as ex:
+                        e["response_body"] = f"<getResponseBody error: {ex}>"
+            except Exception:
+                pass
+        return ok(json.dumps(entries, indent=2, default=str)[:50000])
+    # Legacy event-stream view
     logs = BrowserState.network_logs
     if filter_url:
         logs = [l for l in logs if filter_url in l.get("url", "")]
@@ -6197,6 +6299,637 @@ async def detect_and_bypass() -> str:
                 indent=2, ensure_ascii=False,
             ))
         return ok(json.dumps(result, indent=2, ensure_ascii=False))
+    except Exception as e:
+        return err(str(e))
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 26. ⭐⭐⭐ NETWORK + AUTH + WAIT — paste, click_and_wait, auth_capture,
+#     http_request_with_session, wait_for_request, form_introspect
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Closes gaps surfaced by real-world automation: response body retrieval
+# on captured requests, modern-framework paste-event handlers, browser
+# session bridge for authenticated API calls, and click outcome
+# disambiguation.
+
+
+# ── paste_text ─────────────────────────────────────────────────────────────
+
+
+@mcp.tool()
+async def paste_text(
+    text: str,
+    ref: Optional[str] = None,
+    selector: Optional[str] = None,
+    submit: bool = False,
+) -> str:
+    """⭐ Set field value by simulating a real paste event sequence.
+
+    Use when fill / type_text don't register on modern frameworks (SolidJS
+    runes, Svelte 5 runes, some Qwik forms) that ONLY listen for paste
+    events or beforeinput with inputType:'insertFromPaste'.
+
+    Sequence dispatched (mimics a real Cmd-V):
+      1. focus
+      2. ClipboardEvent('paste', {clipboardData: 'text/plain': text})
+      3. InputEvent('beforeinput', {inputType: 'insertFromPaste', data: text})
+      4. native value setter (HTMLInputElement / HTMLTextAreaElement)
+      5. InputEvent('input', {inputType: 'insertFromPaste', data: text})
+      6. Event('change')
+
+    Args:
+        text: value to paste
+        ref: data-mcp-ref from browser_snapshot
+        selector: CSS selector
+        submit: if True, simulate Enter keypress after paste
+    """
+    try:
+        tab = BrowserState.active_tab()
+        target_selector: Optional[str] = None
+        if ref:
+            el = await resolve_ref(ref)
+            if el is None:
+                return err(f"ref {ref} not found")
+            # Walk up to find a queryable selector via data-mcp-ref attribute
+            target_selector = f'[data-mcp-ref="{ref}"]'
+        elif selector:
+            target_selector = selector
+        else:
+            return err("paste_text: pass ref= or selector=")
+
+        # Single-shot JS that does the full event dance — keeps timing tight.
+        result_raw = await _wait(tab.evaluate(
+            f"""
+            (() => {{
+              const el = document.querySelector({json.dumps(target_selector)});
+              if (!el) return JSON.stringify({{ok: false, error: 'element not found'}});
+              const text = {json.dumps(text)};
+              try {{ el.focus(); }} catch (e) {{}}
+              // 1. Paste event with DataTransfer
+              try {{
+                const dt = new DataTransfer();
+                dt.setData('text/plain', text);
+                const pasteEv = new ClipboardEvent('paste', {{
+                  clipboardData: dt, bubbles: true, cancelable: true,
+                }});
+                el.dispatchEvent(pasteEv);
+              }} catch (e) {{}}
+              // 2. beforeinput
+              try {{
+                const beforeEv = new InputEvent('beforeinput', {{
+                  inputType: 'insertFromPaste', data: text,
+                  bubbles: true, cancelable: true,
+                }});
+                el.dispatchEvent(beforeEv);
+              }} catch (e) {{}}
+              // 3. Native value setter so React/Vue/Solid see the change
+              try {{
+                const proto = el.tagName === 'TEXTAREA'
+                  ? HTMLTextAreaElement.prototype
+                  : HTMLInputElement.prototype;
+                const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+                setter.call(el, text);
+              }} catch (e) {{ el.value = text; }}
+              // 4. input event
+              try {{
+                el.dispatchEvent(new InputEvent('input', {{
+                  inputType: 'insertFromPaste', data: text, bubbles: true,
+                }}));
+              }} catch (e) {{
+                el.dispatchEvent(new Event('input', {{bubbles: true}}));
+              }}
+              // 5. change event for blur-validators
+              el.dispatchEvent(new Event('change', {{bubbles: true}}));
+              return JSON.stringify({{ok: true, value: el.value}});
+            }})()
+            """,
+            return_by_value=True,
+        ), what="paste_text")
+        result_text = result_raw.value if hasattr(result_raw, "value") and not isinstance(result_raw, str) else result_raw
+        data = parse_json(str(result_text), {})
+        if not isinstance(data, dict) or not data.get("ok"):
+            return err(f"paste failed: {data.get('error') if isinstance(data, dict) else result_text}")
+        if submit:
+            try:
+                await tab.send_keys("\r")  # Enter
+            except Exception:
+                try:
+                    await tab.evaluate(
+                        f"""document.querySelector({json.dumps(target_selector)}).form?.requestSubmit?.()"""
+                    )
+                except Exception:
+                    pass
+        return ok(f"pasted {len(text)} chars; field value={str(data.get('value', ''))[:80]}")
+    except Exception as e:
+        return err(str(e))
+
+
+# ── auth_capture ───────────────────────────────────────────────────────────
+
+
+@mcp.tool()
+async def auth_capture(
+    filter_url_pattern: str,
+    count: int = 1,
+    timeout: float = 10.0,
+    include_response_headers: bool = False,
+) -> str:
+    """⭐ Intercept the next N requests matching a URL pattern and return
+    their headers (Authorization, Cookie, X-CSRF-*, etc.) — useful for
+    SPAs that hold bearer tokens in JS memory and never write them to
+    localStorage.
+
+    Pattern: substring match on URL (case-sensitive). For regex use
+    network_get instead.
+
+    Args:
+        filter_url_pattern: e.g. "/api/" or "graphql"
+        count: stop capturing after this many matches (default 1)
+        timeout: max seconds to wait (default 10)
+        include_response_headers: also wait for + return response headers
+
+    Returns JSON array of {url, method, request_headers, request_body,
+    [response_headers, status]}.
+    """
+    try:
+        tab = BrowserState.active_tab()
+        from nodriver.cdp import network as cdp_network
+        try:
+            await tab.send(cdp_network.enable())
+        except Exception:
+            pass
+        captured: list[dict] = []
+        pending_response: dict[str, dict] = {}
+        done = asyncio.Event()
+        active = {"flag": True}
+
+        async def on_req(event):
+            if not active["flag"]:
+                return
+            try:
+                req = event.request
+                url = getattr(req, "url", "")
+                if filter_url_pattern not in url:
+                    return
+                rid = str(event.request_id)
+                entry = {
+                    "url": url,
+                    "method": getattr(req, "method", ""),
+                    "request_headers": dict(getattr(req, "headers", None) or {}),
+                    "request_body": getattr(req, "post_data", None),
+                }
+                if include_response_headers:
+                    pending_response[rid] = entry
+                else:
+                    captured.append(entry)
+                    if len(captured) >= count:
+                        active["flag"] = False
+                        done.set()
+            except Exception:
+                pass
+
+        async def on_res(event):
+            if not active["flag"]:
+                return
+            try:
+                rid = str(event.request_id)
+                if rid not in pending_response:
+                    return
+                entry = pending_response.pop(rid)
+                resp = event.response
+                entry["status"] = getattr(resp, "status", None)
+                entry["response_headers"] = dict(getattr(resp, "headers", None) or {})
+                captured.append(entry)
+                if len(captured) >= count:
+                    active["flag"] = False
+                    done.set()
+            except Exception:
+                pass
+
+        tab.add_handler(cdp_network.RequestWillBeSent, on_req)
+        if include_response_headers:
+            tab.add_handler(cdp_network.ResponseReceived, on_res)
+        try:
+            await asyncio.wait_for(done.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            active["flag"] = False  # disable handlers (handler stays bound but no-ops)
+        if not captured:
+            return err(
+                f"auth_capture: no requests matched {filter_url_pattern!r} within {timeout}s"
+            )
+        return ok(json.dumps(captured, indent=2, default=str)[:30000])
+    except Exception as e:
+        return err(str(e))
+
+
+# ── http_request_with_session ──────────────────────────────────────────────
+
+
+def _latest_auth_header_for(url: str) -> Optional[str]:
+    """Pick the most recent Authorization header from network_index for
+    requests whose URL shares the host of the target. Used by
+    http_request_with_session as a fallback when the caller doesn't pass
+    headers explicitly."""
+    try:
+        from urllib.parse import urlparse
+        target_host = urlparse(url).hostname or ""
+        if not target_host:
+            return None
+        # Iterate in insertion order — index is dict keyed by request_id and
+        # Python dicts preserve insertion order, so the last matching entry
+        # is the freshest.
+        latest = None
+        for entry in BrowserState.network_index.values():
+            host = urlparse(entry.get("url", "")).hostname or ""
+            if host != target_host:
+                continue
+            headers = entry.get("request_headers") or {}
+            for k, v in headers.items():
+                if k.lower() == "authorization" and v:
+                    latest = str(v)
+                    break
+        return latest
+    except Exception:
+        return None
+
+
+@mcp.tool()
+async def http_request_with_session(
+    url: str,
+    method: str = "GET",
+    json_body: Optional[dict] = None,
+    data: Optional[str] = None,
+    extra_headers: Optional[dict] = None,
+    auth_header: Optional[str] = None,
+    impersonate: str = "chrome",
+    return_mode: str = "auto",
+    timeout: float = 30.0,
+) -> str:
+    """⭐ Authenticated HTTP request that piggybacks on the BROWSER's session.
+
+    Combines:
+      - cookies from active tab (use_browser_cookies=True in http_request)
+      - Authorization header — explicit auth_header, OR auto-extracted
+        from network_index (the most recent same-host request captured
+        via network_start). Pages that hold bearer tokens in JS memory
+        only become reachable after navigate / interaction emits a
+        request — call network_start once at session begin.
+
+    Args:
+        url, method, json_body, data, impersonate, return_mode, timeout:
+            same as http_request
+        extra_headers: merged on top of auto-detected ones
+        auth_header: explicit bearer / basic value, e.g. "Bearer eyJ..."
+
+    Returns same shape as http_request.
+    """
+    headers = dict(extra_headers or {})
+    if auth_header:
+        headers.setdefault("Authorization", auth_header)
+    elif "Authorization" not in {k.lower() for k in headers}:
+        candidate = _latest_auth_header_for(url)
+        if candidate:
+            headers["Authorization"] = candidate
+    if not headers and not BrowserState.network_index:
+        # Soft warning — still useful for cookie-only auth
+        pass
+    return await http_request(
+        url=url, method=method, impersonate=impersonate,
+        use_browser_cookies=True, headers=headers,
+        data=data, json_body=json_body, timeout=timeout,
+        return_mode=return_mode,
+    )
+
+
+# ── wait_for_request ───────────────────────────────────────────────────────
+
+
+@mcp.tool()
+async def wait_for_request(
+    url_pattern: str,
+    method: Optional[str] = None,
+    timeout: float = 15.0,
+    require_response: bool = True,
+) -> str:
+    """⭐ Block until a network request matching url_pattern is observed.
+    Replaces the setTimeout(2000)+poll anti-pattern.
+
+    Args:
+        url_pattern: substring match
+        method: optional HTTP verb filter (GET/POST/...)
+        timeout: max seconds to wait
+        require_response: also wait for the response phase (default True)
+
+    Returns JSON of the matching entry (url/method/status/request_headers/
+    response_headers).
+    """
+    try:
+        tab = BrowserState.active_tab()
+        from nodriver.cdp import network as cdp_network
+        try:
+            await tab.send(cdp_network.enable())
+        except Exception:
+            pass
+        match: dict = {}
+        done = asyncio.Event()
+        active = {"flag": True}
+
+        async def on_req(event):
+            if not active["flag"]:
+                return
+            try:
+                req = event.request
+                url = getattr(req, "url", "")
+                if url_pattern not in url:
+                    return
+                if method and getattr(req, "method", "").upper() != method.upper():
+                    return
+                rid = str(event.request_id)
+                match.update({
+                    "request_id": rid,
+                    "url": url,
+                    "method": getattr(req, "method", ""),
+                    "request_headers": dict(getattr(req, "headers", None) or {}),
+                    "request_body": getattr(req, "post_data", None),
+                })
+                if not require_response:
+                    active["flag"] = False
+                    done.set()
+            except Exception:
+                pass
+
+        async def on_res(event):
+            if not active["flag"]:
+                return
+            try:
+                rid = str(event.request_id)
+                if match.get("request_id") != rid:
+                    return
+                resp = event.response
+                match["status"] = getattr(resp, "status", None)
+                match["response_headers"] = dict(getattr(resp, "headers", None) or {})
+                match["mime"] = getattr(resp, "mime_type", None)
+                active["flag"] = False
+                done.set()
+            except Exception:
+                pass
+
+        tab.add_handler(cdp_network.RequestWillBeSent, on_req)
+        if require_response:
+            tab.add_handler(cdp_network.ResponseReceived, on_res)
+        try:
+            await asyncio.wait_for(done.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return err(
+                f"no request matched {url_pattern!r}"
+                + (f" method={method}" if method else "")
+                + f" within {timeout}s"
+            )
+        finally:
+            active["flag"] = False
+        return ok(json.dumps(match, indent=2, default=str))
+    except Exception as e:
+        return err(str(e))
+
+
+# ── click_and_wait ─────────────────────────────────────────────────────────
+
+
+@mcp.tool()
+async def click_and_wait(
+    ref: Optional[str] = None,
+    selector: Optional[str] = None,
+    text: Optional[str] = None,
+    expect: str = "auto",
+    expect_url_pattern: Optional[str] = None,
+    expect_text: Optional[str] = None,
+    expect_selector: Optional[str] = None,
+    expect_request_pattern: Optional[str] = None,
+    timeout: float = 8.0,
+) -> str:
+    """⭐ Click + wait for the side-effect to land. Distinguishes a
+    successful action from a silent failure (e.g. form invalid where
+    click() returns success but submit never happened).
+
+    Args:
+        ref / selector / text: element to click (passed through to existing
+            click tools — text uses click_text fuzzy match)
+        expect: what to wait for after the click. One of:
+            "navigation"     — URL changes
+            "url"            — URL matches expect_url_pattern (regex)
+            "text"           — page contains expect_text
+            "selector"       — expect_selector becomes visible
+            "request"        — outgoing request matches expect_request_pattern
+            "network_idle"   — no in-flight requests for 500ms
+            "auto"           — try navigation→network_idle→nothing
+        expect_*: target for the matching expect mode
+        timeout: per-mode max wait
+
+    Returns JSON {clicked, observed: {what, evidence}, elapsed_ms}.
+    """
+    import time as _time
+    if not (ref or selector or text):
+        return err("click_and_wait: pass ref=, selector=, or text=")
+    try:
+        tab = BrowserState.active_tab()
+        url_before = await get_url(tab)
+        t0 = _time.monotonic()
+        # Dispatch the click — reuse existing tools
+        if text:
+            click_res = await click_text(text, exact=False)
+        else:
+            click_res = await click(ref=ref, selector=selector)
+        click_str = str(click_res)
+        if click_str.startswith("Error:"):
+            return err(f"click failed: {click_str}")
+
+        observed: dict = {"what": None, "evidence": None}
+        modes_to_try = [expect] if expect != "auto" else ["navigation", "network_idle"]
+
+        for mode in modes_to_try:
+            try:
+                if mode == "navigation":
+                    deadline = _time.monotonic() + timeout
+                    while _time.monotonic() < deadline:
+                        url_now = await get_url(tab)
+                        if url_now != url_before:
+                            observed = {"what": "navigation",
+                                          "evidence": {"from": url_before, "to": url_now}}
+                            break
+                        await asyncio.sleep(0.2)
+                elif mode == "url":
+                    if not expect_url_pattern:
+                        return err("expect='url' requires expect_url_pattern=")
+                    res = await assert_url_matches(expect_url_pattern, timeout=timeout)
+                    if not str(res).startswith("Error:"):
+                        observed = {"what": "url", "evidence": str(res)[:200]}
+                elif mode == "text":
+                    if not expect_text:
+                        return err("expect='text' requires expect_text=")
+                    res = await assert_text_present(expect_text, timeout=timeout)
+                    if not str(res).startswith("Error:"):
+                        observed = {"what": "text", "evidence": str(res)[:200]}
+                elif mode == "selector":
+                    if not expect_selector:
+                        return err("expect='selector' requires expect_selector=")
+                    res = await assert_element_visible(selector=expect_selector, timeout=timeout)
+                    if not str(res).startswith("Error:"):
+                        observed = {"what": "selector", "evidence": str(res)[:200]}
+                elif mode == "request":
+                    if not expect_request_pattern:
+                        return err("expect='request' requires expect_request_pattern=")
+                    res = await wait_for_request(expect_request_pattern, timeout=timeout)
+                    if not str(res).startswith("Error:"):
+                        observed = {"what": "request", "evidence": str(res)[:300]}
+                elif mode == "network_idle":
+                    # Quick network-idle: no in-flight CDP requests for 500ms
+                    deadline = _time.monotonic() + timeout
+                    last_count = len(BrowserState.network_logs)
+                    last_change = _time.monotonic()
+                    while _time.monotonic() < deadline:
+                        cur = len(BrowserState.network_logs)
+                        if cur != last_count:
+                            last_count = cur
+                            last_change = _time.monotonic()
+                        elif _time.monotonic() - last_change >= 0.5:
+                            observed = {"what": "network_idle", "evidence": f"{cur} events"}
+                            break
+                        await asyncio.sleep(0.1)
+            except Exception as e:
+                observed["error"] = str(e)
+            if observed.get("what"):
+                break
+
+        elapsed_ms = int((_time.monotonic() - t0) * 1000)
+        if not observed.get("what") and expect != "auto":
+            return err(json.dumps({
+                "clicked": click_str[:200],
+                "observed": "no matching expect signal",
+                "elapsed_ms": elapsed_ms,
+                "hint": "the click registered but no side-effect was detected — "
+                        "form may be invalid; check describe_page errors[]",
+            }, indent=2))
+        return ok(json.dumps({
+            "clicked": click_str[:200],
+            "observed": observed,
+            "elapsed_ms": elapsed_ms,
+        }, indent=2, default=str))
+    except Exception as e:
+        return err(str(e))
+
+
+# ── form_introspect ────────────────────────────────────────────────────────
+
+
+_FORM_INTROSPECT_JS = """
+((selector) => {
+  const visible = (el) => {
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    const cs = getComputedStyle(el);
+    return cs.display !== 'none' && cs.visibility !== 'hidden' && cs.opacity !== '0';
+  };
+  const labelOf = (el) => {
+    const id = el.id;
+    if (id) {
+      const lbl = document.querySelector('label[for="' + CSS.escape(id) + '"]');
+      if (lbl && lbl.innerText.trim()) return lbl.innerText.trim();
+    }
+    let p = el.parentElement;
+    for (let i = 0; i < 4 && p; i++, p = p.parentElement) {
+      if (p.tagName === 'LABEL' && p.innerText.trim()) return p.innerText.trim();
+    }
+    if (el.getAttribute) {
+      const al = el.getAttribute('aria-label');
+      if (al) return al.trim();
+      const ph = el.getAttribute('placeholder');
+      if (ph) return ph.trim();
+      const nm = el.getAttribute('name');
+      if (nm) return nm.trim();
+    }
+    return '';
+  };
+  const detectFramework = (el) => {
+    const out = [];
+    for (const k of Object.keys(el)) {
+      if (k.startsWith('__reactFiber') || k.startsWith('__reactProps')) out.push('react');
+      if (k.startsWith('__vnode') || k === '__vue__') out.push('vue');
+      if (k.startsWith('$$') || k.startsWith('$0')) out.push('solid_or_svelte');
+      if (k.startsWith('lit-')) out.push('lit');
+    }
+    return [...new Set(out)];
+  };
+  const root = selector ? document.querySelector(selector) : document;
+  if (!root) return JSON.stringify({error: 'form not found'});
+  const inputs = [...root.querySelectorAll('input,textarea,select')]
+    .filter(el => visible(el) && el.type !== 'hidden');
+  const fields = inputs.map(el => {
+    const tag = el.tagName.toLowerCase();
+    return {
+      label: labelOf(el),
+      tag,
+      type: tag === 'input' ? (el.type || 'text') : tag,
+      name: el.name || null,
+      id: el.id || null,
+      value: typeof el.value === 'string' ? el.value.slice(0, 200) : el.value,
+      required: !!el.required,
+      disabled: !!el.disabled,
+      readonly: !!el.readOnly,
+      pattern: el.pattern || null,
+      maxlength: el.maxLength > 0 ? el.maxLength : null,
+      minlength: el.minLength > 0 ? el.minLength : null,
+      validation_message: el.validity ? (el.validationMessage || null) : null,
+      valid: el.validity ? el.validity.valid : null,
+      aria_invalid: el.getAttribute('aria-invalid') === 'true',
+      aria_describedby: el.getAttribute('aria-describedby') || null,
+      framework: detectFramework(el),
+    };
+  });
+  // Submit / reset buttons inside the form
+  const buttons = [...root.querySelectorAll(
+    'button, input[type=submit], input[type=reset], [role=button]'
+  )].filter(visible).map(el => ({
+    text: (el.innerText || el.value || '').trim().slice(0, 80),
+    type: el.type || 'button',
+    disabled: !!el.disabled,
+  }));
+  // Form-level metadata
+  const formEl = root.tagName === 'FORM' ? root : root.querySelector('form');
+  const meta = formEl ? {
+    action: formEl.getAttribute('action') || '',
+    method: formEl.getAttribute('method') || 'get',
+    enctype: formEl.enctype || '',
+    novalidate: !!formEl.noValidate,
+  } : null;
+  return JSON.stringify({fields, buttons, meta});
+})
+"""
+
+
+@mcp.tool()
+async def form_introspect(form_selector: Optional[str] = None) -> str:
+    """⭐ Detailed form analysis in a single call. Returns label,
+    framework binding (react/vue/solid_or_svelte/lit), validation state,
+    and constraints (pattern, min/max length, required) per field.
+
+    Args:
+        form_selector: CSS selector for a specific form (default: scan
+            whole document for visible inputs)
+    """
+    try:
+        tab = BrowserState.active_tab()
+        sel = json.dumps(form_selector) if form_selector else "null"
+        raw = await _wait(tab.evaluate(
+            f"({_FORM_INTROSPECT_JS})({sel})", return_by_value=True,
+        ), what="form_introspect")
+        text = raw.value if hasattr(raw, "value") and not isinstance(raw, str) else raw
+        data = parse_json(str(text), {})
+        if isinstance(data, dict) and data.get("error"):
+            return err(data["error"])
+        return ok(json.dumps(data, indent=2, ensure_ascii=False))
     except Exception as e:
         return err(str(e))
 

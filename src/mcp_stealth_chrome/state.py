@@ -284,6 +284,10 @@ class BrowserState:
     active_tab_index: int = 0
     console_logs: list[dict] = []
     network_logs: list[dict] = []
+    # Per-request map: request_id → full entry with headers/body. Populated
+    # by network_start when capture_bodies=True. Flat network_logs above
+    # remains the legacy event-stream view.
+    network_index: dict[str, dict] = {}
     page_errors: list[str] = []
     capture_console: bool = False
     capture_network: bool = False
