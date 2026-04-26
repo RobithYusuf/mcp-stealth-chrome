@@ -60,7 +60,29 @@ from .state import (
     ensure_dirs,
     find_chrome_binary,
     is_chrome_profile_locked,
+    per_process_profile,
+    resolve_default_profile,
 )
+
+# Hard ceiling on `nodriver.start()` — without this a locked profile or hung
+# Chrome subprocess hangs the entire MCP session. Override via env var.
+BROWSER_LAUNCH_TIMEOUT = int(os.environ.get("BROWSER_LAUNCH_TIMEOUT", "45"))
+BROWSER_NAV_TIMEOUT = int(os.environ.get("BROWSER_NAV_TIMEOUT", "20"))
+
+# Serialize concurrent launches inside ONE MCP process. Cross-process collision
+# is handled separately by `resolve_default_profile()` (per-PID fallback).
+_LAUNCH_LOCK = asyncio.Lock()
+
+
+async def _safe_stop_browser(browser: Optional[Browser]) -> None:
+    """Best-effort shutdown — used in cleanup paths so a half-launched Chrome
+    doesn't leak its profile lock."""
+    if browser is None:
+        return
+    try:
+        browser.stop()
+    except Exception:
+        pass
 
 mcp = FastMCP("stealth-chrome")
 
@@ -112,72 +134,129 @@ async def browser_launch(
     if BrowserState.is_up():
         return ok(f"Browser already running with {len(BrowserState.tabs)} tab(s).")
 
-    ensure_dirs()
-    if persistent:
-        clean_profile_state(PROFILE_DIR)  # avoid "Restore pages?" intercept
-    config = Config(
-        user_data_dir=str(PROFILE_DIR) if persistent else None,
-        headless=headless,
-        lang=lang,
-        browser_args=list(extra_args or []),
-    )
-    # Extra flags to suppress any first-run / restore / notification interrupts
-    config.add_argument("--hide-crash-restore-bubble")
-    config.add_argument("--disable-session-crashed-bubble")
-    config.add_argument("--disable-restore-session-state")
-    config.add_argument("--no-default-browser-check")
-    if user_agent:
-        config.add_argument(f"--user-agent={user_agent}")
-    if proxy:
-        config.add_argument(f"--proxy-server={proxy}")
-    config.add_argument(f"--window-size={window_width},{window_height}")
-    if testing_mode:
-        # Speed > stealth. Skip image decoding, background dampers, translate, etc.
-        for _flag in (
-            "--blink-settings=imagesEnabled=false",
-            "--disable-features=Translate,BackForwardCache,AcceptCHFrame",
-            "--disable-background-timer-throttling",
-            "--disable-renderer-backgrounding",
-            "--disable-backgrounding-occluded-windows",
-            "--disable-ipc-flooding-protection",
-            "--disable-notifications",
-            "--autoplay-policy=user-gesture-required",
-            "--mute-audio",
-        ):
-            config.add_argument(_flag)
+    if _LAUNCH_LOCK.locked():
+        return err("another launch is already in progress — wait for it to finish")
 
-    try:
-        BrowserState.browser = await nodriver.start(config=config)
-    except Exception as e:
-        return err(f"launch failed: {e}")
+    async with _LAUNCH_LOCK:
+        # Re-check inside the lock (race with another concurrent call)
+        if BrowserState.is_up():
+            return ok(f"Browser already running with {len(BrowserState.tabs)} tab(s).")
 
-    if storage_state_path:
+        ensure_dirs()
+        # Per-process profile fallback: if another live MCP server already
+        # holds the shared default profile lock, use ~/.mcp-stealth/profile-pid<N>/
+        # so parallel Claude sessions never collide on Chrome's SingletonLock.
+        profile_path = resolve_default_profile(persistent)
+        used_fallback = persistent and profile_path != PROFILE_DIR
+        if persistent:
+            clean_profile_state(profile_path)  # only clears stale locks
+        config = Config(
+            user_data_dir=str(profile_path) if persistent else None,
+            headless=headless,
+            lang=lang,
+            browser_args=list(extra_args or []),
+        )
+        # Extra flags to suppress any first-run / restore / notification interrupts
+        config.add_argument("--hide-crash-restore-bubble")
+        config.add_argument("--disable-session-crashed-bubble")
+        config.add_argument("--disable-restore-session-state")
+        config.add_argument("--no-default-browser-check")
+        if user_agent:
+            config.add_argument(f"--user-agent={user_agent}")
+        if proxy:
+            config.add_argument(f"--proxy-server={proxy}")
+        config.add_argument(f"--window-size={window_width},{window_height}")
+        if testing_mode:
+            for _flag in (
+                "--blink-settings=imagesEnabled=false",
+                "--disable-features=Translate,BackForwardCache,AcceptCHFrame",
+                "--disable-background-timer-throttling",
+                "--disable-renderer-backgrounding",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-ipc-flooding-protection",
+                "--disable-notifications",
+                "--autoplay-policy=user-gesture-required",
+                "--mute-audio",
+            ):
+                config.add_argument(_flag)
+
+        browser: Optional[Browser] = None
         try:
-            await _apply_storage_state(BrowserState.browser, storage_state_path)
+            browser = await asyncio.wait_for(
+                nodriver.start(config=config),
+                timeout=BROWSER_LAUNCH_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            await _safe_stop_browser(browser)
+            return err(
+                f"launch timed out after {BROWSER_LAUNCH_TIMEOUT}s — "
+                f"profile {profile_path} may be locked by another Chrome, or "
+                f"Chrome is hung. Kill any stale Chrome processes and retry."
+            )
+        except asyncio.CancelledError:
+            await _safe_stop_browser(browser)
+            raise
         except Exception as e:
-            return err(f"storage_state load failed: {e}")
+            await _safe_stop_browser(browser)
+            return err(f"launch failed: {e}")
 
-    # Navigate via existing main_tab (avoids creating extra new-tab page)
-    try:
-        await asyncio.sleep(0.5)  # let Chrome finish window/tab setup
-        main = BrowserState.browser.main_tab
-        if main is None:
-            await BrowserState.browser.update_targets()
-            main = BrowserState.browser.tabs[0] if BrowserState.browser.tabs else None
-        if main is None:
-            # Fallback to browser.get which may open new tab
-            main = await BrowserState.browser.get(url)
-        else:
-            await main.get(url)
-        await main.wait(t=3)  # wait for initial load (best-effort)
-    except Exception as e:
-        return err(f"initial nav failed: {e}")
-    BrowserState.tabs = [main]
-    BrowserState.active_tab_index = 0
-    return ok(
-        f"Browser launched (headless={headless}, persistent={persistent}). "
-        f"Loaded {url}"
-    )
+        BrowserState.browser = browser
+
+        if storage_state_path:
+            try:
+                await _apply_storage_state(BrowserState.browser, storage_state_path)
+            except asyncio.CancelledError:
+                await _safe_stop_browser(BrowserState.browser)
+                BrowserState.reset()
+                raise
+            except Exception as e:
+                await _safe_stop_browser(BrowserState.browser)
+                BrowserState.reset()
+                return err(f"storage_state load failed: {e}")
+
+        try:
+            await asyncio.sleep(0.5)
+            main = BrowserState.browser.main_tab
+            if main is None:
+                await BrowserState.browser.update_targets()
+                main = BrowserState.browser.tabs[0] if BrowserState.browser.tabs else None
+            if main is None:
+                main = await asyncio.wait_for(
+                    BrowserState.browser.get(url), timeout=BROWSER_NAV_TIMEOUT
+                )
+            else:
+                await asyncio.wait_for(main.get(url), timeout=BROWSER_NAV_TIMEOUT)
+            try:
+                await asyncio.wait_for(main.wait(t=3), timeout=BROWSER_NAV_TIMEOUT)
+            except asyncio.TimeoutError:
+                pass  # initial load wait is best-effort
+        except asyncio.TimeoutError:
+            await _safe_stop_browser(BrowserState.browser)
+            BrowserState.reset()
+            return err(
+                f"initial nav timed out after {BROWSER_NAV_TIMEOUT}s — Chrome "
+                f"started but couldn't load {url}. Check network/proxy."
+            )
+        except asyncio.CancelledError:
+            await _safe_stop_browser(BrowserState.browser)
+            BrowserState.reset()
+            raise
+        except Exception as e:
+            await _safe_stop_browser(BrowserState.browser)
+            BrowserState.reset()
+            return err(f"initial nav failed: {e}")
+        BrowserState.tabs = [main]
+        BrowserState.active_tab_index = 0
+        BrowserState.current_profile_dir = profile_path
+        suffix = (
+            f" [profile fallback: {profile_path.name} — default profile is in use "
+            f"by another Chrome]"
+            if used_fallback else ""
+        )
+        return ok(
+            f"Browser launched (headless={headless}, persistent={persistent}). "
+            f"Loaded {url}{suffix}"
+        )
 
 
 @mcp.tool()
@@ -3375,15 +3454,32 @@ async def _launch_browser_instance(
         config.add_argument(f"--proxy-server={proxy}")
     config.add_argument(f"--window-size={window_width},{window_height}")
 
+    browser: Optional[Browser] = None
     try:
-        browser = await nodriver.start(config=config)
+        browser = await asyncio.wait_for(
+            nodriver.start(config=config), timeout=BROWSER_LAUNCH_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        await _safe_stop_browser(browser)
+        return False, (
+            f"launch timed out after {BROWSER_LAUNCH_TIMEOUT}s — profile "
+            f"{profile_path} may be locked or Chrome is hung."
+        )
+    except asyncio.CancelledError:
+        await _safe_stop_browser(browser)
+        raise
     except Exception as e:
+        await _safe_stop_browser(browser)
         return False, f"launch failed: {e}"
 
     if storage_state_path:
         try:
             await _apply_storage_state(browser, storage_state_path)
+        except asyncio.CancelledError:
+            await _safe_stop_browser(browser)
+            raise
         except Exception as e:
+            await _safe_stop_browser(browser)
             return False, f"storage_state load failed: {e}"
 
     try:
@@ -3393,11 +3489,24 @@ async def _launch_browser_instance(
             await browser.update_targets()
             main_tab = browser.tabs[0] if browser.tabs else None
         if main_tab is None:
-            main_tab = await browser.get(url)
+            main_tab = await asyncio.wait_for(browser.get(url), timeout=BROWSER_NAV_TIMEOUT)
         else:
-            await main_tab.get(url)
-        await main_tab.wait(t=3)
+            await asyncio.wait_for(main_tab.get(url), timeout=BROWSER_NAV_TIMEOUT)
+        try:
+            await asyncio.wait_for(main_tab.wait(t=3), timeout=BROWSER_NAV_TIMEOUT)
+        except asyncio.TimeoutError:
+            pass
+    except asyncio.TimeoutError:
+        await _safe_stop_browser(browser)
+        return False, (
+            f"initial nav timed out after {BROWSER_NAV_TIMEOUT}s on instance "
+            f"{instance_id!r}."
+        )
+    except asyncio.CancelledError:
+        await _safe_stop_browser(browser)
+        raise
     except Exception as e:
+        await _safe_stop_browser(browser)
         return False, f"initial nav failed: {e}"
 
     # Write into the target instance slot
@@ -4522,17 +4631,39 @@ async def console_clear() -> str:
 def main() -> None:
     """Stdio MCP entry point.
 
-    Wraps mcp.run() with:
-    - KeyboardInterrupt / SIGINT: clean browser shutdown before exit.
-    - BrokenPipeError: Claude Code closed stdio pipe — exit cleanly to avoid
-      leaving orphan process that shows up as zombie in `ps`.
+    SIGINT handling: stdio MCP servers should NOT exit on SIGINT — Claude Code's
+    Esc keybind cancels the in-flight tool call but the server must keep
+    serving. We ignore the first SIGINT and only exit on the second within 2s
+    (so a real `Ctrl+C` from a terminal still works for standalone runs).
+
+    Also handles:
+    - BrokenPipeError: parent closed stdio — exit cleanly.
     """
+    import signal
+
+    last_sigint = [0.0]
+
+    def _on_sigint(signum, frame):
+        now = time.time()
+        if now - last_sigint[0] < 2.0:
+            # Second Ctrl+C within 2s — actually quit
+            raise KeyboardInterrupt
+        last_sigint[0] = now
+        # First press: swallow. The cancel signal Claude Code uses to stop a
+        # tool call is a JSON-RPC cancel notification, not SIGINT — but Claude
+        # Code (and some shells) still SIGINT child stdio processes when the
+        # user hits Esc, which would otherwise terminate the whole MCP session.
+
+    try:
+        signal.signal(signal.SIGINT, _on_sigint)
+    except (ValueError, OSError):
+        pass  # not in main thread — leave default handler
+
     try:
         mcp.run()
     except (KeyboardInterrupt, BrokenPipeError):
         pass
     finally:
-        # Best-effort browser cleanup on exit (prevents Chrome orphans + profile locks).
         try:
             if BrowserState.browser and not getattr(BrowserState.browser, "stopped", False):
                 BrowserState.browser.stop()

@@ -128,13 +128,83 @@ def chrome_user_data_root() -> Optional[Path]:
     return None
 
 
-def is_chrome_profile_locked(profile_path: Path) -> bool:
-    """Check if Chrome is currently using a profile (via SingletonLock)."""
+def _read_singleton_pid(profile_path: Path) -> Optional[int]:
+    """Chrome's SingletonLock is a symlink whose target is `hostname-PID`.
+    Returns the PID it points to, or None if unreadable / not a symlink."""
     lock = profile_path / "SingletonLock"
     try:
-        return lock.exists() or lock.is_symlink()
+        if not lock.is_symlink():
+            return None
+        target = os.readlink(lock)  # e.g. "hostname-12345"
+        pid_str = target.rsplit("-", 1)[-1]
+        return int(pid_str) if pid_str.isdigit() else None
+    except (OSError, ValueError):
+        return None
+
+
+def _pid_alive(pid: int) -> bool:
+    """True if a process with this PID exists (POSIX: signal 0; Windows: tasklist)."""
+    if pid <= 0:
+        return False
+    import sys
+    if sys.platform == "win32":
+        try:
+            import subprocess
+            r = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
+                capture_output=True, text=True, timeout=2,
+            )
+            return str(pid) in (r.stdout or "")
+        except Exception:
+            return True  # assume alive when uncertain
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists but not ours
     except OSError:
         return False
+
+
+def is_chrome_profile_locked(profile_path: Path) -> bool:
+    """True only if SingletonLock exists AND points to a live PID.
+    Stale locks (Chrome crashed / orphaned) return False so we treat the
+    profile as free to use."""
+    lock = profile_path / "SingletonLock"
+    try:
+        if not (lock.exists() or lock.is_symlink()):
+            return False
+    except OSError:
+        return False
+    pid = _read_singleton_pid(profile_path)
+    if pid is None:
+        # Lock exists but unreadable / not a symlink — assume live to be safe
+        return True
+    return _pid_alive(pid)
+
+
+def per_process_profile() -> Path:
+    """Per-PID profile path. Used when the shared default profile is held by
+    another live MCP server process — lets parallel Claude sessions coexist
+    instead of hanging on Chrome's SingletonLock."""
+    return HOME / ".mcp-stealth" / f"profile-pid{os.getpid()}"
+
+
+def resolve_default_profile(persistent: bool) -> Path:
+    """Return the profile path to use for `main` instance.
+    Falls back to a per-PID profile if the shared default is held live by
+    another process."""
+    if not persistent:
+        return PROFILE_DIR
+    if is_chrome_profile_locked(PROFILE_DIR):
+        # Another live Chrome (likely a parallel MCP session) owns this profile.
+        # Use a per-process profile so we never collide on the lock.
+        p = per_process_profile()
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+    return PROFILE_DIR
 
 
 def ensure_dirs() -> None:
@@ -143,7 +213,9 @@ def ensure_dirs() -> None:
 
 
 def clean_profile_state(profile_dir: Path | str | None = None) -> None:
-    """Prevent 'Restore pages?' dialog by marking previous exit as clean."""
+    """Prevent 'Restore pages?' dialog by marking previous exit as clean.
+    Only removes Singleton* locks if they're STALE (PID dead) — never yanks
+    a lock from a live Chrome instance."""
     pdir = Path(profile_dir) if profile_dir else PROFILE_DIR
     prefs = pdir / "Default" / "Preferences"
     if prefs.exists():
@@ -157,6 +229,10 @@ def clean_profile_state(profile_dir: Path | str | None = None) -> None:
                 prefs.write_text(json.dumps(data))
         except Exception:
             pass
+    # Don't blindly nuke locks — if a sibling MCP process owns them, that
+    # would corrupt its session. Only remove when stale.
+    if is_chrome_profile_locked(pdir):
+        return
     for lock_name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
         lock = pdir / lock_name
         try:
