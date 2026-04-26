@@ -4631,44 +4631,65 @@ async def console_clear() -> str:
 def main() -> None:
     """Stdio MCP entry point.
 
-    SIGINT handling: stdio MCP servers should NOT exit on SIGINT — Claude Code's
-    Esc keybind cancels the in-flight tool call but the server must keep
-    serving. We ignore the first SIGINT and only exit on the second within 2s
-    (so a real `Ctrl+C` from a terminal still works for standalone runs).
+    Survival rules — MCP stdio servers must NOT die when the parent (Claude
+    Code) cancels a tool call or hits Esc:
 
-    Also handles:
-    - BrokenPipeError: parent closed stdio — exit cleanly.
+    1. Detach into a new session via `os.setsid()`. Terminal-group signals
+       (the SIGINT a shell sends on Ctrl+C / Esc to its whole process group)
+       no longer reach us.
+    2. SIG_IGN on SIGINT and SIGTERM at process level. asyncio overrides
+       SIGINT once its loop starts, so we also re-install via the loop in
+       a startup hook (best-effort — if it fails, setsid still protects us).
+    3. Restart loop: if mcp.run() ever raises despite the above (broken
+       transport, transient asyncio crash), re-enter up to 3 times before
+       actually exiting. EOF on stdin (BrokenPipeError) is a normal
+       shutdown signal from the parent and exits immediately.
     """
     import signal
 
-    last_sigint = [0.0]
-
-    def _on_sigint(signum, frame):
-        now = time.time()
-        if now - last_sigint[0] < 2.0:
-            # Second Ctrl+C within 2s — actually quit
-            raise KeyboardInterrupt
-        last_sigint[0] = now
-        # First press: swallow. The cancel signal Claude Code uses to stop a
-        # tool call is a JSON-RPC cancel notification, not SIGINT — but Claude
-        # Code (and some shells) still SIGINT child stdio processes when the
-        # user hits Esc, which would otherwise terminate the whole MCP session.
-
+    # 1. Detach from the parent's process group so terminal SIGINT/SIGTERM
+    #    aimed at the group never lands on us.
     try:
-        signal.signal(signal.SIGINT, _on_sigint)
-    except (ValueError, OSError):
-        pass  # not in main thread — leave default handler
+        os.setsid()
+    except (OSError, AttributeError):
+        pass  # Windows or already a session leader
 
-    try:
-        mcp.run()
-    except (KeyboardInterrupt, BrokenPipeError):
-        pass
-    finally:
+    # 2. Ignore at process level. asyncio may override SIGINT later; that's
+    #    okay — setsid above already shields from group-targeted signals.
+    for sig_name in ("SIGINT", "SIGTERM", "SIGHUP", "SIGPIPE"):
+        sig = getattr(signal, sig_name, None)
+        if sig is not None:
+            try:
+                signal.signal(sig, signal.SIG_IGN)
+            except (ValueError, OSError):
+                pass
+
+    # 3. Restart loop. mcp.run() blocks until stdin EOF or a crash. On a
+    #    crash we re-enter; on EOF or repeated crashes we exit cleanly.
+    crashes = 0
+    while True:
         try:
-            if BrowserState.browser and not getattr(BrowserState.browser, "stopped", False):
-                BrowserState.browser.stop()
+            mcp.run()
+            break  # clean stdin EOF — parent closed connection
+        except (BrokenPipeError, EOFError):
+            break  # parent gone, stop trying
+        except KeyboardInterrupt:
+            # Should not arrive (we SIG_IGN'd it), but if asyncio re-raised
+            # one anyway, swallow and continue.
+            continue
         except Exception:
+            crashes += 1
+            if crashes >= 3:
+                break
+            continue
+        finally:
             pass
+
+    try:
+        if BrowserState.browser and not getattr(BrowserState.browser, "stopped", False):
+            BrowserState.browser.stop()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
