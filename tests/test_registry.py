@@ -4,10 +4,14 @@ Run after every refactor commit:
     uv run python tests/test_registry.py
 
 Baseline captured at v0.4.0 (pre-refactor): 133 tools.
+v0.4.3 bumped to 134 (added tab_focus; also restored cookie_set's
+@mcp.tool decorator that was lost during the v0.2.11 cookie_import work
+and removed an erroneous decorator from the _active_tab_host helper —
+both surfaced by the registry gate).
 """
 import sys
 
-EXPECTED_COUNT = 133
+EXPECTED_COUNT = 134
 EXPECTED_TOOLS = {
     # Lifecycle
     "browser_launch", "browser_close",
@@ -75,6 +79,8 @@ EXPECTED_TOOLS = {
     "workflow_run", "detect_and_bypass",
     # 0.4.0 additions
     "paste_text", "auth_capture", "click_and_wait", "form_introspect",
+    # 0.4.3 — focus + cookie_set decorator restoration
+    "tab_focus",
 }
 
 

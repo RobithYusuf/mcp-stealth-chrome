@@ -579,12 +579,24 @@ async def browser_close() -> str:
 
 
 @mcp.tool()
-async def navigate(url: str, wait_until: str = "load", auto_verify: bool = True) -> str:
+async def navigate(
+    url: str,
+    wait_until: str = "load",
+    auto_verify: bool = True,
+    focus: bool = True,
+) -> str:
     """Navigate the active tab to url. wait_until: load|domcontentloaded|none.
 
     auto_verify: if True (default), automatically detect Cloudflare /
     Turnstile challenges after load and click the checkbox naturally
     (CDP-level click, max 2 attempts). Set False to opt out.
+
+    focus: if True (default), bring the tab's window to the OS foreground
+    after navigating. Without this, programmatic navigation in Chrome
+    does NOT raise the window — so on systems with the user's own
+    Chrome already open, MCP-driven navigation can be invisible to the
+    eye even though it succeeded internally. Set False to navigate
+    silently (background scraping flows).
     """
     if not BrowserState.is_up():
         return err("Browser not running. Call browser_launch first.")
@@ -593,6 +605,15 @@ async def navigate(url: str, wait_until: str = "load", auto_verify: bool = True)
         await tab.get(url)
         if wait_until != "none":
             await tab.wait()
+        if focus:
+            try:
+                await tab.activate()
+            except Exception:
+                pass
+            try:
+                await tab.bring_to_front()
+            except Exception:
+                pass
         verify_suffix = ""
         if auto_verify:
             try:
@@ -600,6 +621,60 @@ async def navigate(url: str, wait_until: str = "load", auto_verify: bool = True)
             except (asyncio.TimeoutError, Exception):
                 verify_suffix = ""
         return ok(f"Navigated to {await get_url(tab)}{verify_suffix}")
+    except Exception as e:
+        return err(str(e))
+
+
+@mcp.tool()
+async def tab_focus() -> str:
+    """⭐ Bring the active tab's browser window to the OS foreground.
+
+    Programmatic CDP navigation does not raise Chrome to the front, so
+    on a desktop where the user has their own Chrome already open you
+    may see only the original window even though MCP successfully
+    drove a different window/tab. Call this when you want to *see*
+    what MCP is doing.
+
+    Common reasons MCP's window is hidden:
+      - Per-PID profile fallback: another Chrome already held
+        ~/.mcp-stealth/profile/, so MCP launched into
+        ~/.mcp-stealth/profile-pid<N>/ — that's a SEPARATE Chrome window.
+        Run server_status to confirm (profile_dir field).
+      - OAuth popup opened a new tab/window MCP now drives.
+      - macOS Spaces / minimized window / behind other apps.
+    """
+    try:
+        tab = BrowserState.active_tab()
+        focused_actions = []
+        try:
+            await tab.activate()
+            focused_actions.append("activate")
+        except Exception as e:
+            focused_actions.append(f"activate_failed:{type(e).__name__}")
+        try:
+            await tab.bring_to_front()
+            focused_actions.append("bring_to_front")
+        except Exception as e:
+            focused_actions.append(f"front_failed:{type(e).__name__}")
+        url = await get_url(tab)
+        title = await get_title(tab)
+        profile = (
+            BrowserState.current_profile_dir.name
+            if BrowserState.current_profile_dir else "(default)"
+        )
+        hint = ""
+        if profile.startswith("profile-pid"):
+            hint = (
+                "\nNOTE: MCP is using a per-PID profile fallback "
+                f"({profile}) — this is a SEPARATE Chrome window from your "
+                "personal Chrome. Look for the new window in Mission "
+                "Control / Alt-Tab."
+            )
+        return ok(
+            f"focused: {title!r} @ {url}\n"
+            f"actions: {', '.join(focused_actions)}\n"
+            f"profile: {profile}{hint}"
+        )
     except Exception as e:
         return err(str(e))
 
@@ -743,7 +818,10 @@ async def screenshot(
             data = base64.b64decode(b64)
             path.write_bytes(data)
         else:
-            # nodriver path — quality param only valid for jpeg
+            # Multi-strategy capture — pages with stuck JS / heavy SPAs can
+            # make tab.save_screenshot hang because nodriver's wrapper waits
+            # for paint stability and file IO. We try fastest viewport
+            # capture first, then full_page if requested.
             save_kwargs: dict[str, Any] = {
                 "filename": str(path),
                 "format": fmt,
@@ -751,7 +829,43 @@ async def screenshot(
             }
             if fmt == "jpeg" and quality is not None:
                 save_kwargs["quality"] = int(quality)
-            await _wait(tab.save_screenshot(**save_kwargs), what="screenshot")
+            try:
+                await _wait(tab.save_screenshot(**save_kwargs),
+                            timeout=15.0, what="screenshot (nodriver)")
+            except TimeoutError:
+                # Fallback 1: raw CDP Page.captureScreenshot — bypasses
+                # nodriver's paint-wait hooks.
+                try:
+                    from nodriver.cdp import page as cdp_page
+                    cdp_kwargs: dict[str, Any] = {"format_": fmt,
+                                                    "capture_beyond_viewport": bool(full_page)}
+                    if fmt == "jpeg" and quality is not None:
+                        cdp_kwargs["quality"] = int(quality)
+                    b64 = await _wait(
+                        tab.send(cdp_page.capture_screenshot(**cdp_kwargs)),
+                        timeout=10.0, what="screenshot (CDP raw)",
+                    )
+                    path.write_bytes(base64.b64decode(b64))
+                except TimeoutError:
+                    # Fallback 2: viewport-only JPEG (smallest payload, no
+                    # full-page stitching). Last resort before giving up.
+                    try:
+                        from nodriver.cdp import page as cdp_page
+                        b64 = await _wait(
+                            tab.send(cdp_page.capture_screenshot(
+                                format_="jpeg", quality=60,
+                                capture_beyond_viewport=False,
+                            )),
+                            timeout=8.0, what="screenshot (viewport JPEG)",
+                        )
+                        path.write_bytes(base64.b64decode(b64))
+                    except Exception as final_e:
+                        return err(
+                            f"screenshot failed across all 3 strategies (last: "
+                            f"{type(final_e).__name__}: {final_e}). "
+                            f"Page JS likely deadlocked — try browser_close() + "
+                            f"browser_launch() to recover."
+                        )
 
         # Auto-downscale if either dimension exceeds max_dimension.
         # Uses cv2 (already a dep via opencv-python). INTER_AREA = best for shrinking.
@@ -1303,7 +1417,6 @@ async def cookie_list(url: Optional[str] = None) -> str:
         return err(str(e))
 
 
-@mcp.tool()
 def _active_tab_host() -> Optional[str]:
     """Best-effort hostname of the active tab — used as default cookie domain
     when raw_text doesn't include one."""
@@ -1388,6 +1501,7 @@ def _parse_cookie_text(text: str, default_domain: Optional[str]) -> list[dict]:
     return out
 
 
+@mcp.tool()
 async def cookie_set(name: str, value: str, domain: str, path: str = "/",
                      secure: bool = False, http_only: bool = False) -> str:
     """Set a cookie on the browser."""
