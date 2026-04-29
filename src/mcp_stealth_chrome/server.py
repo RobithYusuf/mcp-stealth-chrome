@@ -556,12 +556,18 @@ async def browser_close() -> str:
     except Exception as e:
         return err(f"close failed: {e}")
     BrowserState.reset()
-    # Clear transient caches that key off tab identity (id() can be reused)
+    # Clear transient caches that key off tab identity (id() can be reused).
+    # devtools state lives in tools/devtools.py — lazy import + tolerate
+    # the module not being loaded yet (no devtools tool ever called).
     _SNAPSHOT_CACHE.clear()
-    _TRACE_ACTIVE.update({"tab_id": None, "started_at": 0.0, "categories": "",
-                           "handler": None})
-    _TRACE_BUFFER.clear()
-    _COVERAGE_ACTIVE.update({"tab_id": None, "js": False, "css": False})
+    try:
+        from .tools import devtools as _dt
+        _dt._TRACE_ACTIVE.update({"tab_id": None, "started_at": 0.0,
+                                   "categories": "", "handler": None})
+        _dt._TRACE_BUFFER.clear()
+        _dt._COVERAGE_ACTIVE.update({"tab_id": None, "js": False, "css": False})
+    except Exception:
+        pass
     # Drop registered dialog handler tab IDs so a new tab with a recycled
     # id() doesn't get skipped on re-arm.
     try:
@@ -571,6 +577,84 @@ async def browser_close() -> str:
     # Mark profile as cleanly exited so next launch skips restore dialog
     clean_profile_state(PROFILE_DIR)
     return ok("Browser closed.")
+
+
+@mcp.tool()
+async def browser_recover() -> str:
+    """Force-recover from a stuck browser state.
+
+    Escape hatch when browser_close() can't run (graceful shutdown depends
+    on internal state that may be corrupt). Steps:
+    1. Best-effort browser.stop() — ignore any errors
+    2. Reset BrowserState (clears tabs, instances, network index, locks)
+    3. Clear devtools / dialog caches
+    4. Wipe stale Singleton* lock files in the default profile (only if
+       their PID is dead — never yanks a live sibling process's lock)
+    5. Mark profile as cleanly exited
+
+    Always succeeds — never raises. Use this when normal close hangs or
+    returns an error you can't diagnose. After this, browser_launch()
+    again to start fresh.
+    """
+    steps: list[str] = []
+
+    # 1. Best-effort stop
+    try:
+        b = BrowserState.browser
+        if b and not getattr(b, "stopped", False):
+            try:
+                b.stop()
+                steps.append("browser.stop() ok")
+            except Exception as e:
+                steps.append(f"browser.stop() failed: {type(e).__name__}")
+    except Exception:
+        pass
+
+    # 2. Reset state regardless
+    try:
+        BrowserState.reset()
+        steps.append("state reset")
+    except Exception as e:
+        steps.append(f"state reset failed: {type(e).__name__}: {e}")
+
+    # 3. Clear caches
+    try:
+        _SNAPSHOT_CACHE.clear()
+    except Exception:
+        pass
+    try:
+        from .tools import devtools as _dt
+        _dt._TRACE_ACTIVE.update({"tab_id": None, "started_at": 0.0,
+                                   "categories": "", "handler": None})
+        _dt._TRACE_BUFFER.clear()
+        _dt._COVERAGE_ACTIVE.update({"tab_id": None, "js": False, "css": False})
+    except Exception:
+        pass
+    try:
+        _DIALOG_AUTO_CFG["_registered_tab_ids"].clear()
+    except Exception:
+        pass
+
+    # 4. Sweep stale locks across all known profile dirs
+    from .state import PROFILE_DIR as _PROFILE_DIR, PROFILES_ROOT, per_process_profile
+    sweep_dirs: list = [_PROFILE_DIR, per_process_profile()]
+    try:
+        if PROFILES_ROOT.exists():
+            for sub in PROFILES_ROOT.iterdir():
+                if sub.is_dir():
+                    sweep_dirs.append(sub)
+    except Exception:
+        pass
+    cleared = 0
+    for pdir in sweep_dirs:
+        try:
+            clean_profile_state(pdir)  # only removes locks with dead PIDs
+            cleared += 1
+        except Exception:
+            pass
+    steps.append(f"swept {cleared}/{len(sweep_dirs)} profile dirs")
+
+    return ok("recovered: " + " | ".join(steps))
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -829,10 +913,18 @@ async def screenshot(
             }
             if fmt == "jpeg" and quality is not None:
                 save_kwargs["quality"] = int(quality)
+            # Collect per-strategy errors so the final message tells the
+            # caller exactly which paths failed and how — no more single
+            # "last error" mystery.
+            strategy_errors: list[str] = []
+            captured = False
             try:
                 await _wait(tab.save_screenshot(**save_kwargs),
                             timeout=15.0, what="screenshot (nodriver)")
-            except TimeoutError:
+                captured = True
+            except Exception as e1:
+                strategy_errors.append(f"nodriver(15s): {type(e1).__name__}: {e1}")
+            if not captured:
                 # Fallback 1: raw CDP Page.captureScreenshot — bypasses
                 # nodriver's paint-wait hooks.
                 try:
@@ -846,26 +938,44 @@ async def screenshot(
                         timeout=10.0, what="screenshot (CDP raw)",
                     )
                     path.write_bytes(base64.b64decode(b64))
-                except TimeoutError:
-                    # Fallback 2: viewport-only JPEG (smallest payload, no
-                    # full-page stitching). Last resort before giving up.
-                    try:
-                        from nodriver.cdp import page as cdp_page
-                        b64 = await _wait(
-                            tab.send(cdp_page.capture_screenshot(
-                                format_="jpeg", quality=60,
-                                capture_beyond_viewport=False,
-                            )),
-                            timeout=8.0, what="screenshot (viewport JPEG)",
-                        )
-                        path.write_bytes(base64.b64decode(b64))
-                    except Exception as final_e:
-                        return err(
-                            f"screenshot failed across all 3 strategies (last: "
-                            f"{type(final_e).__name__}: {final_e}). "
-                            f"Page JS likely deadlocked — try browser_close() + "
-                            f"browser_launch() to recover."
-                        )
+                    captured = True
+                except Exception as e2:
+                    strategy_errors.append(f"cdp_raw(10s): {type(e2).__name__}: {e2}")
+            if not captured:
+                # Fallback 2: viewport-only JPEG (smallest payload, no
+                # full-page stitching). Last resort before giving up.
+                try:
+                    from nodriver.cdp import page as cdp_page
+                    b64 = await _wait(
+                        tab.send(cdp_page.capture_screenshot(
+                            format_="jpeg", quality=60,
+                            capture_beyond_viewport=False,
+                        )),
+                        timeout=8.0, what="screenshot (viewport JPEG)",
+                    )
+                    path.write_bytes(base64.b64decode(b64))
+                    captured = True
+                except Exception as e3:
+                    strategy_errors.append(f"viewport_jpeg(8s): {type(e3).__name__}: {e3}")
+            if not captured:
+                # Probe whether JS is actually responsive — if evaluate()
+                # works, the screenshot path itself is the bottleneck (CDP /
+                # GPU / profile-state issue), not page JS.
+                hint = "browser_recover() to force-restart, or browser_close() + browser_launch(persistent=False)"
+                try:
+                    rs = await _wait(tab.evaluate("document.readyState"),
+                                      timeout=2.0, what="js probe")
+                    if rs:
+                        hint = (f"page JS responsive (readyState={rs}) — "
+                                f"CDP screenshot path is stuck. {hint}")
+                    else:
+                        hint = f"page JS unresponsive too. {hint}"
+                except Exception:
+                    hint = f"page JS also unresponsive (evaluate timed out). {hint}"
+                return err(
+                    "screenshot failed across all 3 strategies. "
+                    + " | ".join(strategy_errors) + ". " + hint
+                )
 
         # Auto-downscale if either dimension exceeds max_dimension.
         # Uses cv2 (already a dep via opencv-python). INTER_AREA = best for shrinking.
@@ -1643,20 +1753,41 @@ async def cookie_import(
             ):
                 if src in c and c[src] is not None:
                     kwargs[dst] = bool(c[src])
-            # Float fields — CDP TimeSinceEpoch is a float; reject session
-            # cookies (expires=-1 / "Session" / 0) since they don't map.
+            # TimeSinceEpoch — CDP class is float-subclass with .to_json();
+            # CookieParam.to_json() calls self.expires.to_json(), so a raw float
+            # crashes. Reject session cookies (expires=-1 / "Session" / 0).
             if "expires" in c and c["expires"] is not None:
                 try:
                     exp = float(c["expires"])
                     if exp > 0:
-                        kwargs["expires"] = exp
+                        kwargs["expires"] = cdp_network.TimeSinceEpoch(exp)
                 except (TypeError, ValueError):
                     pass
-            # Enum field
+            # Enum field — sameSite
             if "sameSite" in c or "same_site" in c:
                 ss = _coerce_same_site(c.get("sameSite", c.get("same_site")))
                 if ss is not None:
                     kwargs["same_site"] = ss
+            # Enum field — priority (Low/Medium/High)
+            pri_raw = c.get("priority")
+            if pri_raw:
+                try:
+                    pmap = {"low": "Low", "medium": "Medium", "high": "High"}
+                    canon = pmap.get(str(pri_raw).strip().lower())
+                    if canon:
+                        kwargs["priority"] = cdp_network.CookiePriority(canon)
+                except Exception:
+                    pass
+            # Enum field — sourceScheme (Unset/NonSecure/Secure)
+            ss_raw = c.get("sourceScheme") or c.get("source_scheme")
+            if ss_raw:
+                try:
+                    smap = {"unset": "Unset", "nonsecure": "NonSecure", "secure": "Secure"}
+                    canon = smap.get(str(ss_raw).strip().lower())
+                    if canon:
+                        kwargs["source_scheme"] = cdp_network.CookieSourceScheme(canon)
+                except Exception:
+                    pass
             try:
                 params.append(cdp_network.CookieParam(**kwargs))
             except Exception:

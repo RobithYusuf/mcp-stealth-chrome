@@ -11,10 +11,10 @@ both surfaced by the registry gate).
 """
 import sys
 
-EXPECTED_COUNT = 134
+EXPECTED_COUNT = 135
 EXPECTED_TOOLS = {
     # Lifecycle
-    "browser_launch", "browser_close",
+    "browser_launch", "browser_close", "browser_recover",
     # Navigation
     "navigate", "go_back", "go_forward", "reload",
     # DOM / content
