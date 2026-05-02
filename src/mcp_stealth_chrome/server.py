@@ -391,6 +391,8 @@ async def browser_launch(
     storage_state_path: Optional[str] = None,
     testing_mode: bool = False,
     auto_verify: bool = True,
+    user_data_dir: Optional[str] = None,
+    profile_directory: Optional[str] = None,
 ) -> str:
     """Launch stealth Chrome via nodriver. Creates persistent profile by default.
 
@@ -412,6 +414,15 @@ async def browser_launch(
             Turnstile challenges after the initial load and dispatch a
             CDP-level click on the checkbox. Caps at 2 attempts ~6s total —
             never loops. Set False to opt out.
+        user_data_dir: launch Chrome against an EXISTING user profile root
+            (e.g. "~/Library/Application Support/Google/Chrome"). Overrides
+            persistent + the default MCP profile. The target Chrome instance
+            (if any) MUST be closed first — locked profiles are detected
+            upfront and refused with the lock-holder PID. Supports ~ expansion.
+        profile_directory: when paired with user_data_dir, picks a sub-profile
+            inside it (e.g. "Default", "Profile 21"). Without this, Chrome
+            uses "Default". Helpful to drive a specific persona without
+            cloning the profile. Use list_chrome_profiles to enumerate.
     """
     if BrowserState.is_up():
         return ok(f"Browser already running with {len(BrowserState.tabs)} tab(s).")
@@ -426,48 +437,100 @@ async def browser_launch(
 
         ensure_dirs()
 
-        # Validate user-supplied --user-data-dir BEFORE launch (saves a 30s timeout).
-        # Many users pass a Chrome profile path in extra_args that's currently
-        # held by their daily Chrome — fail fast with actionable advice.
-        custom_udd: Optional[Path] = None
-        for arg in (extra_args or []):
-            if arg.startswith("--user-data-dir="):
-                custom_udd = Path(arg.split("=", 1)[1]).expanduser()
-                break
-        if custom_udd is not None:
-            holder_pid = chrome_lock_holder_pid(custom_udd) if custom_udd.exists() else None
+        # Build effective extra_args (we may inject --profile-directory into them).
+        merged_extra_args = list(extra_args or [])
+
+        # If the user passed user_data_dir explicitly, that takes precedence over
+        # both `persistent` and any --user-data-dir already in extra_args.
+        explicit_udd: Optional[Path] = None
+        if user_data_dir:
+            explicit_udd = Path(user_data_dir).expanduser()
+            if not explicit_udd.exists():
+                return err(
+                    f"user_data_dir does not exist: {explicit_udd}. "
+                    "Check the path. Common defaults: "
+                    "~/Library/Application Support/Google/Chrome (macOS), "
+                    "~/.config/google-chrome (Linux), "
+                    "%LOCALAPPDATA%/Google/Chrome/User Data (Windows). "
+                    "Use list_chrome_profiles to discover."
+                )
+            holder_pid = chrome_lock_holder_pid(explicit_udd)
             if holder_pid is not None:
                 return err(
-                    f"Profile directory is locked by another Chrome process: "
-                    f"{custom_udd} (PID {holder_pid}). Close that Chrome window first, "
-                    f"OR use clone_chrome_profile to make a snapshot copy, "
-                    f"OR omit --user-data-dir to use the default MCP profile."
+                    f"user_data_dir {explicit_udd} is currently in use by Chrome PID {holder_pid}. "
+                    "Close that Chrome window first (a single Chrome process locks the whole "
+                    "user-data-dir, regardless of profile_directory). "
+                    "Or use clone_chrome_profile to take a snapshot copy of the profile, "
+                    "or attach_to_chrome(port=...) if Chrome was started with --remote-debugging-port."
                 )
+            # Validate sub-profile if specified
+            if profile_directory:
+                pd_path = explicit_udd / profile_directory
+                if not pd_path.exists():
+                    avail = [p.name for p in explicit_udd.iterdir()
+                             if p.is_dir() and (p / "Preferences").exists()][:15]
+                    return err(
+                        f"profile_directory {profile_directory!r} not found inside {explicit_udd}. "
+                        f"Available: {avail}"
+                    )
+                merged_extra_args.append(f"--profile-directory={profile_directory}")
+            persistent = False  # we're managing user_data_dir ourselves; skip default profile flow
+            profile_path = explicit_udd
+            used_fallback = False
+        else:
+            # Validate user-supplied --user-data-dir BEFORE launch (saves a 30s timeout).
+            # Many users pass a Chrome profile path in extra_args that's currently
+            # held by their daily Chrome — fail fast with actionable advice.
+            custom_udd: Optional[Path] = None
+            for arg in merged_extra_args:
+                if arg.startswith("--user-data-dir="):
+                    custom_udd = Path(arg.split("=", 1)[1]).expanduser()
+                    break
+            if custom_udd is not None:
+                holder_pid = chrome_lock_holder_pid(custom_udd) if custom_udd.exists() else None
+                if holder_pid is not None:
+                    return err(
+                        f"Profile directory is locked by another Chrome process: "
+                        f"{custom_udd} (PID {holder_pid}). Close that Chrome window first, "
+                        f"OR use clone_chrome_profile to make a snapshot copy, "
+                        f"OR use the user_data_dir parameter (with same fail-fast lock check), "
+                        f"OR omit --user-data-dir to use the default MCP profile, "
+                        f"OR use attach_to_chrome(port=...) if Chrome was started with debug port."
+                    )
 
-        # Per-process profile fallback: if another live MCP server already
-        # holds the shared default profile lock, use ~/.mcp-stealth/profile-pid<N>/
-        # so parallel Claude sessions never collide on Chrome's SingletonLock.
-        profile_path = resolve_default_profile(persistent)
-        used_fallback = persistent and profile_path != PROFILE_DIR
+            # Per-process profile fallback: if another live MCP server already
+            # holds the shared default profile lock, use ~/.mcp-stealth/profile-pid<N>/
+            # so parallel Claude sessions never collide on Chrome's SingletonLock.
+            profile_path = resolve_default_profile(persistent)
+            used_fallback = persistent and profile_path != PROFILE_DIR
 
-        # Friendly upfront check on the default profile too (after resolve_default_profile
-        # has potentially picked a fallback). If somehow the resolved one is still locked
-        # by a live process, refuse with actionable error rather than hanging.
-        if persistent:
-            holder_pid = chrome_lock_holder_pid(profile_path)
-            if holder_pid is not None:
-                return err(
-                    f"Default MCP profile is locked by PID {holder_pid}. "
-                    f"This usually means another mcp-stealth-chrome instance is running. "
-                    f"Run `pkill -f mcp-stealth-chrome` then retry, or use persistent=False "
-                    f"for an ephemeral throwaway profile."
-                )
-            clean_profile_state(profile_path)  # only clears stale locks
+            # Friendly upfront check on the default profile too (after resolve_default_profile
+            # has potentially picked a fallback). If somehow the resolved one is still locked
+            # by a live process, refuse with actionable error rather than hanging.
+            if persistent:
+                holder_pid = chrome_lock_holder_pid(profile_path)
+                if holder_pid is not None:
+                    return err(
+                        f"Default MCP profile is locked by PID {holder_pid}. "
+                        f"This usually means another mcp-stealth-chrome instance is running. "
+                        f"Run `pkill -f mcp-stealth-chrome` then retry, or use persistent=False "
+                        f"for an ephemeral throwaway profile."
+                    )
+                clean_profile_state(profile_path)  # only clears stale locks
+
+        # Determine final user_data_dir for Config (None = nodriver picks a temp dir).
+        if explicit_udd is not None:
+            final_udd: Optional[str] = str(explicit_udd)
+        elif persistent:
+            final_udd = str(profile_path)
+        else:
+            final_udd = None
+
         config = Config(
-            user_data_dir=str(profile_path) if persistent else None,
+            user_data_dir=final_udd,
             headless=headless,
             lang=lang,
-            browser_args=list(extra_args or []),
+            browser_args=list(merged_extra_args),
         )
         # Extra flags to suppress any first-run / restore / notification interrupts
         config.add_argument("--hide-crash-restore-bubble")
@@ -5573,6 +5636,241 @@ async def form_introspect(form_selector: Optional[str] = None) -> str:
         return ok(json.dumps(data, indent=2, ensure_ascii=False))
     except Exception as e:
         return err(str(e))
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ATTACH MODE — connect to existing Chrome via CDP (no new browser launch)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Requires the target Chrome to be started with `--remote-debugging-port=<N>`.
+# macOS shorthand:
+#   /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
+#     --remote-debugging-port=9222 --user-data-dir=/path/to/your/profile
+#
+# Then `attach_to_chrome(port=9222)` connects without spawning a new browser
+# and respects the existing tabs/cookies/profile (including Profile 21, etc).
+# `detach()` releases the connection but leaves Chrome running.
+
+# Tracks whether current BrowserState was created via attach (True) or
+# spawned by us (False). detach() is a no-op for spawned browsers.
+_ATTACHED_BROWSERS: set[str] = set()
+
+
+@mcp.tool()
+async def list_external_chrome() -> str:
+    """List Chrome processes running on this machine, with their CDP debugging
+    port if any. Use before attach_to_chrome to find a target. Returns array
+    of {pid, debugging_port, user_data_dir, cmd}. Chromes without a debugging
+    port show port=null and cannot be attached unless restarted with
+    --remote-debugging-port=<N>."""
+    import subprocess
+    import sys
+    out: list[dict] = []
+    if sys.platform == "win32":
+        try:
+            r = subprocess.run(
+                ["wmic", "process", "where", "name='chrome.exe'", "get", "ProcessId,CommandLine", "/format:csv"],
+                capture_output=True, text=True, timeout=3,
+            )
+            lines = (r.stdout or "").splitlines()
+        except Exception:
+            return ok(json.dumps([]))
+        for line in lines:
+            if "chrome.exe" not in line:
+                continue
+            parts = line.split(",")
+            if len(parts) < 3:
+                continue
+            cmd = parts[1] if len(parts) > 1 else ""
+            pid_s = parts[-1].strip()
+            try:
+                pid = int(pid_s)
+            except ValueError:
+                continue
+            port = None
+            udd = None
+            for tok in cmd.split():
+                if tok.startswith("--remote-debugging-port="):
+                    try: port = int(tok.split("=", 1)[1])
+                    except ValueError: pass
+                elif tok.startswith("--user-data-dir="):
+                    udd = tok.split("=", 1)[1]
+            out.append({"pid": pid, "debugging_port": port,
+                        "user_data_dir": udd, "cmd": cmd[:200]})
+    else:
+        # POSIX: ps + parse args
+        try:
+            r = subprocess.run(
+                ["ps", "axo", "pid,args"], capture_output=True, text=True, timeout=3,
+            )
+            lines = (r.stdout or "").splitlines()
+        except Exception:
+            return ok(json.dumps([]))
+        seen_pids: set[int] = set()
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            # Pick parent Chrome processes — heuristic: has --user-data-dir
+            # or is named "Google Chrome" / "chromium" (not helper renderers).
+            lower = line.lower()
+            is_chrome = (
+                "google chrome" in lower or "chromium" in lower or
+                "/chrome " in lower or lower.endswith("/chrome")
+            )
+            if not is_chrome:
+                continue
+            # Skip helper subprocs (renderers, GPU process, etc) — they run
+            # under "Helper" in macOS or have --type=renderer.
+            if "--type=" in lower or "Helper" in line:
+                continue
+            parts = line.split(None, 1)
+            if len(parts) < 2:
+                continue
+            try:
+                pid = int(parts[0])
+            except ValueError:
+                continue
+            if pid in seen_pids:
+                continue
+            seen_pids.add(pid)
+            cmd = parts[1]
+            port = None
+            udd = None
+            for tok in cmd.split():
+                if tok.startswith("--remote-debugging-port="):
+                    try: port = int(tok.split("=", 1)[1])
+                    except ValueError: pass
+                elif tok.startswith("--user-data-dir="):
+                    udd = tok.split("=", 1)[1]
+            out.append({"pid": pid, "debugging_port": port,
+                        "user_data_dir": udd, "cmd": cmd[:200]})
+            if len(out) >= 30:
+                break
+    # Sort: ones with debugging port first
+    out.sort(key=lambda x: (x.get("debugging_port") is None, x.get("pid", 0)))
+    return ok(json.dumps(out, indent=2))
+
+
+async def _detect_chrome_debugging_port() -> Optional[int]:
+    """Find the lowest debugging port from running Chromes (returns None if none)."""
+    import subprocess
+    try:
+        r = subprocess.run(["ps", "axo", "args"], capture_output=True, text=True, timeout=3)
+    except Exception:
+        return None
+    ports: list[int] = []
+    for line in (r.stdout or "").splitlines():
+        for tok in line.split():
+            if tok.startswith("--remote-debugging-port="):
+                try:
+                    ports.append(int(tok.split("=", 1)[1]))
+                except ValueError:
+                    pass
+    return min(ports) if ports else None
+
+
+@mcp.tool()
+async def attach_to_chrome(
+    port: Optional[int] = None,
+    host: str = "127.0.0.1",
+    instance_id: str = "attached",
+) -> str:
+    """⭐ Attach to an existing Chrome instance via CDP — no new browser launch,
+    no profile lock conflict. Target Chrome must have been started with
+    `--remote-debugging-port=<N>`. Auto-detects port if omitted (picks lowest).
+
+    Use cases:
+    - Control your existing Chrome (e.g. Profile 21) without closing it.
+    - Drive a Chrome session you launched manually with custom flags.
+    - Connect to a remote/Docker Chrome via host=<remote> port=<N>.
+
+    To detach without closing Chrome, call detach(). Calling browser_close()
+    after attach DOES close the target Chrome — use detach() instead if you
+    want to keep it running.
+    """
+    if BrowserState.is_up():
+        return err(
+            f"Browser already attached/running on instance {BrowserState.current_instance_id!r}. "
+            f"Call browser_close() or detach() first."
+        )
+    if port is None:
+        port = await _detect_chrome_debugging_port()
+        if port is None:
+            return err(
+                "No Chrome with --remote-debugging-port found. Start Chrome with:\n"
+                "  /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome "
+                "--remote-debugging-port=9222 --user-data-dir=/path/to/profile\n"
+                "Then call attach_to_chrome(port=9222) or just attach_to_chrome()."
+            )
+    # Probe the CDP endpoint with httpx — fail fast with a clear message
+    # if the port isn't actually open or doesn't speak CDP.
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as cli:
+            r = await cli.get(f"http://{host}:{port}/json/version")
+            r.raise_for_status()
+            info = r.json()
+    except Exception as e:
+        return err(
+            f"CDP probe failed at http://{host}:{port}/json/version — {e}. "
+            "Make sure Chrome is running with --remote-debugging-port and the "
+            "port is reachable (no firewall, correct host)."
+        )
+
+    config = Config(host=host, port=port)
+    try:
+        browser = await asyncio.wait_for(
+            nodriver.start(config=config),
+            timeout=BROWSER_LAUNCH_TIMEOUT,
+        )
+    except Exception as e:
+        return err(f"attach failed after CDP probe ok: {e}")
+
+    BrowserState.browser = browser
+    BrowserState.current_instance_id = instance_id
+    BrowserState.current_profile_dir = None  # unknown — managed by external Chrome
+    BrowserState.current_idle_timeout = 0  # never auto-close attached browsers
+    BrowserState.current_last_active = time.time()
+    BrowserState.current_created_at = time.time()
+    _ATTACHED_BROWSERS.add(instance_id)
+    await _refresh_tabs()
+    return ok(
+        f"Attached to existing Chrome at {host}:{port} as {instance_id!r}. "
+        f"Browser: {info.get('Browser', '?')}, {len(BrowserState.tabs)} tab(s). "
+        "Use detach() to release without closing Chrome."
+    )
+
+
+@mcp.tool()
+async def detach() -> str:
+    """⭐ Release CDP connection to an attached Chrome WITHOUT closing it.
+    Only valid for browsers connected via attach_to_chrome — for browsers
+    spawned by browser_launch/spawn_browser this is equivalent to a no-op
+    (use browser_close instead).
+
+    After detach, Chrome keeps running with all tabs intact. You can
+    re-attach later with attach_to_chrome(port=...)."""
+    iid = BrowserState.current_instance_id
+    if not BrowserState.is_up():
+        return err("no browser currently attached/running")
+    if iid not in _ATTACHED_BROWSERS:
+        return err(
+            f"current browser ({iid!r}) was launched by us, not attached. "
+            "Use browser_close() to close it. detach() only applies to "
+            "attach_to_chrome() connections."
+        )
+    # Close just the websocket connection, leave the Chrome process alive.
+    try:
+        if BrowserState.browser and getattr(BrowserState.browser, "connection", None):
+            try:
+                await BrowserState.browser.connection.aclose()
+            except Exception:
+                pass
+        # Don't call .stop() — that terminates Chrome.
+    finally:
+        _ATTACHED_BROWSERS.discard(iid)
+        BrowserState.reset()
+    return ok(f"detached from {iid!r}. Chrome still running externally.")
 
 
 # ══════════════════════════════════════════════════════════════════════════
