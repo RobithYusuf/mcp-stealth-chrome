@@ -349,19 +349,40 @@ class BrowserState:
     # ── Legacy API (backward compat) ───────────────────────────────────────
 
     @classmethod
+    def _browser_alive(cls) -> bool:
+        """Return True if the browser connection is still live.
+
+        nodriver's `stopped` property checks `_process.returncode`, which is
+        always True (i.e. "stopped") when _process is None — that happens for
+        attached browsers (no subprocess was spawned). Use `connection.closed`
+        for those instead.
+        """
+        b = cls.browser
+        if b is None:
+            return False
+        # Attached browser: _process is None, so use CDP websocket liveness.
+        if getattr(b, "_process", None) is None:
+            conn = getattr(b, "connection", None)
+            if conn is None:
+                return False
+            return not getattr(conn, "closed", True)
+        # Launched browser: use the standard stopped flag.
+        return not getattr(b, "stopped", True)
+
+    @classmethod
     def is_up(cls) -> bool:
         if cls.browser is None or len(cls.tabs) == 0:
             return False
         # Check if browser process died (websocket dead, Chrome crashed, user closed window).
         # Without this check, stale references cause confusing "HTTP 500" on every subsequent call.
-        if getattr(cls.browser, "stopped", False):
+        if not cls._browser_alive():
             cls.reset()
             return False
         return True
 
     @classmethod
     def active_tab(cls) -> Tab:
-        if cls.browser is not None and getattr(cls.browser, "stopped", False):
+        if cls.browser is not None and not cls._browser_alive():
             cls.reset()
             raise RuntimeError(
                 "Browser died (Chrome closed or CDP websocket lost). State auto-reset — "
