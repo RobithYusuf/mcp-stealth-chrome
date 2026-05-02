@@ -55,10 +55,12 @@ from .state import (
     BrowserState,
     InstanceSnapshot,
     chrome_install_hint,
+    chrome_lock_holder_pid,
     chrome_user_data_root,
     clean_profile_state,
     ensure_dirs,
     find_chrome_binary,
+    find_external_chrome_pids,
     is_chrome_profile_locked,
     per_process_profile,
     resolve_default_profile,
@@ -423,12 +425,43 @@ async def browser_launch(
             return ok(f"Browser already running with {len(BrowserState.tabs)} tab(s).")
 
         ensure_dirs()
+
+        # Validate user-supplied --user-data-dir BEFORE launch (saves a 30s timeout).
+        # Many users pass a Chrome profile path in extra_args that's currently
+        # held by their daily Chrome — fail fast with actionable advice.
+        custom_udd: Optional[Path] = None
+        for arg in (extra_args or []):
+            if arg.startswith("--user-data-dir="):
+                custom_udd = Path(arg.split("=", 1)[1]).expanduser()
+                break
+        if custom_udd is not None:
+            holder_pid = chrome_lock_holder_pid(custom_udd) if custom_udd.exists() else None
+            if holder_pid is not None:
+                return err(
+                    f"Profile directory is locked by another Chrome process: "
+                    f"{custom_udd} (PID {holder_pid}). Close that Chrome window first, "
+                    f"OR use clone_chrome_profile to make a snapshot copy, "
+                    f"OR omit --user-data-dir to use the default MCP profile."
+                )
+
         # Per-process profile fallback: if another live MCP server already
         # holds the shared default profile lock, use ~/.mcp-stealth/profile-pid<N>/
         # so parallel Claude sessions never collide on Chrome's SingletonLock.
         profile_path = resolve_default_profile(persistent)
         used_fallback = persistent and profile_path != PROFILE_DIR
+
+        # Friendly upfront check on the default profile too (after resolve_default_profile
+        # has potentially picked a fallback). If somehow the resolved one is still locked
+        # by a live process, refuse with actionable error rather than hanging.
         if persistent:
+            holder_pid = chrome_lock_holder_pid(profile_path)
+            if holder_pid is not None:
+                return err(
+                    f"Default MCP profile is locked by PID {holder_pid}. "
+                    f"This usually means another mcp-stealth-chrome instance is running. "
+                    f"Run `pkill -f mcp-stealth-chrome` then retry, or use persistent=False "
+                    f"for an ephemeral throwaway profile."
+                )
             clean_profile_state(profile_path)  # only clears stale locks
         config = Config(
             user_data_dir=str(profile_path) if persistent else None,
@@ -478,7 +511,26 @@ async def browser_launch(
             raise
         except Exception as e:
             await _safe_stop_browser(browser)
-            return err(f"launch failed: {e}")
+            # Diagnose common nodriver "Failed to connect to browser" — usually
+            # means Chrome started but its CDP websocket couldn't be reached
+            # (profile locked, port collision, AV interference).
+            msg = str(e)
+            hint = ""
+            if "Failed to connect" in msg or "websocket" in msg.lower() or "connection refused" in msg.lower():
+                holder = chrome_lock_holder_pid(profile_path) if persistent else None
+                ext = find_external_chrome_pids()
+                parts = [f"launch failed (Chrome started but CDP unreachable): {msg}"]
+                if holder is not None:
+                    parts.append(f"→ Profile {profile_path} is locked by PID {holder}.")
+                elif ext:
+                    parts.append(f"→ Other Chrome processes running: PIDs {ext[:5]}{'...' if len(ext)>5 else ''}.")
+                parts.append(
+                    "Fix: (1) close existing Chrome / kill stale PIDs, "
+                    "(2) use persistent=False, or "
+                    "(3) clone_chrome_profile for an isolated snapshot."
+                )
+                hint = " ".join(parts)
+            return err(hint or f"launch failed: {e}")
 
         BrowserState.browser = browser
 
@@ -962,12 +1014,24 @@ async def screenshot(
                 # works, the screenshot path itself is the bottleneck (CDP /
                 # GPU / profile-state issue), not page JS.
                 hint = "browser_recover() to force-restart, or browser_close() + browser_launch(persistent=False)"
+                current_url = ""
+                try:
+                    current_url = await _wait(tab.evaluate("location.href"),
+                                              timeout=2.0, what="url probe") or ""
+                except Exception:
+                    pass
                 try:
                     rs = await _wait(tab.evaluate("document.readyState"),
                                       timeout=2.0, what="js probe")
                     if rs:
-                        hint = (f"page JS responsive (readyState={rs}) — "
-                                f"CDP screenshot path is stuck. {hint}")
+                        # about:blank has no paintable content — common foot-gun
+                        # right after browser_launch with default URL.
+                        if current_url in ("about:blank", "", "chrome://newtab/"):
+                            hint = (f"page is {current_url or 'about:blank'} — nothing to paint. "
+                                    "navigate() to a real URL first, then screenshot().")
+                        else:
+                            hint = (f"page JS responsive (readyState={rs}, url={current_url}) — "
+                                    f"CDP screenshot path is stuck. {hint}")
                     else:
                         hint = f"page JS unresponsive too. {hint}"
                 except Exception:
@@ -3737,7 +3801,9 @@ async def spawn_browser(
 
 @mcp.tool()
 async def list_instances() -> str:
-    """⭐ List all browser instances with status + last-active time."""
+    """⭐ List all browser instances with status + last-active time.
+    Also reports external (non-MCP) Chrome processes that may conflict with
+    custom --user-data-dir launches."""
     snapshots = BrowserState.list_snapshots()
     out = []
     now = time.time()
@@ -3755,7 +3821,16 @@ async def list_instances() -> str:
             "profile": str(s.profile_dir) if s.profile_dir else None,
             "uptime_seconds": int(now - s.created_at) if s.is_running() else 0,
         })
-    return ok(json.dumps(out, indent=2, default=str))
+    external = find_external_chrome_pids()
+    payload = {
+        "instances": out,
+        "external_chrome_pids": external,
+        "warning": (
+            f"{len(external)} external Chrome process(es) detected — "
+            "custom --user-data-dir pointing to your daily Chrome profile will conflict."
+        ) if external else None,
+    }
+    return ok(json.dumps(payload, indent=2, default=str))
 
 
 @mcp.tool()
