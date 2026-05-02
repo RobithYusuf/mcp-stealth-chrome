@@ -185,6 +185,46 @@ def is_chrome_profile_locked(profile_path: Path) -> bool:
     return _pid_alive(pid)
 
 
+def chrome_lock_holder_pid(profile_path: Path) -> Optional[int]:
+    """Return the PID currently holding this profile's SingletonLock, or None
+    if free / stale. Used to give actionable error messages on launch failure."""
+    if not is_chrome_profile_locked(profile_path):
+        return None
+    return _read_singleton_pid(profile_path)
+
+
+def find_external_chrome_pids() -> list[int]:
+    """Find PIDs of running Chrome processes NOT spawned by this MCP server.
+    Returns up to 10 PIDs. Empty list on error or non-POSIX without `pgrep`."""
+    import sys
+    if sys.platform == "win32":
+        try:
+            import subprocess
+            r = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq chrome.exe", "/NH", "/FO", "CSV"],
+                capture_output=True, text=True, timeout=2,
+            )
+            pids = []
+            for line in (r.stdout or "").splitlines()[:10]:
+                parts = line.split(",")
+                if len(parts) >= 2:
+                    pid_str = parts[1].strip('"')
+                    if pid_str.isdigit():
+                        pids.append(int(pid_str))
+            return pids
+        except Exception:
+            return []
+    try:
+        import subprocess
+        r = subprocess.run(
+            ["pgrep", "-f", "Google Chrome|chromium|chrome"],
+            capture_output=True, text=True, timeout=2,
+        )
+        return [int(p) for p in (r.stdout or "").split() if p.isdigit()][:10]
+    except Exception:
+        return []
+
+
 def per_process_profile() -> Path:
     """Per-PID profile path. Used when the shared default profile is held by
     another live MCP server process — lets parallel Claude sessions coexist
