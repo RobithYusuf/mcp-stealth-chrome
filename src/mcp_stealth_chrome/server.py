@@ -517,6 +517,15 @@ async def browser_launch(
                         f"for an ephemeral throwaway profile."
                     )
                 clean_profile_state(profile_path)  # only clears stale locks
+                # Selectively wipe corrupt window-placement / session-restore
+                # state. Idempotent + cheap (a few file writes), preserves
+                # cookies/login. Saves us from "window 0×0, hidden" bugs that
+                # survive macOS sleep/wake cycles. See state.wipe_window_state.
+                try:
+                    from .state import wipe_window_state as _wws
+                    _wws(profile_path)
+                except Exception:
+                    pass
 
         # Determine final user_data_dir for Config (None = nodriver picks a temp dir).
         if explicit_udd is not None:
@@ -845,8 +854,14 @@ async def browser_recover() -> str:
     except Exception:
         pass
 
-    # 5. Sweep stale locks across all known profile dirs
-    from .state import PROFILE_DIR as _PROFILE_DIR, PROFILES_ROOT, per_process_profile
+    # 5. Sweep stale locks + wipe corrupt window-state across all known profile
+    #    dirs. Selective wipe (NOT a full nuke) — preserves cookies/login but
+    #    removes the window_placement record + Sessions/ files that survive
+    #    sleep/wake cycles and cause "window 0×0 hidden" launches.
+    from .state import (
+        PROFILE_DIR as _PROFILE_DIR, PROFILES_ROOT, per_process_profile,
+        wipe_window_state,
+    )
     sweep_dirs: list = [_PROFILE_DIR, per_process_profile()]
     try:
         if PROFILES_ROOT.exists():
@@ -856,13 +871,25 @@ async def browser_recover() -> str:
     except Exception:
         pass
     cleared = 0
+    healed = {"prefs": 0, "sessions": 0, "files": 0}
     for pdir in sweep_dirs:
         try:
             clean_profile_state(pdir)  # only removes locks with dead PIDs
             cleared += 1
         except Exception:
             pass
+        try:
+            r = wipe_window_state(pdir)
+            if r.get("prefs"): healed["prefs"] += 1
+            healed["sessions"] += r.get("sessions", 0)
+            healed["files"] += r.get("files", 0)
+        except Exception:
+            pass
     steps.append(f"swept {cleared}/{len(sweep_dirs)} profile dirs")
+    steps.append(
+        f"healed window state: {healed['prefs']} prefs, "
+        f"{healed['sessions']} sessions, {healed['files']} blobs"
+    )
 
     return ok("recovered: " + " | ".join(steps))
 
