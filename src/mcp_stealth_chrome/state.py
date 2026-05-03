@@ -225,6 +225,40 @@ def find_external_chrome_pids() -> list[int]:
         return []
 
 
+def find_chrome_pids_by_profile(profile_path: Path) -> list[int]:
+    """Find PIDs of Chrome processes launched against a specific user-data-dir.
+    Used by browser_recover to kill zombie Chromes whose CDP path is wedged
+    but the OS process is still alive. Matches ANY argv containing
+    `--user-data-dir=<resolved_profile>` (covers nodriver-spawned helpers too).
+    Returns [] on Windows / pgrep failure.
+    """
+    import sys
+    if sys.platform == "win32":
+        return []  # WMIC argv parsing is fragile; skip until needed
+    try:
+        import subprocess
+        target = str(profile_path)
+        # `ps -ax -o pid=,command=` is portable across macOS+Linux. Pattern
+        # match in Python instead of pgrep -f because pgrep escapes regex
+        # characters in profile paths inconsistently across platforms.
+        r = subprocess.run(
+            ["ps", "-ax", "-o", "pid=,command="],
+            capture_output=True, text=True, timeout=3,
+        )
+        needle = f"--user-data-dir={target}"
+        pids: list[int] = []
+        for line in (r.stdout or "").splitlines():
+            line = line.strip()
+            if not line or needle not in line:
+                continue
+            head = line.split(None, 1)[0]
+            if head.isdigit():
+                pids.append(int(head))
+        return pids
+    except Exception:
+        return []
+
+
 def per_process_profile() -> Path:
     """Per-PID profile path. Used when the shared default profile is held by
     another live MCP server process — lets parallel Claude sessions coexist
