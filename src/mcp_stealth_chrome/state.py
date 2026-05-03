@@ -225,6 +225,89 @@ def find_external_chrome_pids() -> list[int]:
         return []
 
 
+def wipe_window_state(profile_path: Path | str | None = None) -> dict:
+    """Selectively wipe Chrome's window/session-restore state from a profile.
+
+    PRESERVES: cookies, login data, history, bookmarks, autofill, IndexedDB,
+    LocalStorage, extensions, site settings.
+
+    WIPES:
+      • `Default/Preferences` keys: `browser.window_placement`,
+        `session.startup_urls`, `session.restore_on_startup_migrated`
+      • `Default/Sessions/*` (tab/window restore data)
+      • `Default/Current Session`, `Default/Current Tabs`,
+        `Default/Last Session`, `Default/Last Tabs` (live session blobs)
+
+    Why: macOS sleep/wake cycles can corrupt the window-placement record
+    such that next launch has outerWidth/Height = 0 and visibilityState =
+    'hidden'. Disabling restore via launch flags doesn't help because
+    Chrome still reads the corrupt placement record. Wiping these files
+    forces Chrome to bring up a fresh window at default position/size on
+    the next launch, while keeping login + cookies intact.
+
+    Always best-effort — never raises. Returns a dict {prefs:bool, sessions:int, files:int}
+    summarising what got cleaned.
+    """
+    pdir = Path(profile_path) if profile_path else PROFILE_DIR
+    result = {"prefs": False, "sessions": 0, "files": 0}
+    default_dir = pdir / "Default"
+    if not default_dir.exists():
+        return result
+
+    # 1. Trim corrupt keys from Preferences (JSON file). Don't rewrite if
+    # parse fails — assume Chrome will rebuild on next launch.
+    prefs_file = default_dir / "Preferences"
+    if prefs_file.exists():
+        try:
+            data = json.loads(prefs_file.read_text())
+            changed = False
+            browser = data.get("browser") or {}
+            for key in ("window_placement", "last_window_state",
+                         "last_window_screen_placement"):
+                if key in browser:
+                    del browser[key]
+                    changed = True
+            if changed:
+                data["browser"] = browser
+            session = data.get("session") or {}
+            for key in ("startup_urls", "restore_on_startup_migrated"):
+                if key in session:
+                    del session[key]
+                    changed = True
+            if changed:
+                data["session"] = session
+                prefs_file.write_text(json.dumps(data))
+                result["prefs"] = True
+        except Exception:
+            pass
+
+    # 2. Remove Sessions/ contents (directory itself stays).
+    sessions_dir = default_dir / "Sessions"
+    if sessions_dir.exists():
+        try:
+            for child in sessions_dir.iterdir():
+                try:
+                    if child.is_file() or child.is_symlink():
+                        child.unlink()
+                        result["sessions"] += 1
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # 3. Remove top-level current/last session+tabs blobs.
+    for fname in ("Current Session", "Current Tabs",
+                   "Last Session", "Last Tabs"):
+        f = default_dir / fname
+        try:
+            if f.exists() or f.is_symlink():
+                f.unlink()
+                result["files"] += 1
+        except Exception:
+            pass
+    return result
+
+
 def find_chrome_pids_by_profile(profile_path: Path) -> list[int]:
     """Find PIDs of Chrome processes launched against a specific user-data-dir.
     Used by browser_recover to kill zombie Chromes whose CDP path is wedged
