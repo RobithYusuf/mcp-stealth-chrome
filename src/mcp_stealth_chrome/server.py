@@ -542,6 +542,15 @@ async def browser_launch(
         if proxy:
             config.add_argument(f"--proxy-server={proxy}")
         config.add_argument(f"--window-size={window_width},{window_height}")
+        # Force a deterministic on-screen position. Without this, Chrome
+        # restores its last saved position from the persistent profile —
+        # which after a macOS sleep/wake cycle is often off-screen or 0×0,
+        # making the window invisible and CDP Browser.getWindowForTarget
+        # return -32000 "window not found". Override unless the user
+        # already supplied their own --window-position via extra_args.
+        if not any((a or "").startswith("--window-position=")
+                    for a in merged_extra_args):
+            config.add_argument("--window-position=100,100")
         if testing_mode:
             for _flag in (
                 "--blink-settings=imagesEnabled=false",
@@ -648,6 +657,50 @@ async def browser_launch(
             f"by another Chrome]"
             if used_fallback else ""
         )
+
+        # Post-launch health check — degenerate window detection.
+        # After a macOS sleep/wake cycle (or some persistent-profile state
+        # corruption) Chrome can come up with outerWidth==0, position
+        # off-screen, or visibilityState=='hidden'. Tools work but every
+        # mouse_click_xy / set_viewport_size fails with cryptic CDP errors.
+        # Detect once + try a single bring_to_front; report rather than fix
+        # silently so the caller knows when to call browser_recover().
+        health_suffix = ""
+        if not headless:
+            try:
+                probe = await _wait(main.evaluate(
+                    "JSON.stringify({w:window.outerWidth,h:window.outerHeight,"
+                    "v:document.visibilityState,sx:window.screenX,sy:window.screenY})"
+                ), timeout=2.0, what="health probe")
+                import json as _json
+                hv = _json.loads(probe) if isinstance(probe, str) else (probe or {})
+                if hv.get("w", 1) == 0 or hv.get("h", 1) == 0 or hv.get("v") == "hidden":
+                    # One nudge — bring window to front and re-probe
+                    try:
+                        await main.bring_to_front()
+                    except Exception:
+                        pass
+                    try:
+                        await main.activate()
+                    except Exception:
+                        pass
+                    try:
+                        probe2 = await _wait(main.evaluate(
+                            "JSON.stringify({w:window.outerWidth,h:window.outerHeight,"
+                            "v:document.visibilityState})"
+                        ), timeout=2.0, what="health re-probe")
+                        hv2 = _json.loads(probe2) if isinstance(probe2, str) else (probe2 or {})
+                    except Exception:
+                        hv2 = hv
+                    if hv2.get("w", 1) == 0 or hv2.get("h", 1) == 0 or hv2.get("v") == "hidden":
+                        health_suffix = (
+                            f" [⚠ window degenerate (w={hv2.get('w')},h={hv2.get('h')},"
+                            f"v={hv2.get('v')}) — likely sleep/wake corruption. "
+                            f"Run browser_recover() then browser_launch() to recover.]"
+                        )
+            except Exception:
+                pass  # health probe is best-effort; never block launch
+
         verify_suffix = ""
         if auto_verify:
             try:
@@ -656,7 +709,7 @@ async def browser_launch(
                 verify_suffix = ""
         return ok(
             f"Browser launched (headless={headless}, persistent={persistent}). "
-            f"Loaded {url}{suffix}{verify_suffix}"
+            f"Loaded {url}{suffix}{verify_suffix}{health_suffix}"
         )
 
 
@@ -701,11 +754,12 @@ async def browser_recover() -> str:
     Escape hatch when browser_close() can't run (graceful shutdown depends
     on internal state that may be corrupt). Steps:
     1. Best-effort browser.stop() — ignore any errors
-    2. Reset BrowserState (clears tabs, instances, network index, locks)
-    3. Clear devtools / dialog caches
-    4. Wipe stale Singleton* lock files in the default profile (only if
-       their PID is dead — never yanks a live sibling process's lock)
-    5. Mark profile as cleanly exited
+    2. Kill orphan Chrome PIDs whose argv references the active profile
+       (SIGTERM, then SIGKILL after 2s if still alive) — only PIDs spawned
+       against THIS MCP profile, never the user's daily Chrome
+    3. Reset BrowserState (clears tabs, instances, network index, locks)
+    4. Clear devtools / dialog caches
+    5. Wipe stale Singleton* lock files in all known profile dirs
 
     Always succeeds — never raises. Use this when normal close hangs or
     returns an error you can't diagnose. After this, browser_launch()
@@ -713,7 +767,9 @@ async def browser_recover() -> str:
     """
     steps: list[str] = []
 
-    # 1. Best-effort stop
+    # 1. Best-effort stop. Capture profile dir BEFORE reset so step 2 can
+    #    target only Chrome PIDs that belong to this profile.
+    target_profile = BrowserState.current_profile_dir
     try:
         b = BrowserState.browser
         if b and not getattr(b, "stopped", False):
@@ -725,14 +781,53 @@ async def browser_recover() -> str:
     except Exception:
         pass
 
-    # 2. Reset state regardless
+    # 2. SIGTERM/SIGKILL orphan Chrome PIDs that match this profile. Skips
+    #    silently if no profile dir is recorded (attached browser, etc).
+    if target_profile is not None:
+        try:
+            from .state import find_chrome_pids_by_profile
+            pids = find_chrome_pids_by_profile(target_profile)
+        except Exception:
+            pids = []
+        if pids:
+            import signal as _signal
+            terminated = 0
+            killed = 0
+            for pid in pids:
+                try:
+                    os.kill(pid, _signal.SIGTERM)
+                    terminated += 1
+                except ProcessLookupError:
+                    pass
+                except Exception:
+                    pass
+            if terminated:
+                # Give SIGTERM up to 2s to take effect, then SIGKILL stragglers.
+                await asyncio.sleep(2.0)
+                for pid in pids:
+                    try:
+                        os.kill(pid, 0)  # liveness probe
+                    except ProcessLookupError:
+                        continue
+                    except Exception:
+                        continue
+                    try:
+                        os.kill(pid, _signal.SIGKILL)
+                        killed += 1
+                    except Exception:
+                        pass
+            steps.append(f"chrome PIDs: {terminated} SIGTERM, {killed} SIGKILL")
+        else:
+            steps.append("no orphan chrome PIDs")
+
+    # 3. Reset state regardless
     try:
         BrowserState.reset()
         steps.append("state reset")
     except Exception as e:
         steps.append(f"state reset failed: {type(e).__name__}: {e}")
 
-    # 3. Clear caches
+    # 4. Clear caches
     try:
         _SNAPSHOT_CACHE.clear()
     except Exception:
@@ -750,7 +845,7 @@ async def browser_recover() -> str:
     except Exception:
         pass
 
-    # 4. Sweep stale locks across all known profile dirs
+    # 5. Sweep stale locks across all known profile dirs
     from .state import PROFILE_DIR as _PROFILE_DIR, PROFILES_ROOT, per_process_profile
     sweep_dirs: list = [_PROFILE_DIR, per_process_profile()]
     try:
