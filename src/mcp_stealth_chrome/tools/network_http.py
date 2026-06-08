@@ -10,22 +10,18 @@ Tools:
 - detect_anti_bot: classify Cloudflare / DataDome / PerimeterX / Akamai / etc.
 
 Internal helpers re-exported by server.py for backward compat:
-- _http_session_state
 - _get_browser_cookies_for_url
 """
 from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any, Literal, Optional
+from typing import Literal, Optional
 
 from .._app import mcp
 from ..helpers import err, get_url, ok, parse_json
 from ..humanize import humanized_move
 from ..state import BrowserState
-
-
-_http_session_state: dict[str, Any] = {"cookies": [], "last_origin": None}
 
 
 async def _get_browser_cookies_for_url(url: str) -> list[dict]:
@@ -104,10 +100,13 @@ async def http_request(
                 kwargs["headers"] = hdrs
             if cookies_dict:
                 kwargs["cookies"] = cookies_dict
-            if data is not None:
-                kwargs["data"] = data
+            # json_body takes precedence — curl_cffi overwrites the data-derived
+            # body with the JSON body anyway, so make that explicit and never
+            # pass both (which would also clobber the Content-Type).
             if json_body is not None:
                 kwargs["json"] = json_body
+            elif data is not None:
+                kwargs["data"] = data
 
             resp = await session.request(method.upper(), url, **kwargs)
 
@@ -162,6 +161,8 @@ async def http_session_cookies(url: str) -> str:
 
     Helpful to verify session sharing works before making requests.
     """
+    if not BrowserState.is_up():
+        return err("browser_launch first")
     cookies = await _get_browser_cookies_for_url(url)
     return ok(json.dumps({
         "url": url,
@@ -186,7 +187,7 @@ async def session_warmup(
     """
     # Late import: mouse_drift lives in server.py (precision mouse section).
     # By call time, server.py module is fully initialized.
-    from ..server import mouse_drift  # noqa: E402
+    from ..server import mouse_drift
     try:
         if not BrowserState.is_up():
             return err("browser_launch first")
@@ -217,7 +218,8 @@ async def session_warmup(
                 (() => {{
                   const t = {json.dumps(target_url)};
                   const links = Array.from(document.querySelectorAll('a[href]'));
-                  const hit = links.find(a => t.startsWith(a.href) || a.href.includes(new URL(t).pathname.split('/')[1] || ''));
+                  const seg = new URL(t).pathname.split('/')[1] || '';
+                  const hit = links.find(a => t.startsWith(a.href) || (seg && a.href.includes(seg)));
                   if (!hit) return null;
                   const r = hit.getBoundingClientRect();
                   return JSON.stringify({{

@@ -14,7 +14,6 @@ def _patch_cookie_same_party() -> None:
     """
     try:
         from nodriver.cdp import network as cdp_network
-        from dataclasses import fields
         if getattr(cdp_network.Cookie, "_mcp_sameparty_patched", False):
             return
 
