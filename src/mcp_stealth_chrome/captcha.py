@@ -51,10 +51,20 @@ async def solve(
             f"{CAPSOLVER_API}/createTask",
             json={"clientKey": api_key, "task": payload_task},
         )
-        data = create.json()
+        # A non-JSON body (HTML error page, gateway 502, rate-limit text) would
+        # raise a bare JSONDecodeError that the caller's `except CapSolverError`
+        # doesn't catch — normalise it into a CapSolverError.
+        try:
+            data = create.json()
+        except Exception as e:
+            raise CapSolverError(
+                f"createTask HTTP {create.status_code}: {create.text[:200]}"
+            ) from e
         if data.get("errorId"):
             raise CapSolverError(f"createTask: {data.get('errorDescription', data)}")
-        task_id = data["taskId"]
+        task_id = data.get("taskId")
+        if not task_id:
+            raise CapSolverError(f"createTask: missing taskId in {data}")
 
         deadline = asyncio.get_event_loop().time() + timeout
         while asyncio.get_event_loop().time() < deadline:
@@ -63,7 +73,12 @@ async def solve(
                 f"{CAPSOLVER_API}/getTaskResult",
                 json={"clientKey": api_key, "taskId": task_id},
             )
-            rdata = res.json()
+            try:
+                rdata = res.json()
+            except Exception as e:
+                raise CapSolverError(
+                    f"getTaskResult HTTP {res.status_code}: {res.text[:200]}"
+                ) from e
             if rdata.get("errorId"):
                 raise CapSolverError(f"getTaskResult: {rdata.get('errorDescription', rdata)}")
             if rdata.get("status") == "ready":
