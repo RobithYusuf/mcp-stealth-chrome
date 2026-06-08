@@ -18,6 +18,8 @@ from typing import Optional, Tuple
 
 from nodriver import Element, Tab
 
+from .helpers import parse_json
+
 
 def _bezier_point(t: float, p0: Tuple[float, float], p1: Tuple[float, float],
                   p2: Tuple[float, float], p3: Tuple[float, float]) -> Tuple[float, float]:
@@ -142,19 +144,18 @@ async def humanized_scroll(
 
     # Default wheel origin to viewport center
     if position is None:
+        position = (500, 400)
         try:
             vp = await tab.evaluate(
                 "JSON.stringify([innerWidth/2, innerHeight/2])",
                 return_by_value=True,
             )
-            import json as _j
-            try:
-                px, py = _j.loads(str(vp))
-                position = (int(px), int(py))
-            except Exception:
-                position = (500, 400)
+            vp = vp.value if hasattr(vp, "value") else vp
+            coords = parse_json(str(vp), None)
+            if isinstance(coords, list) and len(coords) == 2:
+                position = (int(coords[0]), int(coords[1]))
         except Exception:
-            position = (500, 400)
+            pass
 
     target = abs(delta_y)
     direction = 1 if delta_y > 0 else -1
@@ -172,11 +173,23 @@ async def humanized_scroll(
                 delta_y=chunk * direction,
             ))
         except Exception:
-            # Fallback: JS scroll (less stealthy but works)
-            await tab.evaluate(
-                f"window.scrollBy(0, {chunk * direction})",
-                return_by_value=True,
-            )
+            # Retry the real wheel event once — CDP wheel is the stealth path
+            # (window.scrollBy is the detected pattern this module avoids, see
+            # module docstring #3). Only fall back to scrollBy if CDP input is
+            # persistently unavailable.
+            try:
+                await asyncio.sleep(0.05)
+                await tab.send(cdp_input.dispatch_mouse_event(
+                    type_="mouseWheel",
+                    x=position[0], y=position[1],
+                    delta_x=0, delta_y=chunk * direction,
+                ))
+            except Exception:
+                # LAST-RESORT, INTENTIONALLY NON-STEALTH fallback.
+                await tab.evaluate(
+                    f"window.scrollBy(0, {chunk * direction})",
+                    return_by_value=True,
+                )
         scrolled += chunk
         # Micro-pause between chunks (scroll bursts, not continuous)
         await asyncio.sleep(random.uniform(0.05, 0.15))

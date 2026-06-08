@@ -131,6 +131,8 @@ async def _claude_vision_pick_tiles(
                 }],
             },
         )
+        if resp.status_code >= 400:
+            raise RuntimeError(f"vision API {resp.status_code}: {resp.text[:300]}")
         data = resp.json()
         text = (data.get("content", [{}])[0]).get("text", "[]").strip()
         return _parse_vision_response(text)
@@ -167,6 +169,8 @@ async def _openai_compat_vision_pick_tiles(
                 }],
             },
         )
+        if resp.status_code >= 400:
+            raise RuntimeError(f"vision API {resp.status_code}: {resp.text[:300]}")
         data = resp.json()
         try:
             text = data["choices"][0]["message"]["content"]
@@ -417,7 +421,7 @@ async def solve_recaptcha_ai(
             shot_path = SCREENSHOT_DIR / ts_filename(f"recaptcha-r{round_num}", "png")
             await tab.save_screenshot(filename=str(shot_path), format="png")
             try:
-                img_bytes = open(str(shot_path), "rb").read()
+                img_bytes = shot_path.read_bytes()
                 if not img_bytes:
                     return err(f"screenshot file empty: {shot_path}")
                 img_b64 = _b64.b64encode(img_bytes).decode()
@@ -433,6 +437,7 @@ async def solve_recaptcha_ai(
             # model may refuse / under-identify ambiguous ones but next challenge works.
             grid_detected, tiles = "3x3", []
             max_refresh = 3
+            refresh_read_err = None
             for refresh_attempt in range(max_refresh + 1):
                 if resolved_provider == "anthropic":
                     grid_detected, tiles = await _claude_vision_pick_tiles(
@@ -457,16 +462,22 @@ async def solve_recaptcha_ai(
                     )
                     await tab.save_screenshot(filename=str(shot_path), format="png")
                     try:
-                        img_bytes = open(str(shot_path), "rb").read()
+                        img_bytes = shot_path.read_bytes()
+                        if not img_bytes:
+                            raise ValueError("empty refresh screenshot")
                         img_b64 = _b64.b64encode(img_bytes).decode()
-                    except Exception:
-                        pass  # keep previous img_b64
+                    except Exception as e:
+                        # Fresh screenshot unreadable — don't re-query the model
+                        # on the stale identical image; bail to the err() below.
+                        refresh_read_err = e
+                        break
 
             if not tiles:
+                suffix = f"; refresh screenshot unreadable: {refresh_read_err}" if refresh_read_err else ""
                 return err(
                     f"round {round_num}: {resolved_provider} ({resolved_model}) "
                     f"returned no tiles after {max_refresh} refresh attempts "
-                    f"(grid={grid_detected!r})"
+                    f"(grid={grid_detected!r}){suffix}"
                 )
 
             # Step 5: dynamic grid math (supports 3x3 images OR 4x4 squares)
@@ -558,7 +569,7 @@ async def vision_locate(
     # Late import of _wait — defined in server.py and only available after
     # server.py finishes its module body. Vision module is imported at the
     # end of server.py, so by call time _wait is bound on server.
-    from ..server import _wait  # noqa: E402
+    from ..server import _wait
     try:
         tab = BrowserState.active_tab()
         try:
@@ -603,6 +614,8 @@ async def vision_locate(
                         ]}],
                     },
                 )
+                if resp.status_code >= 400:
+                    raise RuntimeError(f"vision API {resp.status_code}: {resp.text[:300]}")
                 data = resp.json()
                 response_text = (data.get("content", [{}])[0]).get("text", "").strip()
         else:
@@ -623,6 +636,8 @@ async def vision_locate(
                         ]}],
                     },
                 )
+                if resp.status_code >= 400:
+                    raise RuntimeError(f"vision API {resp.status_code}: {resp.text[:300]}")
                 data = resp.json()
                 try:
                     response_text = data["choices"][0]["message"]["content"]

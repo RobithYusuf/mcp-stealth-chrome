@@ -20,7 +20,6 @@ from typing import Any, Literal, Optional
 import httpx
 
 import nodriver
-from mcp.server.fastmcp import FastMCP
 from nodriver import Browser, Config, Tab
 
 from . import __version__
@@ -62,7 +61,6 @@ from .state import (
     find_chrome_binary,
     find_external_chrome_pids,
     is_chrome_profile_locked,
-    per_process_profile,
     resolve_default_profile,
 )
 
@@ -82,11 +80,11 @@ async def _wait(coro, timeout: Optional[float] = None, what: str = "operation"):
     asyncio.TimeoutError as a regular exception with a useful message."""
     try:
         return await asyncio.wait_for(coro, timeout=timeout or TOOL_ACTION_TIMEOUT)
-    except asyncio.TimeoutError:
+    except asyncio.TimeoutError as e:
         raise TimeoutError(
             f"{what} timed out after {timeout or TOOL_ACTION_TIMEOUT}s — "
             f"page JS may be stuck or blocked. Try reload, or close+launch."
-        )
+        ) from e
 
 # Serialize concurrent launches inside ONE MCP process. Cross-process collision
 # is handled separately by `resolve_default_profile()` (per-PID fallback).
@@ -681,8 +679,7 @@ async def browser_launch(
                     "JSON.stringify({w:window.outerWidth,h:window.outerHeight,"
                     "v:document.visibilityState,sx:window.screenX,sy:window.screenY})"
                 ), timeout=2.0, what="health probe")
-                import json as _json
-                hv = _json.loads(probe) if isinstance(probe, str) else (probe or {})
+                hv = json.loads(probe) if isinstance(probe, str) else (probe or {})
                 if hv.get("w", 1) == 0 or hv.get("h", 1) == 0 or hv.get("v") == "hidden":
                     # One nudge — bring window to front and re-probe
                     try:
@@ -698,7 +695,7 @@ async def browser_launch(
                             "JSON.stringify({w:window.outerWidth,h:window.outerHeight,"
                             "v:document.visibilityState})"
                         ), timeout=2.0, what="health re-probe")
-                        hv2 = _json.loads(probe2) if isinstance(probe2, str) else (probe2 or {})
+                        hv2 = json.loads(probe2) if isinstance(probe2, str) else (probe2 or {})
                     except Exception:
                         hv2 = hv
                     if hv2.get("w", 1) == 0 or hv2.get("h", 1) == 0 or hv2.get("v") == "hidden":
@@ -714,7 +711,7 @@ async def browser_launch(
         if auto_verify:
             try:
                 verify_suffix = await asyncio.wait_for(_auto_verify_cf(main), timeout=25.0)
-            except (asyncio.TimeoutError, Exception):
+            except Exception:
                 verify_suffix = ""
         return ok(
             f"Browser launched (headless={headless}, persistent={persistent}). "
@@ -732,7 +729,11 @@ async def browser_close() -> str:
             BrowserState.browser.stop()
     except Exception as e:
         return err(f"close failed: {e}")
+    # Capture the id BEFORE reset() (which may change current_instance_id) so
+    # we can drop any attached-browser bookkeeping for it.
+    _closed_iid = BrowserState.current_instance_id
     BrowserState.reset()
+    _ATTACHED_BROWSERS.discard(_closed_iid)
     # Clear transient caches that key off tab identity (id() can be reused).
     # devtools state lives in tools/devtools.py — lazy import + tolerate
     # the module not being loaded yet (no devtools tool ever called).
@@ -749,6 +750,9 @@ async def browser_close() -> str:
     # id() doesn't get skipped on re-arm.
     try:
         _DIALOG_AUTO_CFG["_registered_tab_ids"].clear()
+        _dialog_pre_action["_registered_tab_ids"].clear()
+        _CONSOLE_ARMED_TAB_IDS.clear()
+        _NETWORK_ARMED_TAB_IDS.clear()
     except Exception:
         pass
     # Mark profile as cleanly exited so next launch skips restore dialog
@@ -851,6 +855,9 @@ async def browser_recover() -> str:
         pass
     try:
         _DIALOG_AUTO_CFG["_registered_tab_ids"].clear()
+        _dialog_pre_action["_registered_tab_ids"].clear()
+        _CONSOLE_ARMED_TAB_IDS.clear()
+        _NETWORK_ARMED_TAB_IDS.clear()
     except Exception:
         pass
 
@@ -906,7 +913,7 @@ async def navigate(
     auto_verify: bool = True,
     focus: bool = True,
 ) -> str:
-    """Navigate the active tab to url. wait_until: load|domcontentloaded|none.
+    """Navigate the active tab to url. wait_until: load|none.
 
     auto_verify: if True (default), automatically detect Cloudflare /
     Turnstile challenges after load and click the checkbox naturally
@@ -939,7 +946,7 @@ async def navigate(
         if auto_verify:
             try:
                 verify_suffix = await asyncio.wait_for(_auto_verify_cf(tab), timeout=25.0)
-            except (asyncio.TimeoutError, Exception):
+            except Exception:
                 verify_suffix = ""
         return ok(f"Navigated to {await get_url(tab)}{verify_suffix}")
     except Exception as e:
@@ -1275,7 +1282,9 @@ async def get_text(selector: Optional[str] = None, ref: Optional[str] = None) ->
                 return err(f"selector not found: {selector}")
             return ok(el.text_all or "")
         result = await tab.evaluate("document.body.innerText", return_by_value=True)
-        return ok(str(result or ""))
+        # Unwrap RemoteObject (nodriver returns the wrapper for falsy values).
+        text = result.value if hasattr(result, "value") and not isinstance(result, str) else result
+        return ok(str(text or ""))
     except Exception as e:
         return err(str(e))
 
@@ -1455,14 +1464,21 @@ async def type_text(text: str, humanize: bool = False,
         el = await tab.query_selector("[data-mcp-focused='1']")
         if el is None:
             return err("focused element lookup failed")
-        if humanize:
-            await humanized_type(el, text, mean_delay=mean_delay)
-        else:
-            await el.send_keys(text)
-        await tab.evaluate(
-            "document.querySelectorAll('[data-mcp-focused]').forEach(e=>e.removeAttribute('data-mcp-focused'))",
-            return_by_value=True,
-        )
+        try:
+            if humanize:
+                await humanized_type(el, text, mean_delay=mean_delay)
+            else:
+                await el.send_keys(text)
+        finally:
+            # Always strip the marker, even if typing raised — a stale
+            # data-mcp-focused would poison the next type_text lookup.
+            try:
+                await tab.evaluate(
+                    "document.querySelectorAll('[data-mcp-focused]').forEach(e=>e.removeAttribute('data-mcp-focused'))",
+                    return_by_value=True,
+                )
+            except Exception:
+                pass
         return ok("typed")
     except Exception as e:
         return err(str(e))
@@ -1668,6 +1684,14 @@ async def wait_for_response(url_pattern: str, timeout: float = 15.0) -> str:
         regex = re.compile(url_pattern)
         matched: dict[str, Any] = {}
         from nodriver.cdp import network as cdp_network
+        # CDP does NOT dispatch Network.responseReceived unless the Network
+        # domain is enabled on this tab — without this the handler never fires
+        # and the tool always (falsely) times out. Mirrors network_start /
+        # network_get / auth_capture / wait_for_request. Idempotent.
+        try:
+            await tab.send(cdp_network.enable())
+        except Exception:
+            pass
 
         async def handler(event):
             if hasattr(event, "response") and regex.search(event.response.url):
@@ -1675,10 +1699,18 @@ async def wait_for_response(url_pattern: str, timeout: float = 15.0) -> str:
                 matched["status"] = event.response.status
 
         tab.add_handler(cdp_network.ResponseReceived, handler)
-        deadline = time.time() + timeout
-        while time.time() < deadline and "url" not in matched:
-            await asyncio.sleep(0.2)
-        tab.remove_handler(cdp_network.ResponseReceived, handler)
+        try:
+            deadline = time.time() + timeout
+            while time.time() < deadline and "url" not in matched:
+                await asyncio.sleep(0.2)
+        finally:
+            # Drop ONLY our handler. nodriver's remove_handler(evt, fn) deletes
+            # the whole handler list for that event (clobbering a concurrent
+            # network_start/auth_capture capture); filter the list directly.
+            try:
+                tab.handlers[cdp_network.ResponseReceived].remove(handler)
+            except (KeyError, ValueError):
+                pass
         if "url" in matched:
             return ok(f"response {matched['status']} {matched['url']}")
         return err("timeout")
@@ -1700,8 +1732,17 @@ async def tab_list() -> str:
         await _refresh_tabs()
         lines = [f"Active tab: {BrowserState.active_tab_index}"]
         for i, t in enumerate(BrowserState.tabs):
-            url = await get_url(t)
-            title = await get_title(t)
+            # One combined evaluate per tab (was two: get_url + get_title).
+            try:
+                r = await t.evaluate(
+                    "JSON.stringify([window.location.href, document.title])",
+                    return_by_value=True,
+                )
+                r = r.value if hasattr(r, "value") and not isinstance(r, str) else r
+                url, title = json.loads(r)
+                url, title = (url or ""), (title or "")
+            except Exception:
+                url, title = "", ""
             marker = "*" if i == BrowserState.active_tab_index else " "
             lines.append(f"{marker}[{i}] {title[:40]} | {url}")
         return ok("\n".join(lines))
@@ -1767,13 +1808,30 @@ async def cookie_list(url: Optional[str] = None) -> str:
             return err("browser not running")
         cookies = await BrowserState.browser.cookies.get_all()
         if url:
-            cookies = [c for c in cookies if url in (c.domain or "")]
+            cookies = [c for c in cookies if _cookie_domain_match(c.domain, url)]
         data = [{"name": c.name, "value": c.value, "domain": c.domain,
                  "path": c.path, "expires": c.expires,
                  "http_only": c.http_only, "secure": c.secure} for c in cookies]
         return ok(json.dumps(data, indent=2, default=str))
     except Exception as e:
         return err(str(e))
+
+
+def _cookie_domain_match(cookie_domain: Optional[str], url_or_host: str) -> bool:
+    """Match a cookie domain against a user-supplied host or full URL.
+
+    Accepts a bare host ("example.com") or a URL ("https://example.com/x").
+    Matches the exact host or a parent-domain (registrable-suffix) cookie,
+    ignoring a leading dot on the cookie domain — so filtering by "example.com"
+    no longer also matches "notexample.com" or "example.com.evil.test" the way
+    a bare substring check did.
+    """
+    from urllib.parse import urlparse
+    host = (urlparse(url_or_host).hostname or url_or_host).lower().strip().strip(".")
+    cd = (cookie_domain or "").lower().strip().lstrip(".")
+    if not cd or not host:
+        return False
+    return host == cd or host.endswith("." + cd) or cd.endswith("." + host)
 
 
 def _active_tab_host() -> Optional[str]:
@@ -1815,11 +1873,22 @@ def _parse_cookie_text(text: str, default_domain: Optional[str]) -> list[dict]:
                 return [c for c in data if isinstance(c, dict)]
         except Exception:
             pass  # fall through to text parsing
-    # 2. Netscape cookies.txt — tab-separated, lines may have leading "# "
-    lines = [ln for ln in text.splitlines() if ln.strip() and not ln.startswith("#")]
-    if lines and "\t" in lines[0]:
+    # 2. Netscape cookies.txt — tab-separated. The "#HttpOnly_" prefix is a real
+    #    flag (curl/wget emit it), NOT a comment; every other "#" line is a comment.
+    parsed_lines: list[tuple[str, bool]] = []
+    for ln in text.splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        if s.startswith("#HttpOnly_"):
+            parsed_lines.append((s[len("#HttpOnly_"):], True))
+        elif s.startswith("#"):
+            continue
+        else:
+            parsed_lines.append((s, False))
+    if parsed_lines and "\t" in parsed_lines[0][0]:
         out: list[dict] = []
-        for ln in lines:
+        for ln, http_only in parsed_lines:
             parts = ln.split("\t")
             if len(parts) < 7:
                 continue
@@ -1832,6 +1901,7 @@ def _parse_cookie_text(text: str, default_domain: Optional[str]) -> list[dict]:
                 "name": name, "value": value,
                 "domain": domain, "path": path,
                 "secure": secure.lower() == "true",
+                "httpOnly": http_only,
                 "expires": exp,
             })
         if out:
@@ -2065,7 +2135,7 @@ async def cookie_export(filename: Optional[str] = None,
             return err("browser not running")
         cookies = await BrowserState.browser.cookies.get_all()
         if url:
-            cookies = [c for c in cookies if url in (c.domain or "")]
+            cookies = [c for c in cookies if _cookie_domain_match(c.domain, url)]
         data = [{
             "name": c.name, "value": c.value, "domain": c.domain,
             "path": c.path, "expires": c.expires,
@@ -2095,6 +2165,10 @@ async def localstorage_get(key: Optional[str] = None) -> str:
             result = await tab.evaluate(
                 f"localStorage.getItem({json.dumps(key)})", return_by_value=True,
             )
+            # nodriver hands back a raw RemoteObject when the value is falsy
+            # (e.g. empty-string item) — unwrap so we never return its repr.
+            if hasattr(result, "value") and not isinstance(result, (str, int, float, bool, list, dict)):
+                result = result.value
             return ok(str(result) if result is not None else "null")
         all_ls = await tab.get_local_storage()
         return ok(json.dumps(all_ls, indent=2))
@@ -2136,12 +2210,16 @@ async def sessionstorage_get(key: Optional[str] = None) -> str:
             result = await tab.evaluate(
                 f"sessionStorage.getItem({json.dumps(key)})", return_by_value=True,
             )
+            if hasattr(result, "value") and not isinstance(result, (str, int, float, bool, list, dict)):
+                result = result.value
             return ok(str(result) if result is not None else "null")
         # Enumerate all keys
         result = await tab.evaluate(
             "(() => {var o={}; for(var i=0;i<sessionStorage.length;i++){var k=sessionStorage.key(i); o[k]=sessionStorage.getItem(k);} return JSON.stringify(o);})()",
             return_by_value=True,
         )
+        if hasattr(result, "value") and not isinstance(result, (str, int, float, bool, list, dict)):
+            result = result.value
         return ok(str(result or "{}"))
     except Exception as e:
         return err(str(e))
@@ -2263,7 +2341,9 @@ async def evaluate(expression: str) -> str:
 
 @mcp.tool()
 async def inject_init_script(script: str) -> str:
-    """Register a script that runs on every new document (before page scripts)."""
+    """Register a script that runs before page scripts on every navigation of
+    the CURRENT tab. Scope is the active tab/target only — it is NOT auto-applied
+    to other open tabs or to tabs opened later; re-run per tab if needed."""
     try:
         tab = BrowserState.active_tab()
         from nodriver.cdp import page as cdp_page
@@ -2311,11 +2391,23 @@ async def get_attribute(
         sel_for_js = f'[data-mcp-ref="{ref}"]' if ref else selector
         if not sel_for_js:
             return err("ref or selector required")
-        result = await tab.evaluate(
-            f'document.querySelector({json.dumps(sel_for_js)}).getAttribute({json.dumps(name)})',
-            return_by_value=True,
+        # IIFE: null-check the element (raw querySelector(...).getAttribute
+        # throws on a missing element) and map JS null to a non-falsy sentinel
+        # so nodriver doesn't hand back a RemoteObject we'd str()-dump.
+        js = (
+            f"(() => {{ var el = document.querySelector({json.dumps(sel_for_js)}); "
+            f"if (!el) return '__MCP_NO_EL__'; "
+            f"var v = el.getAttribute({json.dumps(name)}); "
+            f"return v === null ? '__MCP_NULL__' : v; }})()"
         )
-        return ok(str(result) if result is not None else "null")
+        result = await tab.evaluate(js, return_by_value=True)
+        if hasattr(result, "value") and not isinstance(result, (str, int, float, bool, list, dict)):
+            result = result.value
+        if result == "__MCP_NO_EL__":
+            return err("element not found")
+        if result == "__MCP_NULL__" or result is None:
+            return ok("null")
+        return ok(str(result))
     except Exception as e:
         return err(str(e))
 
@@ -2387,19 +2479,29 @@ async def list_frames() -> str:
 
 @mcp.tool()
 async def frame_evaluate(frame_url_pattern: str, expression: str) -> str:
-    """Run JS inside an iframe matching URL pattern."""
+    """Run JS inside an iframe matching URL pattern.
+
+    Same-origin frames only: cross-origin iframes (reCAPTCHA bframe, payment
+    widgets, third-party embeds) block contentWindow.eval and return an error.
+    """
     try:
         tab = BrowserState.active_tab()
-        regex = re.compile(frame_url_pattern)
-        # Simplified: find iframe element by src match, then evaluate within
+        # Build the matcher from a string via new RegExp(...) so slashes and
+        # other regex/JS-special chars in the pattern can't break the JS literal.
         result = await tab.evaluate(
-            f"(() => {{ var iframes = document.querySelectorAll('iframe'); "
-            f"for (var f of iframes) {{ if (/{regex.pattern}/.test(f.src)) {{ "
+            f"(() => {{ var re = new RegExp({json.dumps(frame_url_pattern)}); "
+            f"var iframes = document.querySelectorAll('iframe'); "
+            f"for (var f of iframes) {{ if (re.test(f.src)) {{ "
             f"try {{ return JSON.stringify(f.contentWindow.eval({json.dumps(expression)})); }} "
             f"catch(e){{ return 'ERR:'+e.message; }} }} }} return 'no frame matched'; }})()",
             return_by_value=True,
         )
-        return ok(str(result))
+        result = result.value if hasattr(result, "value") and not isinstance(result, str) else result
+        text = str(result)
+        # Cross-origin access throws a SecurityError inside contentWindow.eval.
+        if text.startswith("ERR:") and ("cross-origin" in text.lower() or "SecurityError" in text):
+            return err(f"cross-origin frame not accessible: {text[4:]}")
+        return ok(text)
     except Exception as e:
         return err(str(e))
 
@@ -2441,11 +2543,17 @@ async def batch_actions(actions: list[dict]) -> str:
             else:
                 r = err(f"unknown action type: {atype}")
             results.append(f"[{i}] {atype}: {str(r)[:80]}")
+            # A tool can return an "Error: ..." string WITHOUT raising — honor
+            # stop_on_error for those too, not just for exceptions.
+            if isinstance(r, str) and r.startswith("Error:") and act.get("stop_on_error"):
+                break
         except Exception as e:
             results.append(f"[{i}] {atype}: ERR {e}")
             if act.get("stop_on_error"):
                 break
-    return ok("\n".join(results))
+    n_failed = sum(1 for ln in results if ": Error:" in ln or ": ERR " in ln)
+    header = f"{len(results)} actions, {n_failed} failed" if n_failed else f"{len(results)} actions OK"
+    return ok(header + "\n" + "\n".join(results))
 
 
 @mcp.tool()
@@ -2594,7 +2702,11 @@ async def scroll_to(
 # 15. DIALOG + ACCESSIBILITY
 # ══════════════════════════════════════════════════════════════════════════
 
-_dialog_pre_action: dict[str, Any] = {"action": None, "text": None}
+# Read-at-fire-time config so re-arming with a new action/text updates the
+# response without stacking another CDP handler. Keyed by tab id().
+_dialog_pre_action: dict[str, Any] = {
+    "action": None, "text": None, "_registered_tab_ids": set(),
+}
 
 
 @mcp.tool()
@@ -2605,17 +2717,23 @@ async def dialog_handle(action: str = "accept", text: Optional[str] = None) -> s
     try:
         tab = BrowserState.active_tab()
         from nodriver.cdp import page as cdp_page
+        tid = id(tab)
+        if tid in _dialog_pre_action["_registered_tab_ids"]:
+            # Handler already armed on this tab — config updated above; don't
+            # stack a second handler (which would accumulate every call).
+            return ok(f"dialog handler re-armed ({action})")
 
         async def handle(_event):
             try:
                 await tab.send(cdp_page.handle_java_script_dialog(
-                    accept=(action == "accept"),
-                    prompt_text=text or "",
+                    accept=(_dialog_pre_action["action"] == "accept"),
+                    prompt_text=_dialog_pre_action["text"] or "",
                 ))
             except Exception:
                 pass
 
         tab.add_handler(cdp_page.JavascriptDialogOpening, handle)
+        _dialog_pre_action["_registered_tab_ids"].add(tid)
         return ok(f"dialog handler armed ({action})")
     except Exception as e:
         return err(str(e))
@@ -2630,6 +2748,13 @@ _DIALOG_AUTO_CFG: dict = {
     "types": None,  # None=all; or set like {"beforeunload"}
     "_registered_tab_ids": set(),
 }
+
+# Track which tabs already have a console / network capture handler armed, so
+# repeated console_start/network_start calls reset the buffers but do NOT stack
+# duplicate CDP handlers (which would double-record every event). Cleared on
+# browser_close / browser_recover alongside the other per-tab caches.
+_CONSOLE_ARMED_TAB_IDS: set = set()
+_NETWORK_ARMED_TAB_IDS: set = set()
 
 
 @mcp.tool()
@@ -2748,12 +2873,22 @@ async def console_start() -> str:
         tab = BrowserState.active_tab()
         BrowserState.console_logs = []
         BrowserState.capture_console = True
+        tid = id(tab)
+        if tid in _CONSOLE_ARMED_TAB_IDS:
+            return ok("console capture started (handler already armed on this tab)")
         from nodriver.cdp import runtime as cdp_runtime
 
         async def handle(event):
             try:
-                args = [getattr(a, "value", None) or getattr(a, "description", "")
-                        for a in (event.args or [])]
+                args = []
+                for a in (event.args or []):
+                    val = getattr(a, "value", None)
+                    # `or` would drop console.log(0)/false/'' — keep falsy-but-real
+                    # values, fall back to description only when value is absent.
+                    if val is not None:
+                        args.append(val)
+                    else:
+                        args.append(getattr(a, "description", "") or "")
                 BrowserState.console_logs.append({
                     "type": event.type_,
                     "text": " ".join(str(a) for a in args)[:500],
@@ -2762,6 +2897,7 @@ async def console_start() -> str:
                 pass
 
         tab.add_handler(cdp_runtime.ConsoleAPICalled, handle)
+        _CONSOLE_ARMED_TAB_IDS.add(tid)
         return ok("console capture started")
     except Exception as e:
         return err(str(e))
@@ -2769,7 +2905,7 @@ async def console_start() -> str:
 
 @mcp.tool()
 async def console_get(limit: int = 100) -> str:
-    """Retrieve captured console messages (most recent first)."""
+    """Retrieve captured console messages (chronological: oldest first within the last `limit`, newest last)."""
     logs = BrowserState.console_logs[-limit:]
     return ok(json.dumps(logs, indent=2, default=str))
 
@@ -2843,8 +2979,15 @@ async def network_start(capture_bodies: bool = True) -> str:
             except Exception:
                 pass
 
+        tid = id(tab)
+        if tid in _NETWORK_ARMED_TAB_IDS:
+            return ok(
+                f"network capture started (capture_bodies={capture_bodies}); "
+                "handler already armed on this tab"
+            )
         tab.add_handler(cdp_network.RequestWillBeSent, on_req)
         tab.add_handler(cdp_network.ResponseReceived, on_res)
+        _NETWORK_ARMED_TAB_IDS.add(tid)
         return ok(f"network capture started (capture_bodies={capture_bodies})")
     except Exception as e:
         return err(str(e))
@@ -2861,7 +3004,7 @@ async def network_get(
     """Retrieve captured network events.
 
     Args:
-        limit: max entries returned (most recent first)
+        limit: max entries returned (chronological: oldest first within the last `limit`, newest last)
         filter_url: substring filter on URL
         include_body: fetch response bodies via CDP Network.getResponseBody
             for each matching entry. Bodies are truncated to max_body_bytes.
@@ -2897,9 +3040,10 @@ async def network_get(
                         if body is None and isinstance(result, tuple):
                             body = result[0]
                         body_str = str(body) if body is not None else ""
-                        if len(body_str) > max_body_bytes:
+                        orig_len = len(body_str)
+                        if orig_len > max_body_bytes:
                             body_str = body_str[:max_body_bytes] + (
-                                f"... [truncated, original {len(body)} chars]"
+                                f"... [truncated, original {orig_len} chars]"
                             )
                         e["response_body"] = body_str
                     except asyncio.TimeoutError:
@@ -3153,13 +3297,14 @@ async def _apply_storage_state(browser: Browser, path: str) -> None:
             ))
         except Exception:
             continue
-    # LocalStorage — set via script per origin (requires navigation to that origin first)
+    # LocalStorage — one evaluate per origin (was one round-trip PER KEY).
     for origin, pairs in (data.get("origins") or {}).items():
         try:
             await tab.get(origin)
-            for k, v in pairs.items():
+            if pairs:
                 await tab.evaluate(
-                    f"localStorage.setItem({json.dumps(k)}, {json.dumps(v)})",
+                    f"(() => {{ const d = {json.dumps(pairs)}; "
+                    f"for (const k in d) localStorage.setItem(k, d[k]); }})()",
                     return_by_value=True,
                 )
         except Exception:
@@ -3183,7 +3328,12 @@ async def storage_state_save(filename: Optional[str] = None) -> str:
         tab = BrowserState.active_tab()
         cookies = await BrowserState.browser.cookies.get_all()
         local_storage = await tab.get_local_storage()
-        origin = (await get_url(tab)).rsplit("/", 1)[0] if await get_url(tab) else ""
+        # Derive a real scheme://host[:port] origin (one get_url round-trip,
+        # not two) — rsplit('/',1) mangled URLs with paths into a bad key.
+        from urllib.parse import urlparse
+        _url = await get_url(tab)
+        _p = urlparse(_url) if _url else None
+        origin = f"{_p.scheme}://{_p.netloc}" if _p and _p.scheme and _p.netloc else ""
         state = {
             "cookies": [{
                 "name": c.name, "value": c.value, "domain": c.domain,
@@ -3541,40 +3691,48 @@ async def find_by_image(
     """
     try:
         import cv2
-        import numpy as np
         tab = BrowserState.active_tab()
         ensure_dirs()
         tmp_path = SCREENSHOT_DIR / ts_filename("match-tmp", "png")
         await tab.save_screenshot(filename=str(tmp_path))
-
-        page_img = cv2.imread(str(tmp_path))
-        template = cv2.imread(template_path)
-        if page_img is None:
-            return err(f"could not read screenshot at {tmp_path}")
-        if template is None:
-            return err(f"could not read template at {template_path}")
-
-        # Scale for Retina: screenshot is 2x CSS pixels on macOS
-        scale = 2.0
-        result = cv2.matchTemplate(page_img, template, cv2.TM_CCOEFF_NORMED)
-        _, max_val, _, max_loc = cv2.minMaxLoc(result)
-        if max_val < threshold:
-            return ok(json.dumps({
-                "found": False, "score": float(max_val),
-                "threshold": threshold, "template": template_path,
-            }))
-        th, tw = template.shape[:2]
-        # Convert screenshot-pixel coords back to CSS coords
-        cx = int((max_loc[0] + tw / 2) / scale)
-        cy = int((max_loc[1] + th / 2) / scale)
         try:
-            tmp_path.unlink()
-        except Exception:
-            pass
-        return ok(json.dumps({
-            "found": True, "x": cx, "y": cy,
-            "score": float(max_val), "template": template_path,
-        }))
+            page_img = cv2.imread(str(tmp_path))
+            template = cv2.imread(template_path)
+            if page_img is None:
+                return err(f"could not read screenshot at {tmp_path}")
+            if template is None:
+                return err(f"could not read template at {template_path}")
+
+            # capture_screenshot returns device pixels (DPR-scaled); mouse_click
+            # expects CSS pixels. Read the real ratio instead of assuming Retina
+            # 2.0 (wrong on non-Retina macs, Linux, Windows, HiDPI emulation).
+            dpr_raw = await tab.evaluate("window.devicePixelRatio", return_by_value=True)
+            try:
+                scale = float(dpr_raw.value if hasattr(dpr_raw, "value") else dpr_raw) or 1.0
+            except (TypeError, ValueError):
+                scale = 1.0
+            result = cv2.matchTemplate(page_img, template, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, max_loc = cv2.minMaxLoc(result)
+            if max_val < threshold:
+                return ok(json.dumps({
+                    "found": False, "score": float(max_val),
+                    "threshold": threshold, "template": template_path,
+                }))
+            th, tw = template.shape[:2]
+            # Convert screenshot-pixel coords back to CSS coords
+            cx = int((max_loc[0] + tw / 2) / scale)
+            cy = int((max_loc[1] + th / 2) / scale)
+            return ok(json.dumps({
+                "found": True, "x": cx, "y": cy,
+                "score": float(max_val), "template": template_path,
+            }))
+        finally:
+            # Always remove the temp screenshot — previously leaked on the
+            # not-found return and every error path.
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
     except ImportError:
         return err("opencv-python not installed")
     except Exception as e:
@@ -3668,20 +3826,33 @@ async def mouse_record(duration_seconds: float = 5.0) -> str:
             """,
             return_by_value=True,
         )
-        await asyncio.sleep(duration_seconds)
-        data = await tab.evaluate(
-            """
-            (() => {
-              document.removeEventListener('mousemove', window.__mcpMouseHandler);
-              const out = window.__mcpMouseRec || [];
-              delete window.__mcpMouseRec;
-              delete window.__mcpMouseHandler;
-              return JSON.stringify(out);
-            })()
-            """,
-            return_by_value=True,
-        )
-        return ok(str(data))
+        try:
+            await asyncio.sleep(duration_seconds)
+            data = await tab.evaluate(
+                """
+                (() => {
+                  document.removeEventListener('mousemove', window.__mcpMouseHandler);
+                  const out = window.__mcpMouseRec || [];
+                  delete window.__mcpMouseRec;
+                  delete window.__mcpMouseHandler;
+                  return JSON.stringify(out);
+                })()
+                """,
+                return_by_value=True,
+            )
+            return ok(str(data))
+        finally:
+            # Guarantee teardown even on CancelledError / mid-sleep failure so
+            # the mousemove listener + window globals don't leak on the page.
+            try:
+                await tab.evaluate(
+                    "(() => { if (window.__mcpMouseHandler) {"
+                    "document.removeEventListener('mousemove', window.__mcpMouseHandler);"
+                    "delete window.__mcpMouseHandler; delete window.__mcpMouseRec; } })()",
+                    return_by_value=True,
+                )
+            except Exception:
+                pass
     except Exception as e:
         return err(str(e))
 
@@ -3717,7 +3888,7 @@ async def mouse_replay(path_json: str, speed: float = 1.0) -> str:
 from .tools import vision as _vision  # noqa: F401  -- registers solve_recaptcha_ai + vision_locate
 # Re-export private helpers AND tool callables. Tools must remain in server's
 # globals() because workflow_run.dispatch_table looks them up by name there.
-from .tools.vision import (  # noqa: F401, E402
+from .tools.vision import (  # noqa: F401
     _PROMPT_TEMPLATE, _VISION_LOCATE_PROMPT,
     _parse_tile_indices, _parse_vision_response,
     _claude_vision_pick_tiles, _openai_compat_vision_pick_tiles,
@@ -3731,8 +3902,8 @@ from .tools.vision import (  # noqa: F401, E402
 # ══════════════════════════════════════════════════════════════════════════
 from .tools import network_http as _network_http  # noqa: F401
 # Re-export so workflow_run + http_request_with_session find them in globals().
-from .tools.network_http import (  # noqa: F401, E402
-    _http_session_state, _get_browser_cookies_for_url,
+from .tools.network_http import (  # noqa: F401
+    _get_browser_cookies_for_url,
     http_request, http_session_cookies, session_warmup, detect_anti_bot,
 )
 
@@ -3903,17 +4074,24 @@ async def _idle_reaper_loop() -> None:
                         snap.browser.stop()
                 except Exception:
                     pass
+                # Mark profile cleanly exited (matches close_instance) so the
+                # next launch doesn't hit a "Restore pages?" / stale-lock state.
+                if snap.profile_dir:
+                    clean_profile_state(snap.profile_dir)
                 BrowserState.instances.pop(iid, None)
             # Check current instance
             if (BrowserState.is_up()
                 and BrowserState.current_idle_timeout > 0
                 and (time.time() - BrowserState.current_last_active) > BrowserState.current_idle_timeout):
+                _cur_profile = BrowserState.current_profile_dir
                 try:
                     if BrowserState.browser:
                         BrowserState.browser.stop()
                 except Exception:
                     pass
                 BrowserState.reset()
+                if _cur_profile:
+                    clean_profile_state(_cur_profile)
         except asyncio.CancelledError:
             return
         except Exception:
@@ -3926,7 +4104,7 @@ def _ensure_idle_reaper_running() -> None:
     if BrowserState._reaper_task is not None and not BrowserState._reaper_task.done():
         return
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         BrowserState._reaper_task = loop.create_task(_idle_reaper_loop())
     except RuntimeError:
         pass  # no event loop yet — will try again on next launch
@@ -4045,9 +4223,11 @@ async def close_instance(instance_id: str) -> str:
                     BrowserState.browser.stop()
             except Exception as e:
                 return err(f"close failed: {e}")
+            _iid = BrowserState.current_instance_id
             BrowserState.reset()
             if BrowserState.current_profile_dir:
                 clean_profile_state(BrowserState.current_profile_dir)
+            _ATTACHED_BROWSERS.discard(_iid)
             return ok(f"closed current instance {instance_id!r}")
         return ok(f"current instance {instance_id!r} was not running")
     # Close stored
@@ -4062,6 +4242,7 @@ async def close_instance(instance_id: str) -> str:
     if snap.profile_dir:
         clean_profile_state(snap.profile_dir)
     BrowserState.instances.pop(instance_id, None)
+    _ATTACHED_BROWSERS.discard(instance_id)
     return ok(f"closed instance {instance_id!r}")
 
 
@@ -4091,6 +4272,8 @@ async def close_all_instances() -> str:
             clean_profile_state(BrowserState.current_profile_dir)
         closed.append(BrowserState.current_instance_id)
     BrowserState.reset()
+    for _iid in closed:
+        _ATTACHED_BROWSERS.discard(_iid)
     return ok(f"closed {len(closed)} instance(s): {closed}")
 
 
@@ -5104,7 +5287,11 @@ async def detect_and_bypass() -> str:
                 "DataDome: no automated bypass. Use mouse_record→mouse_replay of a real session, "
                 "session_warmup, residential proxy, and storage_state reuse."
             )
-        if "perimeterx" in det_lower or "human" in det_lower:
+        # Match only "perimeterx" — detect_anti_bot always labels this vendor
+        # "PerimeterX/HUMAN", so the bare "human" token only added DataDome
+        # false positives (its message mentions "a real session" → "human"-free,
+        # but other detections containing the substring would mis-fire).
+        if "perimeterx" in det_lower:
             result["next_steps"].append(
                 "PerimeterX/HUMAN: storage_state_load is most reliable. New sessions need "
                 "mobile proxy + humanize_click."
@@ -5174,10 +5361,9 @@ async def paste_text(
         tab = BrowserState.active_tab()
         target_selector: Optional[str] = None
         if ref:
-            el = await resolve_ref(ref)
-            if el is None:
+            # Existence probe only — the actual paste re-queries via the selector.
+            if await resolve_ref(ref) is None:
                 return err(f"ref {ref} not found")
-            # Walk up to find a queryable selector via data-mcp-ref attribute
             target_selector = f'[data-mcp-ref="{ref}"]'
         elif selector:
             target_selector = selector
@@ -5341,7 +5527,15 @@ async def auth_capture(
         except asyncio.TimeoutError:
             pass
         finally:
-            active["flag"] = False  # disable handlers (handler stays bound but no-ops)
+            active["flag"] = False
+            # Unregister our own closures (filter the list; nodriver's
+            # remove_handler would drop the whole event's handlers).
+            for _evt, _fn in ((cdp_network.RequestWillBeSent, on_req),
+                              (cdp_network.ResponseReceived, on_res)):
+                try:
+                    tab.handlers[_evt].remove(_fn)
+                except (KeyError, ValueError):
+                    pass
         if not captured:
             return err(
                 f"auth_capture: no requests matched {filter_url_pattern!r} within {timeout}s"
@@ -5516,6 +5710,15 @@ async def wait_for_request(
             )
         finally:
             active["flag"] = False
+            # Remove ONLY our closures (not tab.remove_handler, which under
+            # nodriver 0.48.1 nukes the whole event's handler list and would
+            # kill a concurrent network_start capture).
+            for _evt, _fn in ((cdp_network.RequestWillBeSent, on_req),
+                              (cdp_network.ResponseReceived, on_res)):
+                try:
+                    tab.handlers[_evt].remove(_fn)
+                except (KeyError, ValueError):
+                    pass
         return ok(json.dumps(match, indent=2, default=str))
     except Exception as e:
         return err(str(e))

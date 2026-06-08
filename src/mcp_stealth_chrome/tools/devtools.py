@@ -126,10 +126,20 @@ async def performance_trace_start(
                 pass
 
         tab.add_handler(cdp_tracing.DataCollected, on_data)
-        await tab.send(cdp_tracing.start(
-            categories=cats,
-            transfer_mode="ReportEvents",
-        ))
+        try:
+            await tab.send(cdp_tracing.start(
+                categories=cats,
+                transfer_mode="ReportEvents",
+            ))
+        except Exception:
+            # Tracing.start failed — don't leave the DataCollected handler
+            # registered (it would accumulate across retries and silently
+            # fill _TRACE_BUFFER from an unmanaged trace).
+            try:
+                tab.handlers[cdp_tracing.DataCollected].remove(on_data)
+            except (KeyError, ValueError):
+                pass
+            raise
         _TRACE_ACTIVE.update({
             "tab_id": id(tab),
             "started_at": time.time(),
@@ -315,11 +325,15 @@ async def web_vitals(timeout: float = 8.0) -> str:
           return JSON.stringify(window.__mcp_vitals);
         })()
         """
-        # Poll for values up to timeout
+        # Inject the importing IIFE ONCE (await_promise), then poll with a
+        # cheap read-only expression — re-running the async import wrapper each
+        # iteration is a needless promise round-trip.
+        await tab.evaluate(script, await_promise=True, return_by_value=True)
+        read = "JSON.stringify(window.__mcp_vitals || {})"
         deadline = time.time() + timeout
         last = {}
         while time.time() < deadline:
-            raw = await tab.evaluate(script, await_promise=True, return_by_value=True)
+            raw = await tab.evaluate(read, return_by_value=True)
             last = parse_json(raw, {}) or {}
             if isinstance(last, dict) and "__error" in last:
                 return err(f"web-vitals load failed: {last['__error']}")
@@ -509,7 +523,7 @@ async def coverage_stop() -> str:
                 js_rows.append((unused, used_bytes, total_bytes, url))
             js_rows.sort(reverse=True)
             lines.append(f"\nJS ({len(js_rows)} files):")
-            for unused, used, total, url in js_rows[:20]:
+            for unused, _used, total, url in js_rows[:20]:
                 pct = (unused / total * 100) if total else 0
                 lines.append(
                     f"  unused {unused:>7}B / {total:>7}B ({pct:5.1f}% dead)  {url[:100]}"
@@ -588,6 +602,11 @@ async def memory_heap_snapshot(
             if chunks and idle_ms >= stable_ms:
                 break
             await asyncio.sleep(0.05)
+        if not chunks:
+            return err(
+                f"heap snapshot produced no data within {max_wait}s "
+                "(snapshot may have failed or the tab navigated/closed)"
+            )
         fname = filename or ts_filename("heap", "heapsnapshot")
         path = EXPORT_DIR / fname
         ensure_dirs()

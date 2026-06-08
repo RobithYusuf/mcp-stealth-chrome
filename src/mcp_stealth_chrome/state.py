@@ -14,7 +14,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import ClassVar, Optional
 
 from nodriver import Browser, Tab
 
@@ -187,10 +187,14 @@ def is_chrome_profile_locked(profile_path: Path) -> bool:
 
 def chrome_lock_holder_pid(profile_path: Path) -> Optional[int]:
     """Return the PID currently holding this profile's SingletonLock, or None
-    if free / stale. Used to give actionable error messages on launch failure."""
-    if not is_chrome_profile_locked(profile_path):
+    if free / stale / unreadable. Used for actionable launch-failure messages.
+
+    Reads the symlink once (is_chrome_profile_locked + _read_singleton_pid
+    both re-read it otherwise) and returns the PID only when it is alive."""
+    pid = _read_singleton_pid(profile_path)
+    if pid is None:
         return None
-    return _read_singleton_pid(profile_path)
+    return pid if _pid_alive(pid) else None
 
 
 def find_external_chrome_pids() -> list[int]:
@@ -216,13 +220,49 @@ def find_external_chrome_pids() -> list[int]:
             return []
     try:
         import subprocess
+        # NB: must EXCLUDE Chromes this MCP launched (docstring contract) — a
+        # bare pgrep 'chrome' matches our own subprocess and substring-only
+        # false hits (e.g. chrome-devtools-mcp). Parse `ps` and drop any
+        # process whose argv references an MCP-managed profile.
+        mcp_root = str(HOME / ".mcp-stealth")
         r = subprocess.run(
-            ["pgrep", "-f", "Google Chrome|chromium|chrome"],
-            capture_output=True, text=True, timeout=2,
+            ["ps", "-ax", "-o", "pid=,command="],
+            capture_output=True, text=True, timeout=3,
         )
-        return [int(p) for p in (r.stdout or "").split() if p.isdigit()][:10]
+        pids: list[int] = []
+        for line in (r.stdout or "").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            low = line.lower()
+            if "chrome" not in low and "chromium" not in low:
+                continue
+            if f"--user-data-dir={mcp_root}" in line:
+                continue  # spawned by this MCP server — not "external"
+            head = line.split(None, 1)[0]
+            if head.isdigit():
+                pids.append(int(head))
+            if len(pids) >= 10:
+                break
+        return pids
     except Exception:
         return []
+
+
+def _update_prefs(prefs_file: Path, mutate) -> bool:
+    """Load Default/Preferences JSON, call mutate(data) -> bool(changed),
+    rewrite only if it reports a change. Best-effort: never raises, and never
+    rewrites on a parse failure (Chrome rebuilds Preferences on next launch)."""
+    if not prefs_file.exists():
+        return False
+    try:
+        data = json.loads(prefs_file.read_text())
+        if mutate(data):
+            prefs_file.write_text(json.dumps(data))
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def wipe_window_state(profile_path: Path | str | None = None) -> dict:
@@ -254,32 +294,27 @@ def wipe_window_state(profile_path: Path | str | None = None) -> dict:
     if not default_dir.exists():
         return result
 
-    # 1. Trim corrupt keys from Preferences (JSON file). Don't rewrite if
-    # parse fails — assume Chrome will rebuild on next launch.
-    prefs_file = default_dir / "Preferences"
-    if prefs_file.exists():
-        try:
-            data = json.loads(prefs_file.read_text())
-            changed = False
-            browser = data.get("browser") or {}
-            for key in ("window_placement", "last_window_state",
-                         "last_window_screen_placement"):
-                if key in browser:
-                    del browser[key]
-                    changed = True
-            if changed:
-                data["browser"] = browser
-            session = data.get("session") or {}
-            for key in ("startup_urls", "restore_on_startup_migrated"):
-                if key in session:
-                    del session[key]
-                    changed = True
-            if changed:
-                data["session"] = session
-                prefs_file.write_text(json.dumps(data))
-                result["prefs"] = True
-        except Exception:
-            pass
+    # 1. Trim corrupt keys from Preferences (JSON file).
+    def _trim(data: dict) -> bool:
+        changed = False
+        browser = data.get("browser") or {}
+        for key in ("window_placement", "last_window_state",
+                     "last_window_screen_placement"):
+            if key in browser:
+                del browser[key]
+                changed = True
+        if changed:
+            data["browser"] = browser
+        session = data.get("session") or {}
+        for key in ("startup_urls", "restore_on_startup_migrated"):
+            if key in session:
+                del session[key]
+                changed = True
+        if changed:
+            data["session"] = session
+        return changed
+
+    result["prefs"] = _update_prefs(default_dir / "Preferences", _trim)
 
     # 2. Remove Sessions/ contents (directory itself stays).
     sessions_dir = default_dir / "Sessions"
@@ -374,18 +409,17 @@ def clean_profile_state(profile_dir: Path | str | None = None) -> None:
     Only removes Singleton* locks if they're STALE (PID dead) — never yanks
     a lock from a live Chrome instance."""
     pdir = Path(profile_dir) if profile_dir else PROFILE_DIR
-    prefs = pdir / "Default" / "Preferences"
-    if prefs.exists():
-        try:
-            data = json.loads(prefs.read_text())
-            profile = data.get("profile", {})
-            if profile.get("exit_type") != "Normal":
-                profile["exit_type"] = "Normal"
-                profile["exited_cleanly"] = True
-                data["profile"] = profile
-                prefs.write_text(json.dumps(data))
-        except Exception:
-            pass
+
+    def _mark_clean(data: dict) -> bool:
+        profile = data.get("profile", {})
+        if profile.get("exit_type") != "Normal":
+            profile["exit_type"] = "Normal"
+            profile["exited_cleanly"] = True
+            data["profile"] = profile
+            return True
+        return False
+
+    _update_prefs(pdir / "Default" / "Preferences", _mark_clean)
     # Don't blindly nuke locks — if a sibling MCP process owns them, that
     # would corrupt its session. Only remove when stale.
     if is_chrome_profile_locked(pdir):
@@ -412,6 +446,7 @@ class InstanceSnapshot:
     created_at: float = field(default_factory=time.time)
     console_logs: list[dict] = field(default_factory=list)
     network_logs: list[dict] = field(default_factory=list)
+    network_index: dict[str, dict] = field(default_factory=dict)
     page_errors: list[str] = field(default_factory=list)
     capture_console: bool = False
     capture_network: bool = False
@@ -435,32 +470,35 @@ class BrowserState:
     are stored in `instances` dict as snapshots — switching swaps snapshots in.
     """
 
-    # Current instance state (class-level — existing code writes here directly)
-    browser: Optional[Browser] = None
-    tabs: list[Tab] = []
-    active_tab_index: int = 0
-    console_logs: list[dict] = []
-    network_logs: list[dict] = []
+    # Current instance state (class-level — existing code writes here directly).
+    # These are deliberately class-level shared mutable state: BrowserState is a
+    # singleton facade that is never instantiated, so ClassVar both documents
+    # the intent and silences the mutable-default lint.
+    browser: ClassVar[Optional[Browser]] = None
+    tabs: ClassVar[list[Tab]] = []
+    active_tab_index: ClassVar[int] = 0
+    console_logs: ClassVar[list[dict]] = []
+    network_logs: ClassVar[list[dict]] = []
     # Per-request map: request_id → full entry with headers/body. Populated
     # by network_start when capture_bodies=True. Flat network_logs above
     # remains the legacy event-stream view.
-    network_index: dict[str, dict] = {}
-    page_errors: list[str] = []
-    capture_console: bool = False
-    capture_network: bool = False
+    network_index: ClassVar[dict[str, dict]] = {}
+    page_errors: ClassVar[list[str]] = []
+    capture_console: ClassVar[bool] = False
+    capture_network: ClassVar[bool] = False
 
     # Multi-instance: other instances stored here, plus metadata for current
-    current_instance_id: str = "main"
-    current_profile_dir: Optional[Path] = None
-    current_idle_timeout: int = DEFAULT_IDLE_TIMEOUT
-    current_last_active: float = time.time()
-    current_created_at: float = time.time()
+    current_instance_id: ClassVar[str] = "main"
+    current_profile_dir: ClassVar[Optional[Path]] = None
+    current_idle_timeout: ClassVar[int] = DEFAULT_IDLE_TIMEOUT
+    current_last_active: ClassVar[float] = time.time()
+    current_created_at: ClassVar[float] = time.time()
 
     # Last mouse position — enables realistic cursor continuation (no teleports).
     # Updated by tools that move the mouse.
-    last_mouse_xy: dict[str, Optional[int]] = {"x": None, "y": None}
+    last_mouse_xy: ClassVar[dict[str, Optional[int]]] = {"x": None, "y": None}
 
-    instances: dict[str, InstanceSnapshot] = {}  # does NOT include current
+    instances: ClassVar[dict[str, InstanceSnapshot]] = {}  # does NOT include current
     _reaper_task = None  # asyncio.Task
 
     # ── Legacy API (backward compat) ───────────────────────────────────────
@@ -520,6 +558,7 @@ class BrowserState:
         cls.active_tab_index = 0
         cls.console_logs = []
         cls.network_logs = []
+        cls.network_index = {}
         cls.page_errors = []
         cls.capture_console = False
         cls.capture_network = False
@@ -540,6 +579,7 @@ class BrowserState:
             created_at=cls.current_created_at,
             console_logs=list(cls.console_logs),
             network_logs=list(cls.network_logs),
+            network_index=dict(cls.network_index),
             page_errors=list(cls.page_errors),
             capture_console=cls.capture_console,
             capture_network=cls.capture_network,
@@ -558,6 +598,7 @@ class BrowserState:
         cls.current_created_at = snap.created_at
         cls.console_logs = list(snap.console_logs)
         cls.network_logs = list(snap.network_logs)
+        cls.network_index = dict(snap.network_index)
         cls.page_errors = list(snap.page_errors)
         cls.capture_console = snap.capture_console
         cls.capture_network = snap.capture_network

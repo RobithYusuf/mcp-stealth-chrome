@@ -23,6 +23,9 @@ async def get_url(tab: Tab) -> str:
     """Get current URL via evaluate — nodriver doesn't expose direct property."""
     try:
         result = await tab.evaluate("window.location.href", return_by_value=True)
+        # nodriver hands back a raw RemoteObject when the value is falsy —
+        # unwrap so a blank result never becomes the wrapper's repr string.
+        result = result.value if hasattr(result, "value") else result
         return str(result) if result else ""
     except Exception:
         return ""
@@ -31,6 +34,7 @@ async def get_url(tab: Tab) -> str:
 async def get_title(tab: Tab) -> str:
     try:
         result = await tab.evaluate("document.title", return_by_value=True)
+        result = result.value if hasattr(result, "value") else result
         return str(result) if result else ""
     except Exception:
         return ""
