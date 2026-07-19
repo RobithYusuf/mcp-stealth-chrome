@@ -135,7 +135,15 @@ async def _browser_render(tab, url: str, max_wait: float = 16.0,
         low = (html or "").lower()
         challenging = (len(html or "") < 1500) or any(m in low for m in _CHALLENGE_MARKERS)
         if html and not challenging:
-            return html
+            # SPA hydration guard: a challenge-free shell can still have ~no
+            # visible text until JS renders the content (Reddit/Threads search
+            # returned chars=0 on the first hit). Require real visible text before
+            # returning; accept a sparse page only after a short grace period
+            # (some pages are legitimately short).
+            stripped = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", html)
+            words = len(re.sub(r"<[^>]+>", " ", stripped).split())
+            if words >= 30 or (time.monotonic() - start) >= 6.0:
+                return html
         last = html or last
         # One reload partway through: the JS challenge sets a clearance cookie on
         # the first hit, so a reload on the SAME session usually passes (verified
@@ -831,10 +839,20 @@ async def smart_fetch(
         except Exception as e:
             return err(f"browser escalation failed: {type(e).__name__}: {e}")
         md = _html_to_markdown(html, base_url=u, max_chars=max_chars)
+        blk = "blocked by network security" in (html or "").lower()
+        hint = None
+        if blk:
+            hint = ("still challenge-blocked after wait+reload — the page needs a "
+                    "logged-in session (cookie_import/storage_state) or a residential "
+                    "proxy; retry once more (a warmed session often passes).")
+        elif len(md) < 60:
+            hint = ("near-empty after render — page may be login-walled or still "
+                    "hydrating; import a session cookie or retry once.")
         return ok(json.dumps({
             "url": u, "path": "browser", "status": 200, "chars": len(md),
             "escalated_from_http_status": status,
             "elapsed_ms": int((time.monotonic() - t0) * 1000),
+            "hint": hint,
             "markdown": md,
         }, ensure_ascii=False))
 
