@@ -509,7 +509,8 @@ async def _browser_search(query: str, engine: str, count: int) -> list[dict]:
     from urllib.parse import quote_plus
     if not BrowserState.is_up():
         return []
-    cfg = _BROWSER_SERP.get(engine if engine in _BROWSER_SERP else "bing")
+    eng = engine if engine in _BROWSER_SERP else "bing"
+    cfg = _BROWSER_SERP[eng]
     js = cfg["js"] % max(count, 8)
     try:
         tab = BrowserState.active_tab()
@@ -529,7 +530,13 @@ async def _browser_search(query: str, engine: str, count: int) -> list[dict]:
             out, seen = [], set()
             for r in data:
                 u = (r or {}).get("url", "")
-                if u.startswith("http") and u not in seen:
+                if eng == "bing":
+                    u = _decode_bing_href(u)   # rendered anchors still point at /ck/a
+                try:
+                    host = urlparse(u).netloc
+                except Exception:
+                    host = ""
+                if u.startswith("http") and host and "bing.com" not in host and u not in seen:
                     seen.add(u)
                     out.append({"title": (r.get("title") or "").strip(),
                                 "url": u, "snippet": (r.get("snippet") or "").strip()})
