@@ -122,7 +122,7 @@ async def _browser_render(tab, url: str, max_wait: float = 16.0,
     start = time.monotonic()
     deadline = start + max_wait
     last = ""
-    reloaded = False
+    reloads = 0
     while time.monotonic() < deadline:
         await asyncio.sleep(settle)
         try:
@@ -145,11 +145,14 @@ async def _browser_render(tab, url: str, max_wait: float = 16.0,
             if words >= 30 or (time.monotonic() - start) >= 6.0:
                 return html
         last = html or last
-        # One reload partway through: the JS challenge sets a clearance cookie on
-        # the first hit, so a reload on the SAME session usually passes (verified
-        # on Reddit — the manual "2nd fetch works" behaviour, now automatic).
-        if not reloaded and (time.monotonic() - start) > max_wait * 0.35:
-            reloaded = True
+        # Reload up to 2x while still challenged: the JS challenge sets a
+        # clearance cookie on the first hit, so a reload on the SAME session
+        # usually passes. Two attempts make even the FIRST call one-shot instead
+        # of needing a manual warm retry.
+        elapsed = time.monotonic() - start
+        if (reloads == 0 and elapsed > max_wait * 0.22) or \
+           (reloads == 1 and elapsed > max_wait * 0.5):
+            reloads += 1
             try:
                 await tab.reload()
             except Exception:
