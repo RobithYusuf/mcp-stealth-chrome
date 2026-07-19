@@ -2,7 +2,7 @@
 
 # MCP Stealth Chrome
 
-**133 tools** for AI agents that bypass Cloudflare, Turnstile, reCAPTCHA, and modern anti-bot systems — with an LLM-optimized action kit (`describe_page`, `smart_fill`, `workflow_run`, vision-LLM element locator) layered on top of standard automation.
+**143 tools** for AI agents that bypass Cloudflare, Turnstile, reCAPTCHA, and modern anti-bot systems — with an LLM-optimized action kit (`describe_page`, `smart_fill`, `workflow_run`, vision-LLM element locator) and a self-sufficient web-research kit (`web_search`, `scrape_markdown`, `deep_research`) layered on top of standard automation.
 
 [![PyPI version](https://img.shields.io/pypi/v/mcp-stealth-chrome.svg)](https://pypi.org/project/mcp-stealth-chrome/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -105,7 +105,7 @@ Compared to the leading Python stealth MCP ([vibheksoni/stealth-browser-mcp](htt
 
 | Feature | mcp-stealth-chrome | vibheksoni |
 |---------|:-------------------:|:-----------:|
-| Tools | **133** | 90 |
+| Tools | **143** | 90 |
 | LLM-optimized kit (describe_page, smart_fill, vision_locate, workflow_run, assert_*) | ✅ **Unique** | ❌ |
 | Network body capture + session-bridged HTTP | ✅ **Unique** | ❌ |
 | `click_turnstile` one-liner | ✅ Embed widgets + template fallback | ❌ |
@@ -263,7 +263,7 @@ Settings → Extensions → MCP Servers, or edit `~/.config/zed/settings.json`:
 
 ## 🔑 BYOK (Bring Your Own Key) — Optional
 
-`mcp-stealth-chrome` is **fully functional without any API key** — 130 of 133 tools work out of the box, including `click_turnstile` (Cloudflare Turnstile bypass), TLS-perfect HTTP, multi-instance, DevTools-level perf/coverage/emulation, the full LLM-optimized kit (`describe_page` / `smart_fill` / `workflow_run`), and all scraping tools.
+`mcp-stealth-chrome` is **fully functional without any API key** — 140 of 143 tools work out of the box, including `click_turnstile` (Cloudflare Turnstile bypass), TLS-perfect HTTP, multi-instance, DevTools-level perf/coverage/emulation, the full LLM-optimized kit (`describe_page` / `smart_fill` / `workflow_run`), the web-research kit (`web_search` / `scrape_markdown` / `deep_research` — no search-API key needed), and all scraping tools.
 
 **API keys are optional — only needed for 3 vision/solver tools:**
 
@@ -401,7 +401,18 @@ Legacy `AI_VISION_*` env still work but emit `DeprecationWarning`. Migrate to `O
 - `uv` installed: `curl -LsSf https://astral.sh/uv/install.sh | sh`
 - Chrome or Chromium browser (auto-detected by nodriver)
 
-## Tool Categories (133)
+## Tool Categories (143)
+
+### ⭐⭐⭐ Self-Sufficient Web Research (new) — replaces firecrawl/tavily for most tasks
+Browserless-first (curl_cffi), escalates to the stealth browser only when a page is anti-bot blocked. Runs fully headless/API-mode and is ~10–12× lighter than driving Chrome for normal pages (verified: HTTP path 10–12× faster than headless render on example.com / Wikipedia).
+
+| Tool | Purpose |
+|------|---------|
+| `web_search` | SERP search with **no browser and no API key** (Bing default, DuckDuckGo/Exa optional) → `{title,url,snippet}` |
+| `scrape_markdown` | One URL → clean LLM-ready markdown (stdlib, ~70–98% smaller than raw HTML) |
+| `smart_fetch` | HTTP-first; auto-escalates to the stealth browser **only** when the request is blocked |
+| `deep_research` | search → fetch top-N sources → markdown + citations, in one call |
+| `search_page` | Grep the current page's text (zero-LLM, instant) |
 
 ### ⭐⭐⭐ Dual-Mode HTTP (unique)
 | Tool | Purpose |

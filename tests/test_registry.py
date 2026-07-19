@@ -11,7 +11,7 @@ both surfaced by the registry gate).
 """
 import sys
 
-EXPECTED_COUNT = 138
+EXPECTED_COUNT = 143
 EXPECTED_TOOLS = {
     # Lifecycle
     "browser_launch", "browser_close", "browser_recover",
@@ -83,6 +83,8 @@ EXPECTED_TOOLS = {
     "paste_text", "auth_capture", "click_and_wait", "form_introspect",
     # 0.4.3 — focus + cookie_set decorator restoration
     "tab_focus",
+    # Self-sufficient web-research kit (tools/research.py)
+    "web_search", "scrape_markdown", "smart_fetch", "deep_research", "search_page",
 }
 
 
@@ -98,7 +100,7 @@ def test_tool_count():
         print(f"  MISSING ({len(missing)}): {missing}")
         print(f"  EXTRA  ({len(extra)}): {extra}")
         raise SystemExit(1)
-    print("  OK — all 133 tools registered")
+    print(f"  OK — all {EXPECTED_COUNT} tools registered")
 
 
 def test_critical_helpers():

@@ -4489,6 +4489,15 @@ from .tools import devtools as _devtools  # noqa: F401  -- registers tools with 
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# 27. ⭐⭐⭐ SELF-SUFFICIENT WEB-RESEARCH KIT — tools/research.py
+# ══════════════════════════════════════════════════════════════════════════
+# web_search / scrape_markdown / smart_fetch / deep_research / search_page.
+# HTTP-first (curl_cffi, browserless) with stealth-browser fallback — aims to
+# replace firecrawl/tavily and most of exa for everyday research.
+from .tools import research as _research  # noqa: F401  -- registers tools with mcp
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # 25. ⭐⭐⭐ LLM-OPTIMIZED ACTION KIT
 # ══════════════════════════════════════════════════════════════════════════
 #
