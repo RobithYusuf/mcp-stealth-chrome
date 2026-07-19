@@ -66,9 +66,36 @@ def test_truncation():
     print("  markdown truncation honored")
 
 
+def test_proxy_resolution():
+    import os
+    from mcp_stealth_chrome.tools.research import _default_proxy
+    assert _default_proxy("http://explicit:1") == "http://explicit:1"
+    saved = os.environ.get("RESEARCH_PROXY")
+    try:
+        os.environ["RESEARCH_PROXY"] = "http://envproxy:8080"
+        assert _default_proxy(None) == "http://envproxy:8080"
+        assert _default_proxy("http://win:1") == "http://win:1"  # explicit overrides env
+    finally:
+        if saved is None:
+            os.environ.pop("RESEARCH_PROXY", None)
+        else:
+            os.environ["RESEARCH_PROXY"] = saved
+    print("  proxy resolution (explicit > env) OK")
+
+
+def test_browser_serp_config():
+    from mcp_stealth_chrome.tools.research import _BROWSER_SERP
+    for eng in ("bing", "duckduckgo"):
+        cfg = _BROWSER_SERP[eng]
+        assert "{q}" in cfg["url"], eng
+        assert "%d" in cfg["js"] and "querySelectorAll" in cfg["js"], eng
+    print("  browser-SERP live-DOM config present (bing + duckduckgo)")
+
+
 if __name__ == "__main__":
     for fn in (test_block_detection, test_bing_decode, test_ddg_decode,
-               test_html_to_markdown, test_truncation):
+               test_html_to_markdown, test_truncation,
+               test_proxy_resolution, test_browser_serp_config):
         print(f"\n{fn.__name__}:")
         try:
             fn()

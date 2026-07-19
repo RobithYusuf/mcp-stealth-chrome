@@ -94,6 +94,18 @@ async def _serp_throttle() -> None:
 # curl_cffi HTTP fetch (the browserless fast path)
 # ---------------------------------------------------------------------------
 
+def _default_proxy(explicit: Optional[str]) -> Optional[str]:
+    """Resolve a proxy: explicit arg > RESEARCH_PROXY > HTTPS_PROXY > ALL_PROXY env.
+
+    Routing through a residential/mobile proxy is the scenario that actually
+    penetrates IP-level blocks (Reddit, rate-limited SERPs, datacenter-IP bans)
+    — no amount of fingerprint/stealth tuning beats a bad source IP. Set once via
+    `export RESEARCH_PROXY=http://user:pass@host:port` and every fetch uses it.
+    """
+    return (explicit or os.environ.get("RESEARCH_PROXY")
+            or os.environ.get("HTTPS_PROXY") or os.environ.get("ALL_PROXY") or None)
+
+
 async def _fetch_http(
     url: str,
     impersonate: str = "chrome",
@@ -101,8 +113,12 @@ async def _fetch_http(
     method: str = "GET",
     data=None,
     headers: Optional[dict] = None,
+    proxy: Optional[str] = None,
 ) -> tuple[Optional[int], str, dict]:
-    """Fetch via curl_cffi. Returns (status, text, headers). status=None on error."""
+    """Fetch via curl_cffi. Returns (status, text, headers). status=None on error.
+
+    proxy: explicit override; otherwise falls back to RESEARCH_PROXY/HTTPS_PROXY env.
+    """
     try:
         from curl_cffi.requests import AsyncSession
     except ImportError:
@@ -113,12 +129,14 @@ async def _fetch_http(
     }
     if headers:
         hdrs.update(headers)
+    proxy = _default_proxy(proxy)
+    req_kw: dict = {"data": data, "headers": hdrs, "timeout": timeout,
+                    "allow_redirects": True}
+    if proxy:
+        req_kw["proxies"] = {"http": proxy, "https": proxy}
     try:
         async with AsyncSession(impersonate=impersonate) as s:
-            resp = await s.request(
-                method.upper(), url, data=data, headers=hdrs,
-                timeout=timeout, allow_redirects=True,
-            )
+            resp = await s.request(method.upper(), url, **req_kw)
             try:
                 text = resp.text
             except Exception:
@@ -312,7 +330,7 @@ class _DDGParser(HTMLParser):
             self._buf.append(data)
 
 
-async def _ddg_search(query: str, count: int) -> list[dict]:
+async def _ddg_search(query: str, count: int, proxy: Optional[str] = None) -> list[dict]:
     """DuckDuckGo SERP via the html endpoint, with the lite endpoint as fallback."""
     from urllib.parse import quote_plus
     out: list[dict] = []
@@ -323,6 +341,7 @@ async def _ddg_search(query: str, count: int) -> list[dict]:
         data={"q": query, "kl": "us-en"},
         headers={"Content-Type": "application/x-www-form-urlencoded",
                  "Referer": "https://html.duckduckgo.com/"},
+        proxy=proxy,
     )
     if status == 200 and text:
         p = _DDGParser()
@@ -334,7 +353,7 @@ async def _ddg_search(query: str, count: int) -> list[dict]:
     # 2) fallback: lite endpoint (GET) if html gave nothing
     if not out:
         status, text, _ = await _fetch_http(
-            f"https://lite.duckduckgo.com/lite/?q={quote_plus(query)}"
+            f"https://lite.duckduckgo.com/lite/?q={quote_plus(query)}", proxy=proxy,
         )
         if status == 200 and text:
             p = _DDGParser()
@@ -368,7 +387,7 @@ def _decode_bing_href(href: str) -> str:
     return href
 
 
-async def _bing_search(query: str, count: int) -> list[dict]:
+async def _bing_search(query: str, count: int, proxy: Optional[str] = None) -> list[dict]:
     """Bing SERP scrape (block-split regex — robust to nested markup).
 
     mkt=en-US is REQUIRED: without it, cookieless results are near-random
@@ -381,6 +400,7 @@ async def _bing_search(query: str, count: int) -> list[dict]:
         f"https://www.bing.com/search?q={quote_plus(query)}"
         f"&mkt=en-US&setlang=en&count={max(count, 10)}&form=QBLH",
         headers={"Referer": "https://www.bing.com/"},
+        proxy=proxy,
     )
     if status != 200 or not text:
         return []
@@ -410,7 +430,7 @@ async def _bing_search(query: str, count: int) -> list[dict]:
     return out
 
 
-async def _exa_search(query: str, count: int) -> list[dict]:
+async def _exa_search(query: str, count: int, proxy: Optional[str] = None) -> list[dict]:
     """Optional neural search via Exa (BYO EXA_API_KEY). The one thing a browser
     can't replicate — offered as a backend, not reimplemented."""
     key = os.environ.get("EXA_API_KEY")
@@ -418,13 +438,16 @@ async def _exa_search(query: str, count: int) -> list[dict]:
         return []
     try:
         from curl_cffi.requests import AsyncSession
+        proxy = _default_proxy(proxy)
+        post_kw: dict = {
+            "headers": {"x-api-key": key, "Content-Type": "application/json"},
+            "data": json.dumps({"query": query, "numResults": count}),
+            "timeout": 25.0,
+        }
+        if proxy:
+            post_kw["proxies"] = {"http": proxy, "https": proxy}
         async with AsyncSession() as s:
-            resp = await s.post(
-                "https://api.exa.ai/search",
-                headers={"x-api-key": key, "Content-Type": "application/json"},
-                data=json.dumps({"query": query, "numResults": count}),
-                timeout=25.0,
-            )
+            resp = await s.post("https://api.exa.ai/search", **post_kw)
             data = resp.json()
         return [
             {"title": r.get("title", ""), "url": r.get("url", ""),
@@ -435,16 +458,84 @@ async def _exa_search(query: str, count: int) -> list[dict]:
         return []
 
 
-async def _search(query: str, engine: str, count: int) -> list[dict]:
+async def _search(query: str, engine: str, count: int,
+                  proxy: Optional[str] = None) -> list[dict]:
     engine = (engine or "bing").lower()
     if engine in ("exa", "neural"):
-        return await _exa_search(query, count)
+        return await _exa_search(query, count, proxy)
     if engine in ("duckduckgo", "ddg"):
-        res = await _ddg_search(query, count)
-        return res or await _bing_search(query, count)
+        res = await _ddg_search(query, count, proxy)
+        return res or await _bing_search(query, count, proxy)
     # default: bing (most reliable browserless engine), fall back to duckduckgo
-    res = await _bing_search(query, count)
-    return res or await _ddg_search(query, count)
+    res = await _bing_search(query, count, proxy)
+    return res or await _ddg_search(query, count, proxy)
+
+
+# ---------------------------------------------------------------------------
+# Browser-driven SERP (escalation rung: real Chrome fingerprint + live DOM)
+# ---------------------------------------------------------------------------
+# Parses the RENDERED DOM via tab.evaluate (not get_content HTML) because SERPs
+# inject results with JS after load — regex on the pre-hydration HTML misses them.
+
+_BROWSER_SERP = {
+    "bing": {
+        "url": "https://www.bing.com/search?q={q}&mkt=en-US&setlang=en",
+        "js": r"""(() => JSON.stringify(
+            Array.from(document.querySelectorAll('#b_results > li.b_algo')).slice(0, %d)
+              .map(li => { const a = li.querySelector('h2 a');
+                           const p = li.querySelector('.b_caption p') || li.querySelector('p');
+                           return a ? {title: a.innerText, url: a.href,
+                                       snippet: p ? p.innerText.slice(0,300) : ''} : null; })
+              .filter(Boolean)))()""",
+    },
+    "duckduckgo": {
+        "url": "https://duckduckgo.com/?q={q}&ia=web",
+        "js": r"""(() => JSON.stringify(
+            Array.from(document.querySelectorAll('article[data-testid=\"result\"]')).slice(0, %d)
+              .map(x => { const a = x.querySelector('a[data-testid=\"result-title-a\"]');
+                          const s = x.querySelector('[data-result=\"snippet\"]');
+                          return a ? {title: a.innerText, url: a.href,
+                                      snippet: s ? s.innerText.slice(0,300) : ''} : null; })
+              .filter(Boolean)))()""",
+    },
+}
+
+
+async def _browser_search(query: str, engine: str, count: int) -> list[dict]:
+    """Run the SERP inside the live stealth browser and read results from the
+    rendered DOM. Requires a running browser (browser_launch). Beats curl_cffi
+    on soft-blocked / TLS-broken engines because it uses a real Chrome session.
+    """
+    from urllib.parse import quote_plus
+    if not BrowserState.is_up():
+        return []
+    cfg = _BROWSER_SERP.get(engine if engine in _BROWSER_SERP else "bing")
+    js = cfg["js"] % max(count, 8)
+    try:
+        tab = BrowserState.active_tab()
+        await tab.get(cfg["url"].format(q=quote_plus(query)))
+    except Exception:
+        return []
+    # Poll until results render (SPA) or ~9s elapse.
+    for _ in range(18):
+        await asyncio.sleep(0.5)
+        try:
+            raw = await tab.evaluate(js, return_by_value=True)
+            raw = raw.value if hasattr(raw, "value") else raw
+            data = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception:
+            data = None
+        if isinstance(data, list) and data:
+            out, seen = [], set()
+            for r in data:
+                u = (r or {}).get("url", "")
+                if u.startswith("http") and u not in seen:
+                    seen.add(u)
+                    out.append({"title": (r.get("title") or "").strip(),
+                                "url": u, "snippet": (r.get("snippet") or "").strip()})
+            if out:
+                return out[:count]
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -457,38 +548,57 @@ async def web_search(
     query: str,
     engine: Literal["bing", "duckduckgo", "exa"] = "bing",
     count: int = 8,
+    use_browser: Literal["auto", "off", "on"] = "auto",
+    proxy: Optional[str] = None,
 ) -> str:
     """⭐ Web search WITHOUT a browser or paid API — replaces tavily/exa discovery.
 
-    Scrapes a SERP via curl_cffi (TLS-perfect), so it runs fully headless/API-mode
-    and light (no Chrome process). Bing default (most reliable, mkt=en-US);
-    DuckDuckGo fallback. engine="exa" uses Exa neural search IF EXA_API_KEY is set
-    (the one capability a browser can't reproduce).
+    Escalation ladder ("use every scenario"):
+      1. curl_cffi SERP (browserless, headless/API-mode, light) — Bing default
+         (mkt=en-US), DuckDuckGo fallback.
+      2. If that is soft-blocked/empty AND a browser is running, escalate to a
+         browser-driven SERP (real Chrome fingerprint + live DOM) — set
+         use_browser="on" to force it, "off" to disable.
+      3. engine="exa" → Exa neural search (BYO EXA_API_KEY) — reliable + semantic.
 
-    Returns {query, engine, count, results:[{title, url, snippet}]}.
+    proxy: route through a residential/mobile proxy (or set RESEARCH_PROXY env) —
+    the only thing that beats IP-level blocks (rate-limited SERPs, datacenter bans).
+
+    Returns {query, engine, count, via:"http"|"browser", results:[{title,url,snippet}]}.
     """
     q = (query or "").strip()
     if not q:
         return err("empty query")
     count = max(1, min(int(count), 25))
     t0 = time.monotonic()
-    results = await _search(q, engine, count)
+
+    via = "http"
+    results = await _search(q, engine, count, proxy=proxy)
+    # Escalate to the browser SERP when HTTP is degraded (auto) or forced (on).
+    if ((use_browser == "on") or (use_browser == "auto" and not results)) \
+            and BrowserState.is_up():
+        br = await _browser_search(q, engine, count)
+        if br:
+            results, via = br, "browser"
+
     if not results:
         return ok(json.dumps({
             "query": q, "engine": engine, "count": 0, "results": [],
             "degraded": True,
-            "note": "no results — the SERP is likely rate-limiting this IP (rapid "
-                    "queries trigger soft-blocks that return 0 or decoy results). "
-                    "Wait a bit and retry, switch engine, use engine='exa' (BYO "
-                    "EXA_API_KEY) for reliable/semantic search, or smart_fetch a "
-                    "known URL directly.",
+            "note": "no results — the SERP is likely rate-limiting/IP-blocking this "
+                    "host (rapid queries trigger soft-blocks that return 0 or decoy "
+                    "results). Options: wait & retry; browser_launch then retry "
+                    "(auto-escalates to a real-Chrome SERP); pass proxy=... or set "
+                    "RESEARCH_PROXY (residential IP beats datacenter bans); or "
+                    "engine='exa' (BYO EXA_API_KEY) for reliable/semantic search.",
         }))
     return ok(json.dumps({
         "query": q,
         "engine": engine,
         "count": len(results),
+        "via": via,
         "elapsed_ms": int((time.monotonic() - t0) * 1000),
-        "browserless": True,
+        "browserless": via == "http",
         "results": results,
     }, ensure_ascii=False))
 
@@ -499,6 +609,7 @@ async def scrape_markdown(
     use_browser: bool = False,
     impersonate: str = "chrome",
     max_chars: int = 20000,
+    proxy: Optional[str] = None,
 ) -> str:
     """⭐ Fetch one URL → clean LLM-ready markdown (firecrawl-scrape equivalent).
 
@@ -530,7 +641,7 @@ async def scrape_markdown(
             "markdown": md,
         }, ensure_ascii=False))
 
-    status, text, _ = await _fetch_http(u, impersonate=impersonate)
+    status, text, _ = await _fetch_http(u, impersonate=impersonate, proxy=proxy)
     if status is None:
         return err(f"fetch failed for {u} (network error)")
     md = _html_to_markdown(text, base_url=u, max_chars=max_chars)
@@ -551,6 +662,7 @@ async def smart_fetch(
     force_browser: bool = False,
     impersonate: str = "chrome",
     max_chars: int = 20000,
+    proxy: Optional[str] = None,
 ) -> str:
     """⭐ Dual-mode fetch: curl_cffi first, auto-escalate to the stealth browser
     ONLY when the HTTP request is anti-bot blocked. The efficiency core — high
@@ -565,7 +677,7 @@ async def smart_fetch(
 
     status, text, _ = None, "", {}
     if not force_browser:
-        status, text, _ = await _fetch_http(u, impersonate=impersonate)
+        status, text, _ = await _fetch_http(u, impersonate=impersonate, proxy=proxy)
         if status is not None and not _looks_blocked(status, text):
             md = _html_to_markdown(text, base_url=u, max_chars=max_chars)
             return ok(json.dumps({
@@ -608,6 +720,7 @@ async def deep_research(
     max_sources: int = 5,
     engine: Literal["bing", "duckduckgo", "exa"] = "bing",
     per_source_chars: int = 3000,
+    proxy: Optional[str] = None,
 ) -> str:
     """⭐ One-call research: search → fetch top-N sources → clean markdown + citations.
 
@@ -623,14 +736,15 @@ async def deep_research(
     max_sources = max(1, min(int(max_sources), 10))
     t0 = time.monotonic()
 
-    results = await _search(q, engine, count=max_sources * 2)
+    results = await _search(q, engine, count=max_sources * 2, proxy=proxy)
     if not results:
         return ok(json.dumps({"query": q, "engine": engine, "count": 0, "sources": [],
-                              "note": "search returned nothing"}))
+                              "note": "search returned nothing — see web_search note "
+                                      "(retry/proxy/browser_launch/engine='exa')"}))
     picked = results[:max_sources]
 
     async def _one(r: dict) -> dict:
-        status, text, _ = await _fetch_http(r.get("url", ""))
+        status, text, _ = await _fetch_http(r.get("url", ""), proxy=proxy)
         blocked = _looks_blocked(status, text)
         content = "" if blocked else _html_to_markdown(
             text, base_url=r.get("url", ""), max_chars=per_source_chars)
