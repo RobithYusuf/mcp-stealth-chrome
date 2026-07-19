@@ -38,8 +38,16 @@ from typing import Literal, Optional
 from urllib.parse import parse_qs, urljoin, urlparse
 
 from .._app import mcp
-from ..helpers import err, ok
+from ..helpers import err, ok, parse_json
 from ..state import BrowserState
+
+
+def _safe_dict(v) -> dict:
+    return v if isinstance(v, dict) else {}
+
+
+def _safe_list(v) -> list:
+    return v if isinstance(v, list) else []
 
 # ---------------------------------------------------------------------------
 # Anti-bot block detection (decides HTTP → browser escalation)
@@ -1099,3 +1107,263 @@ async def social_digest(
                  if blocked and not posts else
                  "reproducible across accounts; sorted by community engagement"),
     }, ensure_ascii=False))
+
+
+# ---------------------------------------------------------------------------
+# Platform adapters — GitHub (REST API) + YouTube (native transcript, no yt-dlp)
+# ---------------------------------------------------------------------------
+
+def _gh_parse(target: str) -> tuple[Optional[str], Optional[str]]:
+    """'owner/repo', a github URL, or 'https://github.com/owner/repo' -> (owner, repo)."""
+    t = (target or "").strip()
+    m = re.search(r"github\.com[/:]([^/]+)/([^/#?]+)", t)
+    if m:
+        return m.group(1), m.group(2).removesuffix(".git")
+    parts = t.strip("/").split("/")
+    if len(parts) >= 2 and "." not in parts[0]:
+        return parts[0], parts[1].removesuffix(".git")
+    return None, None
+
+
+@mcp.tool()
+async def github_read(
+    repo: str,
+    resource: Literal["repo", "readme", "issues", "releases"] = "repo",
+    limit: int = 15,
+    proxy: Optional[str] = None,
+) -> str:
+    """⭐ Read a GitHub repo via the official API — no browser, no anti-bot needed.
+
+    resource:
+      repo     -> metadata {stars, forks, open_issues, language, topics, desc, pushed}
+      readme   -> the README as raw markdown
+      issues   -> recent open issues [{number,title,user,comments,created,state}]
+      releases -> recent releases [{tag,name,published,prerelease}]
+
+    Unauthenticated is rate-limited (60/hr); set GITHUB_TOKEN env for 5000/hr.
+    """
+    owner, name = _gh_parse(repo)
+    if not owner or not name:
+        return err("repo must be 'owner/name' or a github.com URL")
+    hdrs = {"Accept": "application/vnd.github+json",
+            "User-Agent": "mcp-stealth-chrome-research",
+            "X-GitHub-Api-Version": "2022-11-28"}
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if token:
+        hdrs["Authorization"] = f"Bearer {token}"
+    base = f"https://api.github.com/repos/{owner}/{name}"
+    lim = max(1, min(int(limit), 50))
+
+    if resource == "readme":
+        raw_hdrs = dict(hdrs, Accept="application/vnd.github.raw")
+        st, txt, _ = await _fetch_http(base + "/readme", headers=raw_hdrs, proxy=proxy)
+        if st != 200 or not txt:
+            return err(f"readme fetch failed (HTTP {st}) — repo private/missing or rate-limited")
+        return ok(json.dumps({"repo": f"{owner}/{name}", "resource": "readme",
+                              "chars": len(txt), "markdown": txt[:40000]}, ensure_ascii=False))
+
+    if resource == "issues":
+        st, txt, _ = await _fetch_http(
+            base + f"/issues?state=open&sort=created&direction=desc&per_page={lim}",
+            headers=hdrs, proxy=proxy)
+        data = _safe_list(parse_json(txt, None) if st == 200 else None)
+        issues = [{"number": i.get("number"), "title": i.get("title"),
+                   "user": (i.get("user") or {}).get("login"),
+                   "comments": i.get("comments"), "created": i.get("created_at"),
+                   "state": i.get("state")}
+                  for i in data if isinstance(i, dict) and "pull_request" not in i]
+        return ok(json.dumps({"repo": f"{owner}/{name}", "resource": "issues",
+                              "count": len(issues), "issues": issues[:lim]}, ensure_ascii=False))
+
+    if resource == "releases":
+        st, txt, _ = await _fetch_http(base + f"/releases?per_page={lim}", headers=hdrs, proxy=proxy)
+        data = _safe_list(parse_json(txt, None) if st == 200 else None)
+        rels = [{"tag": r.get("tag_name"), "name": r.get("name"),
+                 "published": r.get("published_at"), "prerelease": r.get("prerelease")}
+                for r in data if isinstance(r, dict)]
+        return ok(json.dumps({"repo": f"{owner}/{name}", "resource": "releases",
+                              "count": len(rels), "releases": rels[:lim]}, ensure_ascii=False))
+
+    # default: repo metadata
+    st, txt, _ = await _fetch_http(base, headers=hdrs, proxy=proxy)
+    if st != 200:
+        return err(f"repo fetch failed (HTTP {st}) — not found/private or rate-limited")
+    d = _safe_dict(parse_json(txt, None))
+    return ok(json.dumps({
+        "repo": d.get("full_name"), "resource": "repo",
+        "description": d.get("description"),
+        "stars": d.get("stargazers_count"), "forks": d.get("forks_count"),
+        "open_issues": d.get("open_issues_count"), "watchers": d.get("subscribers_count"),
+        "language": d.get("language"), "topics": d.get("topics"),
+        "license": (d.get("license") or {}).get("spdx_id"),
+        "pushed_at": d.get("pushed_at"), "created_at": d.get("created_at"),
+        "homepage": d.get("homepage"), "archived": d.get("archived"),
+    }, ensure_ascii=False))
+
+
+def _yt_id(target: str) -> Optional[str]:
+    """Extract an 11-char YouTube video id from a URL or a bare id."""
+    t = (target or "").strip()
+    m = re.search(r"(?:v=|youtu\.be/|shorts/|embed/|/v/)([A-Za-z0-9_-]{11})", t)
+    if m:
+        return m.group(1)
+    if re.fullmatch(r"[A-Za-z0-9_-]{11}", t):
+        return t
+    return None
+
+
+def _extract_js_object(text: str, marker: str) -> Optional[str]:
+    """Return the balanced {...} object literal that follows `marker` in text."""
+    i = text.find(marker)
+    if i < 0:
+        return None
+    i = text.find("{", i)
+    if i < 0:
+        return None
+    depth, in_str, esc, q = 0, False, False, ""
+    for j in range(i, len(text)):
+        c = text[j]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == q:
+                in_str = False
+        elif c in "\"'":
+            in_str, q = True, c
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return text[i:j + 1]
+    return None
+
+
+async def _yt_transcript_ytdlp(vid: str, lang: str) -> Optional[str]:
+    """Fallback: yt-dlp (if installed) fetches captions. YouTube's timedtext
+    returns empty for server-side asr fetches without a POT token, so the native
+    path can't get auto-captions; yt-dlp signs the request properly."""
+    import glob
+    import shutil
+    import subprocess
+    import tempfile
+    if not shutil.which("yt-dlp"):
+        return None
+    with tempfile.TemporaryDirectory() as td:
+        out = os.path.join(td, "%(id)s.%(ext)s")
+        cmd = ["yt-dlp", "--quiet", "--no-warnings", "--skip-download",
+               "--write-auto-subs", "--write-subs",
+               "--sub-langs", f"{lang}.*,{lang},en", "--sub-format", "json3",
+               "-o", out, f"https://www.youtube.com/watch?v={vid}"]
+        try:
+            await asyncio.to_thread(subprocess.run, cmd,
+                                    capture_output=True, timeout=90)
+        except Exception:
+            return None
+        files = sorted(glob.glob(os.path.join(td, "*.json3")))
+        if not files:
+            return None
+        try:
+            with open(files[0], encoding="utf-8") as f:
+                data = json.loads(f.read())
+        except Exception:
+            return None
+        lines = []
+        for ev in _safe_dict(data).get("events", []):
+            seg = "".join(s.get("utf8", "") for s in (ev.get("segs") or [])).strip()
+            if seg:
+                lines.append(seg)
+        return " ".join(lines) or None
+
+
+@mcp.tool()
+async def youtube_read(
+    video: str,
+    want: Literal["transcript", "info"] = "transcript",
+    lang: str = "en",
+    max_chars: int = 15000,
+    proxy: Optional[str] = None,
+) -> str:
+    """⭐ Read a YouTube video's TRANSCRIPT + metadata natively (no yt-dlp, no
+    browser) — parses the watch page's player response + timedtext captions.
+
+    Returns {video_id, title, author, views, length_s, lang, transcript} (or just
+    info if want='info'). Returns a clear error if the video has no captions.
+    """
+    vid = _yt_id(video)
+    if not vid:
+        return err("could not parse a YouTube video id from input")
+    st, html, _ = await _fetch_http(
+        f"https://www.youtube.com/watch?v={vid}&hl=en&bpctr=9999999999",
+        headers={"Cookie": "CONSENT=YES+cb; PREF=hl=en&f6=40000000",
+                 "Accept-Language": "en-US,en;q=0.9"},
+        proxy=proxy)
+    if st != 200 or not html:
+        return err(f"watch page fetch failed (HTTP {st})")
+    raw = _extract_js_object(html, "ytInitialPlayerResponse")
+    if not raw:
+        return err("player response not found (video age-restricted, removed, or YT layout changed)")
+    try:
+        data = json.loads(raw)
+    except Exception as e:
+        return err(f"player response parse failed: {e}")
+
+    vd = _safe_dict(data.get("videoDetails"))
+    info = {
+        "video_id": vid,
+        "title": vd.get("title"),
+        "author": vd.get("author"),
+        "views": vd.get("viewCount"),
+        "length_s": vd.get("lengthSeconds"),
+    }
+    if want == "info":
+        return ok(json.dumps(info, ensure_ascii=False))
+
+    tracks = (((data.get("captions") or {})
+               .get("playerCaptionsTracklistRenderer") or {})
+              .get("captionTracks")) or []
+    if not tracks:
+        yt = await _yt_transcript_ytdlp(vid, lang)
+        return ok(json.dumps({
+            **info, "source": "yt-dlp" if yt else "none",
+            "transcript_chars": len(yt or ""),
+            "transcript": (yt or "")[:max_chars],
+            "note": None if yt else "no captions found (native player + yt-dlp)",
+        }, ensure_ascii=False))
+    track = next((t for t in tracks
+                  if str(t.get("languageCode", "")).startswith(lang)), tracks[0])
+    base_url = track.get("baseUrl")
+    if not base_url:
+        return err("caption track has no baseUrl")
+    st2, body, _ = await _fetch_http(base_url + "&fmt=json3", proxy=proxy)
+    lines: list[str] = []
+    try:
+        for ev in _safe_dict(json.loads(body)).get("events", []):
+            seg = "".join(s.get("utf8", "") for s in (ev.get("segs") or []))
+            seg = seg.strip()
+            if seg:
+                lines.append(seg)
+    except Exception:
+        # fallback: XML transcript (<text ...>...</text>)
+        for m in re.finditer(r"<text[^>]*>(.*?)</text>", body or "", re.S):
+            t = unescape(re.sub(r"<[^>]+>", "", m.group(1))).strip()
+            if t:
+                lines.append(t)
+    transcript = " ".join(lines)
+    source = "native"
+    if not transcript:
+        # Server-side timedtext is POT-gated (empty 200) — fall back to yt-dlp.
+        yt = await _yt_transcript_ytdlp(vid, lang)
+        if yt:
+            transcript, source = yt, "yt-dlp"
+    result = {
+        **info, "lang": track.get("languageCode"), "source": source,
+        "transcript_chars": len(transcript),
+        "transcript": transcript[:max_chars],
+    }
+    if not transcript:
+        result["note"] = ("native timedtext empty (POT-gated) and yt-dlp "
+                          "unavailable/failed — install yt-dlp for transcripts")
+    return ok(json.dumps(result, ensure_ascii=False))

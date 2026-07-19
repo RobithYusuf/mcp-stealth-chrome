@@ -11,7 +11,7 @@ both surfaced by the registry gate).
 """
 import sys
 
-EXPECTED_COUNT = 144
+EXPECTED_COUNT = 146
 EXPECTED_TOOLS = {
     # Lifecycle
     "browser_launch", "browser_close", "browser_recover",
@@ -85,7 +85,7 @@ EXPECTED_TOOLS = {
     "tab_focus",
     # Self-sufficient web-research kit (tools/research.py)
     "web_search", "scrape_markdown", "smart_fetch", "deep_research", "search_page",
-    "social_digest",
+    "social_digest", "github_read", "youtube_read",
 }
 
 

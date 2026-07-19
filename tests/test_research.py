@@ -153,12 +153,28 @@ def test_reddit_digest_parse():
     print("  reddit digest parse: dedup + votes/comments/age OK")
 
 
+def test_adapters_parse():
+    import json as _j
+    from mcp_stealth_chrome.tools.research import _gh_parse, _yt_id, _extract_js_object
+    assert _gh_parse("Panniantong/Agent-Reach") == ("Panniantong", "Agent-Reach")
+    assert _gh_parse("https://github.com/openai/whisper") == ("openai", "whisper")
+    assert _gh_parse("git@github.com:a/b.git") == ("a", "b")
+    assert _yt_id("https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=1") == "dQw4w9WgXcQ"
+    assert _yt_id("https://youtu.be/dQw4w9WgXcQ") == "dQw4w9WgXcQ"
+    assert _yt_id("dQw4w9WgXcQ") == "dQw4w9WgXcQ"
+    assert _yt_id("not-a-video-url") is None
+    # string-aware brace matching (YT player response has braces inside strings)
+    obj = _extract_js_object('ytInitialPlayerResponse = {"a":1,"b":{"c":"}"}}; junk', "ytInitialPlayerResponse")
+    assert _j.loads(obj) == {"a": 1, "b": {"c": "}"}}, obj
+    print("  adapter parsers: gh-repo + yt-id + balanced js-object OK")
+
+
 if __name__ == "__main__":
     for fn in (test_block_detection, test_bing_decode, test_ddg_decode,
                test_html_to_markdown, test_truncation,
                test_proxy_resolution, test_browser_serp_config,
                test_challenge_markers, test_slice_main, test_decoy_detection,
-               test_reddit_digest_parse):
+               test_reddit_digest_parse, test_adapters_parse):
         print(f"\n{fn.__name__}:")
         try:
             fn()
