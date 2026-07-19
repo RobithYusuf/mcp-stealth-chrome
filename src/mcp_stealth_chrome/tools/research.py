@@ -969,3 +969,133 @@ async def search_page(text: str, regex: bool = False, max_matches: int = 20,
     return ok(json.dumps({
         "query": q, "regex": regex, "total": len(matches), "matches": matches,
     }, ensure_ascii=False))
+
+
+# ---------------------------------------------------------------------------
+# social_digest — enter a community and return a clean structured digest
+# ---------------------------------------------------------------------------
+
+def _parse_reddit_num(s: str) -> Optional[int]:
+    """'3.5K' -> 3500, '1,234' -> 1234, '548' -> 548."""
+    s = (s or "").strip().replace(",", "")
+    m = re.match(r"([\d.]+)\s*([kKmM]?)", s)
+    if not m:
+        return None
+    try:
+        v = float(m.group(1))
+    except ValueError:
+        return None
+    unit = m.group(2).lower()
+    if unit == "k":
+        v *= 1000
+    elif unit == "m":
+        v *= 1_000_000
+    return int(v)
+
+
+def _parse_reddit_digest(md: str, max_posts: int) -> list[dict]:
+    """Parse Reddit listing/search markdown into structured posts. Robust to the
+    title link appearing twice per post (heading + body) by keying on permalink."""
+    order: list[str] = []
+    by_url: dict[str, dict] = {}
+    cur: Optional[dict] = None
+    for raw in (md or "").split("\n"):
+        ln = raw.strip()
+        m = re.search(
+            r"\[([^\]]+?)\]\((https://www\.reddit\.com/r/[^/]+/comments/[^)]+?)\)", ln)
+        if m:
+            url = m.group(2)
+            if url not in by_url:
+                by_url[url] = {"title": m.group(1).strip(), "url": url,
+                               "votes": None, "comments": None, "age": None}
+                order.append(url)
+            cur = by_url[url]
+            continue
+        if cur is None:
+            continue
+        vc = re.search(r"([\d.,]+[kKmM]?)\s*votes?·\s*([\d.,]+[kKmM]?)\s*comments?", ln)
+        if vc:
+            cur["votes"] = _parse_reddit_num(vc.group(1))
+            cur["comments"] = _parse_reddit_num(vc.group(2))
+            continue
+        ag = re.match(r"·\s*(.+ago)$", ln)
+        if ag and not cur["age"]:
+            cur["age"] = ag.group(1).strip()
+    return [by_url[u] for u in order][:max_posts]
+
+
+@mcp.tool()
+async def social_digest(
+    subreddit: str,
+    query: Optional[str] = None,
+    sort: Literal["top", "hot", "new", "relevance", "comments"] = "top",
+    window: Literal["hour", "day", "week", "month", "year", "all"] = "month",
+    scrolls: int = 3,
+    max_posts: int = 15,
+) -> str:
+    """⭐ Enter a Reddit community and return a clean, STRUCTURED digest of its top
+    posts — a reproducible, account-independent research surface (uses search/sort,
+    NOT the personalized 'For you' feed, so the same call yields the same posts for
+    any account). Needs a running browser (scrolls + clears JS challenges).
+
+    Args:
+      subreddit : community name ("ChatGPTCoding", "r/LocalLLaMA") or a full URL
+      query     : optional — search WITHIN the subreddit instead of browsing it
+      sort      : top/hot/new (browse) or relevance/top/new/comments (search)
+      window    : time window for top/search (hour..all)
+      scrolls   : how many times to scroll to lazy-load more posts
+      max_posts : cap on returned posts
+
+    Returns {surface, mode, sort, window, count, posts:[{title,url,votes,comments,age}], note}.
+    The `surface` label states exactly what was read so results are auditable.
+    """
+    if not BrowserState.is_up():
+        return err("browser_launch first — social_digest scrolls + clears JS "
+                   "challenges inside the stealth browser")
+    from urllib.parse import quote_plus
+    sub = subreddit.strip().lstrip("/")
+    if sub.lower().startswith("r/"):
+        sub = sub[2:]
+    if subreddit.startswith("http"):
+        url = subreddit
+        surface = subreddit
+    elif query:
+        url = (f"https://www.reddit.com/r/{sub}/search/?q={quote_plus(query)}"
+               f"&restrict_sr=1&sort={sort}&t={window}")
+        surface = f"r/{sub} · search:'{query}' · {sort} · {window}"
+    else:
+        s = sort if sort in ("top", "hot", "new", "rising") else "top"
+        url = f"https://www.reddit.com/r/{sub}/{s}/?t={window}"
+        surface = f"r/{sub} · {s} · {window}"
+
+    t0 = time.monotonic()
+    tab = BrowserState.active_tab()
+    html = await _browser_render(tab, url)
+    if "blocked by network security" in (html or "").lower():
+        html = await _browser_render(tab, url)  # warm retry
+    # Scroll to lazy-load more posts, then re-read the DOM.
+    for _ in range(max(0, min(scrolls, 12))):
+        try:
+            await tab.evaluate("window.scrollBy(0, document.body.scrollHeight)")
+        except Exception:
+            pass
+        await asyncio.sleep(1.3)
+    try:
+        html = await tab.get_content()
+    except Exception:
+        pass
+    md = _html_to_markdown(html, base_url=url, max_chars=60000)
+    posts = _parse_reddit_digest(md, max_posts)
+    blocked = "blocked by network security" in (html or "").lower()
+    return ok(json.dumps({
+        "surface": surface,
+        "mode": "objective — deterministic search/sort surface, NOT the "
+                "personalized feed; account only unlocks access, not ranking",
+        "sort": sort, "window": window,
+        "count": len(posts),
+        "elapsed_ms": int((time.monotonic() - t0) * 1000),
+        "posts": posts,
+        "note": ("challenge-blocked — retry once (a warmed session passes)"
+                 if blocked and not posts else
+                 "reproducible across accounts; sorted by community engagement"),
+    }, ensure_ascii=False))

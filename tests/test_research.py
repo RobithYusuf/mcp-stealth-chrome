@@ -130,11 +130,35 @@ def test_decoy_detection():
     print("  SERP decoy detection: rejects off-topic, keeps relevant")
 
 
+def test_reddit_digest_parse():
+    from mcp_stealth_chrome.tools.research import _parse_reddit_digest, _parse_reddit_num
+    assert _parse_reddit_num("3.5K") == 3500
+    assert _parse_reddit_num("1,234") == 1234
+    assert _parse_reddit_num("548") == 548
+    md = (
+        "##\n[Best coding agent thread](https://www.reddit.com/r/X/comments/abc/best/)\n"
+        "[r/X](https://www.reddit.com/r/X/)\n· 3mo ago\n"
+        "[Best coding agent thread](https://www.reddit.com/r/X/comments/abc/best/)\n"
+        "3.5K votes·548 comments\n---\n"
+        "##\n[Second post](https://www.reddit.com/r/X/comments/def/second/)\n"
+        "· 1d ago\n[Second post](https://www.reddit.com/r/X/comments/def/second/)\n"
+        "2K votes·41 comments\n"
+    )
+    posts = _parse_reddit_digest(md, 10)
+    assert len(posts) == 2, posts
+    p = posts[0]
+    assert (p["title"] == "Best coding agent thread" and p["votes"] == 3500
+            and p["comments"] == 548 and p["age"] == "3mo ago"), p
+    assert posts[1]["votes"] == 2000 and posts[1]["comments"] == 41, posts[1]
+    print("  reddit digest parse: dedup + votes/comments/age OK")
+
+
 if __name__ == "__main__":
     for fn in (test_block_detection, test_bing_decode, test_ddg_decode,
                test_html_to_markdown, test_truncation,
                test_proxy_resolution, test_browser_serp_config,
-               test_challenge_markers, test_slice_main, test_decoy_detection):
+               test_challenge_markers, test_slice_main, test_decoy_detection,
+               test_reddit_digest_parse):
         print(f"\n{fn.__name__}:")
         try:
             fn()
