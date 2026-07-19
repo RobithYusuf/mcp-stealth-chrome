@@ -101,11 +101,40 @@ def test_challenge_markers():
     print("  JS-challenge markers + _browser_render present")
 
 
+def test_slice_main():
+    from mcp_stealth_chrome.tools.research import _slice_main, _html_to_markdown
+    html = ("<html><head><title>T</title></head><body>"
+            "<nav>Home About Login Language list AAA BBB CCC</nav>"
+            "<main><h1>Real Title</h1><p>" + ("Actual body content here. " * 20) +
+            "</p></main><footer>copyright junk</footer></body></html>")
+    inner = _slice_main(html)
+    assert inner is not None and "Actual body content" in inner, inner
+    assert "Login" not in inner and "copyright junk" not in inner, "boilerplate leaked"
+    md = _html_to_markdown(html, max_chars=2000)
+    assert "Actual body content" in md and "Login" not in md, md
+    # no main container -> returns None, falls back to whole doc
+    assert _slice_main("<div>hello world plain page no landmarks</div>") is None
+    print("  main-content slice drops nav/footer, keeps article")
+
+
+def test_decoy_detection():
+    from mcp_stealth_chrome.tools.research import _looks_decoy
+    q = "best AI coding agent 2026"
+    decoy = [{"title": "WhatsApp Web", "url": "https://web.whatsapp.com/", "snippet": "messaging"},
+             {"title": "WhatsApp", "url": "https://www.whatsapp.com/", "snippet": "chat"}]
+    real = [{"title": "Top AI coding agents compared", "url": "https://x.com/agents", "snippet": "Cursor, Claude Code..."},
+            {"title": "Best AI agent for coding in 2026", "url": "https://y.com/", "snippet": "review"}]
+    assert _looks_decoy(q, decoy) is True, "should flag off-topic decoys"
+    assert _looks_decoy(q, real) is False, "should accept on-topic results"
+    assert _looks_decoy(q, []) is False
+    print("  SERP decoy detection: rejects off-topic, keeps relevant")
+
+
 if __name__ == "__main__":
     for fn in (test_block_detection, test_bing_decode, test_ddg_decode,
                test_html_to_markdown, test_truncation,
                test_proxy_resolution, test_browser_serp_config,
-               test_challenge_markers):
+               test_challenge_markers, test_slice_main, test_decoy_detection):
         print(f"\n{fn.__name__}:")
         try:
             fn()

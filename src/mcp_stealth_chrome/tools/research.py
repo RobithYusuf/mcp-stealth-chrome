@@ -119,8 +119,10 @@ async def _browser_render(tab, url: str, max_wait: float = 16.0,
         await tab.get(url)
     except Exception:
         return ""
-    deadline = time.monotonic() + max_wait
+    start = time.monotonic()
+    deadline = start + max_wait
     last = ""
+    reloaded = False
     while time.monotonic() < deadline:
         await asyncio.sleep(settle)
         try:
@@ -135,6 +137,18 @@ async def _browser_render(tab, url: str, max_wait: float = 16.0,
         if html and not challenging:
             return html
         last = html or last
+        # One reload partway through: the JS challenge sets a clearance cookie on
+        # the first hit, so a reload on the SAME session usually passes (verified
+        # on Reddit — the manual "2nd fetch works" behaviour, now automatic).
+        if not reloaded and (time.monotonic() - start) > max_wait * 0.35:
+            reloaded = True
+            try:
+                await tab.reload()
+            except Exception:
+                try:
+                    await tab.get(url)
+                except Exception:
+                    pass
     return last
 
 
@@ -290,19 +304,61 @@ class _MarkdownExtractor(HTMLParser):
         self.parts.append(data)
 
 
+# Content containers to prefer over the whole page, MOST-SPECIFIC first — drops
+# nav/sidebar/footer AND site-chrome nested in a broad <main> (e.g. Wikipedia's
+# language list lives in main#content but NOT in #mw-content-text).
+_MAIN_PATTERNS = [
+    re.compile(r'<(article)\b[^>]*>', re.I),
+    re.compile(r'<(\w+)\b[^>]*\bid=["\'](?:mw-content-text|main-content|'
+               r'maincontent|primary|content-main|article-body|post-content)["\']', re.I),
+    re.compile(r'<(main)\b[^>]*>', re.I),
+    re.compile(r'<(\w+)\b[^>]*\brole=["\']main["\']', re.I),
+    re.compile(r'<(\w+)\b[^>]*\bid=["\'](?:content|main)["\']', re.I),
+]
+
+
+def _slice_main(html: str) -> Optional[str]:
+    """Inner HTML of the primary content container, trying the most-specific
+    article-body landmark first, so nav/sidebar/footer boilerplate is dropped.
+    None if no landmark is found (caller falls back to the whole document)."""
+    for pat in _MAIN_PATTERNS:
+        m = pat.search(html)
+        if not m:
+            continue
+        tag = m.group(1).lower()
+        gt = html.find(">", m.start())
+        if gt == -1:
+            continue
+        start = gt + 1
+        depth = 1
+        for mm in re.finditer(rf"<(/?){tag}\b", html[start:], re.I):
+            depth += -1 if mm.group(1) else 1
+            if depth == 0:
+                inner = html[start:start + mm.start()]
+                if len(inner) > 200:
+                    return inner
+                break
+    return None
+
+
 def _html_to_markdown(html: str, base_url: str = "", max_chars: int = 20000) -> str:
     """Convert HTML to trimmed markdown. Best-effort, never raises."""
     if not html:
         return ""
+    # Title from the full document (a sliced main region won't contain <title>).
+    tm = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
+    title = unescape(re.sub(r"<[^>]+>", "", tm.group(1))).strip() if tm else ""
+    # Prefer the primary content container to drop nav/sidebar/footer noise.
+    target = _slice_main(html) or html
     try:
         p = _MarkdownExtractor(base_url=base_url)
-        p.feed(html)
+        p.feed(target)
         raw = "".join(p.parts)
-        title = (p.title or "").strip()
+        if not title:
+            title = (p.title or "").strip()
     except Exception:
         # Fall back to a crude tag strip so we always return *something*.
-        raw = re.sub(r"<[^>]+>", " ", html)
-        title = ""
+        raw = re.sub(r"<[^>]+>", " ", target)
     raw = unescape(raw)
     # Line-wise normalize: collapse intra-line whitespace, rstrip, squeeze blanks.
     lines = [re.sub(r"[ \t ]+", " ", ln).strip() for ln in raw.split("\n")]
@@ -589,6 +645,32 @@ async def _browser_search(query: str, engine: str, count: int) -> list[dict]:
     return []
 
 
+# Words too generic to judge topical relevance by.
+_STOPWORDS = {
+    "the", "a", "an", "and", "or", "of", "to", "in", "for", "on", "is", "are",
+    "best", "top", "how", "what", "why", "vs", "with", "review", "reviews",
+    "2023", "2024", "2025", "2026", "guide", "worth", "it", "your", "you",
+}
+
+
+def _looks_decoy(query: str, results: list) -> bool:
+    """True if SERP results look like soft-block DECOYS: they exist but share
+    almost no keyword with the query (e.g. 'best AI coding agent' -> WhatsApp
+    results). Lets web_search reject silent garbage instead of returning it."""
+    if not results:
+        return False
+    qwords = {w for w in re.findall(r"[a-z0-9]{3,}", query.lower())
+              if w not in _STOPWORDS}
+    if len(qwords) < 2:
+        return False  # too few meaningful words to judge reliably
+    hits = 0
+    for r in results:
+        blob = f"{r.get('title', '')} {r.get('snippet', '')} {r.get('url', '')}".lower()
+        if any(w in blob for w in qwords):
+            hits += 1
+    return hits < max(1, len(results) * 0.34)
+
+
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
@@ -625,11 +707,13 @@ async def web_search(
 
     via = "http"
     results = await _search(q, engine, count, proxy=proxy)
+    if _looks_decoy(q, results):
+        results = []  # soft-block decoy (off-topic) — discard, treat as no-results
     # Escalate to the browser SERP when HTTP is degraded (auto) or forced (on).
     if ((use_browser == "on") or (use_browser == "auto" and not results)) \
             and BrowserState.is_up():
         br = await _browser_search(q, engine, count)
-        if br:
+        if br and not _looks_decoy(q, br):
             results, via = br, "browser"
 
     if not results:
