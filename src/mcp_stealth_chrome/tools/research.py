@@ -94,6 +94,50 @@ async def _serp_throttle() -> None:
 # curl_cffi HTTP fetch (the browserless fast path)
 # ---------------------------------------------------------------------------
 
+# JS-challenge / anti-bot interstitials that a REAL browser clears on its own
+# after a few seconds (Cloudflare "Just a moment", Reddit "network security"
+# js_challenge, etc). curl_cffi can't run the JS, but the stealth browser can —
+# we just have to WAIT for the challenge to resolve instead of reading too early.
+_CHALLENGE_MARKERS = (
+    "just a moment", "checking your browser", "challenge-platform",
+    "blocked by network security", "verifying you are human", "verify you are human",
+    "cf-chl", "jschl", "js_challenge", "please wait", "enable javascript and cookies",
+    "ddos protection by", "attention required",
+)
+
+
+async def _browser_render(tab, url: str, max_wait: float = 16.0,
+                          settle: float = 1.0) -> str:
+    """Navigate then WAIT OUT any JS challenge until real content renders.
+
+    Polls page HTML; treats a tiny body or a known challenge marker as
+    "still challenging" and keeps waiting up to max_wait. Returns the final HTML
+    (real content if the challenge cleared, else the last challenge/block page so
+    _looks_blocked can flag a genuine hard block).
+    """
+    try:
+        await tab.get(url)
+    except Exception:
+        return ""
+    deadline = time.monotonic() + max_wait
+    last = ""
+    while time.monotonic() < deadline:
+        await asyncio.sleep(settle)
+        try:
+            html = await tab.get_content()
+        except Exception:
+            html = ""
+        # Scan the WHOLE body: on Reddit's block page the marker sits far below
+        # ~190KB of leading CSS, so a head-only slice would miss it and return
+        # the block page as if it were real content.
+        low = (html or "").lower()
+        challenging = (len(html or "") < 1500) or any(m in low for m in _CHALLENGE_MARKERS)
+        if html and not challenging:
+            return html
+        last = html or last
+    return last
+
+
 def _default_proxy(explicit: Optional[str]) -> Optional[str]:
     """Resolve a proxy: explicit arg > RESEARCH_PROXY > HTTPS_PROXY > ALL_PROXY env.
 
@@ -636,9 +680,7 @@ async def scrape_markdown(
             return err("use_browser=True but no browser — call browser_launch first")
         try:
             tab = BrowserState.active_tab()
-            await tab.get(u)
-            await asyncio.sleep(1.2)
-            html = await tab.get_content()
+            html = await _browser_render(tab, u)   # waits out JS challenges
         except Exception as e:
             return err(f"browser fetch failed: {type(e).__name__}: {e}")
         md = _html_to_markdown(html, base_url=u, max_chars=max_chars)
@@ -687,19 +729,21 @@ async def smart_fetch(
         status, text, _ = await _fetch_http(u, impersonate=impersonate, proxy=proxy)
         if status is not None and not _looks_blocked(status, text):
             md = _html_to_markdown(text, base_url=u, max_chars=max_chars)
-            return ok(json.dumps({
-                "url": u, "path": "http", "status": status, "chars": len(md),
-                "elapsed_ms": int((time.monotonic() - t0) * 1000),
-                "markdown": md,
-            }, ensure_ascii=False))
+            # A 200 with almost no extractable text is usually a JS/SPA shell
+            # (e.g. www.reddit.com) — fall through to render it in the browser.
+            # If no browser is up, return the HTTP result rather than nothing.
+            if len(md) >= 200 or not BrowserState.is_up():
+                return ok(json.dumps({
+                    "url": u, "path": "http", "status": status, "chars": len(md),
+                    "elapsed_ms": int((time.monotonic() - t0) * 1000),
+                    "markdown": md,
+                }, ensure_ascii=False))
 
-    # Escalate to browser
+    # Escalate to browser (blocked, empty SPA shell, or forced)
     if BrowserState.is_up():
         try:
             tab = BrowserState.active_tab()
-            await tab.get(u)
-            await asyncio.sleep(1.5)
-            html = await tab.get_content()
+            html = await _browser_render(tab, u)   # waits out JS challenges (Reddit/CF)
         except Exception as e:
             return err(f"browser escalation failed: {type(e).__name__}: {e}")
         md = _html_to_markdown(html, base_url=u, max_chars=max_chars)

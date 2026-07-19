@@ -92,10 +92,20 @@ def test_browser_serp_config():
     print("  browser-SERP live-DOM config present (bing + duckduckgo)")
 
 
+def test_challenge_markers():
+    import inspect
+    from mcp_stealth_chrome.tools.research import _CHALLENGE_MARKERS, _browser_render
+    assert "blocked by network security" in _CHALLENGE_MARKERS  # Reddit js_challenge
+    assert "just a moment" in _CHALLENGE_MARKERS                # Cloudflare
+    assert inspect.iscoroutinefunction(_browser_render)
+    print("  JS-challenge markers + _browser_render present")
+
+
 if __name__ == "__main__":
     for fn in (test_block_detection, test_bing_decode, test_ddg_decode,
                test_html_to_markdown, test_truncation,
-               test_proxy_resolution, test_browser_serp_config):
+               test_proxy_resolution, test_browser_serp_config,
+               test_challenge_markers):
         print(f"\n{fn.__name__}:")
         try:
             fn()
