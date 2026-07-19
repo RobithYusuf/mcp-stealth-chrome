@@ -76,6 +76,20 @@ def _looks_blocked(status: Optional[int], text: str) -> bool:
     return False
 
 
+# Polite pacing between SERP hits. Rapid-fire scraping trips soft-blocks: the
+# engine starts returning decoy/degraded results (e.g. dictionary pages for an
+# AI query) or resets the connection. A ~1s gap keeps queries under the radar.
+_SERP_MIN_GAP = 1.0
+_last_serp_at = [0.0]
+
+
+async def _serp_throttle() -> None:
+    gap = _SERP_MIN_GAP - (time.monotonic() - _last_serp_at[0])
+    if gap > 0:
+        await asyncio.sleep(gap)
+    _last_serp_at[0] = time.monotonic()
+
+
 # ---------------------------------------------------------------------------
 # curl_cffi HTTP fetch (the browserless fast path)
 # ---------------------------------------------------------------------------
@@ -302,6 +316,7 @@ async def _ddg_search(query: str, count: int) -> list[dict]:
     """DuckDuckGo SERP via the html endpoint, with the lite endpoint as fallback."""
     from urllib.parse import quote_plus
     out: list[dict] = []
+    await _serp_throttle()
     # 1) html.duckduckgo.com (POST form) — richest markup
     status, text, _ = await _fetch_http(
         "https://html.duckduckgo.com/html/", method="POST",
@@ -361,12 +376,16 @@ async def _bing_search(query: str, count: int) -> list[dict]:
     URLs are hidden behind /ck/a redirects, decoded via _decode_bing_href.
     """
     from urllib.parse import quote_plus
+    await _serp_throttle()
     status, text, _ = await _fetch_http(
         f"https://www.bing.com/search?q={quote_plus(query)}"
         f"&mkt=en-US&setlang=en&count={max(count, 10)}&form=QBLH",
         headers={"Referer": "https://www.bing.com/"},
     )
     if status != 200 or not text:
+        return []
+    # Genuine empty (not a decoy) — bail so the caller reports 0 honestly.
+    if "There are no results for" in text or 'class="b_no"' in text:
         return []
     out, seen = [], set()
     for blk in text.split('class="b_algo"')[1:]:
@@ -457,8 +476,12 @@ async def web_search(
     if not results:
         return ok(json.dumps({
             "query": q, "engine": engine, "count": 0, "results": [],
-            "note": "no results parsed — engine may have changed markup or rate-limited; "
-                    "try engine='bing' or use smart_fetch on a known URL",
+            "degraded": True,
+            "note": "no results — the SERP is likely rate-limiting this IP (rapid "
+                    "queries trigger soft-blocks that return 0 or decoy results). "
+                    "Wait a bit and retry, switch engine, use engine='exa' (BYO "
+                    "EXA_API_KEY) for reliable/semantic search, or smart_fetch a "
+                    "known URL directly.",
         }))
     return ok(json.dumps({
         "query": q,
