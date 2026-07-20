@@ -1430,13 +1430,15 @@ _SOCIAL_NATIVE = {
 }
 
 
-async def _social_native_text(platform: str, topic: str, max_chars: int = 4000) -> str:
+async def _social_native_text(platform: str, topic: str, max_chars: int = 8000,
+                              scroll: int = 3) -> str:
     """Navigate the LIVE browser to a platform's native search and return the
     rendered innerText (best-effort). Uses _browser_render to WAIT OUT JS
     challenges (Reddit "blocked by network security", Cloudflare "just a moment")
-    + SPA hydration before reading — a plain navigate returns the block page.
-    Needs a running browser + (for login-walled platforms) an imported session
-    cookie. Returns '__LOGIN_REQUIRED__' when bounced to a login wall."""
+    + SPA hydration, then SCROLLS `scroll` times to load more of the infinite feed
+    (Threads/FB/X lazy-load on scroll) before reading — so we capture far more than
+    the ~5 above-the-fold posts. Needs a running browser + (for login-walled
+    platforms) an imported session cookie. Returns '__LOGIN_REQUIRED__' at a login wall."""
     from urllib.parse import quote
     url_t = _SOCIAL_NATIVE.get(platform)
     if not url_t or not BrowserState.is_up():
@@ -1450,17 +1452,33 @@ async def _social_native_text(platform: str, topic: str, max_chars: int = 4000) 
     low = (html or "").lower()
     if (len(html or "") < 1500) or any(m in low for m in _CHALLENGE_MARKERS):
         return ""  # hard block / challenge never cleared
-    # read visible text from the now-rendered page
-    try:
-        raw = await tab.evaluate(
-            "document.body ? document.body.innerText : ''", return_by_value=True)
-        txt = str((raw.value if hasattr(raw, "value") else raw) or "")
-    except Exception:
-        txt = ""
+
+    async def _inner() -> str:
+        try:
+            raw = await tab.evaluate(
+                "document.body ? document.body.innerText : ''", return_by_value=True)
+            return str((raw.value if hasattr(raw, "value") else raw) or "")
+        except Exception:
+            return ""
+
+    # login-wall check BEFORE scrolling (don't waste scroll time on a wall)
+    txt = await _inner()
     low2 = txt.lower()
     if platform in _SOCIAL_LOGIN_WALLED and len(txt) < 1500 and (
             "log in" in low2 or "masuk" in low2 or "create new account" in low2):
         return "__LOGIN_REQUIRED__"
+
+    # scroll the infinite feed to load more posts, then re-read the (longer) text
+    for _ in range(max(0, scroll)):
+        try:
+            await tab.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        except Exception:
+            break
+        await asyncio.sleep(1.2)
+    if scroll > 0:
+        more = await _inner()
+        if len(more) > len(txt):
+            txt = more
     return txt[:max_chars]
 
 
@@ -1471,6 +1489,7 @@ async def social_research(
     max_per_platform: int = 8,
     use_browser: bool = True,
     cookie_files: str = "",
+    scroll: int = 3,
     proxy: Optional[str] = None,
 ) -> str:
     """⭐ Social-media market/competitor research — WHO sells/makes X + HOW loud.
@@ -1497,6 +1516,9 @@ async def social_research(
     native + cookies = recall + engagement + recent (but personalized to your acct).
 
     platforms: comma list of reddit,threads,facebook,x,instagram,tiktok,linkedin.
+    scroll: how many times to scroll each native feed (default 3) to load MORE
+    posts from the infinite scroll — raise it (e.g. 6-8) for deeper coverage,
+    lower to 0 for a fast above-the-fold-only read.
 
     Returns {topic, platforms:[{name, dork_results:[{title,url,snippet}],
     native_excerpt, needs_cookies}], cookies_hint, method}. The caller reads the
@@ -1542,7 +1564,7 @@ async def social_research(
                  "native_excerpt": "", "needs_cookies": False}
         # 2) native in-platform search when a browser is running
         if use_browser and browser_up:
-            native = await _social_native_text(p, t)
+            native = await _social_native_text(p, t, scroll=scroll)
             if native == "__LOGIN_REQUIRED__":
                 entry["needs_cookies"] = True
                 need_cookie_for.append(p)
