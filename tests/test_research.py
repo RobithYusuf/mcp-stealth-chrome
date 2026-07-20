@@ -85,11 +85,24 @@ def test_proxy_resolution():
 
 def test_browser_serp_config():
     from mcp_stealth_chrome.tools.research import _BROWSER_SERP
-    for eng in ("bing", "duckduckgo"):
+    for eng in ("bing", "duckduckgo", "brave"):
         cfg = _BROWSER_SERP[eng]
         assert "{q}" in cfg["url"], eng
         assert "%d" in cfg["js"] and "querySelectorAll" in cfg["js"], eng
-    print("  browser-SERP live-DOM config present (bing + duckduckgo)")
+        assert cfg["js"].count("%d") == 1, f"{eng}: exactly one %d for slice count"
+    # Brave relies on the stable data-type="web" attribute (Svelte hashes the rest)
+    assert 'data-type=\\"web\\"' in _BROWSER_SERP["brave"]["js"]
+    assert "search.brave.com" in _BROWSER_SERP["brave"]["url"]
+    print("  browser-SERP live-DOM config present (bing + duckduckgo + brave)")
+
+
+def test_brave_browser_only():
+    import asyncio
+    from mcp_stealth_chrome.tools.research import _search
+    # brave is a browser-only rich SERP: the HTTP _search layer must yield []
+    # so web_search / deep_research escalate to the live-DOM browser SERP.
+    assert asyncio.run(_search("anything at all", "brave", 5)) == []
+    print("  brave routed browser-only (HTTP _search returns [])")
 
 
 def test_challenge_markers():
@@ -173,6 +186,7 @@ if __name__ == "__main__":
     for fn in (test_block_detection, test_bing_decode, test_ddg_decode,
                test_html_to_markdown, test_truncation,
                test_proxy_resolution, test_browser_serp_config,
+               test_brave_browser_only,
                test_challenge_markers, test_slice_main, test_decoy_detection,
                test_reddit_digest_parse, test_adapters_parse):
         print(f"\n{fn.__name__}:")

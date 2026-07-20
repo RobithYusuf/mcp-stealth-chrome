@@ -367,7 +367,7 @@ wheels = [
 
 [[package]]
 name = "mcp-stealth-chrome"
-version = "0.4.12"
+version = "0.5.0"
 source = { editable = "." }
 dependencies = [
     { name = "curl-cffi" },

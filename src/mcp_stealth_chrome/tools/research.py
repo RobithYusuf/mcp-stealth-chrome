@@ -582,6 +582,8 @@ async def _search(query: str, engine: str, count: int,
     engine = (engine or "bing").lower()
     if engine in ("exa", "neural"):
         return await _exa_search(query, count, proxy)
+    if engine == "brave":
+        return []  # browser-only rich SERP — web_search escalates to _browser_search
     if engine in ("duckduckgo", "ddg"):
         res = await _ddg_search(query, count, proxy)
         return res or await _bing_search(query, count, proxy)
@@ -615,6 +617,21 @@ _BROWSER_SERP = {
                           const s = x.querySelector('[data-result=\"snippet\"]');
                           return a ? {title: a.innerText, url: a.href,
                                       snippet: s ? s.innerText.slice(0,300) : ''} : null; })
+              .filter(Boolean)))()""",
+    },
+    # Brave: richest SERP (own index, no Google/Bing dependency). Relies only on
+    # the stable data-type="web" attribute + .title base class (Svelte hashes the
+    # rest). Result anchors are direct URLs — no redirect decode needed.
+    "brave": {
+        "url": "https://search.brave.com/search?q={q}&source=web",
+        "js": r"""(() => JSON.stringify(
+            Array.from(document.querySelectorAll('.snippet[data-type=\"web\"]')).slice(0, %d)
+              .map(x => { const a = x.querySelector('a[href^=\"http\"]'); if (!a) return null;
+                          const t = x.querySelector('.title');
+                          const title = (t ? t.innerText : a.innerText).trim();
+                          let s = ''; const d = x.querySelector('.snippet-description');
+                          if (d) s = d.innerText; else s = (x.innerText || '').replace(title, '').trim();
+                          return {title: title, url: a.href, snippet: (s || '').slice(0,300)}; })
               .filter(Boolean)))()""",
     },
 }
@@ -698,7 +715,7 @@ def _looks_decoy(query: str, results: list) -> bool:
 @mcp.tool()
 async def web_search(
     query: str,
-    engine: Literal["bing", "duckduckgo", "exa"] = "bing",
+    engine: Literal["bing", "duckduckgo", "brave", "exa"] = "bing",
     count: int = 8,
     use_browser: Literal["auto", "off", "on"] = "auto",
     proxy: Optional[str] = None,
@@ -711,6 +728,9 @@ async def web_search(
       2. If that is soft-blocked/empty AND a browser is running, escalate to a
          browser-driven SERP (real Chrome fingerprint + live DOM) — set
          use_browser="on" to force it, "off" to disable.
+      2b. engine="brave" → Brave's own index via the browser SERP: RICHEST results
+          (AI answer + Reddit discussions with vote counts + videos). Needs a browser
+          (browser_launch); best single engine for research-grade discovery.
       3. engine="exa" → Exa neural search (BYO EXA_API_KEY) — reliable + semantic.
 
     proxy: route through a residential/mobile proxy (or set RESEARCH_PROXY env) —
@@ -743,7 +763,8 @@ async def web_search(
                     "host (rapid queries trigger soft-blocks that return 0 or decoy "
                     "results). Options: wait & retry; browser_launch then retry "
                     "(auto-escalates to a real-Chrome SERP); pass proxy=... or set "
-                    "RESEARCH_PROXY (residential IP beats datacenter bans); or "
+                    "RESEARCH_PROXY (residential IP beats datacenter bans); "
+                    "engine='brave' (richest results, needs a running browser); or "
                     "engine='exa' (BYO EXA_API_KEY) for reliable/semantic search.",
         }))
     return ok(json.dumps({
@@ -882,7 +903,7 @@ async def smart_fetch(
 async def deep_research(
     query: str,
     max_sources: int = 5,
-    engine: Literal["bing", "duckduckgo", "exa"] = "bing",
+    engine: Literal["bing", "duckduckgo", "brave", "exa"] = "bing",
     per_source_chars: int = 3000,
     proxy: Optional[str] = None,
 ) -> str:
@@ -901,10 +922,16 @@ async def deep_research(
     t0 = time.monotonic()
 
     results = await _search(q, engine, count=max_sources * 2, proxy=proxy)
+    # Escalate to the browser SERP when HTTP is empty/soft-blocked, or when the
+    # engine is browser-only (brave). Requires a running browser.
+    if (not results or _looks_decoy(q, results)) and BrowserState.is_up():
+        br = await _browser_search(q, engine, count=max_sources * 2)
+        if br and not _looks_decoy(q, br):
+            results = br
     if not results:
         return ok(json.dumps({"query": q, "engine": engine, "count": 0, "sources": [],
                               "note": "search returned nothing — see web_search note "
-                                      "(retry/proxy/browser_launch/engine='exa')"}))
+                                      "(retry/proxy/browser_launch/engine='brave'/engine='exa')"}))
     picked = results[:max_sources]
 
     async def _one(r: dict) -> dict:
