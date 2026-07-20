@@ -85,11 +85,14 @@ def test_proxy_resolution():
 
 def test_browser_serp_config():
     from mcp_stealth_chrome.tools.research import _BROWSER_SERP
-    for eng in ("bing", "duckduckgo", "brave"):
+    for eng in ("bing", "duckduckgo", "brave", "google"):
         cfg = _BROWSER_SERP[eng]
         assert "{q}" in cfg["url"], eng
         assert "%d" in cfg["js"] and "querySelectorAll" in cfg["js"], eng
         assert cfg["js"].count("%d") == 1, f"{eng}: exactly one %d for slice count"
+    # google: reliable fallback SERP, honors site:, anchors on <h3>
+    assert "google.com/search" in _BROWSER_SERP["google"]["url"]
+    assert "h3" in _BROWSER_SERP["google"]["js"]
     # Brave relies on the stable data-type="web" attribute (Svelte hashes the rest)
     assert 'data-type=\\"web\\"' in _BROWSER_SERP["brave"]["js"]
     assert "search.brave.com" in _BROWSER_SERP["brave"]["url"]

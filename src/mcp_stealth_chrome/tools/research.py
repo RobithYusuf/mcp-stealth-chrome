@@ -582,8 +582,8 @@ async def _search(query: str, engine: str, count: int,
     engine = (engine or "bing").lower()
     if engine in ("exa", "neural"):
         return await _exa_search(query, count, proxy)
-    if engine == "brave":
-        return []  # browser-only rich SERP — web_search escalates to _browser_search
+    if engine in ("brave", "google"):
+        return []  # browser-only SERP — web_search escalates to _browser_search
     if engine in ("duckduckgo", "ddg"):
         res = await _ddg_search(query, count, proxy)
         return res or await _bing_search(query, count, proxy)
@@ -633,6 +633,20 @@ _BROWSER_SERP = {
                           if (d) s = d.innerText; else s = (x.innerText || '').replace(title, '').trim();
                           return {title: title, url: a.href, snippet: (s || '').slice(0,300)}; })
               .filter(Boolean)))()""",
+    },
+    # Google: most reliable SERP in practice — Bing/DDG/Brave (HTTP *and* browser)
+    # soft-block in datacenter / CLI environments, Google usually still renders.
+    # Honors site: server-side. Anchor each result on an <h3> inside #search/#rso;
+    # skip google-internal links. Verified live: 10 clean results for a site: query.
+    "google": {
+        "url": "https://www.google.com/search?q={q}",
+        "js": r"""(() => { const seen = new Set(), out = [];
+            for (const a of document.querySelectorAll('#search a[href], #rso a[href]')) {
+              const h = a.querySelector('h3'); const u = a.href || '';
+              if (!h || !u.startsWith('http') || /google\.|\/search\?/.test(u) || seen.has(u)) continue;
+              seen.add(u); out.push({title: h.innerText, url: u, snippet: ''});
+              if (out.length >= %d) break; }
+            return JSON.stringify(out); })()""",
     },
 }
 
@@ -715,7 +729,7 @@ def _looks_decoy(query: str, results: list) -> bool:
 @mcp.tool()
 async def web_search(
     query: str,
-    engine: Literal["bing", "duckduckgo", "brave", "exa"] = "bing",
+    engine: Literal["bing", "duckduckgo", "brave", "google", "exa"] = "bing",
     count: int = 8,
     use_browser: Literal["auto", "off", "on"] = "auto",
     proxy: Optional[str] = None,
@@ -903,7 +917,7 @@ async def smart_fetch(
 async def deep_research(
     query: str,
     max_sources: int = 5,
-    engine: Literal["bing", "duckduckgo", "brave", "exa"] = "bing",
+    engine: Literal["bing", "duckduckgo", "brave", "google", "exa"] = "bing",
     per_source_chars: int = 3000,
     proxy: Optional[str] = None,
 ) -> str:
@@ -1517,6 +1531,11 @@ async def social_research(
         # 1) site: dork — always (no login, clean, non-personalized)
         dork = await _search(f"site:{_SOCIAL_SITES[p]} {t}", "bing",
                              max_per_platform, proxy=proxy)
+        # Bing/DDG HTTP soft-blocks in many envs → escalate the dork to the Google
+        # browser SERP (real Chrome, honors site:) — the one reliable backend here.
+        if (not dork) and use_browser and browser_up:
+            dork = await _browser_search(f"site:{_SOCIAL_SITES[p]} {t}",
+                                         "google", max_per_platform)
         entry = {"name": p, "dork_results": dork[:max_per_platform],
                  "native_excerpt": "", "needs_cookies": False}
         # 2) native in-platform search when a browser is running
