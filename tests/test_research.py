@@ -182,13 +182,35 @@ def test_adapters_parse():
     print("  adapter parsers: gh-repo + yt-id + balanced js-object OK")
 
 
+def test_social_research_config():
+    import inspect
+    from mcp_stealth_chrome.tools.research import (
+        _SOCIAL_SITES, _SOCIAL_LOGIN_WALLED, _SOCIAL_NATIVE,
+        _social_native_text, social_research,
+    )
+    # every login-walled + native platform must have a site domain
+    for p in _SOCIAL_LOGIN_WALLED | set(_SOCIAL_NATIVE):
+        assert p in _SOCIAL_SITES, p
+    # native URLs are query templates
+    for p, url in _SOCIAL_NATIVE.items():
+        assert "{q}" in url and p in url.split("//", 1)[-1] or "reddit" in url, (p, url)
+    assert _SOCIAL_LOGIN_WALLED <= set(_SOCIAL_SITES)
+    assert "reddit" not in _SOCIAL_LOGIN_WALLED  # reddit is public
+    assert inspect.iscoroutinefunction(_social_native_text)
+    # tool is registered + wrapped
+    from mcp_stealth_chrome.server import mcp
+    assert "social_research" in mcp._tool_manager._tools
+    print("  social_research config: sites/native/login-walled coherent + registered")
+
+
 if __name__ == "__main__":
     for fn in (test_block_detection, test_bing_decode, test_ddg_decode,
                test_html_to_markdown, test_truncation,
                test_proxy_resolution, test_browser_serp_config,
                test_brave_browser_only,
                test_challenge_markers, test_slice_main, test_decoy_detection,
-               test_reddit_digest_parse, test_adapters_parse):
+               test_reddit_digest_parse, test_adapters_parse,
+               test_social_research_config):
         print(f"\n{fn.__name__}:")
         try:
             fn()

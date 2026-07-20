@@ -1394,3 +1394,134 @@ async def youtube_read(
         result["note"] = ("native timedtext empty (POT-gated) and yt-dlp "
                           "unavailable/failed — install yt-dlp for transcripts")
     return ok(json.dumps(result, ensure_ascii=False))
+
+
+# ---------------------------------------------------------------------------
+# social_research — social-media market/competitor research (who sells + how loud)
+# ---------------------------------------------------------------------------
+
+_SOCIAL_SITES = {
+    "reddit": "reddit.com", "threads": "threads.com", "facebook": "facebook.com",
+    "x": "x.com", "instagram": "instagram.com", "tiktok": "tiktok.com",
+    "linkedin": "linkedin.com",
+}
+# Platforms whose native search needs a logged-in session (cookies).
+_SOCIAL_LOGIN_WALLED = {"threads", "facebook", "x", "instagram"}
+# Native in-platform search URLs (used when a browser session is available).
+_SOCIAL_NATIVE = {
+    "reddit": "https://www.reddit.com/search/?q={q}&sort=relevance",
+    "threads": "https://www.threads.com/search?q={q}&serp_type=default",
+    "facebook": "https://www.facebook.com/search/posts/?q={q}",
+    "x": "https://x.com/search?q={q}&f=top",
+}
+
+
+async def _social_native_text(platform: str, topic: str, max_chars: int = 4000) -> str:
+    """Navigate the LIVE browser to a platform's native search and return the
+    rendered innerText (best-effort). Needs a running browser + (for login-walled
+    platforms) an imported session cookie. Returns '__LOGIN_REQUIRED__' when the
+    platform bounces us to a login wall."""
+    from urllib.parse import quote
+    url_t = _SOCIAL_NATIVE.get(platform)
+    if not url_t or not BrowserState.is_up():
+        return ""
+    try:
+        tab = BrowserState.active_tab()
+        await tab.get(url_t.format(q=quote(topic)))
+    except Exception:
+        return ""
+    txt = ""
+    for _ in range(9):
+        await asyncio.sleep(0.7)
+        try:
+            raw = await tab.evaluate(
+                "document.body ? document.body.innerText : ''", return_by_value=True)
+            txt = str((raw.value if hasattr(raw, "value") else raw) or "")
+        except Exception:
+            txt = ""
+        low = txt.lower()
+        if platform in _SOCIAL_LOGIN_WALLED and len(txt) < 1500 and (
+                "log in" in low or "masuk" in low or "create new account" in low):
+            return "__LOGIN_REQUIRED__"
+        if len(txt) > 400:
+            break
+    return txt[:max_chars]
+
+
+@mcp.tool()
+async def social_research(
+    topic: str,
+    platforms: str = "reddit,threads,facebook",
+    max_per_platform: int = 8,
+    use_browser: bool = True,
+    proxy: Optional[str] = None,
+) -> str:
+    """⭐ Social-media market/competitor research — WHO sells/makes X + HOW loud.
+
+    Give a topic/niche → sweeps social platforms + the web to surface who is
+    selling/making/discussing it and how busy the buzz is, using OSINT:
+    Google/Bing `site:<platform>` dorks (no login, clean, NON-personalized) +
+    optional NATIVE in-platform search when a browser session exists.
+
+    ⭐ STRONGLY RECOMMENDED — import your session cookies first for login-walled
+    platforms (Threads / Facebook / X / Instagram):
+        browser_launch()
+        cookie_import(file_path="cookies.json")   # export via Cookie-Editor while logged in
+    then call this with use_browser=True. Native search then returns fresher
+    posts + engagement (likes/views) the logged-out `site:` dork can't reach.
+    Reddit works without login.
+
+    Two lenses (use both): `site:` dork = precision + clean + non-personalized;
+    native + cookies = recall + engagement + recent (but personalized to your acct).
+
+    platforms: comma list of reddit,threads,facebook,x,instagram,tiktok,linkedin.
+
+    Returns {topic, platforms:[{name, dork_results:[{title,url,snippet}],
+    native_excerpt, needs_cookies}], cookies_hint, method}. The caller reads the
+    posts to judge sentiment / rank sellers by engagement.
+    """
+    t = (topic or "").strip()
+    if not t:
+        return err("empty topic")
+    want = [p.strip().lower() for p in (platforms or "").split(",") if p.strip()]
+    want = [p for p in want if p in _SOCIAL_SITES] or ["reddit", "threads", "facebook"]
+    max_per_platform = max(1, min(int(max_per_platform), 15))
+    t0 = time.monotonic()
+
+    out, need_cookie_for = [], []
+    browser_up = BrowserState.is_up()
+    for p in want:
+        # 1) site: dork — always (no login, clean, non-personalized)
+        dork = await _search(f"site:{_SOCIAL_SITES[p]} {t}", "bing",
+                             max_per_platform, proxy=proxy)
+        entry = {"name": p, "dork_results": dork[:max_per_platform],
+                 "native_excerpt": "", "needs_cookies": False}
+        # 2) native in-platform search when a browser is running
+        if use_browser and browser_up:
+            native = await _social_native_text(p, t)
+            if native == "__LOGIN_REQUIRED__":
+                entry["needs_cookies"] = True
+                need_cookie_for.append(p)
+            elif native:
+                entry["native_excerpt"] = native
+        elif p in _SOCIAL_LOGIN_WALLED:
+            entry["needs_cookies"] = True
+            need_cookie_for.append(p)
+        out.append(entry)
+
+    hint = None
+    if need_cookie_for:
+        hint = ("For deeper results + engagement on " + ", ".join(sorted(set(need_cookie_for)))
+                + ": browser_launch() then cookie_import(file_path='cookies.json') "
+                "(export via the Cookie-Editor extension while logged in), then re-run "
+                "with use_browser=True. Without cookies these platforms only return the "
+                "public Google-indexed subset (misses login-gated + recent posts).")
+    return ok(json.dumps({
+        "topic": t,
+        "platforms": out,
+        "cookies_hint": hint,
+        "method": "site:<platform> dork (non-personalized, no-login, precision) + "
+                  "native in-platform search when a browser session exists "
+                  "(recall + engagement, needs cookies for login-walled platforms).",
+        "elapsed_ms": int((time.monotonic() - t0) * 1000),
+    }, ensure_ascii=False))

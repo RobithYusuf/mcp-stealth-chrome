@@ -2,7 +2,7 @@
 
 # MCP Stealth Chrome
 
-**143 tools** for AI agents that bypass Cloudflare, Turnstile, reCAPTCHA, and modern anti-bot systems — with an LLM-optimized action kit (`describe_page`, `smart_fill`, `workflow_run`, vision-LLM element locator) and a self-sufficient web-research kit (`web_search`, `scrape_markdown`, `deep_research`) layered on top of standard automation.
+**147 tools** for AI agents that bypass Cloudflare, Turnstile, reCAPTCHA, and modern anti-bot systems — with an LLM-optimized action kit (`describe_page`, `smart_fill`, `workflow_run`, vision-LLM element locator) and a self-sufficient web-research kit (`web_search`, `scrape_markdown`, `deep_research`, `social_research`) layered on top of standard automation.
 
 [![PyPI version](https://img.shields.io/pypi/v/mcp-stealth-chrome.svg)](https://pypi.org/project/mcp-stealth-chrome/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -263,7 +263,7 @@ Settings → Extensions → MCP Servers, or edit `~/.config/zed/settings.json`:
 
 ## 🔑 BYOK (Bring Your Own Key) — Optional
 
-`mcp-stealth-chrome` is **fully functional without any API key** — 140 of 143 tools work out of the box, including `click_turnstile` (Cloudflare Turnstile bypass), TLS-perfect HTTP, multi-instance, DevTools-level perf/coverage/emulation, the full LLM-optimized kit (`describe_page` / `smart_fill` / `workflow_run`), the web-research kit (`web_search` / `scrape_markdown` / `deep_research` — no search-API key needed), and all scraping tools.
+`mcp-stealth-chrome` is **fully functional without any API key** — 144 of 147 tools work out of the box, including `click_turnstile` (Cloudflare Turnstile bypass), TLS-perfect HTTP, multi-instance, DevTools-level perf/coverage/emulation, the full LLM-optimized kit (`describe_page` / `smart_fill` / `workflow_run`), the web-research kit (`web_search` / `scrape_markdown` / `deep_research` / `social_research` — no search-API key needed), and all scraping tools.
 
 **API keys are optional — only needed for 3 vision/solver tools:**
 
@@ -401,18 +401,22 @@ Legacy `AI_VISION_*` env still work but emit `DeprecationWarning`. Migrate to `O
 - `uv` installed: `curl -LsSf https://astral.sh/uv/install.sh | sh`
 - Chrome or Chromium browser (auto-detected by nodriver)
 
-## Tool Categories (143)
+## Tool Categories (147)
 
 ### ⭐⭐⭐ Self-Sufficient Web Research (new) — replaces firecrawl/tavily for most tasks
 Browserless-first (curl_cffi), escalates to the stealth browser only when a page is anti-bot blocked. Runs fully headless/API-mode and is ~10–12× lighter than driving Chrome for normal pages (verified: HTTP path 10–12× faster than headless render on example.com / Wikipedia).
 
 | Tool | Purpose |
 |------|---------|
-| `web_search` | SERP search with **no browser and no API key** (Bing default, DuckDuckGo/Exa optional) → `{title,url,snippet}` |
+| `web_search` | SERP search with **no browser and no API key** (Bing default, Brave/DuckDuckGo/Exa optional) → `{title,url,snippet}` |
 | `scrape_markdown` | One URL → clean LLM-ready markdown (stdlib, ~70–98% smaller than raw HTML) |
 | `smart_fetch` | HTTP-first; auto-escalates to the stealth browser **only** when the request is blocked |
 | `deep_research` | search → fetch top-N sources → markdown + citations, in one call |
 | `search_page` | Grep the current page's text (zero-LLM, instant) |
+| `social_digest` | Structured, account-independent Reddit community digest (votes/comments/age) |
+| `github_read` | Repo / README / issues / releases via GitHub REST API (pure HTTP) |
+| `youtube_read` | Video metadata + transcript (native timedtext, yt-dlp fallback) |
+| **`social_research`** ⭐ | **Social-media market/competitor research — WHO sells/makes X + HOW loud.** Sweeps Reddit/Threads/Facebook/X via OSINT: Google/Bing `site:<platform>` dorks (no login, clean, non-personalized) + native in-platform search. **Recommends `cookie_import`** for login-walled platforms (Threads/FB/X/IG) to unlock engagement + fresh posts. |
 
 ### ⭐⭐⭐ Dual-Mode HTTP (unique)
 | Tool | Purpose |
