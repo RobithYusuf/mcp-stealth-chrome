@@ -1468,6 +1468,15 @@ async def _social_native_text(platform: str, topic: str, max_chars: int = 8000,
             "log in" in low2 or "masuk" in low2 or "create new account" in low2):
         return "__LOGIN_REQUIRED__"
 
+    # SPA hydration wait: the search CHROME (nav bar ~200-400 chars) renders before
+    # the feed — login-walled SPAs (Threads/X) lazy-load posts a beat later. Poll
+    # until real post content populates so we don't return a nav-bar-only excerpt.
+    for _ in range(9):
+        if len(txt) > 700:
+            break
+        await asyncio.sleep(0.8)
+        txt = await _inner()
+
     # scroll the infinite feed to load more; STOP EARLY when it stops growing
     # (feed exhausted / short result) so a high `scroll` isn't slow on small feeds.
     for _ in range(max(0, scroll)):
@@ -1485,6 +1494,34 @@ async def _social_native_text(platform: str, topic: str, max_chars: int = 8000,
     return txt[:max_chars]
 
 
+async def _social_read_post(url: str, max_chars: int = 3000) -> str:
+    """Open ONE post URL and read its full content + visible comments/replies.
+    Rides out JS challenges via _browser_render, then waits for the thread to
+    hydrate (comments lazy-load) before reading innerText. Needs a browser."""
+    if not url or not BrowserState.is_up():
+        return ""
+    try:
+        tab = BrowserState.active_tab()
+    except Exception:
+        return ""
+    html = await _browser_render(tab, url)
+    low = (html or "").lower()
+    if (len(html or "") < 1000) or any(m in low for m in _CHALLENGE_MARKERS):
+        return ""
+    txt = ""
+    for _ in range(9):
+        try:
+            raw = await tab.evaluate(
+                "document.body ? document.body.innerText : ''", return_by_value=True)
+            txt = str((raw.value if hasattr(raw, "value") else raw) or "")
+        except Exception:
+            txt = ""
+        if len(txt) > 500:
+            break
+        await asyncio.sleep(0.8)
+    return txt[:max_chars]
+
+
 @mcp.tool()
 async def social_research(
     topic: str,
@@ -1493,6 +1530,7 @@ async def social_research(
     use_browser: bool = True,
     cookie_files: str = "",
     scroll: int = 3,
+    read_posts: int = 0,
     proxy: Optional[str] = None,
 ) -> str:
     """⭐ Social-media market/competitor research — WHO sells/makes X + HOW loud.
@@ -1522,10 +1560,17 @@ async def social_research(
     scroll: how many times to scroll each native feed (default 3) to load MORE
     posts from the infinite scroll — raise it (e.g. 6-8) for deeper coverage,
     lower to 0 for a fast above-the-fold-only read.
+    read_posts: 0-5 (default 0). When >0, DRILL INTO the top-N dork posts per
+    platform and read each post's FULL content + visible COMMENTS/replies
+    (opt-in — each post is one extra navigation, so it's slower). 0 = listings only.
+
+    Three lenses per platform: dork_results (titles+links, clean/precise) +
+    native_excerpt (feed text + ENGAGEMENT likes/votes/comments) + posts (full
+    body + comments of the top posts, when read_posts>0).
 
     Returns {topic, platforms:[{name, dork_results:[{title,url,snippet}],
-    native_excerpt, needs_cookies}], cookies_hint, method}. The caller reads the
-    posts to judge sentiment / rank sellers by engagement.
+    native_excerpt, posts:[{title,url,content}], needs_cookies}], cookies_hint,
+    method}.
     """
     t = (topic or "").strip()
     if not t:
@@ -1533,6 +1578,7 @@ async def social_research(
     want = [p.strip().lower() for p in (platforms or "").split(",") if p.strip()]
     want = [p for p in want if p in _SOCIAL_SITES] or ["reddit", "threads", "facebook"]
     max_per_platform = max(1, min(int(max_per_platform), 15))
+    read_posts = max(0, min(int(read_posts), 5))
     t0 = time.monotonic()
 
     out, need_cookie_for = [], []
@@ -1576,6 +1622,14 @@ async def social_research(
         elif p in _SOCIAL_LOGIN_WALLED:
             entry["needs_cookies"] = True
             need_cookie_for.append(p)
+        # 3) optionally drill into the top posts to read full content + comments
+        entry["posts"] = []
+        if read_posts > 0 and browser_up and entry["dork_results"]:
+            for r in entry["dork_results"][:read_posts]:
+                body = await _social_read_post(r.get("url", ""))
+                if body:
+                    entry["posts"].append({"title": r.get("title", ""),
+                                           "url": r.get("url", ""), "content": body})
         out.append(entry)
 
     hint = None
