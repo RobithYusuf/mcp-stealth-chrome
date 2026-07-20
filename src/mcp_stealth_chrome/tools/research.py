@@ -1468,17 +1468,20 @@ async def _social_native_text(platform: str, topic: str, max_chars: int = 8000,
             "log in" in low2 or "masuk" in low2 or "create new account" in low2):
         return "__LOGIN_REQUIRED__"
 
-    # scroll the infinite feed to load more posts, then re-read the (longer) text
+    # scroll the infinite feed to load more; STOP EARLY when it stops growing
+    # (feed exhausted / short result) so a high `scroll` isn't slow on small feeds.
     for _ in range(max(0, scroll)):
+        prev = len(txt)
         try:
             await tab.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         except Exception:
             break
         await asyncio.sleep(1.2)
-    if scroll > 0:
-        more = await _inner()
-        if len(more) > len(txt):
-            txt = more
+        cur = await _inner()
+        if len(cur) > len(txt):
+            txt = cur
+        if len(txt) <= prev + 40:   # no meaningful new content → feed is exhausted
+            break
     return txt[:max_chars]
 
 
