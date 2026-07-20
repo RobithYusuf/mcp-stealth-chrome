@@ -1454,6 +1454,7 @@ async def social_research(
     platforms: str = "reddit,threads,facebook",
     max_per_platform: int = 8,
     use_browser: bool = True,
+    cookie_files: str = "",
     proxy: Optional[str] = None,
 ) -> str:
     """⭐ Social-media market/competitor research — WHO sells/makes X + HOW loud.
@@ -1470,6 +1471,11 @@ async def social_research(
     then call this with use_browser=True. Native search then returns fresher
     posts + engagement (likes/views) the logged-out `site:` dork can't reach.
     Reddit works without login.
+
+    ⭐ CRASH-RESILIENT: pass cookie_files="threads.json,x.json,fb.txt" to
+    auto-(re)import those session files at the start of EVERY call. A browser
+    crash/restart drops the in-memory session — this re-applies it automatically
+    so you never manually re-import after a recover.
 
     Two lenses (use both): `site:` dork = precision + clean + non-personalized;
     native + cookies = recall + engagement + recent (but personalized to your acct).
@@ -1490,6 +1496,23 @@ async def social_research(
 
     out, need_cookie_for = [], []
     browser_up = BrowserState.is_up()
+    # Crash-resilient auth: re-apply session cookies from file(s) before searching,
+    # so a browser restart (which drops the in-memory session) never forces a manual
+    # re-import. Reuses the existing cookie_import tool — no duplicated parsing logic.
+    reimported = []
+    if cookie_files.strip() and browser_up:
+        try:
+            from .._app import mcp as _mcp
+            _ci = _mcp._tool_manager._tools.get("cookie_import")
+        except Exception:
+            _ci = None
+        for _path in [p.strip() for p in cookie_files.split(",") if p.strip()]:
+            if _ci is not None:
+                try:
+                    await _ci.fn(file_path=_path)
+                    reimported.append(_path)
+                except Exception:
+                    pass
     for p in want:
         # 1) site: dork — always (no login, clean, non-personalized)
         dork = await _search(f"site:{_SOCIAL_SITES[p]} {t}", "bing",
@@ -1514,11 +1537,14 @@ async def social_research(
         hint = ("For deeper results + engagement on " + ", ".join(sorted(set(need_cookie_for)))
                 + ": browser_launch() then cookie_import(file_path='cookies.json') "
                 "(export via the Cookie-Editor extension while logged in), then re-run "
-                "with use_browser=True. Without cookies these platforms only return the "
-                "public Google-indexed subset (misses login-gated + recent posts).")
+                "with use_browser=True. Best: pass cookie_files='threads.json,x.json' to "
+                "this tool so the session is auto-(re)applied every call (survives browser "
+                "restarts). Without cookies these platforms only return the public "
+                "Google-indexed subset (misses login-gated + recent posts).")
     return ok(json.dumps({
         "topic": t,
         "platforms": out,
+        "cookies_reimported": reimported,
         "cookies_hint": hint,
         "method": "site:<platform> dork (non-personalized, no-login, precision) + "
                   "native in-platform search when a browser session exists "

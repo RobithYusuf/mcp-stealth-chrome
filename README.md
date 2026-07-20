@@ -416,7 +416,7 @@ Browserless-first (curl_cffi), escalates to the stealth browser only when a page
 | `social_digest` | Structured, account-independent Reddit community digest (votes/comments/age) |
 | `github_read` | Repo / README / issues / releases via GitHub REST API (pure HTTP) |
 | `youtube_read` | Video metadata + transcript (native timedtext, yt-dlp fallback) |
-| **`social_research`** ⭐ | **Social-media market/competitor research — WHO sells/makes X + HOW loud.** Sweeps Reddit/Threads/Facebook/X via OSINT: Google/Bing `site:<platform>` dorks (no login, clean, non-personalized) + native in-platform search. **Recommends `cookie_import`** for login-walled platforms (Threads/FB/X/IG) to unlock engagement + fresh posts. |
+| **`social_research`** ⭐ | **Social-media market/competitor research — WHO sells/makes X + HOW loud.** Sweeps Reddit/Threads/Facebook/X via OSINT: Google/Bing `site:<platform>` dorks (no login, clean, non-personalized) + native in-platform search. **Recommends `cookie_import`** for login-walled platforms (Threads/FB/X/IG) to unlock engagement + fresh posts; pass `cookie_files="a.json,b.json"` to **auto-(re)import sessions each call** — crash-resilient (survives a browser restart that drops the session). |
 
 ### ⭐⭐⭐ Dual-Mode HTTP (unique)
 | Tool | Purpose |
