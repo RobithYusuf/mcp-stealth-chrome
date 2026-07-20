@@ -1432,33 +1432,35 @@ _SOCIAL_NATIVE = {
 
 async def _social_native_text(platform: str, topic: str, max_chars: int = 4000) -> str:
     """Navigate the LIVE browser to a platform's native search and return the
-    rendered innerText (best-effort). Needs a running browser + (for login-walled
-    platforms) an imported session cookie. Returns '__LOGIN_REQUIRED__' when the
-    platform bounces us to a login wall."""
+    rendered innerText (best-effort). Uses _browser_render to WAIT OUT JS
+    challenges (Reddit "blocked by network security", Cloudflare "just a moment")
+    + SPA hydration before reading — a plain navigate returns the block page.
+    Needs a running browser + (for login-walled platforms) an imported session
+    cookie. Returns '__LOGIN_REQUIRED__' when bounced to a login wall."""
     from urllib.parse import quote
     url_t = _SOCIAL_NATIVE.get(platform)
     if not url_t or not BrowserState.is_up():
         return ""
     try:
         tab = BrowserState.active_tab()
-        await tab.get(url_t.format(q=quote(topic)))
     except Exception:
         return ""
-    txt = ""
-    for _ in range(9):
-        await asyncio.sleep(0.7)
-        try:
-            raw = await tab.evaluate(
-                "document.body ? document.body.innerText : ''", return_by_value=True)
-            txt = str((raw.value if hasattr(raw, "value") else raw) or "")
-        except Exception:
-            txt = ""
-        low = txt.lower()
-        if platform in _SOCIAL_LOGIN_WALLED and len(txt) < 1500 and (
-                "log in" in low or "masuk" in low or "create new account" in low):
-            return "__LOGIN_REQUIRED__"
-        if len(txt) > 400:
-            break
+    # navigate + ride out any JS challenge / SPA hydration (reloads up to 2x)
+    html = await _browser_render(tab, url_t.format(q=quote(topic)))
+    low = (html or "").lower()
+    if (len(html or "") < 1500) or any(m in low for m in _CHALLENGE_MARKERS):
+        return ""  # hard block / challenge never cleared
+    # read visible text from the now-rendered page
+    try:
+        raw = await tab.evaluate(
+            "document.body ? document.body.innerText : ''", return_by_value=True)
+        txt = str((raw.value if hasattr(raw, "value") else raw) or "")
+    except Exception:
+        txt = ""
+    low2 = txt.lower()
+    if platform in _SOCIAL_LOGIN_WALLED and len(txt) < 1500 and (
+            "log in" in low2 or "masuk" in low2 or "create new account" in low2):
+        return "__LOGIN_REQUIRED__"
     return txt[:max_chars]
 
 

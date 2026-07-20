@@ -621,6 +621,24 @@ detect_anti_bot()
 #           "recommended_tools": [...]}
 ```
 
+### Social-media market/competitor research (who sells + how loud)
+
+```
+browser_launch()
+social_research(
+  topic="AI carousel generator",
+  platforms="reddit,threads,facebook",
+  cookie_files="threads.json,fb.json",   # auto-(re)imports sessions — crash-resilient
+)
+# One call → per platform: Google site: dork (clean, non-personalized) + native
+# in-platform search (engagement/likes/views). Reddit needs no login; Threads/FB/X
+# use your imported session. Read the posts to judge sentiment / rank sellers.
+```
+
+> 📘 The full OSINT method this tool encodes — paraphrase-union, platform-fit,
+> `site:` vs native trade-offs, and **honest limits** — is documented in
+> [`docs/RESEARCH_METHOD.md`](docs/RESEARCH_METHOD.md).
+
 ## Architecture
 
 ```
