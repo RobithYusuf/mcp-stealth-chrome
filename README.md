@@ -2,7 +2,7 @@
 
 # MCP Stealth Chrome
 
-**147 tools** for AI agents that bypass Cloudflare, Turnstile, reCAPTCHA, and modern anti-bot systems — with an LLM-optimized action kit (`describe_page`, `smart_fill`, `workflow_run`, vision-LLM element locator) and a self-sufficient web-research kit (`web_search`, `scrape_markdown`, `deep_research`, `social_research`) layered on top of standard automation.
+**149 tools** for AI agents that bypass Cloudflare, Turnstile, reCAPTCHA, and modern anti-bot systems — with an LLM-optimized action kit (`describe_page`, `smart_fill`, `workflow_run`, vision-LLM element locator) and a self-sufficient web-research kit (`web_search`, `scrape_markdown`, `deep_research`, `social_research`) layered on top of standard automation.
 
 [![PyPI version](https://img.shields.io/pypi/v/mcp-stealth-chrome.svg)](https://pypi.org/project/mcp-stealth-chrome/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -263,7 +263,7 @@ Settings → Extensions → MCP Servers, or edit `~/.config/zed/settings.json`:
 
 ## 🔑 BYOK (Bring Your Own Key) — Optional
 
-`mcp-stealth-chrome` is **fully functional without any API key** — 144 of 147 tools work out of the box, including `click_turnstile` (Cloudflare Turnstile bypass), TLS-perfect HTTP, multi-instance, DevTools-level perf/coverage/emulation, the full LLM-optimized kit (`describe_page` / `smart_fill` / `workflow_run`), the web-research kit (`web_search` / `scrape_markdown` / `deep_research` / `social_research` — no search-API key needed), and all scraping tools.
+`mcp-stealth-chrome` is **fully functional without any API key** — 146 of 149 tools work out of the box, including `click_turnstile` (Cloudflare Turnstile bypass), TLS-perfect HTTP, multi-instance, DevTools-level perf/coverage/emulation, the full LLM-optimized kit (`describe_page` / `smart_fill` / `workflow_run`), the web-research kit (`web_search` / `scrape_markdown` / `deep_research` / `social_research` — no search-API key needed), and all scraping tools.
 
 **API keys are optional — only needed for 3 vision/solver tools:**
 
@@ -401,7 +401,30 @@ Legacy `AI_VISION_*` env still work but emit `DeprecationWarning`. Migrate to `O
 - `uv` installed: `curl -LsSf https://astral.sh/uv/install.sh | sh`
 - Chrome or Chromium browser (auto-detected by nodriver)
 
-## Tool Categories (147)
+## Honest reporting (v0.9.0)
+
+Tools that report a rosier state than reality are the worst failure mode for an
+agent: the caller has no way to notice, so a wrong "success" spreads into wrong
+conclusions. These no longer lie:
+
+| Behaviour | Before | Now |
+|---|---|---|
+| `click_text` / `click_role` on a covered button | `"clicked"` — while nothing happened | Refuses and **names the blocker**: `NOT clicked — obscured by <div#overlay> at {x,y}` |
+| Click that lands but changes nothing | `"clicked"` | `verify=True` (default) reports `clicked but NO page change detected` |
+| `evaluate` on async code | always `null` | Promises are awaited (`await_promise=True` by default) |
+| `console_get` with nothing captured | bare `[]` — "no errors" or "never listening"? | `{attached, capturing, since, total, messages}`; capture survives navigation and records uncaught exceptions |
+| `get_text(selector=...)` | textContent — inlined GTM/JSON a human never sees | innerText semantics; `raw=True` opts back in |
+| `screenshot(return_base64=True)` | emitted a blob that got the whole result rejected | refuses over `B64_INLINE_LIMIT` with the path + how to shrink |
+| `mouse_click_xy` | pressed without hovering — hover-only menus unreachable | hovers first (`move_first=True`) |
+| Lost CDP session | opaque `-32001` | names the condition and the exact recovery |
+| `browser_recover` + relaunch | could silently switch profile → logins looked wiped | **profile affinity** keeps the process on its profile |
+
+New diagnostics: **`assert_clickable`** (would a click reach this? what's in the
+way? — without clicking) and **`wait_for_change`** (click-then-wait in one call,
+with an honest timeout). `screenshot(region_selector="css")` measures the crop box
+for you, removing the CSS-px-vs-device-px guesswork.
+
+## Tool Categories (149)
 
 ### ⭐⭐⭐ Self-Sufficient Web Research (new) — replaces firecrawl/tavily for most tasks
 Browserless-first (curl_cffi), escalates to the stealth browser only when a page is anti-bot blocked. Runs fully headless/API-mode and is ~10–12× lighter than driving Chrome for normal pages (verified: HTTP path 10–12× faster than headless render on example.com / Wikipedia).
@@ -516,10 +539,10 @@ Network capture with response bodies, plus a bridge from browser session into TL
 | Lifecycle: 2 | browser_launch, browser_close |
 | Navigation: 4 | navigate, go_back, go_forward, reload |
 | DOM/Content: 6 | browser_snapshot, screenshot, get_text, get_html, get_url, save_pdf |
-| Interaction: 9 | click, click_text, click_role, hover, fill, select_option, check, uncheck, upload_file |
+| Interaction: 10 | click, click_text, click_role, **assert_clickable**, hover, fill, select_option, check, uncheck, upload_file |
 | Keyboard: 2 | type_text, press_key |
 | Mouse: 3 | mouse_click_xy, mouse_move, drag_and_drop |
-| Wait: 5 | wait_for, wait_for_navigation, wait_for_url, wait_for_response, wait_for_request |
+| Wait: 6 | wait_for, **wait_for_change**, wait_for_navigation, wait_for_url, wait_for_response, wait_for_request |
 | Tabs: 4 | tab_list, tab_new, tab_select, tab_close |
 | Cookies: 5 | cookie_list/set/delete, cookie_import (+ raw_text auto-detect), cookie_export |
 | Storage: 9 | localstorage_get/set/clear, sessionstorage_get/set/clear, cache_clear, indexeddb_list/delete |

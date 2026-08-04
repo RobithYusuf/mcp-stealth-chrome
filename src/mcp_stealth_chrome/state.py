@@ -384,12 +384,41 @@ def per_process_profile() -> Path:
     return HOME / ".mcp-stealth" / f"profile-pid{os.getpid()}"
 
 
+# Profile this process has committed to. Deliberately a module global so it
+# survives BrowserState.reset() — see resolve_default_profile for why.
+_PROFILE_AFFINITY: Optional[Path] = None
+
+
+def set_profile_affinity(p: Optional[Path]) -> None:
+    """Pin this process to a profile dir (None clears the pin)."""
+    global _PROFILE_AFFINITY
+    _PROFILE_AFFINITY = p
+
+
+def get_profile_affinity() -> Optional[Path]:
+    return _PROFILE_AFFINITY
+
+
 def resolve_default_profile(persistent: bool) -> Path:
-    """Return the profile path to use for `main` instance.
-    Falls back to a per-PID profile if the shared default is held live by
-    another process."""
+    """Return the profile path to use for the `main` instance.
+
+    Falls back to a per-PID profile if the shared default is held live by another
+    process — and then STAYS on it (affinity).
+
+    The affinity matters more than it looks. Without it: launch #1 finds the
+    default locked and lands on profile-pid<N>, where you then log in. Something
+    goes wrong, browser_recover kills the Chrome that held the default, freeing
+    it. Launch #2 now picks the *default* profile — a different cookie jar — so
+    every session you built up appears to have been "wiped", while it actually
+    sits untouched in profile-pid<N>. Sticking to the chosen profile keeps the
+    logins that are by far the most expensive state to rebuild.
+    """
     if not persistent:
         return PROFILE_DIR
+    pinned = _PROFILE_AFFINITY
+    if pinned is not None and not is_chrome_profile_locked(pinned):
+        pinned.mkdir(parents=True, exist_ok=True)
+        return pinned
     if is_chrome_profile_locked(PROFILE_DIR):
         # Another live Chrome (likely a parallel MCP session) owns this profile.
         # Use a per-process profile so we never collide on the lock.

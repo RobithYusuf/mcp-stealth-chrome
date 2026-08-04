@@ -11,7 +11,7 @@ both surfaced by the registry gate).
 """
 import sys
 
-EXPECTED_COUNT = 147
+EXPECTED_COUNT = 149
 EXPECTED_TOOLS = {
     # Lifecycle
     "browser_launch", "browser_close", "browser_recover",
@@ -23,11 +23,11 @@ EXPECTED_TOOLS = {
     "browser_snapshot", "screenshot", "get_text", "get_html", "get_url",
     "save_pdf",
     # Interaction
-    "click", "click_text", "click_role", "hover", "fill", "type_text",
+    "click", "click_text", "click_role", "assert_clickable", "hover", "fill", "type_text",
     "press_key", "select_option", "check", "uncheck", "upload_file",
     "mouse_click_xy", "mouse_move", "drag_and_drop",
     # Wait
-    "wait_for", "wait_for_navigation", "wait_for_url", "wait_for_response",
+    "wait_for", "wait_for_change", "wait_for_navigation", "wait_for_url", "wait_for_response",
     "wait_for_request",
     # Tabs
     "tab_list", "tab_new", "tab_select", "tab_close",

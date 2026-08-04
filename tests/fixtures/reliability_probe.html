@@ -1,0 +1,49 @@
+<meta charset="utf-8">
+<title>MCP fix probe</title>
+<style>
+  body { font-family: sans-serif; margin: 20px; }
+  #stage { position: relative; width: 420px; height: 120px; border: 1px solid #ccc; }
+  #realbtn { position: absolute; left: 20px; top: 20px; width: 200px; height: 44px; }
+  /* Transparent overlay that fully covers the button — the Canva-style trap.
+     A click at the button's centre lands on THIS, not on the button. */
+  #overlay { position: absolute; left: 0; top: 0; width: 420px; height: 120px;
+             background: rgba(0,0,0,0.01); z-index: 99; }
+  #hoverzone { margin-top: 24px; width: 260px; height: 60px; background: #eef; }
+  #hoveronly { display: none; }
+  #hoverzone:hover #hoveronly { display: inline-block; }
+  #out { margin-top: 16px; font-weight: bold; }
+</style>
+
+<h1>Probe page</h1>
+
+<div id="stage">
+  <button id="realbtn" onclick="document.getElementById('out').textContent='REAL CLICK';
+    var d=document.createElement('p'); d.textContent='added'; document.body.appendChild(d);">
+    Covered Button
+  </button>
+  <div id="overlay"></div>
+</div>
+
+<button id="freebtn" onclick="document.getElementById('out').textContent='FREE CLICK';
+  var d=document.createElement('p'); d.textContent='free-added'; document.body.appendChild(d);">
+  Free Button
+</button>
+
+<div id="hoverzone">
+  hover here
+  <button id="hoveronly" onclick="document.getElementById('out').textContent='HOVER CLICK';">
+    Hover Only
+  </button>
+</div>
+
+<p id="visible-text">HUMAN_VISIBLE_SENTINEL</p>
+<div id="out">idle</div>
+
+<script>
+  // Big inline payload — textContent would slurp all of this, innerText must not.
+  var SCRIPT_ONLY_SENTINEL = "SCRIPT_PAYLOAD_SENTINEL";
+  var junk = { gtm: "x".repeat(4000), bootstrap: { a: 1, b: 2 } };
+  console.log("probe-console-line");
+  console.warn("probe-warn-line");
+  setTimeout(function () { null.boom; }, 50);   // uncaught TypeError
+</script>

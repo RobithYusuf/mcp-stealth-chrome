@@ -72,6 +72,10 @@ BROWSER_NAV_TIMEOUT = int(os.environ.get("BROWSER_NAV_TIMEOUT", "20"))
 # can keep CDP commands waiting indefinitely otherwise — this ensures each
 # tool call either succeeds or returns a clean timeout error within N seconds.
 TOOL_ACTION_TIMEOUT = int(os.environ.get("TOOL_ACTION_TIMEOUT", "30"))
+# Ceiling for base64 image bodies inlined into a tool result. Clients reject
+# oversized results outright, which throws away the whole call — better to hand
+# back the file path and tell the caller how to shrink the shot.
+B64_INLINE_LIMIT = int(os.environ.get("B64_INLINE_LIMIT", "60000"))
 
 
 async def _wait(coro, timeout: Optional[float] = None, what: str = "operation"):
@@ -85,6 +89,18 @@ async def _wait(coro, timeout: Optional[float] = None, what: str = "operation"):
             f"{what} timed out after {timeout or TOOL_ACTION_TIMEOUT}s — "
             f"page JS may be stuck or blocked. Try reload, or close+launch."
         ) from e
+    except Exception as e:
+        # A dropped CDP session surfaces as an opaque "-32001" with no hint of
+        # what to do next; every subsequent call then fails the same way. Name
+        # the condition and the exact recovery, once, at the point it happens.
+        msg = str(e)
+        if "-32001" in msg or "Session with given id not found" in msg:
+            raise RuntimeError(
+                f"{what} failed: CDP session lost (Chrome closed the target or the "
+                f"websocket dropped). Recover with: browser_recover() then "
+                f"browser_launch(). Your profile — and its logins — are preserved."
+            ) from e
+        raise
 
 # Serialize concurrent launches inside ONE MCP process. Cross-process collision
 # is handled separately by `resolve_default_profile()` (per-PID fallback).
@@ -501,6 +517,12 @@ async def browser_launch(
             # so parallel Claude sessions never collide on Chrome's SingletonLock.
             profile_path = resolve_default_profile(persistent)
             used_fallback = persistent and profile_path != PROFILE_DIR
+            # Pin this process to whatever profile we just settled on, so a later
+            # browser_recover + relaunch cannot silently migrate to a different
+            # cookie jar and make the session look wiped.
+            if persistent:
+                from .state import set_profile_affinity
+                set_profile_affinity(profile_path)
 
             # Friendly upfront check on the default profile too (after resolve_default_profile
             # has potentially picked a fallback). If somehow the resolved one is still locked
@@ -1100,6 +1122,7 @@ async def screenshot(
     format: Literal["auto", "png", "jpeg"] = "auto",
     quality: Optional[int] = None,
     region: Optional[dict] = None,
+    region_selector: Optional[str] = None,
     max_dimension: int = 1920,
 ) -> str:
     """Screenshot active tab. Saves to ~/.mcp-stealth/screenshots/.
@@ -1107,11 +1130,18 @@ async def screenshot(
     Args:
         filename: output name (default timestamped)
         full_page: stitch entire page height (slower, larger file)
-        return_base64: append base64 body to response (useful for vision models)
+        return_base64: append base64 body to response (useful for vision models).
+            Refused when the encoded body would exceed B64_INLINE_LIMIT — you get
+            the path plus advice instead of a rejected tool result.
         format: "auto" (from extension, default), "png" (lossless), or "jpeg" (smaller)
         quality: JPEG quality 1-100 (default 80) — ignored for PNG
-        region: clip to {x, y, width, height} — uses CDP Page.captureScreenshot clip
-                (skips full-viewport paint, 2-5× faster for small crops)
+        region: clip to {x, y, width, height} in **CSS pixels relative to the
+                viewport** — the same coordinate space as getBoundingClientRect()
+                and mouse_click_xy, NOT device/captured pixels. Uses CDP
+                Page.captureScreenshot clip (2-5× faster for small crops)
+        region_selector: CSS selector to crop to — the element's bounding box is
+                measured for you. Prefer this over `region`: it removes the whole
+                class of manual-coordinate mistakes. Wins over `region` if both given.
         max_dimension: if either width or height exceeds this (px), the image is
             resized proportionally via OpenCV INTER_AREA. Default 1920 keeps output
             under the 2000 px per-side limit that LLM image tools (Claude/GPT) enforce
@@ -1128,6 +1158,23 @@ async def screenshot(
             fmt = "png" if ext == "png" else "jpeg"
         else:
             fmt = format
+        # Resolve region_selector → region. Measuring the box here is what makes
+        # the "which coordinate space?" question disappear for the caller.
+        if region_selector:
+            expr = ("(() => { const e = document.querySelector(%s); if (!e) return '';"
+                    " const r = e.getBoundingClientRect();"
+                    " return JSON.stringify({x: r.left, y: r.top, width: r.width,"
+                    " height: r.height}); })()" % json.dumps(region_selector))
+            v = await tab.evaluate(expr, return_by_value=True)
+            v = v.value if hasattr(v, "value") and not isinstance(v, str) else v
+            if not v:
+                return err(f"region_selector not found: {region_selector}")
+            box = json.loads(v)
+            if box["width"] <= 0 or box["height"] <= 0:
+                return err(f"region_selector {region_selector!r} has zero size "
+                           f"({box['width']}×{box['height']}) — element is not rendered")
+            region = box
+
         # Region clip → use raw CDP; nodriver's save_screenshot doesn't expose clip
         if region:
             from nodriver.cdp import page as cdp_page
@@ -1260,28 +1307,76 @@ async def screenshot(
 
         if return_base64:
             data = path.read_bytes()
+            # base64 inflates by 4/3. An oversized blob gets the whole tool result
+            # rejected by the client, wasting the entire call — so refuse up front
+            # with an actionable message instead of emitting it and failing.
+            approx_chars = (len(data) + 2) // 3 * 4
+            if approx_chars > B64_INLINE_LIMIT:
+                return ok(
+                    f"{path}{resized_info}\n"
+                    f"[base64 omitted: ~{approx_chars:,} chars exceeds the "
+                    f"{B64_INLINE_LIMIT:,} inline limit] "
+                    f"Read the file above directly, or re-shoot smaller: "
+                    f"region={{x,y,width,height}} / region_selector='css', "
+                    f"max_dimension=800, format='jpeg', quality=60."
+                )
             return ok(f"{path}{resized_info}\n---base64---\n{base64.b64encode(data).decode()}")
         return ok(f"{path}{resized_info}")
     except Exception as e:
         return err(str(e))
 
 
+async def _visible_text_of(tab, el) -> str:
+    """innerText of a resolved element — excludes script/style/hidden nodes.
+
+    nodriver's `Element.text_all` is textContent-based, so on script-heavy pages
+    it returns inlined JS/JSON that a human never sees. innerText is the
+    rendering-aware equivalent. Falls back to text_all if the JS call fails.
+    """
+    try:
+        v = await el.apply("function() { return this.innerText; }")
+        v = v.value if hasattr(v, "value") and not isinstance(v, str) else v
+        if v is not None:
+            return str(v)
+    except Exception:
+        pass
+    return el.text_all or ""
+
+
 @mcp.tool()
-async def get_text(selector: Optional[str] = None, ref: Optional[str] = None) -> str:
-    """Return innerText of element (by selector or ref) or whole document."""
+async def get_text(selector: Optional[str] = None, ref: Optional[str] = None,
+                   raw: bool = False) -> str:
+    """Return the VISIBLE text of an element (by selector or ref) or the whole document.
+
+    Uses innerText semantics, so non-rendered nodes (`<script>`, `<style>`,
+    `<noscript>`, `<template>`, `display:none`) are excluded — you get what a human
+    reads, not inlined GTM/JSON bootstrap payloads. This matters on script-heavy
+    sites where textContent can be tens of thousands of wasted characters.
+
+    Args:
+        selector: CSS selector of the element to read (default: whole body)
+        ref: element ref from a snapshot (takes precedence over selector)
+        raw: if True, return textContent instead — includes script/style source.
+            Only use when you deliberately want the non-rendered content too.
+    """
     try:
         tab = BrowserState.active_tab()
         if ref:
             el = await resolve_ref(ref)
             if el is None:
                 return err(f"ref {ref} not found")
-            return ok(el.text_all or "")
+            if raw:
+                return ok(el.text_all or "")
+            return ok(await _visible_text_of(tab, el))
         if selector:
             el = await tab.query_selector(selector)
             if el is None:
                 return err(f"selector not found: {selector}")
-            return ok(el.text_all or "")
-        result = await tab.evaluate("document.body.innerText", return_by_value=True)
+            if raw:
+                return ok(el.text_all or "")
+            return ok(await _visible_text_of(tab, el))
+        expr = "document.body.textContent" if raw else "document.body.innerText"
+        result = await tab.evaluate(expr, return_by_value=True)
         # Unwrap RemoteObject (nodriver returns the wrapper for falsy values).
         text = result.value if hasattr(result, "value") and not isinstance(result, str) else result
         return ok(str(text or ""))
@@ -1372,35 +1467,268 @@ async def click(
         return err(str(e))
 
 
+# Probe run ON the target element before clicking. Answers the question the old
+# code never asked: "if I click this element's centre, does the event actually
+# reach it?" — hit-tests via elementFromPoint and names the blocker when it fails.
+_CLICK_PROBE_JS = """
+function() {
+  const d = (el) => {
+    if (!el) return null;
+    let s = el.tagName.toLowerCase();
+    if (el.id) s += '#' + el.id;
+    if (el.className && typeof el.className === 'string') {
+      const c = el.className.trim().split(/\\s+/).filter(Boolean).slice(0, 3);
+      if (c.length) s += '.' + c.join('.');
+    }
+    return s;
+  };
+  const r = this.getBoundingClientRect();
+  const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+  const inVp = cx >= 0 && cy >= 0 && cx <= innerWidth && cy <= innerHeight;
+  let top = null, hit = false;
+  if (inVp) {
+    top = document.elementFromPoint(cx, cy);
+    hit = !!top && (top === this || this.contains(top) || top.contains(this));
+  }
+  const cs = getComputedStyle(this);
+  return JSON.stringify({
+    target: d(this),
+    rect: {x: Math.round(r.left), y: Math.round(r.top),
+           w: Math.round(r.width), h: Math.round(r.height)},
+    point: {x: Math.round(cx), y: Math.round(cy)},
+    sized: r.width > 0 && r.height > 0,
+    in_viewport: inVp,
+    hit: hit,
+    blocker: hit ? null : d(top),
+    disabled: !!(this.disabled || this.getAttribute('aria-disabled') === 'true'),
+    hidden: cs.visibility === 'hidden' || cs.display === 'none' ||
+            parseFloat(cs.opacity || '1') === 0,
+    pointer_events_none: cs.pointerEvents === 'none'
+  });
+}
+"""
+
+# Cheap page fingerprint — used to tell "the click did something" from
+# "the call returned ok but nothing moved".
+_PAGE_SIG_JS = """
+(() => JSON.stringify({
+  url: location.href,
+  len: document.body ? document.body.innerHTML.length : 0,
+  nodes: document.getElementsByTagName('*').length,
+  active: document.activeElement ? document.activeElement.tagName : null
+}))()
+"""
+
+
+async def _click_probe(el) -> dict:
+    """Hit-test the element before clicking. Returns {} if the probe can't run."""
+    try:
+        v = await el.apply(_CLICK_PROBE_JS)
+        v = v.value if hasattr(v, "value") and not isinstance(v, str) else v
+        return json.loads(v) if v else {}
+    except Exception:
+        return {}
+
+
+async def _page_sig(tab) -> dict:
+    """Snapshot a cheap page fingerprint; {} when unavailable."""
+    try:
+        v = await tab.evaluate(_PAGE_SIG_JS, return_by_value=True)
+        v = v.value if hasattr(v, "value") and not isinstance(v, str) else v
+        return json.loads(v) if v else {}
+    except Exception:
+        return {}
+
+
+def _blocked_reason(p: dict) -> Optional[str]:
+    """Human-readable reason the probe says a click can't land — or None."""
+    if not p:
+        return None
+    if not p.get("sized"):
+        return "element has zero size"
+    if p.get("hidden"):
+        return "element is hidden (display/visibility/opacity)"
+    if p.get("disabled"):
+        return "element is disabled"
+    if not p.get("in_viewport"):
+        return f"element centre {p.get('point')} is outside the viewport — scroll it into view first"
+    if p.get("pointer_events_none"):
+        return "element has pointer-events:none"
+    if not p.get("hit"):
+        return f"element is obscured by <{p.get('blocker')}> at {p.get('point')}"
+    return None
+
+
+async def _click_and_report(tab, el, label: str, verify: bool) -> str:
+    """Click `el`, then report what actually happened — never a bare 'clicked'.
+
+    Reports the resolved element and its rect so the caller can judge for itself,
+    refuses up-front when the hit-test says the click cannot land, and (with
+    verify) says plainly when the page did not change.
+    """
+    probe = await _click_probe(el)
+    reason = _blocked_reason(probe)
+    if reason:
+        return err(
+            f"{label}: NOT clicked — {reason}. "
+            f"target=<{probe.get('target')}> rect={probe.get('rect')}. "
+            f"Try: scroll_to / mouse_click_xy at a different point / dismiss the overlay."
+        )
+    before = await _page_sig(tab) if verify else {}
+    await el.click()
+    detail = f"target=<{probe.get('target')}> at {probe.get('point')}" if probe else "target=<unknown>"
+    if not verify:
+        return ok(f"{label}: clicked — {detail}")
+    await asyncio.sleep(0.35)  # let handlers/render settle before re-reading
+    after = await _page_sig(tab)
+    if before and after:
+        if before.get("url") != after.get("url"):
+            return ok(f"{label}: clicked — {detail}; navigated to {after.get('url')}")
+        changed = (before.get("len") != after.get("len")
+                   or before.get("nodes") != after.get("nodes")
+                   or before.get("active") != after.get("active"))
+        if not changed:
+            return ok(
+                f"{label}: clicked but NO page change detected — {detail}. "
+                f"The event was dispatched; the page did not react (handler not bound, "
+                f"click swallowed, or the change is purely visual)."
+            )
+        return ok(f"{label}: clicked — {detail}; page changed "
+                  f"(nodes {before.get('nodes')}→{after.get('nodes')})")
+    return ok(f"{label}: clicked — {detail}")
+
+
 @mcp.tool()
-async def click_text(text: str, exact: bool = False) -> str:
-    """Find and click element whose text matches."""
+async def click_text(text: str, exact: bool = False, verify: bool = True) -> str:
+    """Find and click the element whose text matches, and report what really happened.
+
+    Args:
+        text: text to match
+        exact: True for exact match, False (default) for fuzzy best-match
+        verify: compare a page fingerprint before/after and say so when nothing
+            changed (default True). This is what distinguishes a real click from
+            one that was dispatched into a void.
+
+    Never claims success on finding alone: if the element is obscured, hidden,
+    disabled or off-viewport, this returns an error naming the blocker.
+    """
     try:
         tab = BrowserState.active_tab()
         el = await tab.find(text, best_match=not exact)
         if el is None:
             return err(f"no element with text {text!r}")
-        await el.click()
-        return ok(f"clicked text {text!r}")
+        return await _click_and_report(tab, el, f"click_text {text!r}", verify)
     except Exception as e:
         return err(str(e))
 
 
 @mcp.tool()
-async def click_role(role: str, name: Optional[str] = None) -> str:
-    """Click by ARIA role (e.g. button, link, textbox), optional accessible name."""
+async def click_role(role: str, name: Optional[str] = None, verify: bool = True) -> str:
+    """Click by ARIA role (e.g. button, link, textbox), optional accessible name.
+
+    Same honesty guarantees as click_text: reports the resolved element, refuses
+    when the hit-test says the click can't land, and flags a no-op click.
+    """
     try:
         tab = BrowserState.active_tab()
-        sel = f'[role="{role}"]'
+        # `:has-text()` is a Playwright-ism, not valid CSS — querySelector throws
+        # on it and used to surface as a bare "DOM Error while querying". Query
+        # only valid selectors, then narrow by accessible name in Python.
+        el = None
+        tried: list[str] = []
         if name:
-            sel = f'[role="{role}"][aria-label*="{name}"], [role="{role}"]:has-text("{name}")'
-        el = await tab.query_selector(sel)
+            for sel in (f'[role="{role}"][aria-label*="{name}"]',
+                        f'[role="{role}"][title*="{name}"]'):
+                tried.append(sel)
+                try:
+                    el = await tab.query_selector(sel)
+                except Exception:
+                    el = None
+                if el is not None:
+                    break
+        if el is None:
+            tried.append(f'[role="{role}"]')
+            try:
+                el = await tab.query_selector(f'[role="{role}"]')
+            except Exception:
+                el = None
         if el is None and name:
             el = await tab.find(name, best_match=True)
         if el is None:
-            return err(f"no {role} found")
-        await el.click()
-        return ok(f"clicked {role}")
+            return err(
+                f"no element found for role={role!r}"
+                + (f" name={name!r}" if name else "")
+                + f" — selectors tried: {', '.join(tried)}"
+            )
+        label = f"click_role {role!r}" + (f" name={name!r}" if name else "")
+        return await _click_and_report(tab, el, label, verify)
+    except Exception as e:
+        return err(str(e))
+
+
+@mcp.tool()
+async def assert_clickable(selector: Optional[str] = None, ref: Optional[str] = None,
+                           x: Optional[int] = None, y: Optional[int] = None) -> str:
+    """Check whether a click would actually reach the target — WITHOUT clicking.
+
+    Answers "why did my click do nothing?" before you waste a call on it. Give a
+    selector/ref to hit-test that element's centre, or x/y to ask what sits at a
+    raw viewport point.
+
+    Returns the resolved element, its rect, the hit-test verdict, and — when the
+    point is covered — the element that is in the way.
+    """
+    try:
+        tab = BrowserState.active_tab()
+        if x is not None and y is not None:
+            expr = """
+            (() => {
+              const d = (el) => {
+                if (!el) return null;
+                let s = el.tagName.toLowerCase();
+                if (el.id) s += '#' + el.id;
+                if (el.className && typeof el.className === 'string') {
+                  const c = el.className.trim().split(/\\s+/).filter(Boolean).slice(0, 3);
+                  if (c.length) s += '.' + c.join('.');
+                }
+                return s;
+              };
+              const el = document.elementFromPoint(%d, %d);
+              return JSON.stringify({
+                point: {x: %d, y: %d},
+                topmost: d(el),
+                text: el ? (el.innerText || '').trim().slice(0, 80) : null,
+                in_viewport: %d >= 0 && %d >= 0 && %d <= innerWidth && %d <= innerHeight
+              });
+            })()
+            """ % (x, y, x, y, x, y, x, y)
+            v = await tab.evaluate(expr, return_by_value=True)
+            v = v.value if hasattr(v, "value") and not isinstance(v, str) else v
+            info = json.loads(v) if v else {}
+            if not info.get("in_viewport"):
+                return ok(json.dumps({"clickable": False,
+                                      "reason": "point is outside the viewport",
+                                      **info}, indent=2))
+            return ok(json.dumps({"clickable": info.get("topmost") is not None,
+                                  "reason": None if info.get("topmost") else "nothing at that point",
+                                  **info}, indent=2))
+        el = None
+        if ref:
+            el = await resolve_ref(ref)
+            if el is None:
+                return err(f"ref {ref} not found")
+        elif selector:
+            el = await tab.query_selector(selector)
+            if el is None:
+                return err(f"selector not found: {selector}")
+        else:
+            return err("pass selector=, ref=, or both x= and y=")
+        probe = await _click_probe(el)
+        if not probe:
+            return err("probe failed — could not evaluate the element")
+        reason = _blocked_reason(probe)
+        return ok(json.dumps({"clickable": reason is None, "reason": reason, **probe},
+                             indent=2))
     except Exception as e:
         return err(str(e))
 
@@ -1569,12 +1897,29 @@ async def upload_file(
 
 
 @mcp.tool()
-async def mouse_click_xy(x: int, y: int, button: str = "left") -> str:
-    """Click at raw viewport coordinates."""
+async def mouse_click_xy(x: int, y: int, button: str = "left",
+                         move_first: bool = True) -> str:
+    """Click at raw viewport coordinates (CSS px, relative to the viewport).
+
+    Args:
+        x, y: target point in CSS pixels, viewport-relative (same space as
+            getBoundingClientRect()).
+        button: "left" | "right" | "middle"
+        move_first: send a mousemove to the point before pressing (default True).
+            Real users hover before clicking, and menus/overlays that only render
+            on hover (Canva, Figma, Notion) are unreachable without it. Set False
+            only if a hover handler would interfere.
+    """
     try:
         tab = BrowserState.active_tab()
+        if move_first:
+            # Hover first so hover-rendered targets exist before mousedown.
+            try:
+                await tab.mouse_move(x, y)
+            except Exception:
+                pass  # best-effort; the click below is what matters
         await tab.mouse_click(x, y, button=button)
-        return ok(f"clicked ({x},{y})")
+        return ok(f"clicked ({x},{y}){' after hover' if move_first else ''}")
     except Exception as e:
         return err(str(e))
 
@@ -1644,6 +1989,81 @@ async def wait_for(selector: Optional[str] = None, text: Optional[str] = None,
             return ok(f"{text!r} found")
         await asyncio.sleep(timeout)
         return ok(f"slept {timeout}s")
+    except Exception as e:
+        return err(str(e))
+
+
+@mcp.tool()
+async def wait_for_change(selector: Optional[str] = None, text: Optional[str] = None,
+                          url_contains: Optional[str] = None,
+                          gone: bool = False,
+                          timeout: float = 10.0, poll: float = 0.25) -> str:
+    """Wait until the page actually CHANGES, and report what changed.
+
+    The "click, then wait for the result" pattern belongs in one call. With no
+    arguments it waits for any structural change from the moment it is called —
+    useful right after a click when you don't know what the result looks like.
+
+    Args:
+        selector: wait until this CSS selector appears (or disappears if gone=True)
+        text: wait until this text appears in the visible page (or disappears)
+        url_contains: wait until the URL contains this substring
+        gone: invert selector/text — wait for it to go away instead
+        timeout: seconds to wait before giving up (returns an error saying so)
+        poll: seconds between checks
+
+    Returns what satisfied the wait and how long it took, so a timeout is never
+    mistaken for a silent success.
+    """
+    try:
+        tab = BrowserState.active_tab()
+        loop = asyncio.get_event_loop()
+        started = loop.time()
+        baseline = await _page_sig(tab) if not (selector or text or url_contains) else {}
+
+        def _cond_js() -> Optional[str]:
+            if selector:
+                return ("(() => JSON.stringify({hit: !!document.querySelector(%s)}))()"
+                        % json.dumps(selector))
+            if text:
+                return ("(() => JSON.stringify({hit: (document.body ? document.body.innerText : '')"
+                        ".indexOf(%s) !== -1}))()" % json.dumps(text))
+            return None
+
+        expr = _cond_js()
+        while loop.time() - started < timeout:
+            elapsed = round(loop.time() - started, 2)
+            if url_contains:
+                cur = await get_url(tab)
+                if url_contains in (cur or ""):
+                    return ok(f"url now contains {url_contains!r} after {elapsed}s — {cur}")
+            elif expr:
+                v = await tab.evaluate(expr, return_by_value=True)
+                v = v.value if hasattr(v, "value") and not isinstance(v, str) else v
+                hit = bool(json.loads(v).get("hit")) if v else False
+                if hit != gone:  # gone=False → want hit; gone=True → want !hit
+                    what = selector or repr(text)
+                    verb = "disappeared" if gone else "appeared"
+                    return ok(f"{what} {verb} after {elapsed}s")
+            else:
+                cur = await _page_sig(tab)
+                if baseline and cur and (
+                    cur.get("url") != baseline.get("url")
+                    or cur.get("nodes") != baseline.get("nodes")
+                    or cur.get("len") != baseline.get("len")
+                ):
+                    if cur.get("url") != baseline.get("url"):
+                        return ok(f"page navigated after {elapsed}s → {cur.get('url')}")
+                    return ok(
+                        f"DOM changed after {elapsed}s "
+                        f"(nodes {baseline.get('nodes')}→{cur.get('nodes')}, "
+                        f"html {baseline.get('len')}→{cur.get('len')} chars)"
+                    )
+            await asyncio.sleep(poll)
+
+        target = (selector or (repr(text) if text else None)
+                  or (f"url containing {url_contains!r}" if url_contains else "any DOM change"))
+        return err(f"timeout after {timeout}s waiting for {target} — nothing changed")
     except Exception as e:
         return err(str(e))
 
@@ -2322,11 +2742,23 @@ async def indexeddb_delete(database_name: str) -> str:
 
 
 @mcp.tool()
-async def evaluate(expression: str) -> str:
-    """Execute arbitrary JS expression in page context. Returns stringified result."""
+async def evaluate(expression: str, await_promise: bool = True) -> str:
+    """Execute arbitrary JS expression in page context. Returns stringified result.
+
+    Args:
+        expression: JS to evaluate. May be an async IIFE or any Promise-returning
+            expression — it is awaited by default, so
+            `(async () => { await x; return 'done' })()` returns "done", not null.
+        await_promise: if True (default) a returned Promise is resolved before the
+            value comes back. Pass False for fire-and-forget (returns immediately
+            with the pending Promise's placeholder instead of its value).
+    """
     try:
         tab = BrowserState.active_tab()
-        result = await _wait(tab.evaluate(expression, return_by_value=True), what="evaluate")
+        result = await _wait(
+            tab.evaluate(expression, await_promise=await_promise, return_by_value=True),
+            what="evaluate",
+        )
         # Unwrap nodriver RemoteObject if returned (happens for some primitives)
         if hasattr(result, "value") and not isinstance(result, (str, int, float, bool, list, dict)):
             result = result.value
@@ -2754,6 +3186,14 @@ _DIALOG_AUTO_CFG: dict = {
 # duplicate CDP handlers (which would double-record every event). Cleared on
 # browser_close / browser_recover alongside the other per-tab caches.
 _CONSOLE_ARMED_TAB_IDS: set = set()
+# When capture was armed — surfaced by console_get so an empty result is
+# interpretable ("listening since X, 0 messages" vs "never listening").
+_CONSOLE_STARTED_AT: Optional[str] = None
+
+
+def _now_iso() -> str:
+    from datetime import datetime
+    return datetime.now().isoformat(timespec="seconds")
 _NETWORK_ARMED_TAB_IDS: set = set()
 
 
@@ -2866,17 +3306,42 @@ async def accessibility_snapshot(interesting_only: bool = True) -> str:
 # ══════════════════════════════════════════════════════════════════════════
 
 
+def _console_target_key(tab) -> str:
+    """Stable identity for a tab's CDP target.
+
+    id(tab) was used before — a Python object address, which changes when the Tab
+    object is recreated and can even be recycled onto a different tab after GC.
+    The CDP target id is the thing that actually survives navigation.
+    """
+    t = getattr(tab, "target", None)
+    return str(getattr(t, "target_id", None) or id(tab))
+
+
 @mcp.tool()
 async def console_start() -> str:
-    """Begin capturing console messages of active tab."""
+    """Begin capturing console messages + uncaught exceptions of the active tab.
+
+    Arms the listener on THIS tab only. Call it again after switching or opening
+    a tab. The Runtime domain is enabled explicitly and re-enabled on every
+    navigation, so capture survives page loads instead of silently lapsing.
+    """
+    global _CONSOLE_STARTED_AT
     try:
         tab = BrowserState.active_tab()
         BrowserState.console_logs = []
         BrowserState.capture_console = True
-        tid = id(tab)
+        _CONSOLE_STARTED_AT = _now_iso()
+        tid = _console_target_key(tab)
+        from nodriver.cdp import runtime as cdp_runtime, page as cdp_page
+
         if tid in _CONSOLE_ARMED_TAB_IDS:
-            return ok("console capture started (handler already armed on this tab)")
-        from nodriver.cdp import runtime as cdp_runtime
+            # Handler is still bound, but the domain can lapse — re-enabling is
+            # idempotent and cheap, and it is what makes a re-call actually help.
+            try:
+                await tab.send(cdp_runtime.enable())
+            except Exception:
+                pass
+            return ok("console capture re-armed (handler already bound to this tab)")
 
         async def handle(event):
             try:
@@ -2896,18 +3361,75 @@ async def console_start() -> str:
             except Exception:
                 pass
 
+        async def handle_exception(event):
+            # A page can fail hard with zero console.log calls — without this,
+            # console_get() would report "0 messages" on a page that threw.
+            try:
+                d = getattr(event, "exception_details", None)
+                text = getattr(d, "text", "") or ""
+                exc = getattr(d, "exception", None)
+                desc = getattr(exc, "description", None) if exc else None
+                BrowserState.console_logs.append({
+                    "type": "exception",
+                    "text": (desc or text or "uncaught exception")[:500],
+                })
+            except Exception:
+                pass
+
+        async def on_navigated(event):
+            # Execution contexts are torn down on navigation; re-enable so the
+            # listener keeps receiving events on the new document.
+            try:
+                await tab.send(cdp_runtime.enable())
+            except Exception:
+                pass
+
         tab.add_handler(cdp_runtime.ConsoleAPICalled, handle)
+        tab.add_handler(cdp_runtime.ExceptionThrown, handle_exception)
+        tab.add_handler(cdp_page.FrameNavigated, on_navigated)
+        try:
+            await tab.send(cdp_runtime.enable())
+        except Exception:
+            pass
         _CONSOLE_ARMED_TAB_IDS.add(tid)
-        return ok("console capture started")
+        return ok("console capture started (console + uncaught exceptions)")
     except Exception as e:
         return err(str(e))
 
 
 @mcp.tool()
 async def console_get(limit: int = 100) -> str:
-    """Retrieve captured console messages (chronological: oldest first within the last `limit`, newest last)."""
+    """Retrieve captured console messages WITH the capture status.
+
+    Returns {attached, capturing, since, total, returned, messages} rather than a
+    bare array, because an empty array alone is ambiguous: it cannot tell you
+    whether the page logged nothing or nothing was ever listening. `attached`
+    false + empty means NOT MONITORED — not "no errors".
+
+    Messages are chronological (oldest first within the last `limit`).
+    """
+    tab = None
+    try:
+        tab = BrowserState.active_tab()
+    except Exception:
+        pass
+    armed = tab is not None and _console_target_key(tab) in _CONSOLE_ARMED_TAB_IDS
     logs = BrowserState.console_logs[-limit:]
-    return ok(json.dumps(logs, indent=2, default=str))
+    payload: dict[str, Any] = {
+        "attached": armed,
+        "capturing": bool(BrowserState.capture_console),
+        "since": _CONSOLE_STARTED_AT,
+        "total": len(BrowserState.console_logs),
+        "returned": len(logs),
+        "messages": logs,
+    }
+    if not armed:
+        payload["note"] = (
+            "NOT listening on the active tab — an empty 'messages' here means "
+            "'nothing was monitored', not 'no errors'. Call console_start() "
+            "(re-call it after switching or opening a tab)."
+        )
+    return ok(json.dumps(payload, indent=2, default=str))
 
 
 @mcp.tool()
@@ -3465,8 +3987,27 @@ async def fingerprint_rotate(
 
 @mcp.tool()
 async def humanize_click(ref: Optional[str] = None,
-                          selector: Optional[str] = None) -> str:
-    """⭐ Click with Bezier-curve mouse approach + randomized dwell."""
+                          selector: Optional[str] = None,
+                          x: Optional[int] = None,
+                          y: Optional[int] = None) -> str:
+    """⭐ Click with Bezier-curve mouse approach + randomized dwell.
+
+    Targets an element (ref/selector) OR a raw viewport point (x/y, CSS px).
+    The coordinate form approaches the point along a Bezier path before pressing,
+    which also renders hover-only overlays on the way in.
+    """
+    if x is not None and y is not None:
+        try:
+            tab = BrowserState.active_tab()
+            # Approach from an offset so the path has a direction, like a hand does.
+            await humanized_move(tab, x + 120, y + 90, x, y)
+            await asyncio.sleep(random.uniform(0.05, 0.18))
+            await tab.mouse_click(x, y)
+            return ok(f"clicked ({x},{y}) via Bezier approach")
+        except Exception as e:
+            return err(str(e))
+    if ref is None and selector is None:
+        return err("pass ref=, selector=, or both x= and y=")
     return await click(ref=ref, selector=selector, humanize=True)
 
 
