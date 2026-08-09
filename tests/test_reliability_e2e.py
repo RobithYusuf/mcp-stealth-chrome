@@ -104,6 +104,23 @@ def test_click_text_succeeds_and_confirms_change(loop):
     assert "FREE CLICK" in state
 
 
+def test_click_text_skips_hidden_decoy_and_reaches_the_real_control(loop):
+    """Honest refusal is not enough — it must still get the job done.
+
+    The fixture puts a hidden <span> with the same text first in document order,
+    which is what fuzzy find returns. Refusing there would be truthful but
+    useless; the tool must fall through to the visible button.
+    """
+    loop.run_until_complete(tool("evaluate")(
+        "document.getElementById('out').textContent='idle'"))
+    out = loop.run_until_complete(tool("click_text")("Rescue Target"))
+    assert "clicked" in out and "NOT clicked" not in out
+    assert "unreachable" in out  # says plainly that it had to look past the decoy
+    state = loop.run_until_complete(tool("evaluate")(
+        "document.getElementById('out').textContent"))
+    assert "RESCUED" in state
+
+
 def test_assert_clickable_diagnoses_without_clicking(loop):
     covered = json.loads(loop.run_until_complete(
         tool("assert_clickable")(selector="#realbtn")))

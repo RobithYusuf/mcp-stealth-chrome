@@ -1559,6 +1559,76 @@ def _blocked_reason(p: dict) -> Optional[str]:
     return None
 
 
+# Second chance for click_text. nodriver's fuzzy find often returns the FIRST
+# node containing the text, which on real sites is routinely an off-screen
+# marketing/nav duplicate rather than the control the caller means. Refusing
+# there is honest but useless — so re-scan for a candidate that is genuinely
+# visible and hit-testable, scrolling it into view when that is all that's wrong.
+_CLICK_TEXT_RESCUE_JS = r"""
+(() => {
+  const needle = %s, exact = %s;
+  const cands = [];
+  const collect = (nodes) => {
+    for (const el of nodes) {
+      const t = (el.innerText || el.value || el.getAttribute('aria-label') || '').trim();
+      if (!t) continue;
+      const tl = t.toLowerCase();
+      if (exact ? tl !== needle : tl.indexOf(needle) === -1) continue;
+      const cs = getComputedStyle(el);
+      if (cs.visibility === 'hidden' || cs.display === 'none' ||
+          parseFloat(cs.opacity || '1') === 0 || cs.pointerEvents === 'none') continue;
+      const r = el.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) continue;
+      cands.push({el: el, t: t, len: t.length, area: r.width * r.height});
+    }
+  };
+  const CLICKABLE = 'a,button,[role="button"],[role="link"],[role="tab"],' +
+                    '[role="menuitem"],[onclick],input[type="submit"],' +
+                    'input[type="button"],summary,label';
+  collect(document.querySelectorAll(CLICKABLE));
+  const interactive = cands.length;
+  if (!cands.length) collect(document.querySelectorAll('*'));
+  if (!cands.length) return JSON.stringify({found: 0});
+  // Shortest text wins: the tightest node around the phrase is the real control,
+  // not the section wrapper that happens to contain it.
+  cands.sort((a, b) => a.len - b.len || a.area - b.area);
+  let scrolled = false;
+  for (const c of cands.slice(0, 8)) {
+    let r = c.el.getBoundingClientRect();
+    let cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+    if (cx < 0 || cy < 0 || cx > innerWidth || cy > innerHeight) {
+      c.el.scrollIntoView({block: 'center', inline: 'center'});
+      scrolled = true;
+      r = c.el.getBoundingClientRect();
+      cx = r.left + r.width / 2; cy = r.top + r.height / 2;
+      if (cx < 0 || cy < 0 || cx > innerWidth || cy > innerHeight) continue;
+    }
+    const top = document.elementFromPoint(cx, cy);
+    if (!top || !(top === c.el || c.el.contains(top) || top.contains(c.el))) continue;
+    let d = c.el.tagName.toLowerCase();
+    if (c.el.id) d += '#' + c.el.id;
+    return JSON.stringify({
+      found: cands.length, interactive: interactive, scrolled: scrolled,
+      x: Math.round(cx), y: Math.round(cy), target: d, text: c.t.slice(0, 80)
+    });
+  }
+  return JSON.stringify({found: cands.length, interactive: interactive, blocked: true});
+})()
+"""
+
+
+async def _click_text_rescue(tab, text: str, exact: bool) -> dict:
+    """Find a genuinely clickable element carrying `text`. {} when none."""
+    try:
+        expr = _CLICK_TEXT_RESCUE_JS % (json.dumps(text.lower()),
+                                        "true" if exact else "false")
+        v = await tab.evaluate(expr, return_by_value=True)
+        v = v.value if hasattr(v, "value") and not isinstance(v, str) else v
+        return json.loads(v) if v else {}
+    except Exception:
+        return {}
+
+
 async def _click_and_report(tab, el, label: str, verify: bool) -> str:
     """Click `el`, then report what actually happened — never a bare 'clicked'.
 
@@ -1610,14 +1680,68 @@ async def click_text(text: str, exact: bool = False, verify: bool = True) -> str
             one that was dispatched into a void.
 
     Never claims success on finding alone: if the element is obscured, hidden,
-    disabled or off-viewport, this returns an error naming the blocker.
+    disabled or off-viewport, this does not pretend otherwise — it first looks
+    for another element carrying the same text that IS reachable (scrolling it
+    into view if needed), and only errors, naming the blocker, when there is
+    genuinely nothing clickable.
     """
+    label = f"click_text {text!r}"
     try:
         tab = BrowserState.active_tab()
         el = await tab.find(text, best_match=not exact)
-        if el is None:
+        if el is not None:
+            probe = await _click_probe(el)
+            if _blocked_reason(probe) is None:
+                return await _click_and_report(tab, el, label, verify)
+
+        # The fuzzy match is unusable (or absent). Look for a reachable twin —
+        # on real pages the first text match is often a hidden nav/marketing copy.
+        cand = await _click_text_rescue(tab, text, exact)
+        if cand.get("x") is not None:
+            before = await _page_sig(tab) if verify else {}
+            try:
+                await tab.mouse_move(cand["x"], cand["y"])
+            except Exception:
+                pass
+            await tab.mouse_click(cand["x"], cand["y"])
+            note = (f"{label}: clicked — target=<{cand.get('target')}> "
+                    f"at {{'x': {cand['x']}, 'y': {cand['y']}}}"
+                    + (" (scrolled into view)" if cand.get("scrolled") else "")
+                    + (f"; first text match was unreachable, used a visible one "
+                       f"of {cand.get('found')} candidates"
+                       if el is not None else ""))
+            if not verify:
+                return ok(note)
+            await asyncio.sleep(0.35)
+            after = await _page_sig(tab)
+            if before and after:
+                if before.get("url") != after.get("url"):
+                    return ok(f"{note}; navigated to {after.get('url')}")
+                if (before.get("len") == after.get("len")
+                        and before.get("nodes") == after.get("nodes")
+                        and before.get("active") == after.get("active")):
+                    return ok(f"{note}; but NO page change detected — the event was "
+                              f"dispatched and the page did not react.")
+                return ok(f"{note}; page changed "
+                          f"(nodes {before.get('nodes')}→{after.get('nodes')})")
+            return ok(note)
+
+        if el is None and not cand.get("found"):
             return err(f"no element with text {text!r}")
-        return await _click_and_report(tab, el, f"click_text {text!r}", verify)
+        if el is not None:
+            # Report why the original match is unusable, plus what the scan saw.
+            probe = await _click_probe(el)
+            reason = _blocked_reason(probe) or "unclickable"
+            extra = (f" Scanned {cand.get('found')} other element(s) with this text; "
+                     f"none were reachable." if cand.get("found") else "")
+            return err(
+                f"{label}: NOT clicked — {reason}. "
+                f"target=<{probe.get('target')}> rect={probe.get('rect')}.{extra} "
+                f"Try: scroll_to / mouse_click_xy at a different point / dismiss the overlay."
+            )
+        return err(f"{label}: NOT clicked — found {cand.get('found')} element(s) with "
+                   f"this text but every one is hidden or covered. "
+                   f"Try assert_clickable to inspect, or mouse_click_xy.")
     except Exception as e:
         return err(str(e))
 

@@ -16,6 +16,11 @@
 
 <h1>Probe page</h1>
 
+<!-- Hidden decoy FIRST in document order, so a naive fuzzy find matches this
+     one. Real sites are full of these (off-screen nav/marketing duplicates).
+     click_text must skip it and reach the visible control below. -->
+<span id="ghost" style="display:none">Rescue Target</span>
+
 <div id="stage">
   <button id="realbtn" onclick="document.getElementById('out').textContent='REAL CLICK';
     var d=document.createElement('p'); d.textContent='added'; document.body.appendChild(d);">
@@ -35,6 +40,11 @@
     Hover Only
   </button>
 </div>
+
+<button id="rescuebtn" onclick="document.getElementById('out').textContent='RESCUED';
+  var d=document.createElement('p'); d.textContent='rescue-added'; document.body.appendChild(d);">
+  Rescue Target
+</button>
 
 <p id="visible-text">HUMAN_VISIBLE_SENTINEL</p>
 <div id="out">idle</div>

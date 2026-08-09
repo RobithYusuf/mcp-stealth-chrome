@@ -1,7 +1,7 @@
 [project]
 name = "mcp-stealth-chrome"
 version = "0.9.0"
-description = "Stealth Chrome MCP server — nodriver + Chromium + 80+ tools with Cloudflare/Turnstile bypass, CapSolver, storage-state reuse"
+description = "Stealth Chrome MCP server — nodriver + Chromium + 149 tools with Cloudflare/Turnstile bypass, CapSolver, storage-state reuse, and a self-sufficient web-research kit"
 readme = "README.md"
 license = { text = "MIT" }
 authors = [
