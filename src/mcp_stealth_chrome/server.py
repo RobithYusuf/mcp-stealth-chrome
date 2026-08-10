@@ -5632,6 +5632,49 @@ async def list_chrome_profiles(browser: Optional[str] = None) -> str:
     return ok(json.dumps(payload, indent=2, default=str))
 
 
+def _is_sqlite(path: Path) -> bool:
+    """True when the file carries the SQLite header magic."""
+    try:
+        with path.open("rb") as fh:
+            return fh.read(16) == b"SQLite format 3\x00"
+    except Exception:
+        return False
+
+
+def _sqlite_snapshot(src: Path, dst: Path) -> bool:
+    """Copy a SQLite file the browser may be writing, then verify the copy.
+
+    SQLite's online-backup API looks like the right tool and is not: on a
+    database a live browser keeps writing, `Connection.backup()` blocks inside C
+    code that never yields to Python, so the call cannot even be interrupted by a
+    timeout — measured here as an indefinite hang against a running Brave. A
+    plain byte copy returns instantly, and copying the `-wal`/`-shm` companions
+    alongside is what lets SQLite reconstruct a coherent view from it.
+
+    The copy is integrity-checked afterwards; False means treat it as suspect
+    rather than silently trusting it. The source is never opened for writing.
+    """
+    import shutil as _shutil
+    import sqlite3
+    try:
+        _shutil.copy2(src, dst)
+        for suffix in ("-wal", "-shm"):
+            sidecar = src.with_name(src.name + suffix)
+            if sidecar.exists():
+                _shutil.copy2(sidecar, dst.with_name(dst.name + suffix))
+    except Exception:
+        return False
+    try:
+        conn = sqlite3.connect(f"file:{dst}?mode=ro", uri=True, timeout=3)
+        try:
+            row = conn.execute("pragma quick_check").fetchone()
+            return bool(row and row[0] == "ok")
+        finally:
+            conn.close()
+    except Exception:
+        return False
+
+
 @mcp.tool()
 async def clone_chrome_profile(
     source_profile: str = "Default",
@@ -5639,6 +5682,7 @@ async def clone_chrome_profile(
     skip_cache: bool = True,
     overwrite: bool = False,
     browser: Optional[str] = None,
+    allow_running: bool = False,
 ) -> str:
     """Clone a profile from ANY Chrome-family browser into an isolated MCP location.
 
@@ -5656,6 +5700,11 @@ async def clone_chrome_profile(
         target_instance_id: Name for the cloned instance (becomes folder name).
         skip_cache: Exclude cache dirs for fast + smaller copy (default True).
         overwrite: Delete target if exists before copying (default False).
+        allow_running: clone even while the browser is open. Each SQLite
+            database is copied with its -wal/-shm companions and then
+            integrity-checked; any that fail come back under `sqlite_suspect`
+            instead of being trusted silently. Without this flag the call refuses
+            while the profile is locked.
         browser: which browser to clone FROM — "brave", "chrome", "edge",
             "chromium", "vivaldi", "opera", "arc". Omit to use the first root
             found, which is NOT necessarily the one holding your sessions:
@@ -5680,11 +5729,16 @@ async def clone_chrome_profile(
             f"Run list_chrome_profiles() to see available profiles "
             f"(pass browser= to pick a different browser)."
         )
-    if is_chrome_profile_locked(source_path) or is_chrome_profile_locked(root):
+    running = is_chrome_profile_locked(source_path) or is_chrome_profile_locked(root)
+    if running and not allow_running:
         label = browser or root.name
         return err(
-            f"{label} is currently using this profile (lock file present). "
-            f"Close it FULLY (Cmd+Q on macOS, not just the window), then retry.\n"
+            f"{label} is currently using this profile (lock file present).\n"
+            f"Either close it FULLY (Cmd+Q on macOS, not just the window), or pass "
+            f"allow_running=true — every SQLite database (cookies, logins, history) "
+            f"is then snapshotted through SQLite's online-backup API, which is "
+            f"consistent even while the browser writes. The source profile is only "
+            f"ever opened read-only.\n"
             f"Lock: {source_path / 'SingletonLock'}"
         )
 
@@ -5722,6 +5776,8 @@ async def clone_chrome_profile(
     copied_count = 0
     skipped_cache_bytes = 0
     errors: list[str] = []
+    snapshotted: list[str] = []
+    suspect_dbs: list[str] = []
 
     for item in source_path.iterdir():
         name_lower = item.name.lower()
@@ -5731,6 +5787,16 @@ async def clone_chrome_profile(
                     continue
                 # Also skip -journal WAL sidecars
                 if name_lower.endswith("-journal"):
+                    continue
+                # Cookies/Login Data/History are live SQLite. A plain byte copy of
+                # a database the browser is still writing can land mid-checkpoint
+                # and produce a torn file, so snapshot those through SQLite itself.
+                if _is_sqlite(item):
+                    if _sqlite_snapshot(item, target_default / item.name):
+                        snapshotted.append(item.name)
+                    else:
+                        suspect_dbs.append(item.name)
+                    copied_count += 1
                     continue
                 shutil.copy2(item, target_default / item.name)
                 copied_count += 1
@@ -5768,6 +5834,10 @@ async def clone_chrome_profile(
         total_size = 0
 
     result = {
+        "source_browser": browser or root.name,
+        "source_running": running,
+        "sqlite_verified": snapshotted,
+        "sqlite_suspect": suspect_dbs,
         "source": str(source_path),
         "target": str(target_root),
         "copied_items": copied_count,

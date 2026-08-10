@@ -92,6 +92,42 @@ def test_browser_roots_are_all_reported_and_selectable(monkeypatch):
     assert state.chrome_user_data_root("edge") is None          # honest miss, not a guess
 
 
+def test_sqlite_snapshot_copies_wal_and_verifies(tmp_path):
+    """Cloning a live profile must not depend on Connection.backup().
+
+    That API blocks inside C on a database a running browser keeps writing and
+    ignores signals, so it can hang indefinitely. A byte copy plus the -wal
+    companion returns immediately and still yields a readable database — but it
+    is only worth trusting because the copy is integrity-checked afterwards.
+    """
+    import sqlite3
+
+    from mcp_stealth_chrome.server import _is_sqlite, _sqlite_snapshot
+
+    src = tmp_path / "Cookies"
+    conn = sqlite3.connect(src)
+    conn.execute("pragma journal_mode=WAL")
+    conn.execute("create table cookies (host_key text)")
+    conn.executemany("insert into cookies values (?)", [(".x.com",), (".threads.com",)])
+    conn.commit()
+
+    dst = tmp_path / "out" / "Cookies"
+    dst.parent.mkdir()
+    assert _is_sqlite(src)
+    assert _sqlite_snapshot(src, dst) is True
+    if (src.with_name("Cookies-wal")).exists():
+        assert dst.with_name("Cookies-wal").exists(), "WAL companion must travel with the db"
+
+    copied = sqlite3.connect(f"file:{dst}?mode=ro", uri=True)
+    assert copied.execute("select count(*) from cookies").fetchone()[0] == 2
+    copied.close()
+    conn.close()
+
+    plain = tmp_path / "notes.txt"
+    plain.write_text("not a database")
+    assert _is_sqlite(plain) is False
+
+
 def test_privacy_proxy_supports_pool_and_session_token():
     from mcp_stealth_chrome.server import _privacy_proxy
 
