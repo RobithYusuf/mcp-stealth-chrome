@@ -2,7 +2,7 @@
 
 # MCP Stealth Chrome
 
-**149 tools** for AI agents that bypass Cloudflare, Turnstile, reCAPTCHA, and modern anti-bot systems — with an LLM-optimized action kit (`describe_page`, `smart_fill`, `workflow_run`, vision-LLM element locator) and a self-sufficient web-research kit (`web_search`, `scrape_markdown`, `deep_research`, `social_research`) layered on top of standard automation.
+**154 tools** for AI agents that bypass Cloudflare, Turnstile, reCAPTCHA, and modern anti-bot systems — with an LLM-optimized action kit (`describe_page`, `smart_fill`, `workflow_run`, vision-LLM element locator) and a self-sufficient web-research kit (`web_search`, `scrape_markdown`, `deep_research`, `social_research`) layered on top of standard automation.
 
 [![PyPI version](https://img.shields.io/pypi/v/mcp-stealth-chrome.svg)](https://pypi.org/project/mcp-stealth-chrome/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -263,7 +263,7 @@ Settings → Extensions → MCP Servers, or edit `~/.config/zed/settings.json`:
 
 ## 🔑 BYOK (Bring Your Own Key) — Optional
 
-`mcp-stealth-chrome` is **fully functional without any API key** — 146 of 149 tools work out of the box, including `click_turnstile` (Cloudflare Turnstile bypass), TLS-perfect HTTP, multi-instance, DevTools-level perf/coverage/emulation, the full LLM-optimized kit (`describe_page` / `smart_fill` / `workflow_run`), the web-research kit (`web_search` / `scrape_markdown` / `deep_research` / `social_research` — no search-API key needed), and all scraping tools.
+`mcp-stealth-chrome` is **fully functional without any API key** — 151 of 154 tools work out of the box, including `click_turnstile` (Cloudflare Turnstile bypass), TLS-perfect HTTP, multi-instance, DevTools-level perf/coverage/emulation, the full LLM-optimized kit (`describe_page` / `smart_fill` / `workflow_run`), the web-research kit (`web_search` / `scrape_markdown` / `deep_research` / `social_research` — no search-API key needed), and all scraping tools.
 
 **API keys are optional — only needed for 3 vision/solver tools:**
 
@@ -424,7 +424,7 @@ way? — without clicking) and **`wait_for_change`** (click-then-wait in one cal
 with an honest timeout). `screenshot(region_selector="css")` measures the crop box
 for you, removing the CSS-px-vs-device-px guesswork.
 
-## Tool Categories (149)
+## Tool Categories (154)
 
 ### ⭐⭐⭐ Self-Sufficient Web Research (new) — replaces firecrawl/tavily for most tasks
 Browserless-first (curl_cffi), escalates to the stealth browser only when a page is anti-bot blocked. Runs fully headless/API-mode and is ~10–12× lighter than driving Chrome for normal pages (verified: HTTP path 10–12× faster than headless render on example.com / Wikipedia).
@@ -499,13 +499,22 @@ Network capture with response bodies, plus a bridge from browser session into TL
 | `solve_captcha` | CapSolver API — Turnstile/reCAPTCHA/hCaptcha |
 | `verify_cf` | Cloudflare checkbox via OpenCV template match |
 | `fingerprint_rotate` | UA/lang/platform/timezone via CDP |
+| `identity_pin` / `identity_show` | Persist and inspect a stable fingerprint + proxy per browser instance |
+| `browser_launch(privacy=True)` | Fresh randomized fingerprint + disposable profile removed on close |
 | `humanize_click` / `humanize_type` | Bezier+Gaussian for single actions |
+
+### Local Human Handoff
+| Tool | Purpose |
+|------|---------|
+| `request_human_help` | Focus a headed local browser and promptly tell the human what to complete |
+| `wait_for_human` | Separately wait for an expected URL, selector, or real page change; timeouts are explicit |
 
 ### Multi-Instance
 | Tool | Purpose |
 |------|---------|
-| `spawn_browser` | New named instance (parallel profiles) |
+| `spawn_browser` | New named instance (parallel profiles), with optional `desc` and privacy mode |
 | `list_instances` / `switch_instance` | Manage multiple browsers |
+| `instance_describe` | Set/append semantic purpose memory that survives instance switching |
 | `close_instance` / `close_all_instances` | Clean shutdown |
 
 ### ⭐⭐ DevTools Suite — perf, coverage, emulation (new in v0.2.0)
@@ -529,6 +538,7 @@ Network capture with response bodies, plus a bridge from browser session into TL
 | `browser_snapshot(mode="fast")` | Skip getComputedStyle + minimal attrs (2–3× faster) |
 | `browser_snapshot(mode="viewport")` | Only elements inside current scroll viewport (5–10× on long pages) |
 | `browser_snapshot(diff_from_last=True)` | Cache DOM hash — near-instant if page unchanged |
+| `browser_snapshot(delta=True)` | Prefix only new/changed elements with `*` (first snapshot marks all) |
 | `screenshot(format="jpeg", quality=60)` | JPEG vs PNG — ~3× smaller file |
 | `screenshot(region={x,y,width,height})` | Clip via CDP — 2–5× faster for small crops |
 | `browser_launch(testing_mode=True)` | Disable images / background throttling / translate — 2–5× faster nav for perf tests (not for stealth) |

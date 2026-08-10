@@ -210,3 +210,143 @@ def test_profile_affinity_survives_recover():
     finally:
         st.is_chrome_profile_locked = orig
         st.set_profile_affinity(None)
+
+
+def test_snapshot_delta_marks_only_new_elements(loop):
+    """The second stable snapshot is quiet; one injected control is the only delta."""
+    loop.run_until_complete(tool("navigate")(PROBE.as_uri()))
+    first = loop.run_until_complete(tool("browser_snapshot")())
+    assert "changed)" in first and "* ref=" in first
+    second = loop.run_until_complete(tool("browser_snapshot")())
+    assert ", 0 changed)" in second
+    assert "* ref=" not in second
+    loop.run_until_complete(tool("evaluate")(
+        "(()=>{const b=document.createElement('button');b.id='delta-only';"
+        "b.textContent='DELTA ONLY';document.body.appendChild(b);return true})()"))
+    third = loop.run_until_complete(tool("browser_snapshot")())
+    marked = [line for line in third.splitlines() if line.startswith("* ref=")]
+    assert len(marked) == 1
+    assert "DELTA ONLY" in marked[0]
+    assert ", 1 changed)" in third
+
+
+def test_instance_descriptions_survive_switch_roundtrip(loop):
+    suffix = str(os.getpid())
+    one, two = f"desc_one_{suffix}", f"desc_two_{suffix}"
+    try:
+        assert "Error:" not in loop.run_until_complete(tool("spawn_browser")(
+            one, url=PROBE.as_uri(), headless=True, privacy=True,
+            desc="shopping account for Jakarta",
+        ))
+        assert "Error:" not in loop.run_until_complete(tool("spawn_browser")(
+            two, url=PROBE.as_uri(), headless=True, privacy=True,
+            desc="support dashboard for Acme",
+        ))
+        listing = json.loads(loop.run_until_complete(tool("list_instances")()))
+        descriptions = {row["instance_id"]: row["desc"] for row in listing["instances"]}
+        assert descriptions[one] == "shopping account for Jakarta"
+        assert descriptions[two] == "support dashboard for Acme"
+        loop.run_until_complete(tool("instance_describe")(
+            one, "uses the loyalty login", append=True))
+        loop.run_until_complete(tool("switch_instance")(one))
+        loop.run_until_complete(tool("switch_instance")(two))
+        loop.run_until_complete(tool("switch_instance")(one))
+        listing = json.loads(loop.run_until_complete(tool("list_instances")()))
+        descriptions = {row["instance_id"]: row["desc"] for row in listing["instances"]}
+        assert descriptions[one] == "shopping account for Jakarta; uses the loyalty login"
+    finally:
+        loop.run_until_complete(tool("close_instance")(one))
+        loop.run_until_complete(tool("close_instance")(two))
+        loop.run_until_complete(tool("switch_instance")("main"))
+
+
+def test_human_handoff_focuses_headed_and_times_out_honestly(loop):
+    iid = f"human_{os.getpid()}"
+    try:
+        launched = loop.run_until_complete(tool("spawn_browser")(
+            iid, url=PROBE.as_uri(), headless=False, privacy=True,
+            desc="temporary local human handoff",
+        ))
+        assert "Error:" not in launched
+        loop.run_until_complete(tool("switch_instance")(iid))
+        prompt = loop.run_until_complete(tool("request_human_help")(
+            "Complete the local verification step", timeout=2))
+        assert "foreground" in prompt.lower()
+        assert "wait_for_human" in prompt
+        timed_out = loop.run_until_complete(tool("wait_for_human")(
+            done_selector="#x", timeout=2))
+        assert "timeout" in timed_out.lower()
+        assert "nothing changed" in timed_out.lower()
+    finally:
+        loop.run_until_complete(tool("close_instance")(iid))
+        loop.run_until_complete(tool("switch_instance")("main"))
+
+
+def test_identity_pin_is_reapplied_on_relaunch(loop):
+    from mcp_stealth_chrome.server import _identity_path
+
+    iid = f"pin_e2e_{os.getpid()}"
+    fingerprint = {
+        "user_agent": "Mozilla/5.0 IdentityPinE2E Chrome/147.0.0.0",
+        "accept_language": "en-GB,en;q=0.9",
+        "platform": "Win32",
+        "timezone": "Asia/Tokyo",
+    }
+
+    def reported():
+        raw = loop.run_until_complete(tool("evaluate")(
+            "JSON.stringify({ua:navigator.userAgent,platform:navigator.platform,"
+            "timezone:Intl.DateTimeFormat().resolvedOptions().timeZone})"))
+        return json.loads(raw)
+
+    try:
+        pinned = loop.run_until_complete(tool("identity_pin")(
+            instance_id=iid, fingerprint=fingerprint))
+        assert fingerprint["user_agent"] in pinned
+        for _ in range(2):
+            launched = loop.run_until_complete(tool("spawn_browser")(
+                iid, url=PROBE.as_uri(), headless=True, persistent=False))
+            assert "identity=pinned" in launched
+            loop.run_until_complete(tool("switch_instance")(iid))
+            values = reported()
+            assert values == {
+                "ua": fingerprint["user_agent"],
+                "platform": fingerprint["platform"],
+                "timezone": fingerprint["timezone"],
+            }
+            shown = loop.run_until_complete(tool("identity_show")())
+            assert fingerprint["timezone"] in shown
+            loop.run_until_complete(tool("close_instance")(iid))
+            loop.run_until_complete(tool("switch_instance")("main"))
+    finally:
+        loop.run_until_complete(tool("close_instance")(iid))
+        loop.run_until_complete(tool("switch_instance")("main"))
+        _identity_path(iid).unlink(missing_ok=True)
+
+
+def test_privacy_launch_rotates_and_removes_profiles(loop):
+    iid = f"privacy_e2e_{os.getpid()}"
+    fingerprints = []
+    profiles = []
+    try:
+        for _ in range(2):
+            launched = loop.run_until_complete(tool("spawn_browser")(
+                iid, url=PROBE.as_uri(), headless=True, privacy=True))
+            assert "privacy=True" in launched
+            loop.run_until_complete(tool("switch_instance")(iid))
+            listing = json.loads(loop.run_until_complete(tool("list_instances")()))
+            row = next(item for item in listing["instances"] if item["instance_id"] == iid)
+            profile = pathlib.Path(row["profile"])
+            profiles.append(profile)
+            assert row["privacy"] is True and profile.exists()
+            fingerprints.append(loop.run_until_complete(tool("evaluate")(
+                "navigator.userAgent + '|' + navigator.platform + '|' + "
+                "Intl.DateTimeFormat().resolvedOptions().timeZone")))
+            closed = loop.run_until_complete(tool("close_instance")(iid))
+            assert "Error:" not in closed
+            assert not profile.exists()
+        assert fingerprints[0] != fingerprints[1]
+        assert profiles[0] != profiles[1]
+    finally:
+        loop.run_until_complete(tool("close_instance")(iid))
+        loop.run_until_complete(tool("switch_instance")("main"))
