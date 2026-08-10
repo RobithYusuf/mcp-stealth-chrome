@@ -85,6 +85,21 @@ TOOL_ACTION_TIMEOUT = int(os.environ.get("TOOL_ACTION_TIMEOUT", "30"))
 B64_INLINE_LIMIT = int(os.environ.get("B64_INLINE_LIMIT", "60000"))
 
 
+def _target_key(tab) -> str:
+    """Stable identity for a tab's CDP target.
+
+    id(tab) was used before — a Python object address, which changes when the Tab
+    object is recreated and can even be recycled onto a different tab after GC.
+    The CDP target id is the thing that actually survives navigation.
+
+    Shared by every per-tab cache (console capture arming, snapshot deltas,
+    pending human handoffs), which is why it lives here rather than inside any
+    one of them.
+    """
+    t = getattr(tab, "target", None)
+    return str(getattr(t, "target_id", None) or id(tab))
+
+
 async def _wait(coro, timeout: Optional[float] = None, what: str = "operation"):
     """Wrap a CDP coroutine with a hard timeout — surfaces a clean error
     instead of letting a stuck page freeze the whole tool call. Re-raises
@@ -994,6 +1009,7 @@ async def browser_close() -> str:
     # devtools state lives in tools/devtools.py — lazy import + tolerate
     # the module not being loaded yet (no devtools tool ever called).
     _SNAPSHOT_CACHE.clear()
+    _HUMAN_HELP.clear()
     try:
         from .tools import devtools as _dt
         _dt._TRACE_ACTIVE.update({"tab_id": None, "started_at": 0.0,
@@ -1106,6 +1122,7 @@ async def browser_recover() -> str:
     # 4. Clear caches
     try:
         _SNAPSHOT_CACHE.clear()
+        _HUMAN_HELP.clear()
     except Exception:
         pass
     try:
@@ -1319,7 +1336,7 @@ async def request_human_help(objective: str, timeout: float = 300) -> str:
                 "then call request_human_help again."
             )
         actions = await _foreground_for_human(tab)
-        key = _console_target_key(tab)
+        key = _target_key(tab)
         _HUMAN_HELP[key] = {
             "objective": objective,
             "baseline": await _page_sig(tab),
@@ -1339,17 +1356,29 @@ async def request_human_help(objective: str, timeout: float = 300) -> str:
 
 @mcp.tool()
 async def wait_for_human(
-    timeout: float = 300,
+    timeout: Optional[float] = None,
     done_url_contains: Optional[str] = None,
     done_selector: Optional[str] = None,
 ) -> str:
-    """Wait for objective evidence that a local human handoff completed."""
+    """Wait for objective evidence that a local human handoff completed.
+
+    Args:
+        timeout: seconds to wait. Defaults to the timeout given to
+            request_human_help, or 300s when there is no pending handoff.
+        done_url_contains: finish as soon as the URL contains this substring
+        done_selector: finish as soon as this CSS selector appears
+
+    With neither signal, any URL/DOM change since the handoff counts as done.
+    A timeout is reported as an error — never as a silent success.
+    """
     try:
         tab = BrowserState.active_tab()
-        key = _console_target_key(tab)
+        key = _target_key(tab)
         request = _HUMAN_HELP.get(key, {})
-        if timeout == 300 and request.get("timeout") is not None:
-            timeout = float(request["timeout"])
+        # None means "inherit". Keying off the literal 300 would silently
+        # override a caller who genuinely asked for 300 seconds.
+        if timeout is None:
+            timeout = float(request.get("timeout") or 300)
         baseline = request.get("baseline") or await _page_sig(tab)
         loop = asyncio.get_event_loop()
         started = loop.time()
@@ -1387,9 +1416,13 @@ async def wait_for_human(
                     _HUMAN_HELP.pop(key, None)
                     return ok(f"human handoff completed after {elapsed}s: page changed")
             await asyncio.sleep(0.25)
+        # Drop the pending handoff so a later wait re-baselines against the page
+        # as it is now, instead of measuring against a stale pre-handoff snapshot.
+        _HUMAN_HELP.pop(key, None)
         return err(
             f"timeout after {timeout}s waiting for human completion — nothing changed "
-            "and no completion signal was observed"
+            "and no completion signal was observed. Call request_human_help again "
+            "if the person still needs to act."
         )
     except Exception as e:
         return err(str(e))
@@ -1471,7 +1504,7 @@ async def browser_snapshot(
         url = await get_url(tab)
         title = await get_title(tab)
         h = snapshot_hash(elements)
-        cache_key = _console_target_key(tab)
+        cache_key = _target_key(tab)
         last = _SNAPSHOT_CACHE.get(cache_key)
         if diff_from_last and last and last["url"] == url and last["hash"] == h:
             return ok(format_snapshot(
@@ -3822,14 +3855,8 @@ async def accessibility_snapshot(interesting_only: bool = True) -> str:
 
 
 def _console_target_key(tab) -> str:
-    """Stable identity for a tab's CDP target.
-
-    id(tab) was used before — a Python object address, which changes when the Tab
-    object is recreated and can even be recycled onto a different tab after GC.
-    The CDP target id is the thing that actually survives navigation.
-    """
-    t = getattr(tab, "target", None)
-    return str(getattr(t, "target_id", None) or id(tab))
+    """Deprecated alias for _target_key — kept so no call site silently diverges."""
+    return _target_key(tab)
 
 
 @mcp.tool()
@@ -3846,7 +3873,7 @@ async def console_start() -> str:
         BrowserState.console_logs = []
         BrowserState.capture_console = True
         _CONSOLE_STARTED_AT = _now_iso()
-        tid = _console_target_key(tab)
+        tid = _target_key(tab)
         from nodriver.cdp import runtime as cdp_runtime, page as cdp_page
 
         if tid in _CONSOLE_ARMED_TAB_IDS:
@@ -3928,7 +3955,7 @@ async def console_get(limit: int = 100) -> str:
         tab = BrowserState.active_tab()
     except Exception:
         pass
-    armed = tab is not None and _console_target_key(tab) in _CONSOLE_ARMED_TAB_IDS
+    armed = tab is not None and _target_key(tab) in _CONSOLE_ARMED_TAB_IDS
     logs = BrowserState.console_logs[-limit:]
     payload: dict[str, Any] = {
         "attached": armed,

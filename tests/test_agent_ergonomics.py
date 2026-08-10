@@ -35,6 +35,43 @@ def test_format_snapshot_first_delta_marks_everything():
     assert len([line for line in rendered.splitlines() if line.startswith("* ref=")]) == 2
 
 
+def test_wait_for_human_inherits_timeout_without_a_magic_value():
+    """An explicit timeout must survive.
+
+    The first cut keyed the inherit path off `timeout == 300`, so a caller who
+    genuinely wanted 300s silently got the stored handoff timeout instead. The
+    contract is now `None means inherit`, which cannot collide with a real value.
+    """
+    import inspect
+
+    from mcp_stealth_chrome.server import mcp
+
+    sig = inspect.signature(mcp._tool_manager._tools["wait_for_human"].fn)
+    assert sig.parameters["timeout"].default is None
+
+
+def test_target_key_is_shared_and_console_alias_delegates():
+    """Per-tab caches must agree on one key, or they desync after navigation."""
+    from mcp_stealth_chrome.server import _console_target_key, _target_key
+
+    class _Target:
+        target_id = "TARGET-123"
+
+    class _Tab:
+        target = _Target()
+
+    tab = _Tab()
+    assert _target_key(tab) == "TARGET-123"
+    assert _console_target_key(tab) == _target_key(tab)
+
+    # No CDP target yet: fall back to object identity rather than crashing.
+    class _Bare:
+        pass
+
+    bare = _Bare()
+    assert _target_key(bare) == str(id(bare))
+
+
 def test_privacy_proxy_supports_pool_and_session_token():
     from mcp_stealth_chrome.server import _privacy_proxy
 
