@@ -252,14 +252,21 @@ async def _remove_privacy_profile(profile_dir: Optional[Path]) -> bool:
             return False
     except Exception:
         return False
-    for delay in (0.05, 0.15, 0.35):
+    # Browser.stop() terminates the parent synchronously, but Chrome helpers can
+    # write their final Preferences files a beat later. Deleting immediately can
+    # therefore appear successful and then be recreated behind us.
+    await asyncio.sleep(0.15)
+    for delay in (0.1, 0.25, 0.5):
         try:
             shutil.rmtree(target)
-            return not target.exists()
         except FileNotFoundError:
-            return True
+            pass
         except Exception:
             await asyncio.sleep(delay)
+            continue
+        await asyncio.sleep(delay)
+        if not target.exists():
+            return True
     return not target.exists()
 
 
