@@ -63,6 +63,7 @@ from .state import (
     chrome_install_hint,
     chrome_lock_holder_pid,
     chrome_user_data_root,
+    chrome_user_data_roots,
     clean_profile_state,
     ensure_dirs,
     find_chrome_binary,
@@ -5542,55 +5543,93 @@ async def close_all_instances() -> str:
 
 
 @mcp.tool()
-async def list_chrome_profiles() -> str:
-    """List all Chrome/Chromium/Edge/Brave profiles found on this system.
+async def list_chrome_profiles(browser: Optional[str] = None) -> str:
+    """List profiles across EVERY Chrome-family browser on this system.
 
-    Reads browser 'Local State' JSON (read-only). Returns profile name, user email,
-    path, whether in-use (Chrome currently running on it), and whether it exists.
+    Chrome, Chromium, Edge, Brave, Vivaldi, Opera and Arc are all surveyed —
+    people commonly keep their real logged-in sessions in Brave or Edge while a
+    near-empty Chrome sits alongside, and reporting only the first browser found
+    would hide exactly the profiles worth cloning.
+
+    Each profile reports a `cookies_kb` figure: a profile with kilobytes of
+    cookies has real sessions, one with ~0 has never been used for anything.
+
+    Args:
+        browser: restrict to one browser id (e.g. "brave", "chrome", "edge").
+            Omit to survey them all.
+
+    Reads each browser's 'Local State' JSON read-only — nothing is modified.
     """
-    root = chrome_user_data_root()
-    if root is None:
+    roots = chrome_user_data_roots()
+    if browser:
+        wanted = browser.strip().lower()
+        roots = [(n, p) for n, p in roots if n == wanted]
+        if not roots:
+            available = ", ".join(n for n, _ in chrome_user_data_roots()) or "none"
+            return err(f"no user-data root for browser {browser!r}. Found: {available}")
+    if not roots:
         return err(
             "No Chrome-family browser profile directory found. "
             "Install Chrome/Chromium/Edge/Brave and launch it once to create profiles."
         )
-    local_state = root / "Local State"
-    try:
-        data = json.loads(local_state.read_text())
-    except Exception as e:
-        return err(f"failed to parse Local State at {local_state}: {e}")
 
-    info_cache = data.get("profile", {}).get("info_cache", {})
-    profiles_order = data.get("profile", {}).get("profiles_order", [])
-    seen = set(profiles_order)
-    # Ensure we also include profiles not in profiles_order
-    for k in info_cache.keys():
-        if k not in seen:
-            profiles_order.append(k)
-
-    out = []
-    for name in profiles_order:
-        info = info_cache.get(name, {})
-        pdir = root / name
-        out.append({
-            "profile_dir_name": name,
-            "display_name": info.get("name", name),
-            "email": info.get("user_name", ""),
-            "path": str(pdir),
-            "exists": pdir.exists(),
-            "in_use": is_chrome_profile_locked(pdir) if pdir.exists() else False,
-            "last_active_time": info.get("last_active_time", 0),
+    out: list[dict] = []
+    browsers: list[dict] = []
+    parse_errors: list[str] = []
+    for bname, root in roots:
+        try:
+            data = json.loads((root / "Local State").read_text())
+        except Exception as e:
+            parse_errors.append(f"{bname}: {e}")
+            continue
+        info_cache = data.get("profile", {}).get("info_cache", {})
+        profiles_order = list(data.get("profile", {}).get("profiles_order", []))
+        seen = set(profiles_order)
+        # Ensure we also include profiles not in profiles_order
+        for k in info_cache.keys():
+            if k not in seen:
+                profiles_order.append(k)
+        count_before = len(out)
+        for name in profiles_order:
+            info = info_cache.get(name, {})
+            pdir = root / name
+            cookies = pdir / "Cookies"
+            try:
+                cookies_kb = cookies.stat().st_size // 1024 if cookies.exists() else 0
+            except OSError:
+                cookies_kb = 0
+            out.append({
+                "browser": bname,
+                "profile_dir_name": name,
+                "display_name": info.get("name", name),
+                "email": info.get("user_name", ""),
+                "path": str(pdir),
+                "exists": pdir.exists(),
+                "cookies_kb": cookies_kb,
+                "in_use": is_chrome_profile_locked(pdir) if pdir.exists() else False,
+                "last_active_time": info.get("last_active_time", 0),
+            })
+        browsers.append({
+            "browser": bname,
+            "root": str(root),
+            "running": is_chrome_profile_locked(root),
+            "profile_count": len(out) - count_before,
         })
-    return ok(json.dumps({
-        "browser_root": str(root),
-        "browser_running": is_chrome_profile_locked(root),
+    # Richest sessions first — that is what someone scanning this list wants.
+    out.sort(key=lambda p: p.get("cookies_kb", 0), reverse=True)
+    payload = {
+        "browsers": browsers,
         "profile_count": len(out),
         "profiles": out,
         "usage_hint": (
-            "clone_chrome_profile(source_profile='Default', target_instance_id='my_clone') "
-            "→ then spawn_browser(instance_id='my_clone') to use it"
+            "clone_chrome_profile(browser='brave', source_profile='Default', "
+            "target_instance_id='my_clone') → then spawn_browser(instance_id='my_clone'). "
+            "Pick the profile with the most cookies_kb; its browser must be CLOSED first."
         ),
-    }, indent=2, default=str))
+    }
+    if parse_errors:
+        payload["parse_errors"] = parse_errors
+    return ok(json.dumps(payload, indent=2, default=str))
 
 
 @mcp.tool()
@@ -5599,43 +5638,53 @@ async def clone_chrome_profile(
     target_instance_id: str = "chrome_clone",
     skip_cache: bool = True,
     overwrite: bool = False,
+    browser: Optional[str] = None,
 ) -> str:
-    """Clone an existing Chrome profile into isolated mcp-stealth location.
+    """Clone a profile from ANY Chrome-family browser into an isolated MCP location.
 
-    SAFE: reads source profile without modification, copies to
+    SAFE: reads the source profile without modification, copies to
     ~/.mcp-stealth/profiles/<target_instance_id>/Default/
 
-    Chrome desktop MUST be closed for source profile (we check SingletonLock).
+    The source browser MUST be closed (we check SingletonLock).
     Preserves: cookies, history, bookmarks, saved passwords, extensions state.
     Skips (if skip_cache=True): Cache, Code Cache, GPUCache, Media Cache,
     Service Worker, IndexedDB (regenerable, saves 500MB+).
 
     Args:
-        source_profile: Chrome profile dir name ("Default", "Profile 1", etc).
+        source_profile: profile dir name ("Default", "Profile 1", ...).
                         Use list_chrome_profiles() to see options.
         target_instance_id: Name for the cloned instance (becomes folder name).
         skip_cache: Exclude cache dirs for fast + smaller copy (default True).
         overwrite: Delete target if exists before copying (default False).
+        browser: which browser to clone FROM — "brave", "chrome", "edge",
+            "chromium", "vivaldi", "opera", "arc". Omit to use the first root
+            found, which is NOT necessarily the one holding your sessions:
+            an empty Chrome often shadows the Brave/Edge profile you actually
+            log in with. Pass this explicitly when in doubt.
 
     After clone, launch with:
         spawn_browser(instance_id='<target_instance_id>')
     """
     import shutil
 
-    root = chrome_user_data_root()
+    root = chrome_user_data_root(browser)
     if root is None:
-        return err("No Chrome profile root found. Install Chrome first.")
+        found = ", ".join(n for n, _ in chrome_user_data_roots()) or "none"
+        if browser:
+            return err(f"no user-data root for browser {browser!r}. Found: {found}")
+        return err("No Chrome-family profile root found. Install Chrome/Brave/Edge first.")
     source_path = root / source_profile
     if not source_path.exists():
         return err(
             f"Source profile not found: {source_path}\n"
-            f"Run list_chrome_profiles() to see available profiles."
+            f"Run list_chrome_profiles() to see available profiles "
+            f"(pass browser= to pick a different browser)."
         )
     if is_chrome_profile_locked(source_path) or is_chrome_profile_locked(root):
+        label = browser or root.name
         return err(
-            f"Chrome is currently using this profile (lock file present). "
-            f"Close Chrome desktop FULLY (Cmd+Q on macOS, not just window close), "
-            f"then retry.\n"
+            f"{label} is currently using this profile (lock file present). "
+            f"Close it FULLY (Cmd+Q on macOS, not just the window), then retry.\n"
             f"Lock: {source_path / 'SingletonLock'}"
         )
 

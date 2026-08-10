@@ -97,37 +97,69 @@ def chrome_install_hint() -> str:
     return "Install Chrome or Chromium from https://www.google.com/chrome/"
 
 
-def chrome_user_data_root() -> Optional[Path]:
-    """Find where Chrome stores user profiles. Returns None if no Chrome installed."""
+def chrome_user_data_roots() -> list[tuple[str, Path]]:
+    """Every Chromium-family user-data root on this machine, as (browser, path).
+
+    Returning ALL of them matters: people routinely keep their real logged-in
+    sessions in Brave or Edge while a near-empty Chrome sits alongside. Reporting
+    only the first hit makes the tool look like it surveyed the machine when it
+    actually hid the profiles the user cares about.
+    """
     import sys
     home = Path.home()
-    candidates: list[Path] = []
+    candidates: list[tuple[str, Path]] = []
     if sys.platform == "darwin":
+        support = home / "Library" / "Application Support"
         candidates = [
-            home / "Library" / "Application Support" / "Google" / "Chrome",
-            home / "Library" / "Application Support" / "Chromium",
-            home / "Library" / "Application Support" / "Microsoft Edge",
-            home / "Library" / "Application Support" / "BraveSoftware" / "Brave-Browser",
+            ("chrome", support / "Google" / "Chrome"),
+            ("chrome-beta", support / "Google" / "Chrome Beta"),
+            ("chrome-canary", support / "Google" / "Chrome Canary"),
+            ("chromium", support / "Chromium"),
+            ("edge", support / "Microsoft Edge"),
+            ("brave", support / "BraveSoftware" / "Brave-Browser"),
+            ("brave-beta", support / "BraveSoftware" / "Brave-Browser-Beta"),
+            ("vivaldi", support / "Vivaldi"),
+            ("opera", support / "com.operasoftware.Opera"),
+            ("arc", support / "Arc" / "User Data"),
         ]
     elif sys.platform.startswith("linux"):
+        cfg = home / ".config"
         candidates = [
-            home / ".config" / "google-chrome",
-            home / ".config" / "chromium",
-            home / ".config" / "microsoft-edge",
-            home / ".config" / "BraveSoftware" / "Brave-Browser",
+            ("chrome", cfg / "google-chrome"),
+            ("chromium", cfg / "chromium"),
+            ("edge", cfg / "microsoft-edge"),
+            ("brave", cfg / "BraveSoftware" / "Brave-Browser"),
+            ("vivaldi", cfg / "vivaldi"),
+            ("opera", cfg / "opera"),
         ]
     elif sys.platform == "win32":
         local = Path(os.environ.get("LOCALAPPDATA", home / "AppData" / "Local"))
         candidates = [
-            local / "Google" / "Chrome" / "User Data",
-            local / "Chromium" / "User Data",
-            local / "Microsoft" / "Edge" / "User Data",
-            local / "BraveSoftware" / "Brave-Browser" / "User Data",
+            ("chrome", local / "Google" / "Chrome" / "User Data"),
+            ("chromium", local / "Chromium" / "User Data"),
+            ("edge", local / "Microsoft" / "Edge" / "User Data"),
+            ("brave", local / "BraveSoftware" / "Brave-Browser" / "User Data"),
+            ("vivaldi", local / "Vivaldi" / "User Data"),
+            ("opera", local / "Programs" / "Opera" / "User Data"),
         ]
-    for c in candidates:
-        if c.exists() and (c / "Local State").exists():
-            return c
-    return None
+    return [(name, path) for name, path in candidates
+            if path.exists() and (path / "Local State").exists()]
+
+
+def chrome_user_data_root(browser: Optional[str] = None) -> Optional[Path]:
+    """One user-data root: the named browser, else the first one found.
+
+    Kept for callers that only need a default; prefer chrome_user_data_roots()
+    when the answer should cover the whole machine.
+    """
+    roots = chrome_user_data_roots()
+    if browser:
+        wanted = browser.strip().lower()
+        for name, path in roots:
+            if name == wanted:
+                return path
+        return None
+    return roots[0][1] if roots else None
 
 
 def _read_singleton_pid(profile_path: Path) -> Optional[int]:

@@ -72,6 +72,26 @@ def test_target_key_is_shared_and_console_alias_delegates():
     assert _target_key(bare) == str(id(bare))
 
 
+def test_browser_roots_are_all_reported_and_selectable(monkeypatch):
+    """Only surveying the first browser hides the profiles people actually use.
+
+    A near-empty Chrome routinely sits alongside the Brave/Edge install holding
+    the real logged-in sessions, so returning one root made the tool look like it
+    had scanned the machine while omitting everything worth cloning.
+    """
+    import pathlib
+
+    from mcp_stealth_chrome import state
+
+    fake = [("chrome", pathlib.Path("/tmp/chrome")),
+            ("brave", pathlib.Path("/tmp/brave"))]
+    monkeypatch.setattr(state, "chrome_user_data_roots", lambda: fake)
+
+    assert state.chrome_user_data_root() == fake[0][1]          # first by default
+    assert state.chrome_user_data_root("brave") == fake[1][1]   # named root wins
+    assert state.chrome_user_data_root("edge") is None          # honest miss, not a guess
+
+
 def test_privacy_proxy_supports_pool_and_session_token():
     from mcp_stealth_chrome.server import _privacy_proxy
 
