@@ -11,10 +11,11 @@ both surfaced by the registry gate).
 """
 import sys
 
-EXPECTED_COUNT = 149
+EXPECTED_COUNT = 154
 EXPECTED_TOOLS = {
     # Lifecycle
     "browser_launch", "browser_close", "browser_recover",
+    "request_human_help", "wait_for_human",
     # Attach / inspect external Chrome (v0.4.8)
     "attach_to_chrome", "detach", "list_external_chrome",
     # Navigation
@@ -55,6 +56,7 @@ EXPECTED_TOOLS = {
     "detect_content_pattern", "extract_structured", "extract_table", "scrape_page",
     # Stealth / captcha
     "solve_captcha", "verify_cf", "fingerprint_rotate",
+    "identity_pin", "identity_show",
     "humanize_click", "humanize_type",
     "click_turnstile", "click_element_offset", "click_at_corner",
     "find_by_image", "click_at_image",
@@ -64,7 +66,7 @@ EXPECTED_TOOLS = {
     "http_request", "http_session_cookies", "session_warmup",
     "detect_anti_bot", "http_request_with_session",
     # Multi-instance
-    "spawn_browser", "list_instances", "switch_instance",
+    "spawn_browser", "list_instances", "switch_instance", "instance_describe",
     "close_instance", "close_all_instances",
     # Chrome profile integration
     "list_chrome_profiles", "clone_chrome_profile",

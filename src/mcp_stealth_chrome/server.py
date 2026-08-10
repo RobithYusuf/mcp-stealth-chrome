@@ -13,6 +13,10 @@ import json
 import os
 import random
 import re
+import shutil
+import subprocess
+import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Literal, Optional
@@ -40,15 +44,18 @@ from .snapshot import (
     SNAPSHOT_JS,
     SNAPSHOT_JS_FAST,
     SNAPSHOT_JS_VIEWPORT,
+    element_fingerprint,
     format_snapshot,
     snapshot_hash,
 )
 from .state import (
     DEFAULT_IDLE_TIMEOUT,
     EXPORT_DIR,
+    IDENTITIES_DIR,
     IDLE_REAPER_INTERVAL,
     PROFILE_DIR,
     PROFILES_ROOT,
+    PRIVACY_PROFILE_ROOT,
     SCREENSHOT_DIR,
     STORAGE_STATE_DIR,
     BrowserState,
@@ -105,6 +112,155 @@ async def _wait(coro, timeout: Optional[float] = None, what: str = "operation"):
 # Serialize concurrent launches inside ONE MCP process. Cross-process collision
 # is handled separately by `resolve_default_profile()` (per-PID fallback).
 _LAUNCH_LOCK = asyncio.Lock()
+
+
+_FINGERPRINT_FIELDS = ("user_agent", "accept_language", "platform", "timezone")
+
+
+def _random_fingerprint() -> dict[str, str]:
+    """Return a coherent, fresh desktop fingerprint for a new identity."""
+    family = random.choice((
+        ("Windows NT 10.0; Win64; x64", "Win32", "America/New_York"),
+        ("Macintosh; Intel Mac OS X 10_15_7", "MacIntel", "America/Los_Angeles"),
+        ("X11; Linux x86_64", "Linux x86_64", "Europe/Berlin"),
+    ))
+    major = random.randint(134, 147)
+    build = random.randint(1000, 6999)
+    patch = random.randint(10, 199)
+    language = random.choice(("en-US,en;q=0.9", "en-GB,en;q=0.9", "id-ID,id;q=0.9,en;q=0.8"))
+    return {
+        "user_agent": (
+            f"Mozilla/5.0 ({family[0]}) AppleWebKit/537.36 "
+            f"(KHTML, like Gecko) Chrome/{major}.0.{build}.{patch} Safari/537.36"
+        ),
+        "accept_language": language,
+        "platform": family[1],
+        "timezone": family[2],
+    }
+
+
+def _normalize_fingerprint(value: Optional[dict]) -> dict[str, str]:
+    if value is None:
+        return _random_fingerprint()
+    if not isinstance(value, dict):
+        raise ValueError("fingerprint must be an object")
+    unknown = set(value) - set(_FINGERPRINT_FIELDS)
+    if unknown:
+        raise ValueError(f"unsupported fingerprint field(s): {sorted(unknown)}")
+    normalized = {
+        key: str(value[key]).strip()
+        for key in _FINGERPRINT_FIELDS
+        if value.get(key) is not None and str(value[key]).strip()
+    }
+    if not normalized:
+        raise ValueError("fingerprint must contain at least one override")
+    return normalized
+
+
+def _identity_path(instance_id: str) -> Path:
+    """Resolve an identity file without allowing instance IDs to escape its root."""
+    if not instance_id or not re.fullmatch(r"[A-Za-z0-9._-]+", instance_id):
+        raise ValueError("instance_id may contain only letters, numbers, dot, underscore, and dash")
+    return IDENTITIES_DIR / f"{instance_id}.json"
+
+
+def _load_identity(instance_id: str) -> Optional[dict]:
+    path = _identity_path(instance_id)
+    if not path.exists():
+        return None
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or not isinstance(data.get("fingerprint"), dict):
+        raise ValueError(f"invalid identity file: {path}")
+    return data
+
+
+def _privacy_proxy(proxy: Optional[str]) -> Optional[str]:
+    """Choose a proxy pool member and expand a per-session token when supplied.
+
+    A literal endpoint is still useful when the provider rotates upstream IPs.
+    For client-side rotation callers can pass ``endpoint-a|endpoint-b`` or use a
+    provider URL containing ``{session}``.
+    """
+    if not proxy:
+        return None
+    candidates = [part.strip() for part in proxy.split("|") if part.strip()]
+    chosen = random.choice(candidates) if candidates else proxy
+    return chosen.replace("{session}", f"{random.getrandbits(64):016x}")
+
+
+def _launch_identity(
+    instance_id: str,
+    *,
+    proxy: Optional[str],
+    user_agent: Optional[str],
+    fingerprint: Optional[dict],
+    privacy: bool,
+) -> tuple[Optional[str], dict[str, str], str]:
+    """Resolve explicit, pinned, or privacy identity values for one launch."""
+    pinned = None if privacy else _load_identity(instance_id)
+    if privacy:
+        effective_fp = _random_fingerprint()
+        source = "privacy"
+        effective_proxy = _privacy_proxy(proxy)
+    else:
+        effective_fp = dict((pinned or {}).get("fingerprint") or {})
+        source = "pinned" if pinned else "caller"
+        effective_proxy = proxy if proxy is not None else (pinned or {}).get("proxy")
+    if fingerprint is not None:
+        effective_fp.update(_normalize_fingerprint(fingerprint))
+        source = "caller"
+    if user_agent:
+        effective_fp["user_agent"] = user_agent
+        source = "caller"
+    return effective_proxy, effective_fp, source
+
+
+async def _apply_fingerprint_to_tab(tab: Tab, fingerprint: dict[str, str]) -> None:
+    """Apply a resolved fingerprint to a specific tab via CDP."""
+    from nodriver.cdp import emulation as cdp_emulation
+    from nodriver.cdp import network as cdp_network
+
+    ua_kwargs = {}
+    if fingerprint.get("user_agent"):
+        ua_kwargs["user_agent"] = fingerprint["user_agent"]
+    if fingerprint.get("accept_language"):
+        ua_kwargs["accept_language"] = fingerprint["accept_language"]
+    if fingerprint.get("platform"):
+        ua_kwargs["platform"] = fingerprint["platform"]
+    if ua_kwargs:
+        await tab.send(cdp_network.set_user_agent_override(**ua_kwargs))
+    if fingerprint.get("timezone"):
+        await tab.send(cdp_emulation.set_timezone_override(
+            timezone_id=fingerprint["timezone"]
+        ))
+
+
+def _new_privacy_profile(instance_id: str) -> Path:
+    PRIVACY_PROFILE_ROOT.mkdir(parents=True, exist_ok=True)
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", instance_id).strip(".-") or "browser"
+    return Path(tempfile.mkdtemp(prefix=f"{safe}-", dir=PRIVACY_PROFILE_ROOT))
+
+
+async def _remove_privacy_profile(profile_dir: Optional[Path]) -> bool:
+    """Remove a privacy profile after Chrome releases it, with bounded retries."""
+    if profile_dir is None:
+        return True
+    root = PRIVACY_PROFILE_ROOT.resolve()
+    try:
+        target = profile_dir.resolve()
+        if target == root or root not in target.parents:
+            return False
+    except Exception:
+        return False
+    for delay in (0.05, 0.15, 0.35):
+        try:
+            shutil.rmtree(target)
+            return not target.exists()
+        except FileNotFoundError:
+            return True
+        except Exception:
+            await asyncio.sleep(delay)
+    return not target.exists()
 
 
 async def _safe_stop_browser(browser: Optional[Browser]) -> None:
@@ -407,6 +563,8 @@ async def browser_launch(
     auto_verify: bool = True,
     user_data_dir: Optional[str] = None,
     profile_directory: Optional[str] = None,
+    fingerprint: Optional[dict] = None,
+    privacy: bool = False,
 ) -> str:
     """Launch stealth Chrome via nodriver. Creates persistent profile by default.
 
@@ -437,9 +595,21 @@ async def browser_launch(
             inside it (e.g. "Default", "Profile 21"). Without this, Chrome
             uses "Default". Helpful to drive a specific persona without
             cloning the profile. Use list_chrome_profiles to enumerate.
+        fingerprint: explicit CDP overrides (user_agent, accept_language,
+            platform, timezone). Overrides a pinned identity for this launch.
+        privacy: use a fresh fingerprint and a disposable profile that is
+            deleted by browser_close. Incompatible with user_data_dir.
     """
     if BrowserState.is_up():
         return ok(f"Browser already running with {len(BrowserState.tabs)} tab(s).")
+    if BrowserState.current_privacy and BrowserState.current_profile_dir:
+        stale_profile = BrowserState.current_profile_dir
+        if not await _remove_privacy_profile(stale_profile):
+            return err(f"could not remove stale privacy profile before relaunch: {stale_profile}")
+        BrowserState.current_privacy = False
+        BrowserState.current_headless = False
+        BrowserState.current_fingerprint = {}
+        BrowserState.current_proxy = None
 
     if _LAUNCH_LOCK.locked():
         return err("another launch is already in progress — wait for it to finish")
@@ -453,6 +623,22 @@ async def browser_launch(
 
         # Build effective extra_args (we may inject --profile-directory into them).
         merged_extra_args = list(extra_args or [])
+        if privacy and (user_data_dir or profile_directory or any(
+            (arg or "").startswith("--user-data-dir=") for arg in merged_extra_args
+        )):
+            return err("privacy mode cannot reuse user_data_dir or profile_directory")
+        if privacy:
+            persistent = False
+        try:
+            effective_proxy, effective_fingerprint, identity_source = _launch_identity(
+                BrowserState.current_instance_id,
+                proxy=proxy,
+                user_agent=user_agent,
+                fingerprint=fingerprint,
+                privacy=privacy,
+            )
+        except Exception as e:
+            return err(f"identity setup failed: {e}")
 
         # If the user passed user_data_dir explicitly, that takes precedence over
         # both `persistent` and any --user-data-dir already in extra_args.
@@ -548,7 +734,12 @@ async def browser_launch(
                     pass
 
         # Determine final user_data_dir for Config (None = nodriver picks a temp dir).
-        if explicit_udd is not None:
+        privacy_profile: Optional[Path] = None
+        if privacy:
+            privacy_profile = _new_privacy_profile(BrowserState.current_instance_id)
+            profile_path = privacy_profile
+            final_udd = str(privacy_profile)
+        elif explicit_udd is not None:
             final_udd: Optional[str] = str(explicit_udd)
         elif persistent:
             final_udd = str(profile_path)
@@ -558,7 +749,7 @@ async def browser_launch(
         config = Config(
             user_data_dir=final_udd,
             headless=headless,
-            lang=lang,
+            lang=(effective_fingerprint.get("accept_language", "").split(",")[0] or lang),
             browser_args=list(merged_extra_args),
         )
         # Extra flags to suppress any first-run / restore / notification interrupts
@@ -566,10 +757,10 @@ async def browser_launch(
         config.add_argument("--disable-session-crashed-bubble")
         config.add_argument("--disable-restore-session-state")
         config.add_argument("--no-default-browser-check")
-        if user_agent:
-            config.add_argument(f"--user-agent={user_agent}")
-        if proxy:
-            config.add_argument(f"--proxy-server={proxy}")
+        if effective_fingerprint.get("user_agent"):
+            config.add_argument(f"--user-agent={effective_fingerprint['user_agent']}")
+        if effective_proxy:
+            config.add_argument(f"--proxy-server={effective_proxy}")
         config.add_argument(f"--window-size={window_width},{window_height}")
         # Force a deterministic on-screen position. Without this, Chrome
         # restores its last saved position from the persistent profile —
@@ -602,6 +793,7 @@ async def browser_launch(
             )
         except asyncio.TimeoutError:
             await _safe_stop_browser(browser)
+            await _remove_privacy_profile(privacy_profile)
             return err(
                 f"launch timed out after {BROWSER_LAUNCH_TIMEOUT}s — "
                 f"profile {profile_path} may be locked by another Chrome, or "
@@ -609,9 +801,11 @@ async def browser_launch(
             )
         except asyncio.CancelledError:
             await _safe_stop_browser(browser)
+            await _remove_privacy_profile(privacy_profile)
             raise
         except Exception as e:
             await _safe_stop_browser(browser)
+            await _remove_privacy_profile(privacy_profile)
             # Diagnose common nodriver "Failed to connect to browser" — usually
             # means Chrome started but its CDP websocket couldn't be reached
             # (profile locked, port collision, AV interference).
@@ -641,10 +835,12 @@ async def browser_launch(
             except asyncio.CancelledError:
                 await _safe_stop_browser(BrowserState.browser)
                 BrowserState.reset()
+                await _remove_privacy_profile(privacy_profile)
                 raise
             except Exception as e:
                 await _safe_stop_browser(BrowserState.browser)
                 BrowserState.reset()
+                await _remove_privacy_profile(privacy_profile)
                 return err(f"storage_state load failed: {e}")
 
         try:
@@ -655,10 +851,10 @@ async def browser_launch(
                 main = BrowserState.browser.tabs[0] if BrowserState.browser.tabs else None
             if main is None:
                 main = await asyncio.wait_for(
-                    BrowserState.browser.get(url), timeout=BROWSER_NAV_TIMEOUT
+                    BrowserState.browser.get("about:blank"), timeout=BROWSER_NAV_TIMEOUT
                 )
-            else:
-                await asyncio.wait_for(main.get(url), timeout=BROWSER_NAV_TIMEOUT)
+            await _apply_fingerprint_to_tab(main, effective_fingerprint)
+            await asyncio.wait_for(main.get(url), timeout=BROWSER_NAV_TIMEOUT)
             try:
                 await asyncio.wait_for(main.wait(t=3), timeout=BROWSER_NAV_TIMEOUT)
             except asyncio.TimeoutError:
@@ -666,6 +862,7 @@ async def browser_launch(
         except asyncio.TimeoutError:
             await _safe_stop_browser(BrowserState.browser)
             BrowserState.reset()
+            await _remove_privacy_profile(privacy_profile)
             return err(
                 f"initial nav timed out after {BROWSER_NAV_TIMEOUT}s — Chrome "
                 f"started but couldn't load {url}. Check network/proxy."
@@ -673,14 +870,20 @@ async def browser_launch(
         except asyncio.CancelledError:
             await _safe_stop_browser(BrowserState.browser)
             BrowserState.reset()
+            await _remove_privacy_profile(privacy_profile)
             raise
         except Exception as e:
             await _safe_stop_browser(BrowserState.browser)
             BrowserState.reset()
+            await _remove_privacy_profile(privacy_profile)
             return err(f"initial nav failed: {e}")
         BrowserState.tabs = [main]
         BrowserState.active_tab_index = 0
         BrowserState.current_profile_dir = profile_path
+        BrowserState.current_headless = headless
+        BrowserState.current_privacy = privacy
+        BrowserState.current_fingerprint = dict(effective_fingerprint)
+        BrowserState.current_proxy = effective_proxy
         suffix = (
             f" [profile fallback: {profile_path.name} — default profile is in use "
             f"by another Chrome]"
@@ -736,7 +939,8 @@ async def browser_launch(
             except Exception:
                 verify_suffix = ""
         return ok(
-            f"Browser launched (headless={headless}, persistent={persistent}). "
+            f"Browser launched (headless={headless}, persistent={persistent}, "
+            f"privacy={privacy}, identity={identity_source}). "
             f"Loaded {url}{suffix}{verify_suffix}{health_suffix}"
         )
 
@@ -745,7 +949,26 @@ async def browser_launch(
 async def browser_close() -> str:
     """Close the browser and free the profile lock."""
     if not BrowserState.is_up():
+        stale_privacy_profile = (
+            BrowserState.current_profile_dir if BrowserState.current_privacy else None
+        )
+        BrowserState.current_headless = False
+        BrowserState.current_privacy = False
+        BrowserState.current_fingerprint = {}
+        BrowserState.current_proxy = None
+        if stale_privacy_profile is not None:
+            removed = await _remove_privacy_profile(stale_privacy_profile)
+            if not removed:
+                return err(
+                    "Browser was not running and stale privacy profile cleanup failed: "
+                    f"{stale_privacy_profile}"
+                )
+            return ok("Browser was not running; stale privacy profile removed.")
         return ok("Browser was not running.")
+    privacy_profile = (
+        BrowserState.current_profile_dir if BrowserState.current_privacy else None
+    )
+    closed_profile = BrowserState.current_profile_dir
     try:
         if BrowserState.browser:
             BrowserState.browser.stop()
@@ -755,6 +978,10 @@ async def browser_close() -> str:
     # we can drop any attached-browser bookkeeping for it.
     _closed_iid = BrowserState.current_instance_id
     BrowserState.reset()
+    BrowserState.current_headless = False
+    BrowserState.current_privacy = False
+    BrowserState.current_fingerprint = {}
+    BrowserState.current_proxy = None
     _ATTACHED_BROWSERS.discard(_closed_iid)
     # Clear transient caches that key off tab identity (id() can be reused).
     # devtools state lives in tools/devtools.py — lazy import + tolerate
@@ -778,8 +1005,15 @@ async def browser_close() -> str:
     except Exception:
         pass
     # Mark profile as cleanly exited so next launch skips restore dialog
-    clean_profile_state(PROFILE_DIR)
-    return ok("Browser closed.")
+    if privacy_profile is not None:
+        removed = await _remove_privacy_profile(privacy_profile)
+        if not removed:
+            return err(
+                f"Browser closed, but privacy profile cleanup failed: {privacy_profile}"
+            )
+    elif closed_profile is not None:
+        clean_profile_state(closed_profile)
+    return ok("Browser closed; privacy profile removed." if privacy_profile else "Browser closed.")
 
 
 @mcp.tool()
@@ -1029,6 +1263,131 @@ async def tab_focus() -> str:
         return err(str(e))
 
 
+_HUMAN_HELP: dict[str, dict[str, Any]] = {}
+
+
+async def _foreground_for_human(tab: Tab) -> list[str]:
+    """Best-effort CDP + OS foregrounding for a local headed browser."""
+    actions: list[str] = []
+    try:
+        await tab.activate()
+        actions.append("tab activated")
+    except Exception:
+        pass
+    try:
+        await tab.bring_to_front()
+        actions.append("window brought to front")
+    except Exception:
+        pass
+    if sys.platform == "darwin":
+        try:
+            executable = Path(str(BrowserState.browser.config.browser_executable_path))
+            app = next((p for p in executable.parents if p.suffix == ".app"), None)
+            if app is not None:
+                subprocess.run(
+                    ["open", "-a", str(app)],
+                    capture_output=True,
+                    timeout=3,
+                    check=False,
+                )
+                actions.append("macOS app activated")
+        except Exception:
+            pass
+    return actions
+
+
+@mcp.tool()
+async def request_human_help(objective: str, timeout: float = 300) -> str:
+    """Hand a headed local browser to the human without blocking the MCP call.
+
+    The caller should immediately follow this with wait_for_human, optionally
+    naming a completion URL fragment or selector.
+    """
+    try:
+        tab = BrowserState.active_tab()
+        if BrowserState.current_headless:
+            return err(
+                "human help unavailable: this browser is headless, so there is no "
+                "window a person can operate. Close it and relaunch with headless=False, "
+                "then call request_human_help again."
+            )
+        actions = await _foreground_for_human(tab)
+        key = _console_target_key(tab)
+        _HUMAN_HELP[key] = {
+            "objective": objective,
+            "baseline": await _page_sig(tab),
+            "requested_at": time.time(),
+            "timeout": max(0.0, float(timeout)),
+        }
+        return ok(
+            f"Browser is visible and in the foreground ({', '.join(actions) or 'focus requested'}).\n"
+            f"Human: {objective}\n"
+            "When finished, leave the page in its completed state. The agent must call "
+            "wait_for_human(done_url_contains=... or done_selector=...); without a "
+            "specific signal it will wait for a URL/DOM change from this handoff."
+        )
+    except Exception as e:
+        return err(str(e))
+
+
+@mcp.tool()
+async def wait_for_human(
+    timeout: float = 300,
+    done_url_contains: Optional[str] = None,
+    done_selector: Optional[str] = None,
+) -> str:
+    """Wait for objective evidence that a local human handoff completed."""
+    try:
+        tab = BrowserState.active_tab()
+        key = _console_target_key(tab)
+        request = _HUMAN_HELP.get(key, {})
+        if timeout == 300 and request.get("timeout") is not None:
+            timeout = float(request["timeout"])
+        baseline = request.get("baseline") or await _page_sig(tab)
+        loop = asyncio.get_event_loop()
+        started = loop.time()
+        selector_expr = (
+            "(() => JSON.stringify({hit: !!document.querySelector(%s)}))()"
+            % json.dumps(done_selector)
+            if done_selector else None
+        )
+        while loop.time() - started < max(0.0, timeout):
+            elapsed = round(loop.time() - started, 2)
+            if done_url_contains:
+                current_url = await get_url(tab)
+                if done_url_contains in current_url:
+                    _HUMAN_HELP.pop(key, None)
+                    return ok(
+                        f"human handoff completed after {elapsed}s: URL contains "
+                        f"{done_url_contains!r}"
+                    )
+            if selector_expr:
+                value = await tab.evaluate(selector_expr, return_by_value=True)
+                value = value.value if hasattr(value, "value") and not isinstance(value, str) else value
+                if value and bool(json.loads(value).get("hit")):
+                    _HUMAN_HELP.pop(key, None)
+                    return ok(
+                        f"human handoff completed after {elapsed}s: selector "
+                        f"{done_selector!r} appeared"
+                    )
+            if not done_url_contains and not done_selector:
+                current = await _page_sig(tab)
+                if baseline and current and (
+                    current.get("url") != baseline.get("url")
+                    or current.get("nodes") != baseline.get("nodes")
+                    or current.get("len") != baseline.get("len")
+                ):
+                    _HUMAN_HELP.pop(key, None)
+                    return ok(f"human handoff completed after {elapsed}s: page changed")
+            await asyncio.sleep(0.25)
+        return err(
+            f"timeout after {timeout}s waiting for human completion — nothing changed "
+            "and no completion signal was observed"
+        )
+    except Exception as e:
+        return err(str(e))
+
+
 @mcp.tool()
 async def go_back() -> str:
     """Go back in history."""
@@ -1071,6 +1430,7 @@ async def reload() -> str:
 async def browser_snapshot(
     mode: Literal["full", "fast", "viewport"] = "full",
     diff_from_last: bool = False,
+    delta: bool = True,
 ) -> str:
     """Inject SNAPSHOT_JS and return a ref-indexed list of interactive elements.
 
@@ -1085,6 +1445,9 @@ async def browser_snapshot(
     diff_from_last=True caches a DOM hash per tab; if the hash matches the previous
     call on the same URL, returns "unchanged" without re-serializing the element list
     (near-instant for re-check loops).
+
+    delta=True prefixes elements added or changed since this tab's previous
+    snapshot with ``*``. A tab's first snapshot marks every element.
     """
     try:
         tab = BrowserState.active_tab()
@@ -1094,24 +1457,41 @@ async def browser_snapshot(
             "viewport": SNAPSHOT_JS_VIEWPORT,
         }.get(mode, SNAPSHOT_JS)
         raw = await _wait(tab.evaluate(js, return_by_value=True), what="browser_snapshot")
+        raw = raw.value if hasattr(raw, "value") and not isinstance(raw, str) else raw
         elements = parse_json(raw, [])
         if not isinstance(elements, list):
             elements = []
         url = await get_url(tab)
         title = await get_title(tab)
         h = snapshot_hash(elements)
-        cache_key = id(tab)
+        cache_key = _console_target_key(tab)
         last = _SNAPSHOT_CACHE.get(cache_key)
         if diff_from_last and last and last["url"] == url and last["hash"] == h:
-            return ok(format_snapshot([], url, title, mode=mode, unchanged_from=h))
-        _SNAPSHOT_CACHE[cache_key] = {"url": url, "hash": h}
-        return ok(format_snapshot(elements, url, title, mode=mode))
+            return ok(format_snapshot(
+                [], url, title, mode=mode, unchanged_from=h,
+                changed_fingerprints=set() if delta else None,
+            ))
+        fingerprints = {element_fingerprint(el) for el in elements}
+        previous = set(last.get("fingerprints", ())) if last else set()
+        changed = fingerprints - previous if last else fingerprints
+        _SNAPSHOT_CACHE[cache_key] = {
+            "url": url,
+            "hash": h,
+            "fingerprints": fingerprints,
+        }
+        return ok(format_snapshot(
+            elements,
+            url,
+            title,
+            mode=mode,
+            changed_fingerprints=changed if delta else None,
+        ))
     except Exception as e:
         return err(str(e))
 
 
 # Per-tab snapshot hash cache for diff_from_last (cleared on browser_close / reset)
-_SNAPSHOT_CACHE: dict[int, dict[str, str]] = {}
+_SNAPSHOT_CACHE: dict[str, dict[str, Any]] = {}
 
 
 @mcp.tool()
@@ -2300,7 +2680,11 @@ async def tab_new(url: str = "about:blank") -> str:
     try:
         if not BrowserState.browser:
             return err("browser not running")
-        new_tab = await BrowserState.browser.get(url, new_tab=True)
+        # Apply the instance identity before the destination sees any script.
+        new_tab = await BrowserState.browser.get("about:blank", new_tab=True)
+        await _apply_fingerprint_to_tab(new_tab, BrowserState.current_fingerprint)
+        if url != "about:blank":
+            await new_tab.get(url)
         await _refresh_tabs()
         BrowserState.active_tab_index = BrowserState.tabs.index(new_tab)
         return ok(f"opened tab [{BrowserState.active_tab_index}] {url}")
@@ -4079,6 +4463,60 @@ async def verify_cf(template_image: Optional[str] = None) -> str:
 
 
 @mcp.tool()
+async def identity_pin(
+    instance_id: Optional[str] = None,
+    fingerprint: Optional[dict] = None,
+    proxy: Optional[str] = None,
+) -> str:
+    """Persist a stable fingerprint + proxy for one browser instance.
+
+    Future browser_launch/spawn_browser calls for that instance apply the pin
+    automatically. Omitted fields preserve an existing pin; the first call
+    without a fingerprint creates a coherent random desktop fingerprint.
+    """
+    try:
+        iid = instance_id or BrowserState.current_instance_id
+        ensure_dirs()
+        existing = _load_identity(iid) or {}
+        pinned_fingerprint = dict(existing.get("fingerprint") or {})
+        if fingerprint is not None:
+            pinned_fingerprint.update(_normalize_fingerprint(fingerprint))
+        elif not pinned_fingerprint:
+            pinned_fingerprint = _random_fingerprint()
+        pinned_proxy = proxy if proxy is not None else existing.get("proxy")
+        payload = {
+            "instance_id": iid,
+            "fingerprint": pinned_fingerprint,
+            "proxy": pinned_proxy,
+            "updated_at": int(time.time()),
+        }
+        path = _identity_path(iid)
+        tmp = path.with_suffix(f".json.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+        return ok(json.dumps(payload, indent=2))
+    except Exception as e:
+        return err(str(e))
+
+
+@mcp.tool()
+async def identity_show(instance_id: Optional[str] = None) -> str:
+    """Show the persisted identity pin for an instance."""
+    try:
+        iid = instance_id or BrowserState.current_instance_id
+        identity = _load_identity(iid)
+        if identity is None:
+            return err(f"no pinned identity for instance {iid!r}")
+        return ok(json.dumps(identity, indent=2))
+    except Exception as e:
+        return err(str(e))
+
+
+@mcp.tool()
 async def fingerprint_rotate(
     user_agent: Optional[str] = None,
     accept_language: Optional[str] = None,
@@ -4091,19 +4529,12 @@ async def fingerprint_rotate(
     """
     try:
         tab = BrowserState.active_tab()
-        from nodriver.cdp import network as cdp_network
-        from nodriver.cdp import emulation as cdp_emulation
-        if user_agent or accept_language or platform:
-            kwargs = {}
-            if user_agent:
-                kwargs["user_agent"] = user_agent
-            if accept_language:
-                kwargs["accept_language"] = accept_language
-            if platform:
-                kwargs["platform"] = platform
-            await tab.send(cdp_network.set_user_agent_override(**kwargs))
-        if timezone:
-            await tab.send(cdp_emulation.set_timezone_override(timezone_id=timezone))
+        await _apply_fingerprint_to_tab(tab, {
+            "user_agent": user_agent or "",
+            "accept_language": accept_language or "",
+            "platform": platform or "",
+            "timezone": timezone or "",
+        })
         return ok("fingerprint overrides applied")
     except Exception as e:
         return err(str(e))
@@ -4596,6 +5027,9 @@ async def _launch_browser_instance(
     storage_state_path: Optional[str],
     idle_timeout: int,
     profile_dir_override: Optional[str] = None,
+    fingerprint: Optional[dict] = None,
+    privacy: bool = False,
+    desc: str = "",
 ) -> tuple[bool, str]:
     """Shared launcher for browser_launch + spawn_browser.
 
@@ -4612,8 +5046,29 @@ async def _launch_browser_instance(
 
     ensure_dirs()
 
+    if privacy and (profile_dir_override or any(
+        (arg or "").startswith("--user-data-dir=") for arg in (extra_args or [])
+    )):
+        return False, "privacy mode cannot reuse profile_dir or --user-data-dir"
+    if privacy:
+        persistent = False
+    try:
+        effective_proxy, effective_fingerprint, identity_source = _launch_identity(
+            instance_id,
+            proxy=proxy,
+            user_agent=user_agent,
+            fingerprint=fingerprint,
+            privacy=privacy,
+        )
+    except Exception as e:
+        return False, f"identity setup failed: {e}"
+
     # Determine profile dir per instance
-    if profile_dir_override:
+    privacy_profile: Optional[Path] = None
+    if privacy:
+        privacy_profile = _new_privacy_profile(instance_id)
+        profile_path = privacy_profile
+    elif profile_dir_override:
         profile_path = Path(profile_dir_override)
     elif instance_id == "main":
         profile_path = PROFILE_DIR
@@ -4625,19 +5080,19 @@ async def _launch_browser_instance(
         clean_profile_state(profile_path)
 
     config = Config(
-        user_data_dir=str(profile_path) if persistent else None,
+        user_data_dir=str(profile_path) if (persistent or privacy) else None,
         headless=headless,
-        lang=lang,
+        lang=(effective_fingerprint.get("accept_language", "").split(",")[0] or lang),
         browser_args=list(extra_args or []),
     )
     config.add_argument("--hide-crash-restore-bubble")
     config.add_argument("--disable-session-crashed-bubble")
     config.add_argument("--disable-restore-session-state")
     config.add_argument("--no-default-browser-check")
-    if user_agent:
-        config.add_argument(f"--user-agent={user_agent}")
-    if proxy:
-        config.add_argument(f"--proxy-server={proxy}")
+    if effective_fingerprint.get("user_agent"):
+        config.add_argument(f"--user-agent={effective_fingerprint['user_agent']}")
+    if effective_proxy:
+        config.add_argument(f"--proxy-server={effective_proxy}")
     config.add_argument(f"--window-size={window_width},{window_height}")
 
     browser: Optional[Browser] = None
@@ -4647,15 +5102,18 @@ async def _launch_browser_instance(
         )
     except asyncio.TimeoutError:
         await _safe_stop_browser(browser)
+        await _remove_privacy_profile(privacy_profile)
         return False, (
             f"launch timed out after {BROWSER_LAUNCH_TIMEOUT}s — profile "
             f"{profile_path} may be locked or Chrome is hung."
         )
     except asyncio.CancelledError:
         await _safe_stop_browser(browser)
+        await _remove_privacy_profile(privacy_profile)
         raise
     except Exception as e:
         await _safe_stop_browser(browser)
+        await _remove_privacy_profile(privacy_profile)
         return False, f"launch failed: {e}"
 
     if storage_state_path:
@@ -4663,9 +5121,11 @@ async def _launch_browser_instance(
             await _apply_storage_state(browser, storage_state_path)
         except asyncio.CancelledError:
             await _safe_stop_browser(browser)
+            await _remove_privacy_profile(privacy_profile)
             raise
         except Exception as e:
             await _safe_stop_browser(browser)
+            await _remove_privacy_profile(privacy_profile)
             return False, f"storage_state load failed: {e}"
 
     try:
@@ -4675,24 +5135,27 @@ async def _launch_browser_instance(
             await browser.update_targets()
             main_tab = browser.tabs[0] if browser.tabs else None
         if main_tab is None:
-            main_tab = await asyncio.wait_for(browser.get(url), timeout=BROWSER_NAV_TIMEOUT)
-        else:
-            await asyncio.wait_for(main_tab.get(url), timeout=BROWSER_NAV_TIMEOUT)
+            main_tab = await asyncio.wait_for(browser.get("about:blank"), timeout=BROWSER_NAV_TIMEOUT)
+        await _apply_fingerprint_to_tab(main_tab, effective_fingerprint)
+        await asyncio.wait_for(main_tab.get(url), timeout=BROWSER_NAV_TIMEOUT)
         try:
             await asyncio.wait_for(main_tab.wait(t=3), timeout=BROWSER_NAV_TIMEOUT)
         except asyncio.TimeoutError:
             pass
     except asyncio.TimeoutError:
         await _safe_stop_browser(browser)
+        await _remove_privacy_profile(privacy_profile)
         return False, (
             f"initial nav timed out after {BROWSER_NAV_TIMEOUT}s on instance "
             f"{instance_id!r}."
         )
     except asyncio.CancelledError:
         await _safe_stop_browser(browser)
+        await _remove_privacy_profile(privacy_profile)
         raise
     except Exception as e:
         await _safe_stop_browser(browser)
+        await _remove_privacy_profile(privacy_profile)
         return False, f"initial nav failed: {e}"
 
     # Write into the target instance slot
@@ -4701,6 +5164,11 @@ async def _launch_browser_instance(
         BrowserState.tabs = [main_tab]
         BrowserState.active_tab_index = 0
         BrowserState.current_profile_dir = profile_path
+        BrowserState.current_desc = desc
+        BrowserState.current_headless = headless
+        BrowserState.current_privacy = privacy
+        BrowserState.current_fingerprint = dict(effective_fingerprint)
+        BrowserState.current_proxy = effective_proxy
         BrowserState.current_idle_timeout = idle_timeout
         BrowserState.current_last_active = time.time()
         BrowserState.current_created_at = time.time()
@@ -4712,6 +5180,11 @@ async def _launch_browser_instance(
             tabs=[main_tab],
             active_tab_index=0,
             profile_dir=profile_path,
+            desc=desc,
+            headless=headless,
+            privacy=privacy,
+            fingerprint=dict(effective_fingerprint),
+            proxy=effective_proxy,
             idle_timeout=idle_timeout,
             last_active=time.time(),
             created_at=time.time(),
@@ -4720,7 +5193,10 @@ async def _launch_browser_instance(
 
     # Kick off the idle reaper (once)
     _ensure_idle_reaper_running()
-    return True, f"instance {instance_id!r} launched (headless={headless}, profile={profile_path.name})"
+    return True, (
+        f"instance {instance_id!r} launched (headless={headless}, "
+        f"privacy={privacy}, identity={identity_source}, profile={profile_path.name})"
+    )
 
 
 async def _idle_reaper_loop() -> None:
@@ -4741,7 +5217,9 @@ async def _idle_reaper_loop() -> None:
                     pass
                 # Mark profile cleanly exited (matches close_instance) so the
                 # next launch doesn't hit a "Restore pages?" / stale-lock state.
-                if snap.profile_dir:
+                if snap.privacy:
+                    await _remove_privacy_profile(snap.profile_dir)
+                elif snap.profile_dir:
                     clean_profile_state(snap.profile_dir)
                 BrowserState.instances.pop(iid, None)
             # Check current instance
@@ -4749,13 +5227,18 @@ async def _idle_reaper_loop() -> None:
                 and BrowserState.current_idle_timeout > 0
                 and (time.time() - BrowserState.current_last_active) > BrowserState.current_idle_timeout):
                 _cur_profile = BrowserState.current_profile_dir
+                _cur_privacy = BrowserState.current_privacy
                 try:
                     if BrowserState.browser:
                         BrowserState.browser.stop()
                 except Exception:
                     pass
                 BrowserState.reset()
-                if _cur_profile:
+                BrowserState.current_headless = False
+                BrowserState.current_privacy = False
+                if _cur_privacy:
+                    await _remove_privacy_profile(_cur_profile)
+                elif _cur_profile:
                     clean_profile_state(_cur_profile)
         except asyncio.CancelledError:
             return
@@ -4790,6 +5273,9 @@ async def spawn_browser(
     storage_state_path: Optional[str] = None,
     idle_timeout_seconds: int = DEFAULT_IDLE_TIMEOUT,
     profile_dir: Optional[str] = None,
+    desc: str = "",
+    fingerprint: Optional[dict] = None,
+    privacy: bool = False,
 ) -> str:
     """Create a new named browser instance running in parallel with main.
     Each instance has its own profile, cookies, tabs, logs. Use for multi-account
@@ -4799,6 +5285,9 @@ async def spawn_browser(
         instance_id: unique name (e.g., "scraper_1", "acct_alice")
         idle_timeout_seconds: auto-close after idle (0 = never, default 600s)
         profile_dir: override profile path (default: ~/.mcp-stealth/profiles/<id>/)
+        desc: natural-language purpose used to find the instance by meaning later
+        fingerprint: explicit user_agent/accept_language/platform/timezone overrides
+        privacy: fresh fingerprint + disposable profile removed when closed
         other args: same as browser_launch
 
     Use switch_instance(id) to route subsequent tool calls to this instance.
@@ -4821,6 +5310,9 @@ async def spawn_browser(
         storage_state_path=storage_state_path,
         idle_timeout=idle_timeout_seconds,
         profile_dir_override=profile_dir,
+        fingerprint=fingerprint,
+        privacy=privacy,
+        desc=desc,
     )
     if not ok_flag:
         return err(msg)
@@ -4847,6 +5339,9 @@ async def list_instances() -> str:
             "idle_timeout": s.idle_timeout,
             "auto_close_in": max(0, s.idle_timeout - idle_s) if s.idle_timeout > 0 and s.is_running() else None,
             "profile": str(s.profile_dir) if s.profile_dir else None,
+            "desc": s.desc,
+            "headless": s.headless,
+            "privacy": s.privacy,
             "uptime_seconds": int(now - s.created_at) if s.is_running() else 0,
         })
     external = find_external_chrome_pids()
@@ -4859,6 +5354,28 @@ async def list_instances() -> str:
         ) if external else None,
     }
     return ok(json.dumps(payload, indent=2, default=str))
+
+
+@mcp.tool()
+async def instance_describe(instance_id: str, desc: str, append: bool = False) -> str:
+    """Set or append the natural-language purpose of a browser instance."""
+    try:
+        if instance_id == BrowserState.current_instance_id:
+            old = BrowserState.current_desc
+            BrowserState.current_desc = (
+                f"{old}; {desc}" if append and old and desc else (desc or old if append else desc)
+            )
+            updated = BrowserState.current_desc
+        else:
+            snap = BrowserState.instances.get(instance_id)
+            if snap is None:
+                return err(f"instance {instance_id!r} not found")
+            old = snap.desc
+            snap.desc = f"{old}; {desc}" if append and old and desc else (desc or old if append else desc)
+            updated = snap.desc
+        return ok(f"instance {instance_id!r} description: {updated}")
+    except Exception as e:
+        return err(str(e))
 
 
 @mcp.tool()
@@ -4883,6 +5400,8 @@ async def close_instance(instance_id: str) -> str:
     # Close current
     if instance_id == BrowserState.current_instance_id:
         if BrowserState.is_up():
+            _profile = BrowserState.current_profile_dir
+            _privacy = BrowserState.current_privacy
             try:
                 if BrowserState.browser:
                     BrowserState.browser.stop()
@@ -4890,10 +5409,26 @@ async def close_instance(instance_id: str) -> str:
                 return err(f"close failed: {e}")
             _iid = BrowserState.current_instance_id
             BrowserState.reset()
-            if BrowserState.current_profile_dir:
-                clean_profile_state(BrowserState.current_profile_dir)
+            BrowserState.current_headless = False
+            BrowserState.current_privacy = False
+            BrowserState.current_fingerprint = {}
+            BrowserState.current_proxy = None
+            if _privacy:
+                if not await _remove_privacy_profile(_profile):
+                    return err(f"closed browser but failed to remove privacy profile {_profile}")
+            elif _profile:
+                clean_profile_state(_profile)
             _ATTACHED_BROWSERS.discard(_iid)
             return ok(f"closed current instance {instance_id!r}")
+        if BrowserState.current_privacy:
+            _profile = BrowserState.current_profile_dir
+            BrowserState.current_privacy = False
+            BrowserState.current_headless = False
+            BrowserState.current_fingerprint = {}
+            BrowserState.current_proxy = None
+            if not await _remove_privacy_profile(_profile):
+                return err(f"failed to remove stale privacy profile {_profile}")
+            return ok(f"current instance {instance_id!r} was not running; privacy profile removed")
         return ok(f"current instance {instance_id!r} was not running")
     # Close stored
     snap = BrowserState.instances.get(instance_id)
@@ -4904,10 +5439,15 @@ async def close_instance(instance_id: str) -> str:
             snap.browser.stop()
     except Exception:
         pass
-    if snap.profile_dir:
+    cleanup_ok = True
+    if snap.privacy:
+        cleanup_ok = await _remove_privacy_profile(snap.profile_dir)
+    elif snap.profile_dir:
         clean_profile_state(snap.profile_dir)
     BrowserState.instances.pop(instance_id, None)
     _ATTACHED_BROWSERS.discard(instance_id)
+    if not cleanup_ok:
+        return err(f"closed browser but failed to remove privacy profile {snap.profile_dir}")
     return ok(f"closed instance {instance_id!r}")
 
 
@@ -4922,21 +5462,33 @@ async def close_all_instances() -> str:
                 snap.browser.stop()
         except Exception:
             pass
-        if snap.profile_dir:
+        if snap.privacy:
+            await _remove_privacy_profile(snap.profile_dir)
+        elif snap.profile_dir:
             clean_profile_state(snap.profile_dir)
         closed.append(iid)
     BrowserState.instances.clear()
     # Close current
     if BrowserState.is_up():
+        _current_profile = BrowserState.current_profile_dir
+        _current_privacy = BrowserState.current_privacy
         try:
             if BrowserState.browser:
                 BrowserState.browser.stop()
         except Exception:
             pass
-        if BrowserState.current_profile_dir:
-            clean_profile_state(BrowserState.current_profile_dir)
+        if _current_privacy:
+            await _remove_privacy_profile(_current_profile)
+        elif _current_profile:
+            clean_profile_state(_current_profile)
         closed.append(BrowserState.current_instance_id)
+    elif BrowserState.current_privacy:
+        await _remove_privacy_profile(BrowserState.current_profile_dir)
     BrowserState.reset()
+    BrowserState.current_headless = False
+    BrowserState.current_privacy = False
+    BrowserState.current_fingerprint = {}
+    BrowserState.current_proxy = None
     for _iid in closed:
         _ATTACHED_BROWSERS.discard(_iid)
     return ok(f"closed {len(closed)} instance(s): {closed}")
@@ -6828,6 +7380,10 @@ async def attach_to_chrome(
     BrowserState.browser = browser
     BrowserState.current_instance_id = instance_id
     BrowserState.current_profile_dir = None  # unknown — managed by external Chrome
+    BrowserState.current_headless = False
+    BrowserState.current_privacy = False
+    BrowserState.current_fingerprint = {}
+    BrowserState.current_proxy = None
     BrowserState.current_idle_timeout = 0  # never auto-close attached browsers
     BrowserState.current_last_active = time.time()
     BrowserState.current_created_at = time.time()

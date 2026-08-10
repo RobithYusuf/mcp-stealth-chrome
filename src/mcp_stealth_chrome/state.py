@@ -24,6 +24,8 @@ PROFILE_DIR = HOME / ".mcp-stealth" / "profile"  # legacy default ("main" instan
 SCREENSHOT_DIR = HOME / ".mcp-stealth" / "screenshots"
 EXPORT_DIR = HOME / ".mcp-stealth" / "exports"
 STORAGE_STATE_DIR = HOME / ".mcp-stealth" / "storage-states"
+IDENTITIES_DIR = HOME / ".mcp-stealth" / "identities"
+PRIVACY_PROFILE_ROOT = HOME / ".mcp-stealth" / "privacy-profiles"
 
 DEFAULT_IDLE_TIMEOUT = int(os.environ.get("BROWSER_IDLE_TIMEOUT", "600"))  # 10 min
 IDLE_REAPER_INTERVAL = int(os.environ.get("BROWSER_IDLE_REAPER_INTERVAL", "60"))
@@ -429,7 +431,15 @@ def resolve_default_profile(persistent: bool) -> Path:
 
 
 def ensure_dirs() -> None:
-    for d in (PROFILE_DIR, PROFILES_ROOT, SCREENSHOT_DIR, EXPORT_DIR, STORAGE_STATE_DIR):
+    for d in (
+        PROFILE_DIR,
+        PROFILES_ROOT,
+        SCREENSHOT_DIR,
+        EXPORT_DIR,
+        STORAGE_STATE_DIR,
+        IDENTITIES_DIR,
+        PRIVACY_PROFILE_ROOT,
+    ):
         d.mkdir(parents=True, exist_ok=True)
 
 
@@ -470,6 +480,11 @@ class InstanceSnapshot:
     tabs: list[Tab] = field(default_factory=list)
     active_tab_index: int = 0
     profile_dir: Optional[Path] = None
+    desc: str = ""
+    headless: bool = False
+    privacy: bool = False
+    fingerprint: dict[str, str] = field(default_factory=dict)
+    proxy: Optional[str] = None
     idle_timeout: int = DEFAULT_IDLE_TIMEOUT
     last_active: float = field(default_factory=time.time)
     created_at: float = field(default_factory=time.time)
@@ -519,6 +534,11 @@ class BrowserState:
     # Multi-instance: other instances stored here, plus metadata for current
     current_instance_id: ClassVar[str] = "main"
     current_profile_dir: ClassVar[Optional[Path]] = None
+    current_desc: ClassVar[str] = ""
+    current_headless: ClassVar[bool] = False
+    current_privacy: ClassVar[bool] = False
+    current_fingerprint: ClassVar[dict[str, str]] = {}
+    current_proxy: ClassVar[Optional[str]] = None
     current_idle_timeout: ClassVar[int] = DEFAULT_IDLE_TIMEOUT
     current_last_active: ClassVar[float] = time.time()
     current_created_at: ClassVar[float] = time.time()
@@ -603,6 +623,11 @@ class BrowserState:
             tabs=list(cls.tabs),
             active_tab_index=cls.active_tab_index,
             profile_dir=cls.current_profile_dir,
+            desc=cls.current_desc,
+            headless=cls.current_headless,
+            privacy=cls.current_privacy,
+            fingerprint=dict(cls.current_fingerprint),
+            proxy=cls.current_proxy,
             idle_timeout=cls.current_idle_timeout,
             last_active=cls.current_last_active,
             created_at=cls.current_created_at,
@@ -622,6 +647,11 @@ class BrowserState:
         cls.tabs = list(snap.tabs)
         cls.active_tab_index = snap.active_tab_index
         cls.current_profile_dir = snap.profile_dir
+        cls.current_desc = snap.desc
+        cls.current_headless = snap.headless
+        cls.current_privacy = snap.privacy
+        cls.current_fingerprint = dict(snap.fingerprint)
+        cls.current_proxy = snap.proxy
         cls.current_idle_timeout = snap.idle_timeout
         cls.current_last_active = snap.last_active
         cls.current_created_at = snap.created_at

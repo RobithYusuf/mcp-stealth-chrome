@@ -135,12 +135,23 @@ def snapshot_hash(elements: list[dict]) -> str:
     return hashlib.sha1("\n".join(rows).encode("utf-8")).hexdigest()[:16]
 
 
+def element_fingerprint(element: dict) -> str:
+    """Stable identity for delta snapshots, excluding the regenerated ref."""
+    keys = (
+        "tag", "role", "text", "type", "name", "placeholder", "aria",
+        "href", "checked", "disabled",
+    )
+    row = "|".join(str(element.get(k, "")) for k in keys)
+    return hashlib.sha1(row.encode("utf-8")).hexdigest()[:16]
+
+
 def format_snapshot(
     elements: list[dict],
     url: str,
     title: str,
     mode: str = "full",
     unchanged_from: str | None = None,
+    changed_fingerprints: set[str] | None = None,
 ) -> str:
     """Pretty-print snapshot for LLM consumption."""
     if not elements:
@@ -153,7 +164,17 @@ def format_snapshot(
         header.append(f"Mode: {mode}")
     if unchanged_from:
         header.append(f"DOM hash: {unchanged_from} (unchanged)")
-    header.extend(["", f"Interactive elements ({len(elements)}):", ""])
+    if changed_fingerprints is None:
+        count_header = f"Interactive elements ({len(elements)}):"
+    else:
+        changed_count = sum(
+            element_fingerprint(el) in changed_fingerprints for el in elements
+        )
+        count_header = (
+            f"Interactive elements ({len(elements)}, "
+            f"{changed_count} changed):"
+        )
+    header.extend(["", count_header, ""])
     lines = list(header)
     for el in elements:
         parts = [f"[{el.get('tag', '?')}]"]
@@ -173,5 +194,9 @@ def format_snapshot(
             parts.append("checked")
         if el.get("disabled"):
             parts.append("disabled")
-        lines.append(f"  ref={el.get('ref')}  {' '.join(parts)}")
+        prefix = "* " if (
+            changed_fingerprints is not None
+            and element_fingerprint(el) in changed_fingerprints
+        ) else "  "
+        lines.append(f"{prefix}ref={el.get('ref')}  {' '.join(parts)}")
     return "\n".join(lines)
