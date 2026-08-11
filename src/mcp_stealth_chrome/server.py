@@ -4514,24 +4514,32 @@ async def export_curl(
         }
         body = entry.get("request_body")
 
-        cookie_header = headers.pop("Cookie", None) or headers.pop("cookie", None)
+        cookie_header = None
+        for header_name in list(headers):
+            if header_name.lower() == "cookie":
+                cookie_header = headers.pop(header_name)
+                break
+        cookie_status = "disabled" if not include_cookies else "captured_header"
+        cookie_error = None
         if include_cookies and not cookie_header:
             # The captured headers often omit Cookie (Chrome attaches it later),
-            # so read the live jar for this URL instead of shipping a request
-            # that silently drops the session.
+            # so ask Chrome for exactly the cookies applicable to this URL.
+            # Filtering Storage.getCookies ourselves is unsafe: suffix matching
+            # can leak an example.com cookie to notexample.com, and path/secure/
+            # partition rules are easy to reproduce incorrectly.
             try:
-                from urllib.parse import urlparse
-                jar = await BrowserState.browser.cookies.get_all()
-                host = urlparse(target_url).hostname or ""
-                pairs = [
-                    f"{c.name}={c.value}" for c in jar
-                    if c.domain and (host == c.domain.lstrip(".")
-                                     or host.endswith(c.domain.lstrip(".")))
-                ]
+                tab = BrowserState.active_tab()
+                from nodriver.cdp import network as cdp_network
+                jar = await tab.send(cdp_network.get_cookies(urls=[target_url]))
+                pairs = [f"{c.name}={c.value}" for c in (jar or [])]
                 if pairs:
                     cookie_header = "; ".join(pairs)
-            except Exception:
-                pass
+                    cookie_status = "live_url_jar"
+                else:
+                    cookie_status = "live_url_jar_empty"
+            except Exception as e:
+                cookie_status = "error"
+                cookie_error = f"{type(e).__name__}: {e}"
         if not include_cookies:
             cookie_header = None
 
@@ -4564,6 +4572,8 @@ async def export_curl(
             "header_count": len(headers),
             "has_body": bool(body),
             "cookies_attached": bool(cookie_header),
+            "cookie_status": cookie_status,
+            **({"cookie_error": cookie_error} if cookie_error else {}),
             "curl": " ".join(parts),
             "http_request": http_call,
             "note": (

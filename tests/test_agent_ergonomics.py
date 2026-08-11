@@ -455,6 +455,79 @@ def test_export_curl_builds_a_replayable_pair():
     assert "impersonate='chrome'" in out["http_request"]
 
 
+def test_export_curl_uses_chrome_url_cookie_rules(monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+
+    from mcp_stealth_chrome import server
+
+    class _Tab:
+        def __init__(self):
+            self.command = None
+
+        async def send(self, command):
+            self.command = next(command)
+            return [SimpleNamespace(name="sid", value="secret")]
+
+    tab = _Tab()
+    monkeypatch.setattr(
+        server.BrowserState,
+        "active_tab",
+        classmethod(lambda cls: tab),
+    )
+    previous = server.BrowserState.network_index
+    server.BrowserState.network_index = {
+        "1": {
+            "request_id": "1",
+            "url": "https://notexample.com/account",
+            "method": "GET",
+            "request_headers": {},
+        }
+    }
+    try:
+        export = server.mcp._tool_manager._tools["export_curl"].fn
+        out = json.loads(asyncio.run(export(request_id="1")))
+    finally:
+        server.BrowserState.network_index = previous
+
+    assert tab.command["method"] == "Network.getCookies"
+    assert tab.command["params"]["urls"] == ["https://notexample.com/account"]
+    assert out["cookie_status"] == "live_url_jar"
+    assert "Cookie: sid=secret" in out["curl"]
+
+
+def test_export_curl_surfaces_cookie_measurement_failure(monkeypatch):
+    import asyncio
+
+    from mcp_stealth_chrome import server
+
+    class _Tab:
+        async def send(self, _command):
+            raise RuntimeError("cookie domain unavailable")
+
+    monkeypatch.setattr(
+        server.BrowserState,
+        "active_tab",
+        classmethod(lambda cls: _Tab()),
+    )
+    previous = server.BrowserState.network_index
+    server.BrowserState.network_index = {
+        "1": {
+            "request_id": "1", "url": "https://example.test/",
+            "method": "GET", "request_headers": {},
+        }
+    }
+    try:
+        export = server.mcp._tool_manager._tools["export_curl"].fn
+        out = json.loads(asyncio.run(export(request_id="1")))
+    finally:
+        server.BrowserState.network_index = previous
+
+    assert out["cookies_attached"] is False
+    assert out["cookie_status"] == "error"
+    assert "cookie domain unavailable" in out["cookie_error"]
+
+
 def test_privacy_proxy_supports_pool_and_session_token():
     from mcp_stealth_chrome.server import _privacy_proxy
 
