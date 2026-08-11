@@ -1803,8 +1803,8 @@ async def screenshot(
                     f"{path}{resized_info}\n"
                     f"[base64 omitted: ~{_b64_len(data):,} chars still exceeds the "
                     f"{B64_INLINE_LIMIT:,} inline limit even after downscaling] "
-                    f"Read the file above directly, or narrow the shot with "
-                    f"region_selector='css'."
+                    f"Read the file above directly, lower max_dimension, or narrow "
+                    f"the shot with region_selector='css'."
                 )
             return ok(f"{path}{resized_info}{shrink_note}\n"
                       f"---base64---\n{base64.b64encode(data).decode()}")
