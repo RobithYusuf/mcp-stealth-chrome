@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 from typing import Any
 
 from nodriver import Element, Tab
@@ -42,6 +43,15 @@ async def get_title(tab: Tab) -> str:
 
 def ts_filename(prefix: str, ext: str) -> str:
     return f"{prefix}-{int(time.time() * 1000)}.{ext}"
+
+
+def confined_output_path(root: Path, filename: str) -> Path:
+    """Resolve an output filename without letting it escape its managed root."""
+    base = root.resolve()
+    target = (root / filename).resolve()
+    if target == base or base not in target.parents:
+        raise ValueError(f"output path must stay inside {base}: {filename!r}")
+    return target
 
 
 def ok(text: str) -> str:

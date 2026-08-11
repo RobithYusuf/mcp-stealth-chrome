@@ -31,6 +31,7 @@ from . import patches as _patches
 _patches.apply_all()
 from .captcha import CapSolverError, solve as capsolver_solve
 from .helpers import (
+    confined_output_path,
     err,
     get_title,
     get_url,
@@ -133,6 +134,33 @@ _LAUNCH_LOCK = asyncio.Lock()
 _FINGERPRINT_FIELDS = ("user_agent", "accept_language", "platform", "timezone")
 
 
+def _validate_instance_id(instance_id: str) -> str:
+    """Validate IDs that may become directory names or persistent filenames."""
+    if (
+        not instance_id
+        or instance_id in {".", ".."}
+        or not re.fullmatch(r"[A-Za-z0-9._-]+", instance_id)
+    ):
+        raise ValueError(
+            "instance_id must be a non-empty name containing only letters, "
+            "numbers, dot, underscore, and dash (not '.' or '..')"
+        )
+    return instance_id
+
+
+def _direct_child(root: Path, name: str, label: str) -> Path:
+    """Return a direct child path for a user-supplied profile directory name."""
+    if (
+        not name
+        or name in {".", ".."}
+        or "/" in name
+        or "\\" in name
+        or Path(name).is_absolute()
+    ):
+        raise ValueError(f"{label} must be one directory name, not a path")
+    return root / name
+
+
 def _random_fingerprint() -> dict[str, str]:
     """Return a coherent, fresh desktop fingerprint for a new identity."""
     family = random.choice((
@@ -175,8 +203,7 @@ def _normalize_fingerprint(value: Optional[dict]) -> dict[str, str]:
 
 def _identity_path(instance_id: str) -> Path:
     """Resolve an identity file without allowing instance IDs to escape its root."""
-    if not instance_id or not re.fullmatch(r"[A-Za-z0-9._-]+", instance_id):
-        raise ValueError("instance_id may contain only letters, numbers, dot, underscore, and dash")
+    _validate_instance_id(instance_id)
     return IDENTITIES_DIR / f"{instance_id}.json"
 
 
@@ -213,6 +240,7 @@ def _launch_identity(
     privacy: bool,
 ) -> tuple[Optional[str], dict[str, str], str]:
     """Resolve explicit, pinned, or privacy identity values for one launch."""
+    _validate_instance_id(instance_id)
     pinned = None if privacy else _load_identity(instance_id)
     if privacy:
         effective_fp = _random_fingerprint()
@@ -688,7 +716,12 @@ async def browser_launch(
                 )
             # Validate sub-profile if specified
             if profile_directory:
-                pd_path = explicit_udd / profile_directory
+                try:
+                    pd_path = _direct_child(
+                        explicit_udd, profile_directory, "profile_directory"
+                    )
+                except ValueError as e:
+                    return err(str(e))
                 if not pd_path.exists():
                     avail = [p.name for p in explicit_udd.iterdir()
                              if p.is_dir() and (p / "Preferences").exists()][:15]
@@ -1573,7 +1606,7 @@ async def screenshot(
         tab = BrowserState.active_tab()
         ensure_dirs()
         fname = filename or ts_filename("shot", "png")
-        path = SCREENSHOT_DIR / fname
+        path = confined_output_path(SCREENSHOT_DIR, fname)
         ext = path.suffix.lower().lstrip(".")
         if format == "auto":
             fmt = "png" if ext == "png" else "jpeg"
@@ -1875,7 +1908,7 @@ async def save_pdf(filename: Optional[str] = None, landscape: bool = False) -> s
         tab = BrowserState.active_tab()
         ensure_dirs()
         fname = filename or ts_filename("page", "pdf")
-        path = EXPORT_DIR / fname
+        path = confined_output_path(EXPORT_DIR, fname)
         from nodriver.cdp import page as cdp_page
         result = await tab.send(cdp_page.print_to_pdf(landscape=landscape))
         # result[0] is base64 data per CDP spec
@@ -3149,7 +3182,7 @@ async def cookie_export(filename: Optional[str] = None,
         } for c in cookies]
         ensure_dirs()
         fname = filename or ts_filename("cookies", "json")
-        path = STORAGE_STATE_DIR / fname
+        path = confined_output_path(STORAGE_STATE_DIR, fname)
         path.write_text(json.dumps(data, indent=2, default=str))
         return ok(f"{path}\nexported {len(data)} cookies")
     except Exception as e:
@@ -4531,7 +4564,7 @@ async def export_har(filename: Optional[str] = None) -> str:
     try:
         ensure_dirs()
         fname = filename or ts_filename("traffic", "har")
-        path = EXPORT_DIR / fname
+        path = confined_output_path(EXPORT_DIR, fname)
         path.write_text(json.dumps({
             "log": {
                 "version": "1.2",
@@ -4760,7 +4793,7 @@ async def storage_state_save(filename: Optional[str] = None) -> str:
             return err("browser not running")
         ensure_dirs()
         fname = filename or ts_filename("state", "json")
-        path = STORAGE_STATE_DIR / fname
+        path = confined_output_path(STORAGE_STATE_DIR, fname)
         tab = BrowserState.active_tab()
         cookies = await BrowserState.browser.cookies.get_all()
         local_storage = await tab.get_local_storage()
@@ -5441,6 +5474,11 @@ async def _launch_browser_instance(
 
     Returns (success, message).
     """
+    try:
+        _validate_instance_id(instance_id)
+    except ValueError as e:
+        return False, str(e)
+
     # Pre-flight: ensure Chrome is installed before calling nodriver
     chrome_path = find_chrome_binary()
     if chrome_path is None:
@@ -5698,6 +5736,10 @@ async def spawn_browser(
 
     Use switch_instance(id) to route subsequent tool calls to this instance.
     """
+    try:
+        _validate_instance_id(instance_id)
+    except ValueError as e:
+        return err(str(e))
     if instance_id == BrowserState.current_instance_id and BrowserState.is_up():
         return err(f"instance {instance_id!r} already running (current). Use switch_instance instead.")
     if instance_id in BrowserState.instances and BrowserState.instances[instance_id].is_running():
@@ -5766,6 +5808,7 @@ async def list_instances() -> str:
 async def instance_describe(instance_id: str, desc: str, append: bool = False) -> str:
     """Set or append the natural-language purpose of a browser instance."""
     try:
+        _validate_instance_id(instance_id)
         if instance_id == BrowserState.current_instance_id:
             old = BrowserState.current_desc
             BrowserState.current_desc = (
@@ -5791,6 +5834,10 @@ async def switch_instance(instance_id: str) -> str:
     The previous current instance continues running in the background,
     cookies/tabs preserved. Swap back anytime.
     """
+    try:
+        _validate_instance_id(instance_id)
+    except ValueError as e:
+        return err(str(e))
     if instance_id == BrowserState.current_instance_id:
         return ok(f"already on {instance_id!r}")
     existed = instance_id in BrowserState.instances
@@ -5803,6 +5850,10 @@ async def switch_instance(instance_id: str) -> str:
 @mcp.tool()
 async def close_instance(instance_id: str) -> str:
     """⭐ Close a specific browser instance (frees profile + memory)."""
+    try:
+        _validate_instance_id(instance_id)
+    except ValueError as e:
+        return err(str(e))
     # Close current
     if instance_id == BrowserState.current_instance_id:
         if BrowserState.is_up():
@@ -6087,13 +6138,21 @@ async def clone_chrome_profile(
     """
     import shutil
 
+    try:
+        _validate_instance_id(target_instance_id)
+    except ValueError as e:
+        return err(str(e))
+
     root = chrome_user_data_root(browser)
     if root is None:
         found = ", ".join(n for n, _ in chrome_user_data_roots()) or "none"
         if browser:
             return err(f"no user-data root for browser {browser!r}. Found: {found}")
         return err("No Chrome-family profile root found. Install Chrome/Brave/Edge first.")
-    source_path = root / source_profile
+    try:
+        source_path = _direct_child(root, source_profile, "source_profile")
+    except ValueError as e:
+        return err(str(e))
     if not source_path.exists():
         return err(
             f"Source profile not found: {source_path}\n"
@@ -7864,6 +7923,10 @@ async def attach_to_chrome(
     after attach DOES close the target Chrome — use detach() instead if you
     want to keep it running.
     """
+    try:
+        _validate_instance_id(instance_id)
+    except ValueError as e:
+        return err(str(e))
     if BrowserState.is_up():
         return err(
             f"Browser already attached/running on instance {BrowserState.current_instance_id!r}. "

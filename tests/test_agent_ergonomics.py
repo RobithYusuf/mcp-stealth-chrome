@@ -2,7 +2,31 @@
 
 import json
 
+import pytest
+
 from mcp_stealth_chrome.snapshot import element_fingerprint, format_snapshot
+
+
+def test_managed_output_paths_and_instance_names_cannot_escape_roots(tmp_path):
+    """Managed output/profile parameters are names, not arbitrary write paths."""
+    from mcp_stealth_chrome.helpers import confined_output_path
+    from mcp_stealth_chrome.server import _direct_child, _identity_path
+
+    root = tmp_path / "exports"
+    root.mkdir()
+    assert confined_output_path(root, "report.json") == root / "report.json"
+    assert _direct_child(root, "Profile 1", "profile") == root / "Profile 1"
+
+    with pytest.raises(ValueError):
+        confined_output_path(root, "../escaped.json")
+    with pytest.raises(ValueError):
+        confined_output_path(root, str(tmp_path / "absolute.json"))
+    with pytest.raises(ValueError):
+        _direct_child(root, "../Default", "profile")
+    with pytest.raises(ValueError):
+        _direct_child(root, r"..\Default", "profile")
+    with pytest.raises(ValueError):
+        _identity_path("..")
 
 
 def test_format_snapshot_delta_prefix_and_count():

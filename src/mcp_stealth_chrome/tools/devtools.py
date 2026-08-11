@@ -19,7 +19,7 @@ import time
 from typing import Any, Literal, Optional
 
 from .._app import mcp
-from ..helpers import err, ok, parse_json, ts_filename
+from ..helpers import confined_output_path, err, ok, parse_json, ts_filename
 from ..state import EXPORT_DIR, BrowserState, ensure_dirs
 
 
@@ -194,7 +194,7 @@ async def performance_trace_stop(filename: Optional[str] = None) -> str:
                 except Exception:
                     pass
         fname = filename or ts_filename("trace", "json")
-        path = EXPORT_DIR / fname
+        path = confined_output_path(EXPORT_DIR, fname)
         ensure_dirs()
         payload = {"traceEvents": list(_TRACE_BUFFER)}
         path.write_text(json.dumps(payload))
@@ -608,7 +608,7 @@ async def memory_heap_snapshot(
                 "(snapshot may have failed or the tab navigated/closed)"
             )
         fname = filename or ts_filename("heap", "heapsnapshot")
-        path = EXPORT_DIR / fname
+        path = confined_output_path(EXPORT_DIR, fname)
         ensure_dirs()
         path.write_text("".join(chunks))
         size_mb = path.stat().st_size / 1024 / 1024
