@@ -1728,20 +1728,56 @@ async def screenshot(
 
         if return_base64:
             data = path.read_bytes()
-            # base64 inflates by 4/3. An oversized blob gets the whole tool result
-            # rejected by the client, wasting the entire call — so refuse up front
-            # with an actionable message instead of emitting it and failing.
-            approx_chars = (len(data) + 2) // 3 * 4
-            if approx_chars > B64_INLINE_LIMIT:
+            # base64 inflates by 4/3, and an oversized blob gets the whole tool
+            # result rejected — the call is wasted. Refusing was honest but still
+            # cost a round trip, and a smaller image is nearly always acceptable,
+            # so shrink the INLINE copy until it fits. The saved file keeps its
+            # original quality; only the inlined bytes are reduced.
+            def _b64_len(raw: bytes) -> int:
+                return (len(raw) + 2) // 3 * 4
+
+            shrink_note = ""
+            if _b64_len(data) > B64_INLINE_LIMIT:
+                try:
+                    import cv2
+                    img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+                    if img is not None:
+                        h0, w0 = img.shape[:2]
+                        for dim, q in ((1280, 70), (1024, 60), (800, 55),
+                                       (640, 50), (480, 40), (360, 35)):
+                            longest = max(h0, w0)
+                            if longest > dim:
+                                scale = dim / longest
+                                small = cv2.resize(
+                                    img, (max(1, int(w0 * scale)), max(1, int(h0 * scale))),
+                                    interpolation=cv2.INTER_AREA)
+                            else:
+                                small = img
+                            okimg, buf = cv2.imencode(
+                                ".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, q])
+                            if not okimg:
+                                continue
+                            candidate = buf.tobytes()
+                            if _b64_len(candidate) <= B64_INLINE_LIMIT:
+                                sh, sw = small.shape[:2]
+                                data = candidate
+                                shrink_note = (f" [inline copy auto-shrunk to "
+                                               f"{sw}×{sh} jpeg q{q} to fit the "
+                                               f"{B64_INLINE_LIMIT:,}-char limit; "
+                                               f"the saved file is untouched]")
+                                break
+                except Exception:
+                    pass
+            if _b64_len(data) > B64_INLINE_LIMIT:
                 return ok(
                     f"{path}{resized_info}\n"
-                    f"[base64 omitted: ~{approx_chars:,} chars exceeds the "
-                    f"{B64_INLINE_LIMIT:,} inline limit] "
-                    f"Read the file above directly, or re-shoot smaller: "
-                    f"region={{x,y,width,height}} / region_selector='css', "
-                    f"max_dimension=800, format='jpeg', quality=60."
+                    f"[base64 omitted: ~{_b64_len(data):,} chars still exceeds the "
+                    f"{B64_INLINE_LIMIT:,} inline limit even after downscaling] "
+                    f"Read the file above directly, or narrow the shot with "
+                    f"region_selector='css'."
                 )
-            return ok(f"{path}{resized_info}\n---base64---\n{base64.b64encode(data).decode()}")
+            return ok(f"{path}{resized_info}{shrink_note}\n"
+                      f"---base64---\n{base64.b64encode(data).decode()}")
         return ok(f"{path}{resized_info}")
     except Exception as e:
         return err(str(e))
@@ -4152,6 +4188,341 @@ async def server_status() -> str:
 async def get_page_errors() -> str:
     """Retrieve JS errors caught on active tab."""
     return ok(json.dumps(BrowserState.page_errors, indent=2, default=str))
+
+
+# Headers Chrome recomputes per connection. Replaying them verbatim is worse
+# than omitting them: a stale :authority or a Content-Length that no longer
+# matches the body is itself a bot signal.
+_CURL_SKIP_HEADERS = {
+    "content-length", "host", "connection", "keep-alive", "proxy-connection",
+    "transfer-encoding", "upgrade", "te", "trailer", "expect",
+}
+
+
+def _shq(value: str) -> str:
+    """POSIX single-quote a value so it survives the shell verbatim."""
+    return "'" + str(value).replace("'", "'\\''") + "'"
+
+
+# Runs in-page. Gathers the signals bot-detectors actually read, plus the
+# cross-field pairs that expose a spoof: detectors flag INCONSISTENCY (a Windows
+# UA on a MacIntel platform) far more reliably than any single "bot-like" value.
+_FINGERPRINT_AUDIT_JS = r"""
+(() => {
+  const out = {};
+  const nav = navigator;
+  out.webdriver = nav.webdriver === undefined ? "undefined" : String(nav.webdriver);
+  out.user_agent = nav.userAgent;
+  out.platform = nav.platform;
+  out.languages = (nav.languages || []).join(",");
+  out.language = nav.language;
+  out.hardware_concurrency = nav.hardwareConcurrency;
+  out.device_memory = nav.deviceMemory === undefined ? null : nav.deviceMemory;
+  out.plugins = nav.plugins ? nav.plugins.length : 0;
+  out.mime_types = nav.mimeTypes ? nav.mimeTypes.length : 0;
+  out.has_chrome_object = typeof window.chrome === "object" && window.chrome !== null;
+  out.chrome_runtime = !!(window.chrome && window.chrome.runtime);
+  out.timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  out.timezone_offset_min = new Date().getTimezoneOffset();
+  out.screen = screen.width + "x" + screen.height;
+  out.avail = screen.availWidth + "x" + screen.availHeight;
+  out.outer = window.outerWidth + "x" + window.outerHeight;
+  out.inner = window.innerWidth + "x" + window.innerHeight;
+  out.color_depth = screen.colorDepth;
+  out.pixel_ratio = window.devicePixelRatio;
+  out.touch_points = nav.maxTouchPoints;
+  out.pdf_viewer = nav.pdfViewerEnabled === undefined ? null : nav.pdfViewerEnabled;
+
+  try {
+    const c = document.createElement("canvas");
+    const gl = c.getContext("webgl") || c.getContext("experimental-webgl");
+    if (gl) {
+      const dbg = gl.getExtension("WEBGL_debug_renderer_info");
+      out.webgl_vendor = dbg ? gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) : null;
+      out.webgl_renderer = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : null;
+    } else { out.webgl_vendor = null; out.webgl_renderer = null; }
+  } catch (e) { out.webgl_vendor = null; out.webgl_renderer = null; }
+
+  try {
+    // Same input twice: a canvas that changes between draws is a randomiser,
+    // which is itself detectable as non-human.
+    const draw = () => {
+      const c = document.createElement("canvas");
+      c.width = 200; c.height = 40;
+      const ctx = c.getContext("2d");
+      ctx.textBaseline = "top";
+      ctx.font = "14px Arial";
+      ctx.fillStyle = "#f60"; ctx.fillRect(0, 0, 100, 20);
+      ctx.fillStyle = "#069"; ctx.fillText("mcp-stealth-audit", 2, 15);
+      return c.toDataURL();
+    };
+    const a = draw(), b = draw();
+    out.canvas_stable = a === b;
+    out.canvas_hash = a.length + ":" + a.slice(-24);
+  } catch (e) { out.canvas_stable = null; }
+
+  try {
+    out.permissions_consistent = null;
+    if (nav.permissions && nav.permissions.query) {
+      out.permissions_query_present = true;
+    }
+  } catch (e) {}
+
+  // Classic automation leaks
+  const leaks = [];
+  for (const k of Object.keys(window)) {
+    if (/^(cdc_|\$cdc|__webdriver|__selenium|__nightmare|__fxdriver|_phantom|callPhantom|domAutomation)/.test(k)) {
+      leaks.push(k);
+    }
+  }
+  out.automation_globals = leaks;
+  out.error_stack_has_puppeteer = (() => {
+    try { null.f(); } catch (e) {
+      return /puppeteer|playwright|nodriver/i.test(String(e.stack || ""));
+    }
+    return false;
+  })();
+  return JSON.stringify(out);
+})()
+"""
+
+
+@mcp.tool()
+async def fingerprint_audit(url: Optional[str] = None) -> str:
+    """⭐ Audit THIS browser's own fingerprint for the leaks detectors look for.
+
+    Self-diagnostic for the stealth claim: after fingerprint_rotate, behind a
+    proxy, or in headless, is this browser still coherent? Runs entirely
+    in-page — no third-party detector required, nothing about you leaves the
+    machine.
+
+    Reports findings by severity, and is explicit about what it CANNOT see from
+    inside the page (TLS/JA3 and IP-vs-timezone need a network peer), so a clean
+    report is never mistaken for a total guarantee.
+
+    Args:
+        url: navigate here first (e.g. a real target site) so the audit reflects
+            that page's context. Omit to audit the current page.
+
+    Weighs cross-field consistency heavily: detectors flag a Windows UA on a
+    MacIntel platform far more reliably than any single suspicious value.
+    """
+    try:
+        tab = BrowserState.active_tab()
+        if url:
+            await _wait(tab.get(url), what="fingerprint_audit navigate")
+            await asyncio.sleep(1.0)
+        raw = await _wait(tab.evaluate(_FINGERPRINT_AUDIT_JS, return_by_value=True),
+                          what="fingerprint_audit")
+        raw = raw.value if hasattr(raw, "value") and not isinstance(raw, str) else raw
+        fp = json.loads(raw) if raw else {}
+        if not fp:
+            return err("audit script returned nothing — is a page loaded?")
+
+        critical: list[str] = []
+        warnings: list[str] = []
+        passed: list[str] = []
+
+        def check(is_ok: bool, label: str, detail: str, severity: str = "critical"):
+            if is_ok:
+                passed.append(label)
+            else:
+                (critical if severity == "critical" else warnings).append(
+                    f"{label}: {detail}")
+
+        check(fp.get("webdriver") in ("undefined", "false"), "navigator.webdriver",
+              f"exposed as {fp.get('webdriver')!r} — the single most-checked flag")
+        check(not fp.get("automation_globals"), "automation globals",
+              f"leaked {fp.get('automation_globals')}")
+        check(not fp.get("error_stack_has_puppeteer"), "error stack",
+              "stack traces name an automation library")
+        check(bool(fp.get("has_chrome_object")), "window.chrome",
+              "missing — real Chrome always defines it")
+        check((fp.get("plugins") or 0) > 0, "navigator.plugins",
+              "empty plugin array is a headless tell", "warning")
+        check(bool(fp.get("languages")), "navigator.languages",
+              "empty — real browsers always report at least one", "warning")
+
+        ua = (fp.get("user_agent") or "")
+        platform = (fp.get("platform") or "")
+        ua_os = ("windows" if "Windows" in ua else
+                 "mac" if "Macintosh" in ua or "Mac OS" in ua else
+                 "linux" if "Linux" in ua or "X11" in ua else "unknown")
+        plat_os = ("windows" if platform.startswith("Win") else
+                   "mac" if platform.startswith("Mac") else
+                   "linux" if "Linux" in platform else "unknown")
+        check(ua_os == plat_os or "unknown" in (ua_os, plat_os),
+              "UA vs navigator.platform",
+              f"UA says {ua_os}, platform says {plat_os} ({platform!r}) — "
+              f"detectors weight this mismatch heavily")
+
+        renderer = (fp.get("webgl_renderer") or "")
+        if renderer:
+            gpu_os = ("mac" if "Apple" in renderer else
+                      "windows" if ("Direct3D" in renderer or "ANGLE" in renderer
+                                    and "Apple" not in renderer) else "unknown")
+            check(gpu_os == "unknown" or gpu_os == plat_os or plat_os == "unknown",
+                  "WebGL renderer vs platform",
+                  f"renderer {renderer!r} does not match platform {platform!r}")
+        else:
+            warnings.append("WebGL renderer: unavailable — cannot cross-check GPU")
+
+        check(fp.get("canvas_stable") is not False, "canvas stability",
+              "canvas output changes between identical draws — a randomiser is "
+              "itself a detectable signal", "warning")
+
+        try:
+            ow, oh = (fp.get("outer") or "0x0").split("x")
+            check(int(ow) > 0 and int(oh) > 0, "window.outer dimensions",
+                  f"{fp.get('outer')} — zeros are a classic headless giveaway")
+        except Exception:
+            pass
+
+        verdict = ("clean" if not critical and not warnings else
+                   "warnings only" if not critical else "leaks detected")
+        return ok(json.dumps({
+            "verdict": verdict,
+            "critical": critical,
+            "warnings": warnings,
+            "passed": passed,
+            "fingerprint": fp,
+            "not_checked": [
+                "TLS/JA3 fingerprint — needs a network peer; use "
+                "http_request(impersonate=...) against a TLS-echo endpoint",
+                "IP vs timezone/locale coherence — needs the exit IP's geo",
+                "Behavioural signals (mouse/typing cadence) — see mouse_drift / humanize_*",
+            ],
+        }, indent=2, default=str))
+    except Exception as e:
+        return err(str(e))
+
+
+@mcp.tool()
+async def export_curl(
+    request_id: Optional[str] = None,
+    url_contains: Optional[str] = None,
+    method: Optional[str] = None,
+    include_cookies: bool = True,
+) -> str:
+    """⭐ Turn a captured browser request into a runnable curl AND an http_request call.
+
+    The browser→script bridge. After network_start() + the action you care about,
+    hand this a request and get back the command that reproduces it outside the
+    browser, with the real headers and session cookies attached.
+
+    The `http_request` variant is the one that matters here: replaying a captured
+    request with plain curl sends a curl TLS fingerprint, which is exactly what
+    anti-bot systems key on — the request that worked in the browser then fails
+    on the command line for reasons the headers do not explain. Routing it
+    through http_request(impersonate="chrome") keeps a genuine Chrome JA3, so the
+    replay looks like the browser it came from.
+
+    Args:
+        request_id: id from network_get(). Omit to search by url_contains.
+        url_contains: pick the most recent captured request whose URL contains
+            this substring — usually easier than copying an id.
+        method: additionally require this HTTP method (e.g. "POST") when searching.
+        include_cookies: attach the browser's current cookies for that URL.
+            Turn off to produce a shareable command with no session in it.
+
+    Returns the matched request, a `curl` string, and an `http_request` call.
+    """
+    try:
+        index = BrowserState.network_index or {}
+        if not index:
+            return err(
+                "no captured requests — call network_start() first, then trigger "
+                "the action you want to reproduce, then retry."
+            )
+        entry = None
+        if request_id:
+            entry = index.get(str(request_id))
+            if entry is None:
+                return err(f"request_id {request_id!r} not found among "
+                           f"{len(index)} captured requests")
+        else:
+            if not url_contains:
+                return err("pass request_id= or url_contains= to pick a request")
+            matches = [
+                e for e in index.values()
+                if url_contains in (e.get("url") or "")
+                and (method is None
+                     or (e.get("method") or "").upper() == method.upper())
+            ]
+            if not matches:
+                shown = method.upper() + " " if method else ""
+                return err(f"no captured request matching {shown}{url_contains!r} "
+                           f"(searched {len(index)})")
+            entry = matches[-1]  # most recent wins
+
+        target_url = entry.get("url") or ""
+        http_method = (entry.get("method") or "GET").upper()
+        headers = {
+            k: v for k, v in (entry.get("request_headers") or {}).items()
+            if k.lower() not in _CURL_SKIP_HEADERS and not k.startswith(":")
+        }
+        body = entry.get("request_body")
+
+        cookie_header = headers.pop("Cookie", None) or headers.pop("cookie", None)
+        if include_cookies and not cookie_header:
+            # The captured headers often omit Cookie (Chrome attaches it later),
+            # so read the live jar for this URL instead of shipping a request
+            # that silently drops the session.
+            try:
+                from urllib.parse import urlparse
+                jar = await BrowserState.browser.cookies.get_all()
+                host = urlparse(target_url).hostname or ""
+                pairs = [
+                    f"{c.name}={c.value}" for c in jar
+                    if c.domain and (host == c.domain.lstrip(".")
+                                     or host.endswith(c.domain.lstrip(".")))
+                ]
+                if pairs:
+                    cookie_header = "; ".join(pairs)
+            except Exception:
+                pass
+        if not include_cookies:
+            cookie_header = None
+
+        parts = ["curl", "-X", http_method, _shq(target_url)]
+        for key, value in headers.items():
+            parts += ["-H", _shq(f"{key}: {value}")]
+        if cookie_header:
+            parts += ["-H", _shq(f"Cookie: {cookie_header}")]
+        if body:
+            parts += ["--data-raw", _shq(body)]
+        parts += ["--compressed"]
+
+        replay_headers = dict(headers)
+        if cookie_header:
+            replay_headers["Cookie"] = cookie_header
+        http_call = (
+            "http_request(\n"
+            f"  url={target_url!r},\n"
+            f"  method={http_method!r},\n"
+            f"  headers={json.dumps(replay_headers)},\n"
+            + (f"  data={body!r},\n" if body else "")
+            + "  impersonate='chrome',\n)"
+        )
+
+        return ok(json.dumps({
+            "request_id": entry.get("request_id"),
+            "url": target_url,
+            "method": http_method,
+            "status": entry.get("status"),
+            "header_count": len(headers),
+            "has_body": bool(body),
+            "cookies_attached": bool(cookie_header),
+            "curl": " ".join(parts),
+            "http_request": http_call,
+            "note": (
+                "Prefer the http_request form: plain curl carries a curl TLS "
+                "fingerprint, which anti-bot systems flag even when every header "
+                "matches. impersonate='chrome' replays it with a real Chrome JA3."
+            ),
+        }, indent=2, default=str))
+    except Exception as e:
+        return err(str(e))
 
 
 @mcp.tool()

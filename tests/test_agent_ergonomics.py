@@ -1,5 +1,7 @@
 """Fast unit coverage for the agent-facing snapshot and identity helpers."""
 
+import json
+
 from mcp_stealth_chrome.snapshot import element_fingerprint, format_snapshot
 
 
@@ -126,6 +128,66 @@ def test_sqlite_snapshot_copies_wal_and_verifies(tmp_path):
     plain = tmp_path / "notes.txt"
     plain.write_text("not a database")
     assert _is_sqlite(plain) is False
+
+
+def test_client_security_state_patch_tolerates_missing_field():
+    """A KeyError here is raised inside the CDP listener and kills it silently.
+
+    Chrome 147+ can omit privateNetworkRequestPolicy; nodriver indexes it
+    directly. Once the listener dies every later network event is lost, which
+    looks like "the site sent nothing" rather than a crash — the same failure
+    shape as the sameParty cookie bug.
+    """
+    from mcp_stealth_chrome import patches
+    from nodriver.cdp import network as cdp_network
+
+    patches.apply_all()
+    state = cdp_network.ClientSecurityState.from_json({
+        "initiatorIsSecureContext": True,
+        "initiatorIPAddressSpace": "Public",
+    })
+    assert state.private_network_request_policy is not None
+
+
+def test_export_curl_builds_a_replayable_pair():
+    """The http_request form is the point: plain curl replays with a curl JA3."""
+    import asyncio
+
+    from mcp_stealth_chrome.server import BrowserState, mcp
+
+    previous = BrowserState.network_index
+    BrowserState.network_index = {
+        "42": {
+            "request_id": "42",
+            "url": "https://api.example.test/v1/items?page=2",
+            "method": "POST",
+            "status": 200,
+            "request_headers": {
+                "User-Agent": "Mozilla/5.0 (Macintosh)",
+                "Content-Type": "application/json",
+                "Content-Length": "17",      # recomputed per connection
+                "Host": "api.example.test",  # ditto
+                ":authority": "api.example.test",
+            },
+            "request_body": '{"q":"it\'s ok"}',
+        }
+    }
+    try:
+        raw = asyncio.run(mcp._tool_manager._tools["export_curl"].fn(
+            url_contains="/v1/items", include_cookies=False))
+        out = json.loads(raw)
+    finally:
+        BrowserState.network_index = previous
+
+    assert out["method"] == "POST"
+    assert "curl -X POST" in out["curl"]
+    assert "Content-Type: application/json" in out["curl"]
+    # Volatile headers must not be replayed: a stale Content-Length is itself a tell.
+    assert "Content-Length" not in out["curl"]
+    assert ":authority" not in out["curl"]
+    # The body carries a quote — it has to survive shell quoting intact.
+    assert """'{"q":"it'\\''s ok"}'""" in out["curl"]
+    assert "impersonate='chrome'" in out["http_request"]
 
 
 def test_privacy_proxy_supports_pool_and_session_token():

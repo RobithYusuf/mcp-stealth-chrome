@@ -11,7 +11,7 @@ both surfaced by the registry gate).
 """
 import sys
 
-EXPECTED_COUNT = 154
+EXPECTED_COUNT = 156
 EXPECTED_TOOLS = {
     # Lifecycle
     "browser_launch", "browser_close", "browser_recover",
@@ -51,11 +51,11 @@ EXPECTED_TOOLS = {
     "accessibility_snapshot",
     "console_start", "console_get", "console_clear",
     "network_start", "network_get",
-    "server_status", "get_page_errors", "export_har",
+    "server_status", "get_page_errors", "export_har", "export_curl",
     # Extraction
     "detect_content_pattern", "extract_structured", "extract_table", "scrape_page",
     # Stealth / captcha
-    "solve_captcha", "verify_cf", "fingerprint_rotate",
+    "solve_captcha", "verify_cf", "fingerprint_rotate", "fingerprint_audit",
     "identity_pin", "identity_show",
     "humanize_click", "humanize_type",
     "click_turnstile", "click_element_offset", "click_at_corner",
