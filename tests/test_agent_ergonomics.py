@@ -98,6 +98,130 @@ def test_target_key_is_shared_and_console_alias_delegates():
     assert _target_key(bare) == str(id(bare))
 
 
+def test_per_target_handlers_do_not_duplicate_and_network_mode_reconfigures(monkeypatch):
+    """A replacement Tab wrapper for one CDP target must not stack handlers."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from mcp_stealth_chrome import server
+
+    class _Target:
+        target_id = "TARGET-STABLE"
+
+    class _Tab:
+        target = _Target()
+
+        def __init__(self):
+            self.handlers = []
+
+        async def send(self, _command):
+            return None
+
+        def add_handler(self, event_type, handler):
+            self.handlers.append((event_type, handler))
+
+    first = _Tab()
+    replacement = _Tab()
+    active = iter((first, replacement))
+    monkeypatch.setattr(
+        server.BrowserState,
+        "active_tab",
+        classmethod(lambda cls: next(active)),
+    )
+
+    server._NETWORK_ARMED_TAB_IDS.clear()
+    server._NETWORK_CAPTURE_BODIES.clear()
+    old_logs = server.BrowserState.network_logs
+    old_index = server.BrowserState.network_index
+    try:
+        network_start = server.mcp._tool_manager._tools["network_start"].fn
+        asyncio.run(network_start(capture_bodies=False))
+        assert len(first.handlers) == 2
+
+        asyncio.run(network_start(capture_bodies=True))
+        assert replacement.handlers == []
+
+        request_handler = first.handlers[0][1]
+        event = SimpleNamespace(
+            request_id="request-1",
+            request=SimpleNamespace(
+                headers={}, url="https://example.test/", method="GET",
+                post_data=None,
+            ),
+            type_="Document",
+            timestamp=1,
+        )
+        asyncio.run(request_handler(event))
+        assert "request-1" in server.BrowserState.network_index
+    finally:
+        server._NETWORK_ARMED_TAB_IDS.clear()
+        server._NETWORK_CAPTURE_BODIES.clear()
+        server.BrowserState.network_logs = old_logs
+        server.BrowserState.network_index = old_index
+
+
+def test_dialog_handlers_use_stable_target_identity(monkeypatch):
+    import asyncio
+
+    from mcp_stealth_chrome import server
+
+    class _Target:
+        target_id = "DIALOG-TARGET"
+
+    class _Tab:
+        target = _Target()
+
+        def __init__(self):
+            self.handlers = []
+
+        def add_handler(self, event_type, handler):
+            self.handlers.append((event_type, handler))
+
+    first = _Tab()
+    replacement = _Tab()
+    active = iter((first, replacement))
+    monkeypatch.setattr(
+        server.BrowserState,
+        "active_tab",
+        classmethod(lambda cls: next(active)),
+    )
+    server._dialog_pre_action["_registered_tab_ids"].clear()
+    try:
+        dialog_handle = server.mcp._tool_manager._tools["dialog_handle"].fn
+        asyncio.run(dialog_handle(action="accept"))
+        asyncio.run(dialog_handle(action="dismiss"))
+        assert len(first.handlers) == 1
+        assert replacement.handlers == []
+    finally:
+        server._dialog_pre_action["_registered_tab_ids"].clear()
+
+
+def test_devtools_active_state_survives_tab_wrapper_replacement(monkeypatch):
+    import asyncio
+
+    from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import devtools
+
+    class _Target:
+        target_id = "DEVTOOLS-TARGET"
+
+    class _Tab:
+        target = _Target()
+
+    monkeypatch.setattr(
+        server.BrowserState,
+        "active_tab",
+        classmethod(lambda cls: _Tab()),
+    )
+    devtools._COVERAGE_ACTIVE.update({
+        "tab_id": "DEVTOOLS-TARGET", "js": False, "css": False,
+    })
+    coverage_stop = server.mcp._tool_manager._tools["coverage_stop"].fn
+    result = asyncio.run(coverage_stop())
+    assert not result.startswith("Error:")
+    assert devtools._COVERAGE_ACTIVE["tab_id"] is None
+
+
 def test_browser_roots_are_all_reported_and_selectable(monkeypatch):
     """Only surveying the first browser hides the profiles people actually use.
 

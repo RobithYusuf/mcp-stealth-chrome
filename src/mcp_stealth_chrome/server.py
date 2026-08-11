@@ -38,6 +38,7 @@ from .helpers import (
     ok,
     parse_json,
     resolve_ref,
+    target_key,
     ts_filename,
 )
 from .humanize import humanized_click, humanized_move, humanized_scroll, humanized_type
@@ -98,8 +99,7 @@ def _target_key(tab) -> str:
     pending human handoffs), which is why it lives here rather than inside any
     one of them.
     """
-    t = getattr(tab, "target", None)
-    return str(getattr(t, "target_id", None) or id(tab))
+    return target_key(tab)
 
 
 async def _wait(coro, timeout: Optional[float] = None, what: str = "operation"):
@@ -1059,6 +1059,7 @@ async def browser_close() -> str:
         _dialog_pre_action["_registered_tab_ids"].clear()
         _CONSOLE_ARMED_TAB_IDS.clear()
         _NETWORK_ARMED_TAB_IDS.clear()
+        _NETWORK_CAPTURE_BODIES.clear()
     except Exception:
         pass
     # Mark profile as cleanly exited so next launch skips restore dialog
@@ -1172,6 +1173,7 @@ async def browser_recover() -> str:
         _dialog_pre_action["_registered_tab_ids"].clear()
         _CONSOLE_ARMED_TAB_IDS.clear()
         _NETWORK_ARMED_TAB_IDS.clear()
+        _NETWORK_CAPTURE_BODIES.clear()
     except Exception:
         pass
 
@@ -3753,7 +3755,7 @@ async def scroll_to(
 # ══════════════════════════════════════════════════════════════════════════
 
 # Read-at-fire-time config so re-arming with a new action/text updates the
-# response without stacking another CDP handler. Keyed by tab id().
+# response without stacking another CDP handler. Keyed by CDP target id.
 _dialog_pre_action: dict[str, Any] = {
     "action": None, "text": None, "_registered_tab_ids": set(),
 }
@@ -3767,7 +3769,7 @@ async def dialog_handle(action: str = "accept", text: Optional[str] = None) -> s
     try:
         tab = BrowserState.active_tab()
         from nodriver.cdp import page as cdp_page
-        tid = id(tab)
+        tid = _target_key(tab)
         if tid in _dialog_pre_action["_registered_tab_ids"]:
             # Handler already armed on this tab — config updated above; don't
             # stack a second handler (which would accumulate every call).
@@ -3791,7 +3793,7 @@ async def dialog_handle(action: str = "accept", text: Optional[str] = None) -> s
 
 # ── dialog_auto_handle (persistent, type-filterable) ──────────────────────
 # Read-at-fire-time config so the LLM can update action/types without
-# re-registering the handler. Keyed by tab id() to avoid duplicate handlers
+# re-registering the handler. Keyed by CDP target id to avoid duplicate handlers
 # on the same tab.
 _DIALOG_AUTO_CFG: dict = {
     "enabled": False, "action": "accept", "text": "",
@@ -3813,6 +3815,7 @@ def _now_iso() -> str:
     from datetime import datetime
     return datetime.now().isoformat(timespec="seconds")
 _NETWORK_ARMED_TAB_IDS: set = set()
+_NETWORK_CAPTURE_BODIES: dict[str, bool] = {}
 
 
 @mcp.tool()
@@ -3859,7 +3862,7 @@ async def dialog_auto_handle(
 
     try:
         tab = BrowserState.active_tab()
-        tab_id = id(tab)
+        tab_id = _target_key(tab)
         if tab_id in _DIALOG_AUTO_CFG["_registered_tab_ids"]:
             return ok(
                 f"auto-handle config updated (action={action}, "
@@ -4059,6 +4062,11 @@ async def network_start(capture_bodies: bool = True) -> str:
         BrowserState.network_index = {}
         BrowserState.capture_network = True
         from nodriver.cdp import network as cdp_network
+        tid = _target_key(tab)
+        # The handler is installed once per target, but this option is mutable:
+        # a later network_start(capture_bodies=True) must change what that
+        # existing handler indexes instead of merely claiming that it did.
+        _NETWORK_CAPTURE_BODIES[tid] = bool(capture_bodies)
 
         # Enable Network domain so getResponseBody works later
         try:
@@ -4084,7 +4092,7 @@ async def network_start(capture_bodies: bool = True) -> str:
                     "size": None,
                     "timestamp": getattr(event, "timestamp", None),
                 }
-                if capture_bodies:
+                if _NETWORK_CAPTURE_BODIES.get(tid, False):
                     BrowserState.network_index[rid] = entry
                 BrowserState.network_logs.append({
                     "type": "request", "request_id": rid,
@@ -4113,7 +4121,6 @@ async def network_start(capture_bodies: bool = True) -> str:
             except Exception:
                 pass
 
-        tid = id(tab)
         if tid in _NETWORK_ARMED_TAB_IDS:
             return ok(
                 f"network capture started (capture_bodies={capture_bodies}); "

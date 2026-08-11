@@ -11,6 +11,12 @@ from nodriver import Element, Tab
 from .state import BrowserState
 
 
+def target_key(tab: Any) -> str:
+    """Stable per-tab identity backed by the CDP target id when available."""
+    target = getattr(tab, "target", None)
+    return str(getattr(target, "target_id", None) or id(tab))
+
+
 async def resolve_ref(ref: str) -> Element | None:
     """Find element by data-mcp-ref attribute set via SNAPSHOT_JS."""
     tab = BrowserState.active_tab()

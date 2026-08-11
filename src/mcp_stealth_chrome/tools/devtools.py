@@ -19,7 +19,14 @@ import time
 from typing import Any, Literal, Optional
 
 from .._app import mcp
-from ..helpers import confined_output_path, err, ok, parse_json, ts_filename
+from ..helpers import (
+    confined_output_path,
+    err,
+    ok,
+    parse_json,
+    target_key,
+    ts_filename,
+)
 from ..state import EXPORT_DIR, BrowserState, ensure_dirs
 
 
@@ -141,7 +148,7 @@ async def performance_trace_start(
                 pass
             raise
         _TRACE_ACTIVE.update({
-            "tab_id": id(tab),
+            "tab_id": target_key(tab),
             "started_at": time.time(),
             "categories": cats,
             "handler": on_data,
@@ -164,7 +171,7 @@ async def performance_trace_stop(filename: Optional[str] = None) -> str:
     handler = _TRACE_ACTIVE.get("handler")
     try:
         tab = BrowserState.active_tab()
-        if id(tab) != _TRACE_ACTIVE["tab_id"]:
+        if target_key(tab) != _TRACE_ACTIVE["tab_id"]:
             return err(
                 "active tab is not the one trace was started on — "
                 "switch back with switch_instance / tab_select before stop"
@@ -475,7 +482,7 @@ async def coverage_start(js: bool = True, css: bool = True) -> str:
             await tab.send(cdp_dom.enable())
             await tab.send(cdp_css.enable())
             await tab.send(cdp_css.start_rule_usage_tracking())
-        _COVERAGE_ACTIVE.update({"tab_id": id(tab), "js": js, "css": css})
+        _COVERAGE_ACTIVE.update({"tab_id": target_key(tab), "js": js, "css": css})
         return ok(f"coverage tracking started (js={js}, css={css})")
     except Exception as e:
         return err(str(e))
@@ -492,7 +499,7 @@ async def coverage_stop() -> str:
         return err("no coverage session — call coverage_start first")
     try:
         tab = BrowserState.active_tab()
-        if id(tab) != _COVERAGE_ACTIVE["tab_id"]:
+        if target_key(tab) != _COVERAGE_ACTIVE["tab_id"]:
             return err(
                 "active tab is not the one coverage was started on — "
                 "switch back before calling coverage_stop"
