@@ -2,7 +2,7 @@
 
 # MCP Stealth Chrome
 
-**156 tools** for AI agents that bypass Cloudflare, Turnstile, reCAPTCHA, and modern anti-bot systems — with an LLM-optimized action kit (`describe_page`, `smart_fill`, `workflow_run`, vision-LLM element locator) and a self-sufficient web-research kit (`web_search`, `scrape_markdown`, `deep_research`, `social_research`) layered on top of standard automation.
+**160 tools** for AI agents that bypass Cloudflare, Turnstile, reCAPTCHA, and modern anti-bot systems — with an LLM-optimized action kit (`describe_page`, `smart_fill`, `workflow_run`, vision-LLM element locator) and a self-sufficient web-research kit (`web_search`, `scrape_markdown`, `deep_research`, `social_research`) layered on top of standard automation.
 
 [![PyPI version](https://img.shields.io/pypi/v/mcp-stealth-chrome.svg)](https://pypi.org/project/mcp-stealth-chrome/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -263,7 +263,7 @@ Settings → Extensions → MCP Servers, or edit `~/.config/zed/settings.json`:
 
 ## 🔑 BYOK (Bring Your Own Key) — Optional
 
-`mcp-stealth-chrome` is **fully functional without any API key** — 153 of 156 tools work out of the box, including `click_turnstile` (Cloudflare Turnstile bypass), TLS-perfect HTTP, multi-instance, DevTools-level perf/coverage/emulation, the full LLM-optimized kit (`describe_page` / `smart_fill` / `workflow_run`), the web-research kit (`web_search` / `scrape_markdown` / `deep_research` / `social_research` — no search-API key needed), and all scraping tools.
+`mcp-stealth-chrome` is **fully functional without any API key** — 157 of 160 tools work out of the box, including `click_turnstile` (Cloudflare Turnstile bypass), TLS-perfect HTTP, multi-instance, DevTools-level perf/coverage/emulation, the full LLM-optimized kit (`describe_page` / `smart_fill` / `workflow_run`), the web-research kit (`web_search` / `scrape_markdown` / `deep_research` / `social_research` — no search-API key needed), and all scraping tools.
 
 **API keys are optional — only needed for 3 vision/solver tools:**
 
@@ -424,7 +424,7 @@ way? — without clicking) and **`wait_for_change`** (click-then-wait in one cal
 with an honest timeout). `screenshot(region_selector="css")` measures the crop box
 for you, removing the CSS-px-vs-device-px guesswork.
 
-## Tool Categories (156)
+## Tool Categories (160)
 
 ### ⭐⭐⭐ Self-Sufficient Web Research (new) — replaces firecrawl/tavily for most tasks
 Browserless-first (curl_cffi), escalates to the stealth browser only when a page is anti-bot blocked. Runs fully headless/API-mode and is ~10–12× lighter than driving Chrome for normal pages (verified: HTTP path 10–12× faster than headless render on example.com / Wikipedia).

@@ -11,7 +11,7 @@ both surfaced by the registry gate).
 """
 import sys
 
-EXPECTED_COUNT = 156
+EXPECTED_COUNT = 160
 EXPECTED_TOOLS = {
     # Lifecycle
     "browser_launch", "browser_close", "browser_recover",
@@ -51,6 +51,7 @@ EXPECTED_TOOLS = {
     "accessibility_snapshot",
     "console_start", "console_get", "console_clear",
     "network_start", "network_get",
+    "intercept_start", "intercept_log", "intercept_stop", "dry_run",
     "server_status", "get_page_errors", "export_har", "export_curl",
     # Extraction
     "detect_content_pattern", "extract_structured", "extract_table", "scrape_page",
