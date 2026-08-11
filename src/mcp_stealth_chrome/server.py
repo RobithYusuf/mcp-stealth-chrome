@@ -1008,10 +1008,6 @@ async def browser_close() -> str:
         stale_privacy_profile = (
             BrowserState.current_profile_dir if BrowserState.current_privacy else None
         )
-        BrowserState.current_headless = False
-        BrowserState.current_privacy = False
-        BrowserState.current_fingerprint = {}
-        BrowserState.current_proxy = None
         if stale_privacy_profile is not None:
             removed = await _remove_privacy_profile(stale_privacy_profile)
             if not removed:
@@ -1019,6 +1015,11 @@ async def browser_close() -> str:
                     "Browser was not running and stale privacy profile cleanup failed: "
                     f"{stale_privacy_profile}"
                 )
+        BrowserState.current_headless = False
+        BrowserState.current_privacy = False
+        BrowserState.current_fingerprint = {}
+        BrowserState.current_proxy = None
+        if stale_privacy_profile is not None:
             return ok("Browser was not running; stale privacy profile removed.")
         return ok("Browser was not running.")
     privacy_profile = (
@@ -1066,6 +1067,11 @@ async def browser_close() -> str:
     if privacy_profile is not None:
         removed = await _remove_privacy_profile(privacy_profile)
         if not removed:
+            # Keep the cleanup obligation discoverable/retryable. The browser
+            # is closed, but a privacy close is not complete until the residue
+            # is gone.
+            BrowserState.current_profile_dir = privacy_profile
+            BrowserState.current_privacy = True
             return err(
                 f"Browser closed, but privacy profile cleanup failed: {privacy_profile}"
             )
@@ -5900,6 +5906,8 @@ async def close_instance(instance_id: str) -> str:
             BrowserState.current_proxy = None
             if _privacy:
                 if not await _remove_privacy_profile(_profile):
+                    BrowserState.current_profile_dir = _profile
+                    BrowserState.current_privacy = True
                     return err(f"closed browser but failed to remove privacy profile {_profile}")
             elif _profile:
                 clean_profile_state(_profile)
@@ -5907,12 +5915,12 @@ async def close_instance(instance_id: str) -> str:
             return ok(f"closed current instance {instance_id!r}")
         if BrowserState.current_privacy:
             _profile = BrowserState.current_profile_dir
+            if not await _remove_privacy_profile(_profile):
+                return err(f"failed to remove stale privacy profile {_profile}")
             BrowserState.current_privacy = False
             BrowserState.current_headless = False
             BrowserState.current_fingerprint = {}
             BrowserState.current_proxy = None
-            if not await _remove_privacy_profile(_profile):
-                return err(f"failed to remove stale privacy profile {_profile}")
             return ok(f"current instance {instance_id!r} was not running; privacy profile removed")
         return ok(f"current instance {instance_id!r} was not running")
     # Close stored
@@ -5922,17 +5930,24 @@ async def close_instance(instance_id: str) -> str:
     try:
         if snap.browser:
             snap.browser.stop()
-    except Exception:
-        pass
+    except Exception as e:
+        return err(
+            f"close failed for instance {instance_id!r}: {type(e).__name__}: {e}; "
+            "instance retained for retry"
+        )
+    # Chrome is stopped even if residue cleanup below fails. Retain a minimal
+    # snapshot in that case so a second close_instance call can retry cleanup.
+    snap.browser = None
+    snap.tabs = []
     cleanup_ok = True
     if snap.privacy:
         cleanup_ok = await _remove_privacy_profile(snap.profile_dir)
     elif snap.profile_dir:
         clean_profile_state(snap.profile_dir)
-    BrowserState.instances.pop(instance_id, None)
-    _ATTACHED_BROWSERS.discard(instance_id)
     if not cleanup_ok:
         return err(f"closed browser but failed to remove privacy profile {snap.profile_dir}")
+    BrowserState.instances.pop(instance_id, None)
+    _ATTACHED_BROWSERS.discard(instance_id)
     return ok(f"closed instance {instance_id!r}")
 
 
@@ -5940,19 +5955,25 @@ async def close_instance(instance_id: str) -> str:
 async def close_all_instances() -> str:
     """⭐ Close every running browser instance. Useful for cleanup."""
     closed = []
+    failures = []
     # Close stored
     for iid, snap in list(BrowserState.instances.items()):
         try:
             if snap.browser:
                 snap.browser.stop()
-        except Exception:
-            pass
+        except Exception as e:
+            failures.append(f"{iid}: stop failed ({type(e).__name__}: {e})")
+            continue
+        snap.browser = None
+        snap.tabs = []
         if snap.privacy:
-            await _remove_privacy_profile(snap.profile_dir)
+            if not await _remove_privacy_profile(snap.profile_dir):
+                failures.append(f"{iid}: privacy cleanup failed ({snap.profile_dir})")
+                continue
         elif snap.profile_dir:
             clean_profile_state(snap.profile_dir)
+        BrowserState.instances.pop(iid, None)
         closed.append(iid)
-    BrowserState.instances.clear()
     # Close current
     if BrowserState.is_up():
         _current_profile = BrowserState.current_profile_dir
@@ -5960,22 +5981,50 @@ async def close_all_instances() -> str:
         try:
             if BrowserState.browser:
                 BrowserState.browser.stop()
-        except Exception:
-            pass
-        if _current_privacy:
-            await _remove_privacy_profile(_current_profile)
-        elif _current_profile:
-            clean_profile_state(_current_profile)
-        closed.append(BrowserState.current_instance_id)
+        except Exception as e:
+            failures.append(
+                f"{BrowserState.current_instance_id}: stop failed "
+                f"({type(e).__name__}: {e})"
+            )
+        else:
+            cleanup_ok = True
+            if _current_privacy:
+                cleanup_ok = await _remove_privacy_profile(_current_profile)
+            elif _current_profile:
+                clean_profile_state(_current_profile)
+            if cleanup_ok:
+                closed.append(BrowserState.current_instance_id)
+                BrowserState.reset()
+                BrowserState.current_headless = False
+                BrowserState.current_privacy = False
+                BrowserState.current_fingerprint = {}
+                BrowserState.current_proxy = None
+            else:
+                BrowserState.reset()
+                BrowserState.current_profile_dir = _current_profile
+                BrowserState.current_privacy = True
+                failures.append(
+                    f"{BrowserState.current_instance_id}: privacy cleanup failed "
+                    f"({_current_profile})"
+                )
     elif BrowserState.current_privacy:
-        await _remove_privacy_profile(BrowserState.current_profile_dir)
-    BrowserState.reset()
-    BrowserState.current_headless = False
-    BrowserState.current_privacy = False
-    BrowserState.current_fingerprint = {}
-    BrowserState.current_proxy = None
+        if await _remove_privacy_profile(BrowserState.current_profile_dir):
+            BrowserState.current_privacy = False
+            BrowserState.current_headless = False
+            BrowserState.current_fingerprint = {}
+            BrowserState.current_proxy = None
+        else:
+            failures.append(
+                f"{BrowserState.current_instance_id}: stale privacy cleanup failed "
+                f"({BrowserState.current_profile_dir})"
+            )
     for _iid in closed:
         _ATTACHED_BROWSERS.discard(_iid)
+    if failures:
+        return err(
+            f"closed {len(closed)} instance(s): {closed}; "
+            f"{len(failures)} failure(s): {' | '.join(failures)}"
+        )
     return ok(f"closed {len(closed)} instance(s): {closed}")
 
 

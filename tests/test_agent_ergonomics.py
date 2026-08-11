@@ -359,6 +359,110 @@ def test_windows_brave_binary_and_opera_profile_root(monkeypatch, tmp_path):
     assert ("opera", opera) in state.chrome_user_data_roots()
 
 
+def test_close_instance_keeps_failed_browser_for_retry(monkeypatch):
+    import asyncio
+
+    from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.state import InstanceSnapshot
+
+    class _BrokenBrowser:
+        def stop(self):
+            raise RuntimeError("still alive")
+
+    snap = InstanceSnapshot(
+        instance_id="worker", browser=_BrokenBrowser(), tabs=[object()]
+    )
+    monkeypatch.setattr(server.BrowserState, "instances", {"worker": snap})
+    monkeypatch.setattr(server.BrowserState, "current_instance_id", "main")
+    close = server.mcp._tool_manager._tools["close_instance"].fn
+    result = asyncio.run(close("worker"))
+    assert result.startswith("Error: close failed")
+    assert server.BrowserState.instances["worker"] is snap
+    assert snap.browser is not None
+
+
+def test_close_instance_retains_failed_privacy_cleanup(monkeypatch, tmp_path):
+    import asyncio
+
+    from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.state import InstanceSnapshot
+
+    class _Browser:
+        def stop(self):
+            return None
+
+    async def _cleanup_fails(_path):
+        return False
+
+    profile = tmp_path / "privacy"
+    snap = InstanceSnapshot(
+        instance_id="private", browser=_Browser(), tabs=[object()],
+        profile_dir=profile, privacy=True,
+    )
+    monkeypatch.setattr(server.BrowserState, "instances", {"private": snap})
+    monkeypatch.setattr(server.BrowserState, "current_instance_id", "main")
+    monkeypatch.setattr(server, "_remove_privacy_profile", _cleanup_fails)
+    close = server.mcp._tool_manager._tools["close_instance"].fn
+    result = asyncio.run(close("private"))
+    assert result.startswith("Error: closed browser but failed")
+    assert server.BrowserState.instances["private"] is snap
+    assert snap.browser is None
+    assert snap.tabs == []
+
+
+def test_close_current_retains_failed_privacy_cleanup(monkeypatch, tmp_path):
+    import asyncio
+    from types import SimpleNamespace
+
+    from mcp_stealth_chrome import server
+
+    class _Browser:
+        _process = SimpleNamespace(returncode=None)
+        stopped = False
+
+        def stop(self):
+            return None
+
+    async def _cleanup_fails(_path):
+        return False
+
+    profile = tmp_path / "privacy-current"
+    monkeypatch.setattr(server.BrowserState, "current_instance_id", "private")
+    monkeypatch.setattr(server.BrowserState, "browser", _Browser())
+    monkeypatch.setattr(server.BrowserState, "tabs", [object()])
+    monkeypatch.setattr(server.BrowserState, "current_profile_dir", profile)
+    monkeypatch.setattr(server.BrowserState, "current_privacy", True)
+    monkeypatch.setattr(server, "_remove_privacy_profile", _cleanup_fails)
+    close = server.mcp._tool_manager._tools["close_instance"].fn
+    result = asyncio.run(close("private"))
+    assert result.startswith("Error: closed browser but failed")
+    assert server.BrowserState.current_privacy is True
+    assert server.BrowserState.current_profile_dir == profile
+
+
+def test_close_all_reports_and_retains_stop_failures(monkeypatch):
+    import asyncio
+
+    from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.state import InstanceSnapshot
+
+    class _BrokenBrowser:
+        def stop(self):
+            raise RuntimeError("refused")
+
+    snap = InstanceSnapshot(
+        instance_id="stuck", browser=_BrokenBrowser(), tabs=[object()]
+    )
+    monkeypatch.setattr(server.BrowserState, "instances", {"stuck": snap})
+    monkeypatch.setattr(server.BrowserState, "browser", None)
+    monkeypatch.setattr(server.BrowserState, "tabs", [])
+    monkeypatch.setattr(server.BrowserState, "current_privacy", False)
+    close_all = server.mcp._tool_manager._tools["close_all_instances"].fn
+    result = asyncio.run(close_all())
+    assert result.startswith("Error: closed 0 instance(s)")
+    assert server.BrowserState.instances["stuck"] is snap
+
+
 def test_sqlite_snapshot_copies_wal_and_verifies(tmp_path):
     """Cloning a live profile must not depend on Connection.backup().
 
