@@ -1,8 +1,31 @@
 """Runtime monkey-patches for upstream bugs in nodriver 0.48.x.
 
 Apply by importing this module once at server startup. Patches are idempotent.
+
+Failure is recorded rather than raised: a broken patch must not stop the server
+from starting. But it must not be invisible either — the documented failure mode
+is a dead CDP listener, which looks like "the site sent nothing" rather than a
+crash. `status()` exposes what applied, and server_status surfaces it.
 """
 from __future__ import annotations
+
+# name -> True (applied) | str (why it did not)
+_STATUS: dict[str, object] = {}
+
+
+def status() -> dict:
+    """What each compatibility patch did. Read by server_status."""
+    failed = {k: v for k, v in _STATUS.items() if v is not True}
+    return {
+        "applied": sorted(k for k, v in _STATUS.items() if v is True),
+        "failed": failed,
+        "healthy": not failed,
+        "note": (
+            "A failed patch means nodriver will raise inside the CDP event "
+            "listener, killing it — captures then return empty instead of "
+            "erroring. Upgrade/downgrade nodriver if this is non-empty."
+        ) if failed else None,
+    }
 
 
 def _patch_cookie_same_party() -> None:
@@ -30,8 +53,9 @@ def _patch_cookie_same_party() -> None:
 
         cdp_network.Cookie.from_json = patched_from_json
         cdp_network.Cookie._mcp_sameparty_patched = True
-    except Exception:
-        pass  # never block server startup on patch failure
+        _STATUS["cookie_same_party"] = True
+    except Exception as e:  # never block server startup on patch failure
+        _STATUS["cookie_same_party"] = f"{type(e).__name__}: {e}"
 
 
 def _patch_client_security_state() -> None:
@@ -64,8 +88,9 @@ def _patch_client_security_state() -> None:
 
         target.from_json = patched_from_json
         target._mcp_css_patched = True
-    except Exception:
-        pass  # never block server startup on patch failure
+        _STATUS["client_security_state"] = True
+    except Exception as e:  # never block server startup on patch failure
+        _STATUS["client_security_state"] = f"{type(e).__name__}: {e}"
 
 
 def apply_all() -> None:

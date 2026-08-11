@@ -93,6 +93,9 @@ B64_INLINE_LIMIT = int(os.environ.get("B64_INLINE_LIMIT", "60000"))
 # is preferable to an unbounded climb nobody notices until it matters.
 CAPTURE_MAX_EVENTS = int(os.environ.get("CAPTURE_MAX_EVENTS", "5000"))
 CAPTURE_MAX_INDEXED = int(os.environ.get("CAPTURE_MAX_INDEXED", "1000"))
+# Named storage snapshots are keyed by a caller-supplied name, so a loop that
+# varies the name would otherwise retain every snapshot for the process lifetime.
+_STORAGE_SNAPSHOT_LIMIT = int(os.environ.get("STORAGE_SNAPSHOT_LIMIT", "50"))
 
 
 def _trim_capture(buffer: list) -> None:
@@ -4297,20 +4300,30 @@ async def network_get(
 
 @mcp.tool()
 async def server_status() -> str:
-    """Diagnostic info about the server and browser."""
+    """Diagnostic info about the server, browser, and CDP compatibility patches.
+
+    `compat_patches` is the one worth reading when captures come back empty: a
+    nodriver compatibility patch that failed to apply does not crash anything —
+    it makes the CDP event listener die on the first mismatched payload, so
+    console/network capture returns nothing and looks like a quiet page.
+    """
     status = {
         "version": __version__,
         "browser_running": BrowserState.is_up(),
+        "instance": BrowserState.current_instance_id,
         "tabs": len(BrowserState.tabs),
         "active_tab": BrowserState.active_tab_index,
         "console_capture": BrowserState.capture_console,
         "network_capture": BrowserState.capture_network,
         "console_logs": len(BrowserState.console_logs),
         "network_logs": len(BrowserState.network_logs),
+        "network_indexed": len(BrowserState.network_index),
         "page_errors": len(BrowserState.page_errors),
-        "profile_dir": str(PROFILE_DIR),
+        "intercepting": bool(_INTERCEPT.get("active")),
+        "profile_dir": str(BrowserState.current_profile_dir or PROFILE_DIR),
+        "compat_patches": _patches.status(),
     }
-    return ok(json.dumps(status, indent=2))
+    return ok(json.dumps(status, indent=2, default=str))
 
 
 @mcp.tool()
@@ -6812,11 +6825,29 @@ async def clone_chrome_profile(
         "target_size_mb": round(total_size / 1024 / 1024, 1),
         "cache_skipped_mb": round(skipped_cache_bytes / 1024 / 1024, 1),
         "errors": errors[:10],  # cap error list
-        "next_step": (
-            f"spawn_browser(instance_id='{target_instance_id}', "
-            f"url='https://example.com', headless=False)"
+        "verification_scope": (
+            "Top-level SQLite files are integrity-checked. Databases nested in "
+            "subdirectories are copied without a check, and a live source is a "
+            "structural copy, not an atomic point-in-time snapshot — a "
+            "transaction committed mid-copy can be missing."
         ),
     }
+    # A clone with a corrupt cookie jar looks identical to a good one until a
+    # login silently fails hours later, so a suspect database is an error here
+    # rather than a field somebody has to notice. The copy is left in place to
+    # be inspected; naming it as the next step would endorse it.
+    if suspect_dbs or errors:
+        result["usable"] = False
+        result["recovery"] = (
+            "Re-run with the source browser CLOSED for a clean copy, or delete "
+            f"{target_root} and retry. The partial copy was kept for inspection."
+        )
+        return err(json.dumps(result, indent=2, default=str))
+    result["usable"] = True
+    result["next_step"] = (
+        f"spawn_browser(instance_id='{target_instance_id}', "
+        f"url='https://example.com', headless=False)"
+    )
     return ok(json.dumps(result, indent=2, default=str))
 
 
@@ -7341,14 +7372,26 @@ _STORAGE_SNAPSHOTS: dict[str, dict] = {}
 
 
 async def _take_storage_snapshot(tab) -> dict:
-    """Capture cookies + localStorage + sessionStorage + url + title."""
+    """Capture cookies + localStorage + sessionStorage + url + title.
+
+    Every area records whether it was actually MEASURED. An unreadable area used
+    to fall back to its empty default, so a snapshot that failed to read cookies
+    was indistinguishable from a page that genuinely had none — and storage_diff
+    would then report every real cookie as "removed". Failures are collected in
+    `errors` and the area is marked unmeasured instead of being invented.
+    """
     snap: dict = {"url": "", "title": "", "cookies": [],
-                   "localStorage": {}, "sessionStorage": {}}
+                   "localStorage": {}, "sessionStorage": {},
+                   "errors": {}, "measured": {
+                       "url": False, "cookies": False,
+                       "localStorage": False, "sessionStorage": False,
+                   }}
     try:
         snap["url"] = await get_url(tab)
         snap["title"] = await get_title(tab)
-    except Exception:
-        pass
+        snap["measured"]["url"] = True
+    except Exception as e:
+        snap["errors"]["url"] = f"{type(e).__name__}: {e}"
     try:
         from nodriver.cdp import network as cdp_network
         cookies = await _wait(tab.send(cdp_network.get_cookies()),
@@ -7359,42 +7402,59 @@ async def _take_storage_snapshot(tab) -> dict:
             "domain": getattr(c, "domain", ""),
             "path": getattr(c, "path", "/"),
         } for c in (cookies or [])]
-    except Exception:
-        pass
-    try:
-        ls_raw = await _wait(tab.evaluate(
-            "JSON.stringify(Object.fromEntries(Object.entries(localStorage)))",
-            return_by_value=True,
-        ), what="storage_snapshot localStorage")
-        snap["localStorage"] = parse_json(
-            str(ls_raw.value if hasattr(ls_raw, "value") else ls_raw), {}) or {}
-    except Exception:
-        pass
-    try:
-        ss_raw = await _wait(tab.evaluate(
-            "JSON.stringify(Object.fromEntries(Object.entries(sessionStorage)))",
-            return_by_value=True,
-        ), what="storage_snapshot sessionStorage")
-        snap["sessionStorage"] = parse_json(
-            str(ss_raw.value if hasattr(ss_raw, "value") else ss_raw), {}) or {}
-    except Exception:
-        pass
+        snap["measured"]["cookies"] = True
+    except Exception as e:
+        snap["errors"]["cookies"] = f"{type(e).__name__}: {e}"
+    for area in ("localStorage", "sessionStorage"):
+        try:
+            raw = await _wait(tab.evaluate(
+                f"JSON.stringify(Object.fromEntries(Object.entries({area})))",
+                return_by_value=True,
+            ), what=f"storage_snapshot {area}")
+            value = str(raw.value if hasattr(raw, "value") else raw)
+            parsed = parse_json(value, None)
+            if not isinstance(parsed, dict):
+                # Storage is often blocked outright (file://, sandboxed frames,
+                # third-party cookie policy). That is a real answer, not "empty".
+                raise ValueError(f"unparseable {area} payload")
+            snap[area] = parsed
+            snap["measured"][area] = True
+        except Exception as e:
+            snap["errors"][area] = f"{type(e).__name__}: {e}"
     return snap
 
 
 @mcp.tool()
 async def storage_snapshot(name: str = "default") -> str:
-    """⭐ Capture cookies + localStorage + sessionStorage + URL into named slot
-    for later diffing. Use BEFORE an action you want to inspect."""
+    """⭐ Capture cookies + localStorage + sessionStorage + URL into a named slot
+    for later diffing. Use BEFORE an action you want to inspect.
+
+    Areas that could not be read are reported as unmeasured rather than empty:
+    a snapshot that silently failed to read cookies would make storage_diff
+    announce every existing cookie as "removed" by the action under test.
+    """
     try:
         tab = BrowserState.active_tab()
         snap = await _take_storage_snapshot(tab)
         _STORAGE_SNAPSHOTS[name] = snap
-        return ok(
-            f"snapshot '{name}': {len(snap['cookies'])} cookies, "
-            f"{len(snap['localStorage'])} localStorage, "
-            f"{len(snap['sessionStorage'])} sessionStorage at {snap['url']}"
-        )
+        if len(_STORAGE_SNAPSHOTS) > _STORAGE_SNAPSHOT_LIMIT:
+            for stale in list(_STORAGE_SNAPSHOTS)[:-_STORAGE_SNAPSHOT_LIMIT]:
+                _STORAGE_SNAPSHOTS.pop(stale, None)
+
+        def _area(label: str, count: int) -> str:
+            return f"{count} {label}" if snap["measured"].get(
+                "cookies" if label == "cookies" else label) else f"{label} UNMEASURED"
+
+        parts = [
+            _area("cookies", len(snap["cookies"])),
+            _area("localStorage", len(snap["localStorage"])),
+            _area("sessionStorage", len(snap["sessionStorage"])),
+        ]
+        line = f"snapshot '{name}': {', '.join(parts)} at {snap['url'] or '(url unmeasured)'}"
+        if snap["errors"]:
+            return ok(line + "\nUNMEASURED areas (values below are NOT zero, they "
+                             "are unknown): " + json.dumps(snap["errors"]))
+        return ok(line)
     except Exception as e:
         return err(str(e))
 
@@ -7451,6 +7511,27 @@ async def storage_diff(name: str = "default") -> str:
             "localStorage": _kvdiff(before["localStorage"], after["localStorage"]),
             "sessionStorage": _kvdiff(before["sessionStorage"], after["sessionStorage"]),
         }
+        # An area that could not be read on either side produces a diff that
+        # LOOKS decisive and is not: unreadable cookies before + readable after
+        # renders every existing cookie as "added" by the action under test.
+        # Name those areas so the numbers are not taken at face value.
+        unreliable = sorted({
+            area
+            for side in (before, after)
+            for area, was_measured in (side.get("measured") or {}).items()
+            if not was_measured
+        })
+        if unreliable:
+            diff["unreliable_areas"] = unreliable
+            diff["warning"] = (
+                "These areas were NOT measured on at least one side, so their "
+                "diff is meaningless — differences shown for them reflect a "
+                "failed read, not a change made by the action."
+            )
+            diff["measurement_errors"] = {
+                "before": before.get("errors") or {},
+                "after": after.get("errors") or {},
+            }
         return ok(json.dumps(diff, indent=2, ensure_ascii=False))
     except Exception as e:
         return err(str(e))

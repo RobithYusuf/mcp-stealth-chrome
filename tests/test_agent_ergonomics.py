@@ -946,3 +946,78 @@ def test_capture_buffers_are_bounded():
     assert len(index) == srv.CAPTURE_MAX_INDEXED
     assert str(srv.CAPTURE_MAX_INDEXED + 39) in index
     assert "0" not in index
+
+
+def test_storage_snapshot_marks_unmeasured_areas_instead_of_empty():
+    """An unreadable area must not masquerade as an empty one.
+
+    If cookies fail to read and fall back to [], storage_diff then reports every
+    real cookie as "removed" — the action under test gets blamed for a failed
+    measurement.
+    """
+    import asyncio
+
+    from mcp_stealth_chrome.server import _take_storage_snapshot
+
+    class _Tab:
+        async def send(self, _cmd):
+            raise RuntimeError("cookies unavailable")
+
+        async def evaluate(self, _expr, **_kw):
+            raise RuntimeError("storage blocked")
+
+    snap = asyncio.run(_take_storage_snapshot(_Tab()))
+    assert snap["measured"]["cookies"] is False
+    assert snap["measured"]["localStorage"] is False
+    assert "cookies" in snap["errors"] and "localStorage" in snap["errors"]
+    # The empty containers are still there for shape, but nothing claims they
+    # were measured.
+    assert snap["cookies"] == [] and snap["localStorage"] == {}
+
+
+def test_storage_diff_flags_areas_it_could_not_measure():
+    import asyncio
+    import json as _json
+
+    import mcp_stealth_chrome.server as srv
+
+    before = {
+        "url": "https://a.test/", "title": "a", "cookies": [],
+        "localStorage": {}, "sessionStorage": {},
+        "errors": {"cookies": "RuntimeError: boom"},
+        "measured": {"url": True, "cookies": False,
+                     "localStorage": True, "sessionStorage": True},
+    }
+    after = dict(before, errors={}, measured={"url": True, "cookies": True,
+                                              "localStorage": True,
+                                              "sessionStorage": True})
+    srv._STORAGE_SNAPSHOTS["unit_diff"] = before
+
+    async def fake_snapshot(_tab):
+        return after
+
+    original = srv._take_storage_snapshot
+    original_tab = srv.BrowserState.active_tab
+    srv._take_storage_snapshot = fake_snapshot
+    srv.BrowserState.active_tab = classmethod(lambda cls: object())
+    try:
+        out = _json.loads(asyncio.run(
+            srv.mcp._tool_manager._tools["storage_diff"].fn("unit_diff")))
+    finally:
+        srv._take_storage_snapshot = original
+        srv.BrowserState.active_tab = original_tab
+        srv._STORAGE_SNAPSHOTS.pop("unit_diff", None)
+
+    assert out["unreliable_areas"] == ["cookies"]
+    assert "meaningless" in out["warning"]
+
+
+def test_compat_patch_status_is_visible():
+    """A silently failed patch kills the CDP listener; it must be inspectable."""
+    from mcp_stealth_chrome import patches
+
+    patches.apply_all()
+    st = patches.status()
+    assert st["healthy"] is True
+    assert "cookie_same_party" in st["applied"]
+    assert "client_security_state" in st["applied"]
