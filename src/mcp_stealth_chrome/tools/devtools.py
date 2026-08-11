@@ -184,12 +184,13 @@ async def performance_trace_stop(filename: Optional[str] = None) -> str:
             complete.set()
 
         tab.add_handler(cdp_tracing.TracingComplete, on_complete)
-        await tab.send(cdp_tracing.end())
         try:
-            await asyncio.wait_for(complete.wait(), timeout=10.0)
-        except asyncio.TimeoutError:
-            # Fall through with whatever events we've received so far
-            pass
+            await tab.send(cdp_tracing.end())
+            try:
+                await asyncio.wait_for(complete.wait(), timeout=10.0)
+            except asyncio.TimeoutError:
+                # Fall through with whatever events we've received so far
+                pass
         finally:
             try:
                 tab.remove_handler(cdp_tracing.TracingComplete, on_complete)

@@ -287,6 +287,78 @@ def test_devtools_active_state_survives_tab_wrapper_replacement(monkeypatch):
     assert devtools._COVERAGE_ACTIVE["tab_id"] is None
 
 
+def test_tab_cache_cleanup_preserves_other_live_targets(monkeypatch):
+    from mcp_stealth_chrome import server
+
+    class _TargetA:
+        target_id = "TARGET-A"
+
+    class _TargetB:
+        target_id = "TARGET-B"
+
+    class _TabA:
+        target = _TargetA()
+
+    monkeypatch.setattr(server, "_SNAPSHOT_CACHE", {
+        "TARGET-A": {"hash": "a"}, "TARGET-B": {"hash": "b"},
+    })
+    monkeypatch.setattr(server, "_HUMAN_HELP", {
+        "TARGET-A": {"objective": "a"}, "TARGET-B": {"objective": "b"},
+    })
+    monkeypatch.setattr(server, "_NETWORK_ARMED_TAB_IDS", {"TARGET-A", "TARGET-B"})
+    monkeypatch.setattr(server, "_NETWORK_CAPTURE_BODIES", {
+        "TARGET-A": True, "TARGET-B": False,
+    })
+
+    server._clear_tab_scoped_state([_TabA()])
+
+    assert set(server._SNAPSHOT_CACHE) == {"TARGET-B"}
+    assert set(server._HUMAN_HELP) == {"TARGET-B"}
+    assert server._NETWORK_ARMED_TAB_IDS == {"TARGET-B"}
+    assert server._NETWORK_CAPTURE_BODIES == {"TARGET-B": False}
+
+
+def test_trace_stop_removes_handlers_when_cdp_end_fails(monkeypatch):
+    import asyncio
+    from collections import defaultdict
+
+    from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import devtools
+
+    class _Target:
+        target_id = "TRACE-TARGET"
+
+    class _Tab:
+        target = _Target()
+
+        def __init__(self):
+            self.handlers = defaultdict(list)
+
+        def add_handler(self, event_type, handler):
+            self.handlers[event_type].append(handler)
+
+        def remove_handler(self, event_type, handler):
+            self.handlers[event_type].remove(handler)
+
+        async def send(self, _command):
+            raise RuntimeError("Tracing.end failed")
+
+    tab = _Tab()
+    monkeypatch.setattr(
+        server.BrowserState,
+        "active_tab",
+        classmethod(lambda cls: tab),
+    )
+    devtools._TRACE_ACTIVE.update({
+        "tab_id": "TRACE-TARGET", "started_at": 1.0,
+        "categories": "x", "handler": lambda _event: None,
+    })
+    stop = server.mcp._tool_manager._tools["performance_trace_stop"].fn
+    result = asyncio.run(stop())
+    assert result.startswith("Error: Tracing.end failed")
+    assert all(not handlers for handlers in tab.handlers.values())
+
+
 def test_browser_roots_are_all_reported_and_selectable(monkeypatch):
     """Only surveying the first browser hides the profiles people actually use.
 

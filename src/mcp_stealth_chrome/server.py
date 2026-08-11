@@ -1026,6 +1026,7 @@ async def browser_close() -> str:
         BrowserState.current_profile_dir if BrowserState.current_privacy else None
     )
     closed_profile = BrowserState.current_profile_dir
+    closed_tabs = list(BrowserState.tabs)
     try:
         if BrowserState.browser:
             BrowserState.browser.stop()
@@ -1040,29 +1041,7 @@ async def browser_close() -> str:
     BrowserState.current_fingerprint = {}
     BrowserState.current_proxy = None
     _ATTACHED_BROWSERS.discard(_closed_iid)
-    # Clear transient caches that key off tab identity (id() can be reused).
-    # devtools state lives in tools/devtools.py — lazy import + tolerate
-    # the module not being loaded yet (no devtools tool ever called).
-    _SNAPSHOT_CACHE.clear()
-    _HUMAN_HELP.clear()
-    try:
-        from .tools import devtools as _dt
-        _dt._TRACE_ACTIVE.update({"tab_id": None, "started_at": 0.0,
-                                   "categories": "", "handler": None})
-        _dt._TRACE_BUFFER.clear()
-        _dt._COVERAGE_ACTIVE.update({"tab_id": None, "js": False, "css": False})
-    except Exception:
-        pass
-    # Drop registered dialog handler tab IDs so a new tab with a recycled
-    # id() doesn't get skipped on re-arm.
-    try:
-        _DIALOG_AUTO_CFG["_registered_tab_ids"].clear()
-        _dialog_pre_action["_registered_tab_ids"].clear()
-        _CONSOLE_ARMED_TAB_IDS.clear()
-        _NETWORK_ARMED_TAB_IDS.clear()
-        _NETWORK_CAPTURE_BODIES.clear()
-    except Exception:
-        pass
+    _clear_tab_scoped_state(closed_tabs)
     # Mark profile as cleanly exited so next launch skips restore dialog
     if privacy_profile is not None:
         removed = await _remove_privacy_profile(privacy_profile)
@@ -1090,7 +1069,7 @@ async def browser_recover() -> str:
     2. Kill orphan Chrome PIDs whose argv references the active profile
        (SIGTERM, then SIGKILL after 2s if still alive) — only PIDs spawned
        against THIS MCP profile, never the user's daily Chrome
-    3. Reset BrowserState (clears tabs, instances, network index, locks)
+    3. Reset the current BrowserState (background instances keep running)
     4. Clear devtools / dialog caches
     5. Wipe stale Singleton* lock files in all known profile dirs
 
@@ -1103,6 +1082,8 @@ async def browser_recover() -> str:
     # 1. Best-effort stop. Capture profile dir BEFORE reset so step 2 can
     #    target only Chrome PIDs that belong to this profile.
     target_profile = BrowserState.current_profile_dir
+    target_tabs = list(BrowserState.tabs)
+    target_iid = BrowserState.current_instance_id
     try:
         b = BrowserState.browser
         if b and not getattr(b, "stopped", False):
@@ -1160,28 +1141,11 @@ async def browser_recover() -> str:
     except Exception as e:
         steps.append(f"state reset failed: {type(e).__name__}: {e}")
 
-    # 4. Clear caches
-    try:
-        _SNAPSHOT_CACHE.clear()
-        _HUMAN_HELP.clear()
-    except Exception:
-        pass
-    try:
-        from .tools import devtools as _dt
-        _dt._TRACE_ACTIVE.update({"tab_id": None, "started_at": 0.0,
-                                   "categories": "", "handler": None})
-        _dt._TRACE_BUFFER.clear()
-        _dt._COVERAGE_ACTIVE.update({"tab_id": None, "js": False, "css": False})
-    except Exception:
-        pass
-    try:
-        _DIALOG_AUTO_CFG["_registered_tab_ids"].clear()
-        _dialog_pre_action["_registered_tab_ids"].clear()
-        _CONSOLE_ARMED_TAB_IDS.clear()
-        _NETWORK_ARMED_TAB_IDS.clear()
-        _NETWORK_CAPTURE_BODIES.clear()
-    except Exception:
-        pass
+    # 4. Clear only this instance's tab state. Clearing the global sets here
+    # silently de-armed background instances and made their next start call
+    # stack duplicate handlers on top of the still-live ones.
+    _clear_tab_scoped_state(target_tabs)
+    _ATTACHED_BROWSERS.discard(target_iid)
 
     # 5. Sweep stale locks + wipe corrupt window-state across all known profile
     #    dirs. Selective wipe (NOT a full nuke) — preserves cookies/login but
@@ -2843,7 +2807,9 @@ async def tab_close(index: Optional[int] = None) -> str:
         idx = index if index is not None else BrowserState.active_tab_index
         if idx < 0 or idx >= len(BrowserState.tabs):
             return err(f"tab {idx} out of range")
-        await BrowserState.tabs[idx].close()
+        closed_tab = BrowserState.tabs[idx]
+        await closed_tab.close()
+        _clear_tab_scoped_state([closed_tab])
         await _refresh_tabs()
         if BrowserState.active_tab_index >= len(BrowserState.tabs):
             BrowserState.active_tab_index = max(0, len(BrowserState.tabs) - 1)
@@ -3833,6 +3799,36 @@ def _now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 _NETWORK_ARMED_TAB_IDS: set = set()
 _NETWORK_CAPTURE_BODIES: dict[str, bool] = {}
+
+
+def _clear_tab_scoped_state(tabs: list[Any]) -> None:
+    """Drop lifecycle state for closed targets without touching live instances."""
+    keys = {_target_key(tab) for tab in tabs}
+    if not keys:
+        return
+    for key in keys:
+        _SNAPSHOT_CACHE.pop(key, None)
+        _HUMAN_HELP.pop(key, None)
+        _dialog_pre_action["_registered_tab_ids"].discard(key)
+        _DIALOG_AUTO_CFG["_registered_tab_ids"].discard(key)
+        _CONSOLE_ARMED_TAB_IDS.discard(key)
+        _NETWORK_ARMED_TAB_IDS.discard(key)
+        _NETWORK_CAPTURE_BODIES.pop(key, None)
+    try:
+        from .tools import devtools as _dt
+        if _dt._TRACE_ACTIVE.get("tab_id") in keys:
+            _dt._TRACE_ACTIVE.update({
+                "tab_id": None, "started_at": 0.0,
+                "categories": "", "handler": None,
+            })
+            _dt._TRACE_BUFFER.clear()
+        if _dt._COVERAGE_ACTIVE.get("tab_id") in keys:
+            _dt._COVERAGE_ACTIVE.update({
+                "tab_id": None, "js": False, "css": False,
+            })
+    except Exception:
+        # The module can be unavailable during partial import/startup failure.
+        pass
 
 
 @mcp.tool()
@@ -5688,17 +5684,25 @@ async def _idle_reaper_loop() -> None:
                 if snap.is_running() and snap.is_idle_expired():
                     to_close.append((iid, snap))
             for iid, snap in to_close:
+                _tabs = list(snap.tabs)
                 try:
                     if snap.browser:
                         snap.browser.stop()
                 except Exception:
-                    pass
+                    # Keep the instance reachable and retry next sweep. Popping
+                    # it here would leak a live Chrome with no remaining handle.
+                    continue
                 # Mark profile cleanly exited (matches close_instance) so the
                 # next launch doesn't hit a "Restore pages?" / stale-lock state.
                 if snap.privacy:
-                    await _remove_privacy_profile(snap.profile_dir)
+                    if not await _remove_privacy_profile(snap.profile_dir):
+                        snap.browser = None
+                        snap.tabs = []
+                        _clear_tab_scoped_state(_tabs)
+                        continue
                 elif snap.profile_dir:
                     clean_profile_state(snap.profile_dir)
+                _clear_tab_scoped_state(_tabs)
                 BrowserState.instances.pop(iid, None)
             # Check current instance
             if (BrowserState.is_up()
@@ -5706,16 +5710,21 @@ async def _idle_reaper_loop() -> None:
                 and (time.time() - BrowserState.current_last_active) > BrowserState.current_idle_timeout):
                 _cur_profile = BrowserState.current_profile_dir
                 _cur_privacy = BrowserState.current_privacy
+                _cur_tabs = list(BrowserState.tabs)
                 try:
                     if BrowserState.browser:
                         BrowserState.browser.stop()
                 except Exception:
-                    pass
+                    # State must remain reachable so the next sweep can retry.
+                    continue
                 BrowserState.reset()
+                _clear_tab_scoped_state(_cur_tabs)
                 BrowserState.current_headless = False
                 BrowserState.current_privacy = False
                 if _cur_privacy:
-                    await _remove_privacy_profile(_cur_profile)
+                    if not await _remove_privacy_profile(_cur_profile):
+                        BrowserState.current_profile_dir = _cur_profile
+                        BrowserState.current_privacy = True
                 elif _cur_profile:
                     clean_profile_state(_cur_profile)
         except asyncio.CancelledError:
@@ -5893,6 +5902,7 @@ async def close_instance(instance_id: str) -> str:
         if BrowserState.is_up():
             _profile = BrowserState.current_profile_dir
             _privacy = BrowserState.current_privacy
+            _tabs = list(BrowserState.tabs)
             try:
                 if BrowserState.browser:
                     BrowserState.browser.stop()
@@ -5900,6 +5910,7 @@ async def close_instance(instance_id: str) -> str:
                 return err(f"close failed: {e}")
             _iid = BrowserState.current_instance_id
             BrowserState.reset()
+            _clear_tab_scoped_state(_tabs)
             BrowserState.current_headless = False
             BrowserState.current_privacy = False
             BrowserState.current_fingerprint = {}
@@ -5927,6 +5938,7 @@ async def close_instance(instance_id: str) -> str:
     snap = BrowserState.instances.get(instance_id)
     if snap is None:
         return err(f"instance {instance_id!r} not found")
+    _tabs = list(snap.tabs)
     try:
         if snap.browser:
             snap.browser.stop()
@@ -5939,6 +5951,7 @@ async def close_instance(instance_id: str) -> str:
     # snapshot in that case so a second close_instance call can retry cleanup.
     snap.browser = None
     snap.tabs = []
+    _clear_tab_scoped_state(_tabs)
     cleanup_ok = True
     if snap.privacy:
         cleanup_ok = await _remove_privacy_profile(snap.profile_dir)
@@ -5958,6 +5971,7 @@ async def close_all_instances() -> str:
     failures = []
     # Close stored
     for iid, snap in list(BrowserState.instances.items()):
+        _tabs = list(snap.tabs)
         try:
             if snap.browser:
                 snap.browser.stop()
@@ -5966,6 +5980,7 @@ async def close_all_instances() -> str:
             continue
         snap.browser = None
         snap.tabs = []
+        _clear_tab_scoped_state(_tabs)
         if snap.privacy:
             if not await _remove_privacy_profile(snap.profile_dir):
                 failures.append(f"{iid}: privacy cleanup failed ({snap.profile_dir})")
@@ -5978,6 +5993,7 @@ async def close_all_instances() -> str:
     if BrowserState.is_up():
         _current_profile = BrowserState.current_profile_dir
         _current_privacy = BrowserState.current_privacy
+        _current_tabs = list(BrowserState.tabs)
         try:
             if BrowserState.browser:
                 BrowserState.browser.stop()
@@ -5987,6 +6003,7 @@ async def close_all_instances() -> str:
                 f"({type(e).__name__}: {e})"
             )
         else:
+            _clear_tab_scoped_state(_current_tabs)
             cleanup_ok = True
             if _current_privacy:
                 cleanup_ok = await _remove_privacy_profile(_current_profile)
@@ -8087,6 +8104,7 @@ async def detach() -> str:
             "attach_to_chrome() connections."
         )
     # Close just the websocket connection, leave the Chrome process alive.
+    detached_tabs = list(BrowserState.tabs)
     try:
         if BrowserState.browser and getattr(BrowserState.browser, "connection", None):
             try:
@@ -8097,6 +8115,7 @@ async def detach() -> str:
     finally:
         _ATTACHED_BROWSERS.discard(iid)
         BrowserState.reset()
+        _clear_tab_scoped_state(detached_tabs)
     return ok(f"detached from {iid!r}. Chrome still running externally.")
 
 
