@@ -2,7 +2,7 @@
 
 ## What This Project Does
 
-Python MCP server for stealth Chrome automation via nodriver. **154 tools**. Published on PyPI as `mcp-stealth-chrome`. Sister package of mcp-camoufox (Node/Firefox).
+Python MCP server for stealth Chrome automation via nodriver. **156 tools**. Published on PyPI as `mcp-stealth-chrome`. Sister package of mcp-camoufox (Node/Firefox).
 
 ## Architecture
 
@@ -136,7 +136,7 @@ Target: same tool name, same params, same behavior, same ref format.
 ## README Sync Rule
 
 **Every code change that adds/removes/modifies tools MUST update docs.** Check:
-- `README.md` — tool count (currently **154**), comparison table, categories, BYOK section
+- `README.md` — tool count (currently **156**), comparison table, categories, BYOK section
 - `INSTALL.md` — env vars, troubleshooting
 - `docs/DEMO.md` — feature demos
 - `pyproject.toml` + `__init__.py` — bump version

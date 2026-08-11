@@ -307,6 +307,58 @@ def test_browser_roots_are_all_reported_and_selectable(monkeypatch):
     assert state.chrome_user_data_root("edge") is None          # honest miss, not a guess
 
 
+def test_profile_survey_uses_root_lock_and_network_cookie_db(monkeypatch, tmp_path):
+    import asyncio
+
+    from mcp_stealth_chrome import server
+
+    root = tmp_path / "Chrome"
+    profile = root / "Default"
+    (profile / "Network").mkdir(parents=True)
+    (profile / "Network" / "Cookies").write_bytes(b"x" * 3072)
+    (root / "Local State").write_text(json.dumps({
+        "profile": {
+            "profiles_order": ["Default"],
+            "info_cache": {"Default": {"name": "Person 1"}},
+        }
+    }))
+    monkeypatch.setattr(
+        server, "chrome_user_data_roots", lambda: [("chrome", root)]
+    )
+    monkeypatch.setattr(
+        server, "is_chrome_profile_locked", lambda path: path == root
+    )
+
+    survey = server.mcp._tool_manager._tools["list_chrome_profiles"].fn
+    payload = json.loads(asyncio.run(survey()))
+    assert payload["browsers"][0]["running"] is True
+    assert payload["profiles"][0]["in_use"] is True
+    assert payload["profiles"][0]["cookies_kb"] == 3
+
+
+def test_windows_brave_binary_and_opera_profile_root(monkeypatch, tmp_path):
+    import sys
+
+    from mcp_stealth_chrome import state
+
+    local = tmp_path / "Local"
+    roaming = tmp_path / "Roaming"
+    brave = local / "BraveSoftware" / "Brave-Browser" / "Application" / "brave.exe"
+    opera = roaming / "Opera Software" / "Opera Stable"
+    brave.parent.mkdir(parents=True)
+    brave.write_bytes(b"")
+    opera.mkdir(parents=True)
+    (opera / "Local State").write_text("{}")
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setenv("LOCALAPPDATA", str(local))
+    monkeypatch.setenv("APPDATA", str(roaming))
+    monkeypatch.setenv("ProgramFiles", str(tmp_path / "Program Files"))
+    monkeypatch.setenv("ProgramFiles(x86)", str(tmp_path / "Program Files (x86)"))
+
+    assert state.find_chrome_binary() == str(brave)
+    assert ("opera", opera) in state.chrome_user_data_roots()
+
+
 def test_sqlite_snapshot_copies_wal_and_verifies(tmp_path):
     """Cloning a live profile must not depend on Connection.backup().
 

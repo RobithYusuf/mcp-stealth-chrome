@@ -58,12 +58,14 @@ def find_chrome_binary() -> Optional[str]:
         pfx86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
         localappdata = os.environ.get("LOCALAPPDATA", "")
         candidates = [
-            rf"{pf}\Google\Chrome\Application\chrome.exe",
-            rf"{pfx86}\Google\Chrome\Application\chrome.exe",
-            rf"{localappdata}\Google\Chrome\Application\chrome.exe",
-            rf"{pf}\Microsoft\Edge\Application\msedge.exe",
-            rf"{pfx86}\Microsoft\Edge\Application\msedge.exe",
-            rf"{pf}\Chromium\Application\chromium.exe",
+            str(Path(pf) / "Google" / "Chrome" / "Application" / "chrome.exe"),
+            str(Path(pfx86) / "Google" / "Chrome" / "Application" / "chrome.exe"),
+            str(Path(localappdata) / "Google" / "Chrome" / "Application" / "chrome.exe"),
+            str(Path(pf) / "Microsoft" / "Edge" / "Application" / "msedge.exe"),
+            str(Path(pfx86) / "Microsoft" / "Edge" / "Application" / "msedge.exe"),
+            str(Path(pf) / "Chromium" / "Application" / "chromium.exe"),
+            str(Path(localappdata) / "BraveSoftware" / "Brave-Browser" / "Application" / "brave.exe"),
+            str(Path(localappdata) / "Vivaldi" / "Application" / "vivaldi.exe"),
         ]
     for path in candidates:
         if path and Path(path).exists():
@@ -134,13 +136,14 @@ def chrome_user_data_roots() -> list[tuple[str, Path]]:
         ]
     elif sys.platform == "win32":
         local = Path(os.environ.get("LOCALAPPDATA", home / "AppData" / "Local"))
+        roaming = Path(os.environ.get("APPDATA", home / "AppData" / "Roaming"))
         candidates = [
             ("chrome", local / "Google" / "Chrome" / "User Data"),
             ("chromium", local / "Chromium" / "User Data"),
             ("edge", local / "Microsoft" / "Edge" / "User Data"),
             ("brave", local / "BraveSoftware" / "Brave-Browser" / "User Data"),
             ("vivaldi", local / "Vivaldi" / "User Data"),
-            ("opera", local / "Programs" / "Opera" / "User Data"),
+            ("opera", roaming / "Opera Software" / "Opera Stable"),
         ]
     return [(name, path) for name, path in candidates
             if path.exists() and (path / "Local State").exists()]

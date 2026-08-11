@@ -6024,6 +6024,7 @@ async def list_chrome_profiles(browser: Optional[str] = None) -> str:
             continue
         info_cache = data.get("profile", {}).get("info_cache", {})
         profiles_order = list(data.get("profile", {}).get("profiles_order", []))
+        root_running = is_chrome_profile_locked(root)
         seen = set(profiles_order)
         # Ensure we also include profiles not in profiles_order
         for k in info_cache.keys():
@@ -6033,9 +6034,13 @@ async def list_chrome_profiles(browser: Optional[str] = None) -> str:
         for name in profiles_order:
             info = info_cache.get(name, {})
             pdir = root / name
-            cookies = pdir / "Cookies"
+            cookie_candidates = (pdir / "Cookies", pdir / "Network" / "Cookies")
             try:
-                cookies_kb = cookies.stat().st_size // 1024 if cookies.exists() else 0
+                cookies_kb = max(
+                    (path.stat().st_size // 1024 for path in cookie_candidates
+                     if path.exists()),
+                    default=0,
+                )
             except OSError:
                 cookies_kb = 0
             out.append({
@@ -6046,13 +6051,15 @@ async def list_chrome_profiles(browser: Optional[str] = None) -> str:
                 "path": str(pdir),
                 "exists": pdir.exists(),
                 "cookies_kb": cookies_kb,
-                "in_use": is_chrome_profile_locked(pdir) if pdir.exists() else False,
+                # Chromium locks the user-data root, not each Default/Profile N
+                # child. Checking pdir always reported false while Chrome ran.
+                "in_use": root_running if pdir.exists() else False,
                 "last_active_time": info.get("last_active_time", 0),
             })
         browsers.append({
             "browser": bname,
             "root": str(root),
-            "running": is_chrome_profile_locked(root),
+            "running": root_running,
             "profile_count": len(out) - count_before,
         })
     # Richest sessions first — that is what someone scanning this list wants.
@@ -6064,7 +6071,8 @@ async def list_chrome_profiles(browser: Optional[str] = None) -> str:
         "usage_hint": (
             "clone_chrome_profile(browser='brave', source_profile='Default', "
             "target_instance_id='my_clone') → then spawn_browser(instance_id='my_clone'). "
-            "Pick the profile with the most cookies_kb; its browser must be CLOSED first."
+            "Pick the profile with the most cookies_kb; close its browser first, "
+            "or explicitly use allow_running=true for a verified live snapshot."
         ),
     }
     if parse_errors:
@@ -6184,9 +6192,9 @@ async def clone_chrome_profile(
             f"{label} is currently using this profile (lock file present).\n"
             f"Either close it FULLY (Cmd+Q on macOS, not just the window), or pass "
             f"allow_running=true — every SQLite database (cookies, logins, history) "
-            f"is then snapshotted through SQLite's online-backup API, which is "
-            f"consistent even while the browser writes. The source profile is only "
-            f"ever opened read-only.\n"
+            f"is copied with its WAL companions and integrity-checked. Suspect "
+            f"copies are reported explicitly. The source profile is only ever "
+            f"opened read-only.\n"
             f"Lock: {source_path / 'SingletonLock'}"
         )
 
