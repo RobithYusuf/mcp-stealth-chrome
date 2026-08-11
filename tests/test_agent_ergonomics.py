@@ -535,6 +535,46 @@ def test_close_all_reports_and_retains_stop_failures(monkeypatch):
     assert server.BrowserState.instances["stuck"] is snap
 
 
+def test_instance_snapshot_does_not_report_dead_browser_running():
+    from types import SimpleNamespace
+
+    from mcp_stealth_chrome.state import InstanceSnapshot
+
+    launched = SimpleNamespace(
+        _process=object(), stopped=True,
+    )
+    attached = SimpleNamespace(
+        _process=None, connection=SimpleNamespace(closed=True),
+    )
+    assert InstanceSnapshot(browser=launched, tabs=[object()], instance_id="a").is_running() is False
+    assert InstanceSnapshot(browser=attached, tabs=[object()], instance_id="b").is_running() is False
+
+
+def test_spawn_refuses_stale_instance_slot_before_launch(monkeypatch):
+    import asyncio
+
+    from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.state import InstanceSnapshot
+
+    calls = []
+
+    async def _unexpected_launch(**kwargs):
+        calls.append(kwargs)
+        return True, "launched"
+
+    monkeypatch.setattr(server.BrowserState, "current_instance_id", "main")
+    monkeypatch.setattr(
+        server.BrowserState,
+        "instances",
+        {"worker": InstanceSnapshot(instance_id="worker")},
+    )
+    monkeypatch.setattr(server, "_launch_browser_instance", _unexpected_launch)
+    spawn = server.mcp._tool_manager._tools["spawn_browser"].fn
+    result = asyncio.run(spawn(instance_id="worker"))
+    assert result.startswith("Error: instance 'worker' already exists")
+    assert calls == []
+
+
 def test_sqlite_snapshot_copies_wal_and_verifies(tmp_path):
     """Cloning a live profile must not depend on Connection.backup().
 

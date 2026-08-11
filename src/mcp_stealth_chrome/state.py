@@ -539,7 +539,12 @@ class InstanceSnapshot:
         return (time.time() - self.last_active) > self.idle_timeout
 
     def is_running(self) -> bool:
-        return self.browser is not None and len(self.tabs) > 0
+        if self.browser is None or not self.tabs:
+            return False
+        if getattr(self.browser, "_process", None) is None:
+            connection = getattr(self.browser, "connection", None)
+            return connection is not None and not getattr(connection, "closed", True)
+        return not getattr(self.browser, "stopped", True)
 
 
 class BrowserState:

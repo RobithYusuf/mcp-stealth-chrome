@@ -5783,28 +5783,47 @@ async def spawn_browser(
         _validate_instance_id(instance_id)
     except ValueError as e:
         return err(str(e))
-    if instance_id == BrowserState.current_instance_id and BrowserState.is_up():
-        return err(f"instance {instance_id!r} already running (current). Use switch_instance instead.")
-    if instance_id in BrowserState.instances and BrowserState.instances[instance_id].is_running():
-        return err(f"instance {instance_id!r} already running.")
-    ok_flag, msg = await _launch_browser_instance(
-        instance_id=instance_id,
-        url=url,
-        headless=headless,
-        proxy=proxy,
-        user_agent=user_agent,
-        window_width=window_width,
-        window_height=window_height,
-        persistent=persistent,
-        lang=lang,
-        extra_args=extra_args,
-        storage_state_path=storage_state_path,
-        idle_timeout=idle_timeout_seconds,
-        profile_dir_override=profile_dir,
-        fingerprint=fingerprint,
-        privacy=privacy,
-        desc=desc,
-    )
+    if _LAUNCH_LOCK.locked():
+        return err("another launch is already in progress — wait for it to finish")
+    async with _LAUNCH_LOCK:
+        if instance_id == BrowserState.current_instance_id:
+            if BrowserState.is_up():
+                return err(
+                    f"instance {instance_id!r} already running (current). "
+                    "Use switch_instance instead."
+                )
+            if BrowserState.current_privacy and BrowserState.current_profile_dir:
+                return err(
+                    f"instance {instance_id!r} has pending privacy cleanup. "
+                    "Retry close_instance() before relaunching."
+                )
+        if instance_id in BrowserState.instances:
+            state = (
+                "running" if BrowserState.instances[instance_id].is_running()
+                else "stopped or awaiting cleanup"
+            )
+            return err(
+                f"instance {instance_id!r} already exists ({state}). "
+                "Call close_instance() before reusing its name."
+            )
+        ok_flag, msg = await _launch_browser_instance(
+            instance_id=instance_id,
+            url=url,
+            headless=headless,
+            proxy=proxy,
+            user_agent=user_agent,
+            window_width=window_width,
+            window_height=window_height,
+            persistent=persistent,
+            lang=lang,
+            extra_args=extra_args,
+            storage_state_path=storage_state_path,
+            idle_timeout=idle_timeout_seconds,
+            profile_dir_override=profile_dir,
+            fingerprint=fingerprint,
+            privacy=privacy,
+            desc=desc,
+        )
     if not ok_flag:
         return err(msg)
     return ok(msg)
