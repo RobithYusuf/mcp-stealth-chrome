@@ -4036,13 +4036,15 @@ async def console_get(limit: int = 100) -> str:
 
     Messages are chronological (oldest first within the last `limit`).
     """
+    if limit < 0:
+        return err("limit must be >= 0")
     tab = None
     try:
         tab = BrowserState.active_tab()
     except Exception:
         pass
     armed = tab is not None and _target_key(tab) in _CONSOLE_ARMED_TAB_IDS
-    logs = BrowserState.console_logs[-limit:]
+    logs = BrowserState.console_logs[-limit:] if limit else []
     payload: dict[str, Any] = {
         "attached": armed,
         "capturing": bool(BrowserState.capture_console),
@@ -4168,50 +4170,57 @@ async def network_get(
             from network_index (use this once you've called network_start).
             Default False = legacy flat event stream (backward compat).
     """
+    if limit < 0:
+        return err("limit must be >= 0")
+    if max_body_bytes < 0:
+        return err("max_body_bytes must be >= 0")
     if full or include_body:
-        entries = list(BrowserState.network_index.values())
+        # Work on copies: response bodies are fetched on demand, and caching a
+        # truncated/error sentinel in network_index made a later call with a
+        # larger limit permanently unable to retrieve the real body.
+        entries = [dict(entry) for entry in BrowserState.network_index.values()]
         if filter_url:
             entries = [e for e in entries if filter_url in e.get("url", "")]
-        entries = entries[-limit:]
+        entries = entries[-limit:] if limit else []
         if include_body and entries:
             try:
                 tab = BrowserState.active_tab()
-                from nodriver.cdp import network as cdp_network
-                for e in entries:
-                    if e.get("response_body") is not None:
-                        continue
-                    rid = e.get("request_id")
-                    if not rid:
-                        continue
-                    try:
-                        result = await asyncio.wait_for(
-                            tab.send(cdp_network.get_response_body(
-                                request_id=cdp_network.RequestId(rid)
-                            )),
-                            timeout=5.0,
+            except Exception as e:
+                return err(f"response body capture unavailable: {e}")
+            from nodriver.cdp import network as cdp_network
+            for e in entries:
+                rid = e.get("request_id")
+                if not rid:
+                    e["response_body"] = "<missing request_id>"
+                    continue
+                try:
+                    result = await asyncio.wait_for(
+                        tab.send(cdp_network.get_response_body(
+                            request_id=cdp_network.RequestId(rid)
+                        )),
+                        timeout=5.0,
+                    )
+                    body = getattr(result, "body", None)
+                    if body is None and isinstance(result, tuple):
+                        body = result[0]
+                    body_str = str(body) if body is not None else ""
+                    orig_len = len(body_str)
+                    if orig_len > max_body_bytes:
+                        body_str = body_str[:max_body_bytes] + (
+                            f"... [truncated, original {orig_len} chars]"
                         )
-                        body = getattr(result, "body", None)
-                        if body is None and isinstance(result, tuple):
-                            body = result[0]
-                        body_str = str(body) if body is not None else ""
-                        orig_len = len(body_str)
-                        if orig_len > max_body_bytes:
-                            body_str = body_str[:max_body_bytes] + (
-                                f"... [truncated, original {orig_len} chars]"
-                            )
-                        e["response_body"] = body_str
-                    except asyncio.TimeoutError:
-                        e["response_body"] = "<getResponseBody timeout>"
-                    except Exception as ex:
-                        e["response_body"] = f"<getResponseBody error: {ex}>"
-            except Exception:
-                pass
+                    e["response_body"] = body_str
+                except asyncio.TimeoutError:
+                    e["response_body"] = "<getResponseBody timeout>"
+                except Exception as ex:
+                    e["response_body"] = f"<getResponseBody error: {ex}>"
         return ok(json.dumps(entries, indent=2, default=str)[:50000])
     # Legacy event-stream view
     logs = BrowserState.network_logs
     if filter_url:
         logs = [l for l in logs if filter_url in l.get("url", "")]
-    return ok(json.dumps(logs[-limit:], indent=2, default=str))
+    selected = logs[-limit:] if limit else []
+    return ok(json.dumps(selected, indent=2, default=str))
 
 
 # ══════════════════════════════════════════════════════════════════════════

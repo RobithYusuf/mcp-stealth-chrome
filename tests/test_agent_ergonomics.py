@@ -759,6 +759,83 @@ def test_export_curl_surfaces_cookie_measurement_failure(monkeypatch):
     assert "cookie domain unavailable" in out["cookie_error"]
 
 
+def test_network_get_does_not_cache_truncated_bodies(monkeypatch):
+    import asyncio
+
+    from mcp_stealth_chrome import server
+
+    class _Tab:
+        async def send(self, _command):
+            return ("abcdefgh", False)
+
+    monkeypatch.setattr(
+        server.BrowserState,
+        "active_tab",
+        classmethod(lambda cls: _Tab()),
+    )
+    previous = server.BrowserState.network_index
+    server.BrowserState.network_index = {
+        "1": {"request_id": "1", "url": "https://example.test/"}
+    }
+    try:
+        network_get = server.mcp._tool_manager._tools["network_get"].fn
+        short = json.loads(asyncio.run(network_get(
+            include_body=True, max_body_bytes=3,
+        )))
+        full = json.loads(asyncio.run(network_get(
+            include_body=True, max_body_bytes=20,
+        )))
+        assert "response_body" not in server.BrowserState.network_index["1"]
+    finally:
+        server.BrowserState.network_index = previous
+
+    assert short[0]["response_body"].startswith("abc... [truncated")
+    assert full[0]["response_body"] == "abcdefgh"
+
+
+def test_network_get_reports_when_body_capture_was_not_measured(monkeypatch):
+    import asyncio
+
+    from mcp_stealth_chrome import server
+
+    def _no_tab(cls):
+        raise RuntimeError("browser gone")
+
+    monkeypatch.setattr(server.BrowserState, "active_tab", classmethod(_no_tab))
+    previous = server.BrowserState.network_index
+    server.BrowserState.network_index = {
+        "1": {"request_id": "1", "url": "https://example.test/"}
+    }
+    try:
+        network_get = server.mcp._tool_manager._tools["network_get"].fn
+        result = asyncio.run(network_get(include_body=True))
+    finally:
+        server.BrowserState.network_index = previous
+    assert result.startswith("Error: response body capture unavailable: browser gone")
+
+
+def test_console_and_network_zero_limits_return_zero_entries():
+    import asyncio
+
+    from mcp_stealth_chrome import server
+
+    old_console = server.BrowserState.console_logs
+    old_network = server.BrowserState.network_logs
+    server.BrowserState.console_logs = [{"text": "one"}]
+    server.BrowserState.network_logs = [{"url": "https://example.test/"}]
+    try:
+        console_get = server.mcp._tool_manager._tools["console_get"].fn
+        network_get = server.mcp._tool_manager._tools["network_get"].fn
+        console = json.loads(asyncio.run(console_get(limit=0)))
+        network = json.loads(asyncio.run(network_get(limit=0)))
+    finally:
+        server.BrowserState.console_logs = old_console
+        server.BrowserState.network_logs = old_network
+    assert console["returned"] == 0
+    assert console["messages"] == []
+    assert network == []
+
+
 def test_privacy_proxy_supports_pool_and_session_token():
     from mcp_stealth_chrome.server import _privacy_proxy
 
