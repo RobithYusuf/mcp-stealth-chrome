@@ -886,3 +886,63 @@ def test_privacy_proxy_supports_pool_and_session_token():
     assert "{session}" not in rotated
     assert rotated.startswith(("http://user-"))
     assert rotated.endswith(("@a:1", "@b:2"))
+
+
+def test_capture_sinks_stay_with_their_instance_across_a_switch():
+    """A handler armed on one browser must never file events under another.
+
+    The handler binds its sink when capture is armed. If snapshot/restore copied
+    those buffers, the switch would hand the instance a NEW list and the old
+    handler would keep appending to an orphan — so the user reads a log that
+    stopped growing while the events pile up somewhere unreachable. Worse, code
+    that appended to the class attribute at event time filed instance A's
+    messages under whichever instance happened to be current.
+    """
+    from mcp_stealth_chrome.state import BrowserState
+
+    prev_id, prev_logs = BrowserState.current_instance_id, BrowserState.console_logs
+    prev_instances = dict(BrowserState.instances)
+    try:
+        BrowserState.current_instance_id = "cap_a"
+        BrowserState.console_logs = []
+        sink_a = BrowserState.console_logs        # what the handler closes over
+
+        BrowserState.instances["cap_a"] = BrowserState.snapshot_current()
+        BrowserState.current_instance_id = "cap_b"
+        BrowserState.console_logs = []
+        sink_b = BrowserState.console_logs
+
+        # A's handler fires while B is the current instance.
+        sink_a.append({"type": "log", "text": "from A"})
+        assert sink_b == [], "instance B must not receive instance A's events"
+
+        # Switching back must surface what A captured while it was in background.
+        BrowserState.restore_from(BrowserState.instances["cap_a"])
+        assert BrowserState.console_logs == [{"type": "log", "text": "from A"}]
+        assert BrowserState.console_logs is sink_a, "identity is the contract"
+    finally:
+        BrowserState.instances.clear()
+        BrowserState.instances.update(prev_instances)
+        BrowserState.current_instance_id = prev_id
+        BrowserState.console_logs = prev_logs
+
+
+def test_capture_buffers_are_bounded():
+    """Unbounded growth is invisible until the process is in trouble."""
+    import mcp_stealth_chrome.server as srv
+
+    events = []
+    for i in range(srv.CAPTURE_MAX_EVENTS + 250):
+        events.append({"i": i})
+        srv._trim_capture(events)
+    assert len(events) == srv.CAPTURE_MAX_EVENTS
+    # The newest events are the ones kept.
+    assert events[-1]["i"] == srv.CAPTURE_MAX_EVENTS + 249
+
+    index = {}
+    for i in range(srv.CAPTURE_MAX_INDEXED + 40):
+        index[str(i)] = {"i": i}
+        srv._trim_index(index)
+    assert len(index) == srv.CAPTURE_MAX_INDEXED
+    assert str(srv.CAPTURE_MAX_INDEXED + 39) in index
+    assert "0" not in index

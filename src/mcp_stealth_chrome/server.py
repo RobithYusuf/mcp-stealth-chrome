@@ -87,6 +87,27 @@ TOOL_ACTION_TIMEOUT = int(os.environ.get("TOOL_ACTION_TIMEOUT", "30"))
 # oversized results outright, which throws away the whole call — better to hand
 # back the file path and tell the caller how to shrink the shot.
 B64_INLINE_LIMIT = int(os.environ.get("B64_INLINE_LIMIT", "60000"))
+# Capture buffers grow for as long as capture is armed, and a long session on a
+# chatty site will happily consume the process. These caps make them ring
+# buffers: the newest events are the ones worth keeping, and dropping the oldest
+# is preferable to an unbounded climb nobody notices until it matters.
+CAPTURE_MAX_EVENTS = int(os.environ.get("CAPTURE_MAX_EVENTS", "5000"))
+CAPTURE_MAX_INDEXED = int(os.environ.get("CAPTURE_MAX_INDEXED", "1000"))
+
+
+def _trim_capture(buffer: list) -> None:
+    """Keep a capture list bounded, newest-first-out-last."""
+    overflow = len(buffer) - CAPTURE_MAX_EVENTS
+    if overflow > 0:
+        del buffer[:overflow]
+
+
+def _trim_index(index: dict) -> None:
+    """Keep the request index bounded; dicts preserve insertion order."""
+    overflow = len(index) - CAPTURE_MAX_INDEXED
+    if overflow > 0:
+        for key in list(index)[:overflow]:
+            index.pop(key, None)
 
 
 def _target_key(tab) -> str:
@@ -3986,7 +4007,7 @@ async def console_start() -> str:
     global _CONSOLE_STARTED_AT
     try:
         tab = BrowserState.active_tab()
-        BrowserState.console_logs = []
+        BrowserState.console_logs.clear()
         BrowserState.capture_console = True
         _CONSOLE_STARTED_AT = _now_iso()
         tid = _target_key(tab)
@@ -4001,6 +4022,12 @@ async def console_start() -> str:
                 pass
             return ok("console capture re-armed (handler already bound to this tab)")
 
+        # Bind the sink NOW, to the instance being armed. Reading
+        # BrowserState.console_logs at event time would append to whichever
+        # instance happens to be current, so a switch mid-capture would file this
+        # browser's messages under another one — and stop filling this one.
+        sink = BrowserState.console_logs
+
         async def handle(event):
             try:
                 args = []
@@ -4012,10 +4039,11 @@ async def console_start() -> str:
                         args.append(val)
                     else:
                         args.append(getattr(a, "description", "") or "")
-                BrowserState.console_logs.append({
+                sink.append({
                     "type": event.type_,
                     "text": " ".join(str(a) for a in args)[:500],
                 })
+                _trim_capture(sink)
             except Exception:
                 pass
 
@@ -4027,10 +4055,11 @@ async def console_start() -> str:
                 text = getattr(d, "text", "") or ""
                 exc = getattr(d, "exception", None)
                 desc = getattr(exc, "description", None) if exc else None
-                BrowserState.console_logs.append({
+                sink.append({
                     "type": "exception",
                     "text": (desc or text or "uncaught exception")[:500],
                 })
+                _trim_capture(sink)
             except Exception:
                 pass
 
@@ -4103,8 +4132,8 @@ async def network_start(capture_bodies: bool = True) -> str:
     """
     try:
         tab = BrowserState.active_tab()
-        BrowserState.network_logs = []
-        BrowserState.network_index = {}
+        BrowserState.network_logs.clear()
+        BrowserState.network_index.clear()
         BrowserState.capture_network = True
         from nodriver.cdp import network as cdp_network
         tid = _target_key(tab)
@@ -4118,6 +4147,11 @@ async def network_start(capture_bodies: bool = True) -> str:
             await tab.send(cdp_network.enable())
         except Exception:
             pass
+
+        # Bound now, to the instance being armed — see console_start for why
+        # reading the class attribute at event time cross-files the capture.
+        log_sink = BrowserState.network_logs
+        index_sink = BrowserState.network_index
 
         async def on_req(event):
             try:
@@ -4138,11 +4172,13 @@ async def network_start(capture_bodies: bool = True) -> str:
                     "timestamp": getattr(event, "timestamp", None),
                 }
                 if _NETWORK_CAPTURE_BODIES.get(tid, False):
-                    BrowserState.network_index[rid] = entry
-                BrowserState.network_logs.append({
+                    index_sink[rid] = entry
+                    _trim_index(index_sink)
+                log_sink.append({
                     "type": "request", "request_id": rid,
                     "url": entry["url"], "method": entry["method"],
                 })
+                _trim_capture(log_sink)
             except Exception:
                 pass
 
@@ -4151,18 +4187,19 @@ async def network_start(capture_bodies: bool = True) -> str:
                 rid = str(event.request_id)
                 resp = event.response
                 resp_headers = dict(getattr(resp, "headers", None) or {})
-                if rid in BrowserState.network_index:
-                    e = BrowserState.network_index[rid]
+                if rid in index_sink:
+                    e = index_sink[rid]
                     e["status"] = getattr(resp, "status", None)
                     e["response_headers"] = resp_headers
                     e["mime"] = getattr(resp, "mime_type", None)
                     e["size"] = getattr(resp, "encoded_data_length", None)
-                BrowserState.network_logs.append({
+                log_sink.append({
                     "type": "response", "request_id": rid,
                     "url": getattr(resp, "url", ""),
                     "status": getattr(resp, "status", None),
                     "mime": getattr(resp, "mime_type", None),
                 })
+                _trim_capture(log_sink)
             except Exception:
                 pass
 

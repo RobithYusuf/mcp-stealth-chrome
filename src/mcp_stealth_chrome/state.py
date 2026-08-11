@@ -671,10 +671,15 @@ class BrowserState:
             idle_timeout=cls.current_idle_timeout,
             last_active=cls.current_last_active,
             created_at=cls.current_created_at,
-            console_logs=list(cls.console_logs),
-            network_logs=list(cls.network_logs),
-            network_index=dict(cls.network_index),
-            page_errors=list(cls.page_errors),
+            # Capture buffers are handed over BY REFERENCE, not copied. A CDP
+            # handler armed on this instance keeps a direct reference to these
+            # objects, so copying here would silently orphan it: the instance's
+            # later events would land in a list nobody reads, while the copy the
+            # user does read stops growing. Identity is the contract.
+            console_logs=cls.console_logs,
+            network_logs=cls.network_logs,
+            network_index=cls.network_index,
+            page_errors=cls.page_errors,
             capture_console=cls.capture_console,
             capture_network=cls.capture_network,
         )
@@ -695,10 +700,13 @@ class BrowserState:
         cls.current_idle_timeout = snap.idle_timeout
         cls.current_last_active = snap.last_active
         cls.current_created_at = snap.created_at
-        cls.console_logs = list(snap.console_logs)
-        cls.network_logs = list(snap.network_logs)
-        cls.network_index = dict(snap.network_index)
-        cls.page_errors = list(snap.page_errors)
+        # Restored by reference for the same reason they are snapshotted by
+        # reference — see save_current(). Rebinding to a copy here would make a
+        # switch away and back silently lose everything captured in between.
+        cls.console_logs = snap.console_logs
+        cls.network_logs = snap.network_logs
+        cls.network_index = snap.network_index
+        cls.page_errors = snap.page_errors
         cls.capture_console = snap.capture_console
         cls.capture_network = snap.capture_network
 
