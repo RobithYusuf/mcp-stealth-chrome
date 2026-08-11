@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import fnmatch
 import json
 import os
 import random
@@ -3828,6 +3829,21 @@ def _clear_tab_scoped_state(tabs: list[Any]) -> None:
         _CONSOLE_ARMED_TAB_IDS.discard(key)
         _NETWORK_ARMED_TAB_IDS.discard(key)
         _NETWORK_CAPTURE_BODIES.pop(key, None)
+    # Interception pauses every matching request until the handler answers it, so
+    # it must not survive its target. Left armed, the next launch would inherit a
+    # handler bound to a dead tab and the first request would stall with no error.
+    # Fetch.disable is pointless here — the target is already gone — so only the
+    # local state is released; intercept_stop() handles the live case.
+    intercepted = _INTERCEPT.get("tab")
+    if _INTERCEPT.get("active") and (
+            intercepted is None or _target_key(intercepted) in keys):
+        watchdog = _INTERCEPT.get("watchdog")
+        if watchdog is not None and not watchdog.done():
+            watchdog.cancel()
+        _INTERCEPT.update({
+            "active": False, "tab": None, "handler": None, "watchdog": None,
+            "stop_reason": "target closed",
+        })
     try:
         from .tools import devtools as _dt
         if _dt._TRACE_ACTIVE.get("tab_id") in keys:
@@ -4609,6 +4625,325 @@ async def export_curl(
         }, indent=2, default=str))
     except Exception as e:
         return err(str(e))
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# REQUEST INTERCEPTION (CDP Fetch)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Fetch.enable pauses EVERY matching request until something answers it, so a
+# handler that fails to respond does not raise — it hangs the page with no error
+# at all. Two rules follow, and the whole design is built around them:
+#   1. every path through the handler ends in exactly one continue/fail/fulfill,
+#      including the exception path;
+#   2. interception disables itself on a deadline, so a forgotten intercept
+#      cannot leave the browser wedged.
+_INTERCEPT: dict[str, Any] = {
+    "active": False,
+    "action": "observe",
+    "url_pattern": "*",
+    "methods": None,          # None = every method is a target
+    "log": [],
+    "max_events": 500,
+    "handler": None,
+    "tab": None,
+    "watchdog": None,
+    "expires_at": 0.0,
+    "mock": None,
+    "counts": {"seen": 0, "passed": 0, "blocked": 0, "mocked": 0},
+}
+
+_MUTATING_METHODS = ("POST", "PUT", "PATCH", "DELETE")
+
+
+async def _intercept_disable(reason: str = "stopped") -> None:
+    """Turn interception off and release the page. Safe to call twice."""
+    state = _INTERCEPT
+    watchdog = state.get("watchdog")
+    if watchdog is not None and not watchdog.done():
+        watchdog.cancel()
+    state["watchdog"] = None
+    tab = state.get("tab")
+    if tab is not None:
+        try:
+            from nodriver.cdp import fetch as cdp_fetch
+            await tab.send(cdp_fetch.disable())
+        except Exception:
+            pass
+    state["active"] = False
+    state["tab"] = None
+    state["stop_reason"] = reason
+
+
+def _intercept_matches(url: str, pattern: str) -> bool:
+    """Glob-ish match used only for reporting; CDP does the real filtering."""
+    if not pattern or pattern == "*":
+        return True
+    return fnmatch.fnmatch(url, pattern) or pattern.strip("*") in url
+
+
+@mcp.tool()
+async def intercept_start(
+    url_pattern: str = "*",
+    action: Literal["observe", "cancel", "mock"] = "observe",
+    methods: Optional[str] = None,
+    mock_status: int = 200,
+    mock_body: str = "",
+    mock_content_type: str = "application/json",
+    auto_disable_after: float = 180.0,
+    max_events: int = 500,
+) -> str:
+    """⭐ See a request — and optionally stop it — BEFORE the server ever gets it.
+
+    Answers "what would this button actually send?" without sending it. The usual
+    alternative is patching window.fetch by hand, which misses XHR, misses
+    anything the page captured before your script ran, and cannot stop a request
+    that is already in flight. This works at the CDP layer, so it sees every
+    request regardless of timing.
+
+    Args:
+        url_pattern: CDP glob, e.g. "*/api/*" or "*delete*". "*" matches all.
+        action: what to do with matching requests —
+            "observe" lets them through and records them;
+            "cancel"  aborts them (the page sees a network failure);
+            "mock"    answers them locally with mock_status/mock_body.
+        methods: comma list to target, e.g. "POST,DELETE". Non-matching methods
+            are always let through untouched. Omit to target every method.
+        mock_status / mock_body / mock_content_type: the canned response.
+        auto_disable_after: seconds before interception turns itself off. This is
+            a safety net, not a nicety: an interception left on with a dead
+            handler wedges the page silently. 0 disables the timer.
+        max_events: ring-buffer size for the log.
+
+    Pair with intercept_log() to read what was seen and intercept_stop() to end
+    it early. See dry_run() for the common "explore without mutating" preset.
+    """
+    try:
+        tab = BrowserState.active_tab()
+        if _INTERCEPT["active"]:
+            await _intercept_disable("restarted")
+
+        from nodriver.cdp import fetch as cdp_fetch, network as cdp_network
+
+        wanted: Optional[tuple] = None
+        if methods:
+            wanted = tuple(m.strip().upper() for m in methods.split(",") if m.strip())
+            if not wanted:
+                wanted = None
+
+        state = _INTERCEPT
+        state.update({
+            "active": True,
+            "action": action,
+            "url_pattern": url_pattern or "*",
+            "methods": wanted,
+            "log": [],
+            "max_events": max(1, int(max_events)),
+            "tab": tab,
+            "counts": {"seen": 0, "passed": 0, "blocked": 0, "mocked": 0},
+            "mock": {
+                "status": int(mock_status),
+                "body": mock_body or "",
+                "content_type": mock_content_type,
+            },
+            "stop_reason": None,
+        })
+
+        async def on_paused(event):
+            request_id = getattr(event, "request_id", None)
+            responded = False
+            try:
+                request = event.request
+                method = (getattr(request, "method", "") or "").upper()
+                url = getattr(request, "url", "") or ""
+                state["counts"]["seen"] += 1
+                targeted = state["methods"] is None or method in state["methods"]
+                chosen = state["action"] if targeted else "observe"
+
+                if chosen == "cancel":
+                    await tab.send(cdp_fetch.fail_request(
+                        request_id=request_id,
+                        error_reason=cdp_network.ErrorReason.ABORTED))
+                    responded = True
+                    state["counts"]["blocked"] += 1
+                    outcome = "blocked"
+                elif chosen == "mock":
+                    mock = state["mock"] or {}
+                    body_b64 = base64.b64encode(
+                        (mock.get("body") or "").encode("utf-8")).decode()
+                    await tab.send(cdp_fetch.fulfill_request(
+                        request_id=request_id,
+                        response_code=int(mock.get("status", 200)),
+                        response_headers=[cdp_fetch.HeaderEntry(
+                            name="Content-Type",
+                            value=mock.get("content_type", "application/json"))],
+                        body=body_b64))
+                    responded = True
+                    state["counts"]["mocked"] += 1
+                    outcome = "mocked"
+                else:
+                    await tab.send(cdp_fetch.continue_request(request_id=request_id))
+                    responded = True
+                    state["counts"]["passed"] += 1
+                    outcome = "passed"
+
+                log = state["log"]
+                log.append({
+                    "method": method,
+                    "url": url,
+                    "outcome": outcome,
+                    "targeted": targeted,
+                    "headers": dict(getattr(request, "headers", None) or {}),
+                    "body": getattr(request, "post_data", None),
+                })
+                if len(log) > state["max_events"]:
+                    del log[:-state["max_events"]]
+            except Exception:
+                pass
+            finally:
+                # The page is blocked until this request is resolved exactly once.
+                # Anything that went wrong above must still end in a decision.
+                if not responded:
+                    try:
+                        await tab.send(cdp_fetch.continue_request(request_id=request_id))
+                    except Exception:
+                        pass
+
+        tab.add_handler(cdp_fetch.RequestPaused, on_paused)
+        state["handler"] = on_paused
+        await tab.send(cdp_fetch.enable(patterns=[
+            cdp_fetch.RequestPattern(url_pattern=url_pattern or "*")
+        ]))
+
+        if auto_disable_after and auto_disable_after > 0:
+            state["expires_at"] = time.time() + float(auto_disable_after)
+
+            async def watchdog():
+                try:
+                    await asyncio.sleep(float(auto_disable_after))
+                    if _INTERCEPT["active"]:
+                        await _intercept_disable("auto-disabled on deadline")
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+
+            state["watchdog"] = asyncio.create_task(watchdog())
+        else:
+            state["expires_at"] = 0.0
+
+        return ok(json.dumps({
+            "active": True,
+            "action": action,
+            "url_pattern": url_pattern or "*",
+            "methods": list(wanted) if wanted else "all",
+            "auto_disable_after_s": auto_disable_after or None,
+            "note": (
+                "Every matching request is paused until this handler answers it. "
+                "Call intercept_stop() when done; it also disables itself after "
+                "the deadline so a forgotten intercept cannot wedge the page."
+            ),
+        }, indent=2))
+    except Exception as e:
+        try:
+            await _intercept_disable("failed to start")
+        except Exception:
+            pass
+        return err(str(e))
+
+
+@mcp.tool()
+async def intercept_log(limit: int = 50, clear: bool = False) -> str:
+    """Read what interception saw, with its status attached.
+
+    Reports whether interception is still active and why it stopped, because an
+    empty log means nothing on its own: it cannot otherwise be told apart from
+    "never started" or "the deadline already fired".
+    """
+    state = _INTERCEPT
+    entries = state["log"][-max(1, int(limit)):]
+    payload = {
+        "active": state["active"],
+        "action": state["action"],
+        "url_pattern": state["url_pattern"],
+        "methods": list(state["methods"]) if state["methods"] else "all",
+        "counts": dict(state["counts"]),
+        "expires_in_s": (round(state["expires_at"] - time.time(), 1)
+                         if state["active"] and state["expires_at"] else None),
+        "stop_reason": state.get("stop_reason"),
+        "returned": len(entries),
+        "requests": entries,
+    }
+    if not state["active"]:
+        payload["note"] = (
+            "NOT intercepting — an empty list here means nothing was watched, "
+            "not that the page sent nothing. Call intercept_start() or dry_run()."
+        )
+    if clear:
+        state["log"] = []
+    return ok(json.dumps(payload, indent=2, default=str))
+
+
+@mcp.tool()
+async def intercept_stop() -> str:
+    """Stop intercepting and let the page make requests normally again."""
+    was_active = _INTERCEPT["active"]
+    counts = dict(_INTERCEPT["counts"])
+    await _intercept_disable("stopped by caller")
+    if not was_active:
+        return ok("interception was not active")
+    return ok(json.dumps({"stopped": True, "counts": counts}, indent=2))
+
+
+@mcp.tool()
+async def dry_run(
+    enable: bool = True,
+    url_pattern: str = "*",
+    methods: str = "POST,PUT,PATCH,DELETE",
+    auto_disable_after: float = 300.0,
+) -> str:
+    """⭐ Explore a logged-in account without changing anything.
+
+    Blocks every mutating request (POST/PUT/PATCH/DELETE by default) and records
+    what would have been sent — method, URL, headers, body. Reads still work, so
+    the app is fully navigable while nothing can be created, edited or deleted.
+
+    This is the safe way to answer "which endpoint does the delete button call?"
+    on a real account: click it, read intercept_log(), and see the exact request
+    that was stopped. GET and HEAD are untouched, so the page keeps working.
+
+    Args:
+        enable: False turns dry-run off (same as intercept_stop).
+        url_pattern: narrow to one API surface, e.g. "*/api/*".
+        methods: which methods to block. Widen or narrow as needed.
+        auto_disable_after: seconds before it lifts itself, so a forgotten
+            dry-run does not silently break later work.
+
+    The page will surface blocked calls as network errors — that is the intended,
+    visible signal that a mutation was prevented, not a bug.
+    """
+    if not enable:
+        return await intercept_stop()
+    result = await intercept_start(
+        url_pattern=url_pattern,
+        action="cancel",
+        methods=methods,
+        auto_disable_after=auto_disable_after,
+    )
+    if result.startswith("Error"):
+        return result
+    return ok(json.dumps({
+        "dry_run": True,
+        "blocking": [m.strip().upper() for m in methods.split(",") if m.strip()],
+        "url_pattern": url_pattern,
+        "auto_disable_after_s": auto_disable_after,
+        "how_to_read": (
+            "Drive the UI as usual, then call intercept_log() to see the exact "
+            "requests that were stopped, with headers and body. Blocked calls "
+            "appear in the page as network errors — that is the mutation being "
+            "prevented, working as intended."
+        ),
+    }, indent=2))
 
 
 @mcp.tool()

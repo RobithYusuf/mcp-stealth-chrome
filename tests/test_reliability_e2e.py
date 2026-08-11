@@ -151,14 +151,34 @@ def test_screenshot_region_selector(loop):
     assert "not found" in missing.lower()
 
 
-def test_screenshot_base64_guard(loop):
+def test_screenshot_base64_shrinks_to_fit_then_refuses_honestly(loop):
+    """Shrink the inline copy rather than burning the call on a refusal.
+
+    Refusing was truthful but still cost a round trip, and a smaller image is
+    nearly always acceptable. Only when even the smallest encoding cannot fit
+    should it decline — and then it must say that downscaling was already tried,
+    so the caller does not retry the same thing.
+    """
     import mcp_stealth_chrome.server as srv
+
     prev = srv.B64_INLINE_LIMIT
-    srv.B64_INLINE_LIMIT = 500
     try:
+        # Room for a small image: the inline copy must be shrunk and delivered.
+        srv.B64_INLINE_LIMIT = 20000
         out = loop.run_until_complete(tool("screenshot")(
-            filename="t_b64.png", return_base64=True))
-        assert "base64 omitted" in out and "max_dimension" in out
+            filename="t_b64_fit.png", return_base64=True))
+        assert "---base64---" in out, "a shrunken copy should still be inlined"
+        assert "auto-shrunk" in out
+        body = out.split("---base64---")[1].strip()
+        assert 0 < len(body) <= srv.B64_INLINE_LIMIT
+
+        # Physically impossible budget (~370 bytes): refuse, and say why.
+        srv.B64_INLINE_LIMIT = 500
+        out = loop.run_until_complete(tool("screenshot")(
+            filename="t_b64_tiny.png", return_base64=True))
+        assert "base64 omitted" in out
+        assert "even after downscaling" in out
+        assert "---base64---" not in out
     finally:
         srv.B64_INLINE_LIMIT = prev
 
@@ -350,3 +370,52 @@ def test_privacy_launch_rotates_and_removes_profiles(loop):
     finally:
         loop.run_until_complete(tool("close_instance")(iid))
         loop.run_until_complete(tool("switch_instance")("main"))
+
+
+def test_dry_run_blocks_mutations_and_captures_what_they_would_send(loop):
+    """The point of dry-run: learn what a destructive call sends, without sending it.
+
+    Uses an unresolvable host so the check needs no network — the assertions are
+    on OUR interception log, which records the decision before the request ever
+    leaves the browser.
+    """
+    import json as _json
+
+    try:
+        started = _json.loads(loop.run_until_complete(tool("dry_run")()))
+        assert "POST" in started["blocking"]
+
+        loop.run_until_complete(tool("evaluate")("""
+            (async () => {
+              try { await fetch('https://blocked.invalid/api/items', {
+                      method: 'POST', body: '{"delete_many":[1,2,3]}' }); } catch (e) {}
+              try { await fetch('https://blocked.invalid/api/items'); } catch (e) {}
+              return 'done';
+            })()"""))
+
+        seen = _json.loads(loop.run_until_complete(tool("intercept_log")()))
+        assert seen["active"] is True
+        posts = [r for r in seen["requests"] if r["method"] == "POST"]
+        assert posts, "the POST should have been intercepted"
+        assert posts[0]["outcome"] == "blocked"
+        # The body is the whole reason to do this rather than just watch traffic.
+        assert "delete_many" in (posts[0]["body"] or "")
+        # A GET is not a mutation, so it must be waved through untouched.
+        gets = [r for r in seen["requests"] if r["method"] == "GET"]
+        assert gets and gets[0]["outcome"] == "passed"
+    finally:
+        loop.run_until_complete(tool("intercept_stop")())
+
+    # An idle log must not read as "nothing happened".
+    after = _json.loads(loop.run_until_complete(tool("intercept_log")()))
+    assert after["active"] is False and "note" in after
+
+
+def test_intercept_log_distinguishes_idle_from_silent(loop):
+    """An empty list means 'not watching' here, and says so."""
+    import json as _json
+
+    loop.run_until_complete(tool("intercept_stop")())
+    idle = _json.loads(loop.run_until_complete(tool("intercept_log")()))
+    assert idle["active"] is False
+    assert "NOT intercepting" in idle["note"]
