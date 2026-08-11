@@ -152,6 +152,7 @@ def format_snapshot(
     mode: str = "full",
     unchanged_from: str | None = None,
     changed_fingerprints: set[str] | None = None,
+    total_count: int | None = None,
 ) -> str:
     """Pretty-print snapshot for LLM consumption."""
     if not elements:
@@ -164,7 +165,11 @@ def format_snapshot(
         header.append(f"Mode: {mode}")
     if unchanged_from:
         header.append(f"DOM hash: {unchanged_from} (unchanged)")
-    if changed_fingerprints is None:
+    if unchanged_from and total_count is not None:
+        count_header = (
+            f"Interactive elements ({total_count}, unchanged; details omitted):"
+        )
+    elif changed_fingerprints is None:
         count_header = f"Interactive elements ({len(elements)}):"
     else:
         changed_count = sum(

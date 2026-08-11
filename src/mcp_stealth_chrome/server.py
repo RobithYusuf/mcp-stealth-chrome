@@ -1414,7 +1414,11 @@ async def wait_for_human(
         # None means "inherit". Keying off the literal 300 would silently
         # override a caller who genuinely asked for 300 seconds.
         if timeout is None:
-            timeout = float(request.get("timeout") or 300)
+            timeout = (
+                float(request["timeout"])
+                if "timeout" in request
+                else 300.0
+            )
         baseline = request.get("baseline") or await _page_sig(tab)
         loop = asyncio.get_event_loop()
         started = loop.time()
@@ -1534,9 +1538,14 @@ async def browser_snapshot(
         }.get(mode, SNAPSHOT_JS)
         raw = await _wait(tab.evaluate(js, return_by_value=True), what="browser_snapshot")
         raw = raw.value if hasattr(raw, "value") and not isinstance(raw, str) else raw
-        elements = parse_json(raw, [])
-        if not isinstance(elements, list):
-            elements = []
+        try:
+            elements = raw if isinstance(raw, list) else json.loads(raw)
+        except (TypeError, json.JSONDecodeError) as e:
+            return err(f"snapshot script returned invalid JSON: {e}")
+        if not isinstance(elements, list) or any(
+            not isinstance(element, dict) for element in elements
+        ):
+            return err("snapshot script returned an invalid element list")
         url = await get_url(tab)
         title = await get_title(tab)
         h = snapshot_hash(elements)
@@ -1546,6 +1555,7 @@ async def browser_snapshot(
             return ok(format_snapshot(
                 [], url, title, mode=mode, unchanged_from=h,
                 changed_fingerprints=set() if delta else None,
+                total_count=int(last.get("count", len(elements))),
             ))
         fingerprints = {element_fingerprint(el) for el in elements}
         previous = set(last.get("fingerprints", ())) if last else set()
@@ -1554,6 +1564,7 @@ async def browser_snapshot(
             "url": url,
             "hash": h,
             "fingerprints": fingerprints,
+            "count": len(elements),
         }
         return ok(format_snapshot(
             elements,

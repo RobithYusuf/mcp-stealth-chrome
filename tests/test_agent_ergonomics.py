@@ -61,6 +61,19 @@ def test_format_snapshot_first_delta_marks_everything():
     assert len([line for line in rendered.splitlines() if line.startswith("* ref=")]) == 2
 
 
+def test_format_snapshot_unchanged_preserves_real_element_count():
+    rendered = format_snapshot(
+        [],
+        "https://example.test/",
+        "Example",
+        unchanged_from="abc123",
+        changed_fingerprints=set(),
+        total_count=7,
+    )
+    assert "Interactive elements (7, unchanged; details omitted)" in rendered
+    assert "Interactive elements (0" not in rendered
+
+
 def test_wait_for_human_inherits_timeout_without_a_magic_value():
     """An explicit timeout must survive.
 
@@ -74,6 +87,58 @@ def test_wait_for_human_inherits_timeout_without_a_magic_value():
 
     sig = inspect.signature(mcp._tool_manager._tools["wait_for_human"].fn)
     assert sig.parameters["timeout"].default is None
+
+
+def test_wait_for_human_preserves_zero_second_handoff_timeout(monkeypatch):
+    import asyncio
+
+    from mcp_stealth_chrome import server
+
+    class _Target:
+        target_id = "HUMAN-ZERO"
+
+    class _Tab:
+        target = _Target()
+
+    class _Loop:
+        def time(self):
+            return 0.0
+
+    monkeypatch.setattr(
+        server.BrowserState,
+        "active_tab",
+        classmethod(lambda cls: _Tab()),
+    )
+    monkeypatch.setattr(server.asyncio, "get_event_loop", lambda: _Loop())
+    server._HUMAN_HELP["HUMAN-ZERO"] = {
+        "baseline": {"url": "before", "nodes": 1, "len": 1},
+        "timeout": 0.0,
+    }
+    try:
+        wait = server.mcp._tool_manager._tools["wait_for_human"].fn
+        result = asyncio.run(wait(done_url_contains="would-match-if-polled"))
+        assert result.startswith("Error: timeout after 0.0s")
+    finally:
+        server._HUMAN_HELP.pop("HUMAN-ZERO", None)
+
+
+def test_browser_snapshot_rejects_unmeasured_invalid_json(monkeypatch):
+    import asyncio
+
+    from mcp_stealth_chrome import server
+
+    class _Tab:
+        async def evaluate(self, *_args, **_kwargs):
+            return "not-json"
+
+    monkeypatch.setattr(
+        server.BrowserState,
+        "active_tab",
+        classmethod(lambda cls: _Tab()),
+    )
+    snapshot = server.mcp._tool_manager._tools["browser_snapshot"].fn
+    result = asyncio.run(snapshot())
+    assert result.startswith("Error: snapshot script returned invalid JSON")
 
 
 def test_target_key_is_shared_and_console_alias_delegates():
