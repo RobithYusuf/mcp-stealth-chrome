@@ -492,6 +492,15 @@ Network capture with response bodies, plus a bridge from browser session into TL
 | `wait_for_request` | Block until a request matching `url_pattern` is observed (+ optional method filter, + optional response wait) — replaces `setTimeout` polling |
 | `dialog_auto_handle` | Persistent native-dialog handler with type filter (alert / confirm / prompt / beforeunload). Update action without re-arming. Idempotent per tab |
 
+### ⭐⭐ Request Interception — see a request before the server does
+| Tool | Purpose |
+|------|---------|
+| `dry_run` | **Explore a logged-in account without changing anything.** Blocks POST/PUT/PATCH/DELETE and records what each WOULD have sent (method, URL, headers, body) while reads still work — click the delete button, then read the exact request that was stopped |
+| `intercept_start` | Pause matching requests and `observe` / `cancel` / `mock` them at the CDP layer — catches XHR and anything the page captured before your script ran, which patching `window.fetch` cannot |
+| `intercept_log` | What was seen, plus whether interception is still active — an empty log cannot be mistaken for "the page sent nothing" |
+| `intercept_stop` | End it early; it also disables itself on a deadline so a forgotten intercept cannot wedge the page |
+| `export_curl` | Turn a captured request into a runnable `curl` **and** an `http_request(impersonate='chrome')` call. The second form is the point: plain curl replays with a curl TLS fingerprint, which anti-bot systems flag even when every header matches |
+
 ### ⭐ Stealth Toolkit
 | Tool | Purpose |
 |------|---------|
@@ -499,6 +508,7 @@ Network capture with response bodies, plus a bridge from browser session into TL
 | `solve_captcha` | CapSolver API — Turnstile/reCAPTCHA/hCaptcha |
 | `verify_cf` | Cloudflare checkbox via OpenCV template match |
 | `fingerprint_rotate` | UA/lang/platform/timezone via CDP |
+| `fingerprint_audit` | **Audit this browser's OWN fingerprint** for the leaks detectors read — in-page, nothing leaves the machine. Weights cross-field consistency (a Windows UA on a MacIntel platform) and states what it cannot see from inside a page (TLS/JA3, IP-vs-timezone) |
 | `identity_pin` / `identity_show` | Persist and inspect a stable fingerprint + proxy per browser instance |
 | `browser_launch(privacy=True)` | Fresh randomized fingerprint + disposable profile removed on close |
 | `humanize_click` / `humanize_type` | Bezier+Gaussian for single actions |
@@ -563,7 +573,7 @@ Network capture with response bodies, plus a bridge from browser session into TL
 | Viewport/Scroll: 4 | get/set_viewport_size, scroll, scroll_to |
 | Dialog: 2 | dialog_handle, dialog_auto_handle |
 | A11y: 1 | accessibility_snapshot |
-| Console/Network: 4 | console_start/get, network_start/get |
+| Console/Network: 9 | console_start/get, network_start/get, **intercept_start/log/stop**, **dry_run**, **export_curl** |
 | Debug: 3 | server_status, get_page_errors, export_har |
 | Scraping: 4 | detect_content_pattern, extract_structured, extract_table, scrape_page |
 | Chrome profile integration: 2 | list_chrome_profiles, clone_chrome_profile |
