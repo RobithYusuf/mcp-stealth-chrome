@@ -122,6 +122,40 @@ def test_wait_for_human_preserves_zero_second_handoff_timeout(monkeypatch):
         server._HUMAN_HELP.pop("HUMAN-ZERO", None)
 
 
+def test_focus_and_handoff_do_not_claim_unconfirmed_foreground(monkeypatch):
+    import asyncio
+
+    from mcp_stealth_chrome import server
+
+    class _Target:
+        target_id = "NO-FOCUS"
+
+    class _Tab:
+        target = _Target()
+
+        async def activate(self):
+            raise RuntimeError("activate failed")
+
+        async def bring_to_front(self):
+            raise RuntimeError("front failed")
+
+    monkeypatch.setattr(
+        server.BrowserState,
+        "active_tab",
+        classmethod(lambda cls: _Tab()),
+    )
+    monkeypatch.setattr(server.BrowserState, "current_headless", False)
+    monkeypatch.setattr(server.sys, "platform", "linux")
+    focus = server.mcp._tool_manager._tools["tab_focus"].fn
+    handoff = server.mcp._tool_manager._tools["request_human_help"].fn
+
+    focus_result = asyncio.run(focus())
+    handoff_result = asyncio.run(handoff(objective="finish login"))
+    assert focus_result.startswith("Error: could not confirm")
+    assert handoff_result.startswith("Error: human help unavailable")
+    assert "NO-FOCUS" not in server._HUMAN_HELP
+
+
 def test_browser_snapshot_rejects_unmeasured_invalid_json(monkeypatch):
     import asyncio
 

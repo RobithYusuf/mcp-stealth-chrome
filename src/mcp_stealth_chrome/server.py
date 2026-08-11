@@ -1270,6 +1270,14 @@ async def tab_focus() -> str:
             focused_actions.append("bring_to_front")
         except Exception as e:
             focused_actions.append(f"front_failed:{type(e).__name__}")
+        if not any(
+            action in {"activate", "bring_to_front"}
+            for action in focused_actions
+        ):
+            return err(
+                "could not confirm that the browser was focused; "
+                f"actions: {', '.join(focused_actions)}"
+            )
         url = await get_url(tab)
         title = await get_title(tab)
         profile = (
@@ -1314,13 +1322,14 @@ async def _foreground_for_human(tab: Tab) -> list[str]:
             executable = Path(str(BrowserState.browser.config.browser_executable_path))
             app = next((p for p in executable.parents if p.suffix == ".app"), None)
             if app is not None:
-                subprocess.run(
+                completed = subprocess.run(
                     ["open", "-a", str(app)],
                     capture_output=True,
                     timeout=3,
                     check=False,
                 )
-                actions.append("macOS app activated")
+                if completed.returncode == 0:
+                    actions.append("macOS app activated")
         except Exception:
             pass
     return actions
@@ -1342,6 +1351,11 @@ async def request_human_help(objective: str, timeout: float = 300) -> str:
                 "then call request_human_help again."
             )
         actions = await _foreground_for_human(tab)
+        if not actions:
+            return err(
+                "human help unavailable: no foreground action succeeded, so the "
+                "browser window could not be confirmed visible"
+            )
         key = _target_key(tab)
         _HUMAN_HELP[key] = {
             "objective": objective,
