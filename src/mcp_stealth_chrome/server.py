@@ -5482,6 +5482,23 @@ from .tools.network_http import (  # noqa: F401
 # Idle instances auto-close after configurable timeout (prevents memory leaks).
 
 
+def _instance_profile_path(
+    instance_id: str,
+    *,
+    persistent: bool,
+    privacy: bool,
+    profile_dir_override: Optional[str],
+) -> Optional[Path]:
+    """Resolve the user-data dir actually passed to a named Chrome launch."""
+    if privacy:
+        return _new_privacy_profile(instance_id)
+    if profile_dir_override:
+        return Path(profile_dir_override).expanduser()
+    if not persistent:
+        return None
+    return PROFILE_DIR if instance_id == "main" else PROFILES_ROOT / instance_id
+
+
 async def _launch_browser_instance(
     instance_id: str,
     url: str,
@@ -5538,23 +5555,27 @@ async def _launch_browser_instance(
         return False, f"identity setup failed: {e}"
 
     # Determine profile dir per instance
-    privacy_profile: Optional[Path] = None
-    if privacy:
-        privacy_profile = _new_privacy_profile(instance_id)
-        profile_path = privacy_profile
-    elif profile_dir_override:
-        profile_path = Path(profile_dir_override)
-    elif instance_id == "main":
-        profile_path = PROFILE_DIR
-    else:
-        profile_path = PROFILES_ROOT / instance_id
-    profile_path.mkdir(parents=True, exist_ok=True)
-
-    if persistent:
-        clean_profile_state(profile_path)
+    profile_path = _instance_profile_path(
+        instance_id,
+        persistent=persistent,
+        privacy=privacy,
+        profile_dir_override=profile_dir_override,
+    )
+    privacy_profile = profile_path if privacy else None
+    if profile_path is not None:
+        if profile_path.exists():
+            holder = chrome_lock_holder_pid(profile_path)
+            if holder is not None:
+                return False, (
+                    f"profile {profile_path} is locked by Chrome PID {holder}; "
+                    "close that browser or clone the profile first"
+                )
+        profile_path.mkdir(parents=True, exist_ok=True)
+        if persistent or profile_dir_override:
+            clean_profile_state(profile_path)
 
     config = Config(
-        user_data_dir=str(profile_path) if (persistent or privacy) else None,
+        user_data_dir=str(profile_path) if profile_path is not None else None,
         headless=headless,
         lang=(effective_fingerprint.get("accept_language", "").split(",")[0] or lang),
         browser_args=list(extra_args or []),
@@ -5579,7 +5600,7 @@ async def _launch_browser_instance(
         await _remove_privacy_profile(privacy_profile)
         return False, (
             f"launch timed out after {BROWSER_LAUNCH_TIMEOUT}s — profile "
-            f"{profile_path} may be locked or Chrome is hung."
+            f"{profile_path or '(ephemeral)'} may be locked or Chrome is hung."
         )
     except asyncio.CancelledError:
         await _safe_stop_browser(browser)
@@ -5669,7 +5690,8 @@ async def _launch_browser_instance(
     _ensure_idle_reaper_running()
     return True, (
         f"instance {instance_id!r} launched (headless={headless}, "
-        f"privacy={privacy}, identity={identity_source}, profile={profile_path.name})"
+        f"privacy={privacy}, identity={identity_source}, "
+        f"profile={profile_path.name if profile_path else '(ephemeral Chrome temp)'})"
     )
 
 

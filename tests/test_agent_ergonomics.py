@@ -575,6 +575,21 @@ def test_spawn_refuses_stale_instance_slot_before_launch(monkeypatch):
     assert calls == []
 
 
+def test_named_ephemeral_launch_does_not_claim_or_create_persistent_profile(monkeypatch, tmp_path):
+    from mcp_stealth_chrome import server
+
+    assert server._instance_profile_path(
+        "worker", persistent=False, privacy=False, profile_dir_override=None,
+    ) is None
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    override = server._instance_profile_path(
+        "worker", persistent=False, privacy=False,
+        profile_dir_override="~/chosen-profile",
+    )
+    assert override == tmp_path / "chosen-profile"
+
+
 def test_sqlite_snapshot_copies_wal_and_verifies(tmp_path):
     """Cloning a live profile must not depend on Connection.backup().
 
