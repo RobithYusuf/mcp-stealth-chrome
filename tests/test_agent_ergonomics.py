@@ -761,6 +761,14 @@ def test_export_curl_uses_chrome_url_cookie_rules(monkeypatch):
     assert "Cookie: sid=secret" in out["curl"]
 
 
+def test_cookie_domain_filter_never_sends_child_cookie_to_parent():
+    from mcp_stealth_chrome.server import _cookie_domain_match
+
+    assert _cookie_domain_match(".example.com", "https://sub.example.com/x") is True
+    assert _cookie_domain_match("sub.example.com", "https://example.com/x") is False
+    assert _cookie_domain_match("example.com", "https://notexample.com/x") is False
+
+
 def test_export_curl_surfaces_cookie_measurement_failure(monkeypatch):
     import asyncio
 

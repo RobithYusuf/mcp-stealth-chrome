@@ -2868,7 +2868,7 @@ def _cookie_domain_match(cookie_domain: Optional[str], url_or_host: str) -> bool
     cd = (cookie_domain or "").lower().strip().lstrip(".")
     if not cd or not host:
         return False
-    return host == cd or host.endswith("." + cd) or cd.endswith("." + host)
+    return host == cd or host.endswith("." + cd)
 
 
 def _active_tab_host() -> Optional[str]:
