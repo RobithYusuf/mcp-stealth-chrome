@@ -113,6 +113,99 @@ def _trim_index(index: dict) -> None:
             index.pop(key, None)
 
 
+async def _ensure_browser_dead(browser, profile_dir=None, grace: float = 1.5) -> dict:
+    """Stop a browser and VERIFY the OS process actually died.
+
+    `browser.stop()` talks over CDP. When the websocket is already gone — a
+    reload, a wedged renderer, a socket that closed without a close frame — it
+    can return without raising while Chrome keeps running. Trusting it then
+    reports a clean close, drops the handle, and leaves an orphan nobody owns:
+    the process outlives the only thing that knew about it.
+
+    So the process is confirmed dead out-of-band, and signalled directly if it
+    is not. The PID nodriver recorded at launch is the precise target; the
+    profile-dir scan is the fallback for attached or restored browsers where no
+    PID was ever captured.
+
+    Returns {stopped, pid, killed, still_alive, detail} — never raises.
+    """
+    import signal as _signal
+
+    # `verified` is the load-bearing field: True only when death was actually
+    # confirmed. Absence of evidence (no PID, no profile to scan) is NOT proof,
+    # so it stays False and the caller must not claim a clean close.
+    report = {"stopped": False, "verified": False, "pid": None, "killed": [],
+              "still_alive": [], "detail": ""}
+    pid = getattr(browser, "_process_pid", None) if browser else None
+    report["pid"] = pid
+    try:
+        if browser:
+            browser.stop()
+        report["stopped"] = True
+    except Exception as e:
+        report["detail"] = f"stop() raised: {type(e).__name__}: {e}"
+
+    # Collect every PID that could still be ours.
+    candidates: list[int] = [pid] if isinstance(pid, int) and pid > 0 else []
+    if profile_dir is not None:
+        try:
+            from .state import find_chrome_pids_by_profile
+            for extra in find_chrome_pids_by_profile(profile_dir):
+                if extra not in candidates:
+                    candidates.append(extra)
+        except Exception:
+            pass
+    if not candidates:
+        # Nothing to check against — cannot prove the process ended.
+        return report
+
+    await asyncio.sleep(grace)  # let a graceful stop finish before escalating
+    for target in candidates:
+        try:
+            os.kill(target, 0)          # liveness probe only
+        except (ProcessLookupError, PermissionError, OSError):
+            continue                    # already gone, or not ours to signal
+        try:
+            os.kill(target, _signal.SIGTERM)
+            report["killed"].append(target)
+        except Exception:
+            continue
+    if report["killed"]:
+        await asyncio.sleep(1.0)
+        for target in list(report["killed"]):
+            try:
+                os.kill(target, 0)
+            except (ProcessLookupError, PermissionError, OSError):
+                continue
+            try:
+                os.kill(target, _signal.SIGKILL)
+            except Exception:
+                report["still_alive"].append(target)
+    for target in candidates:
+        try:
+            os.kill(target, 0)
+            if target not in report["still_alive"]:
+                report["still_alive"].append(target)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    report["verified"] = not report["still_alive"]
+    return report
+
+
+def _kill_note(report: dict) -> str:
+    """Human-readable tail for a close result — empty when nothing was needed."""
+    bits = []
+    if report.get("killed"):
+        bits.append(
+            f"CDP stop did not end the process; signalled PID(s) "
+            f"{report['killed']} directly")
+    if report.get("still_alive"):
+        bits.append(
+            f"WARNING: PID(s) {report['still_alive']} are STILL RUNNING and are "
+            f"now orphaned — kill them manually")
+    return (" (" + "; ".join(bits) + ")") if bits else ""
+
+
 def _target_key(tab) -> str:
     """Stable identity for a tab's CDP target.
 
@@ -691,9 +784,37 @@ async def browser_launch(
         return err("another launch is already in progress — wait for it to finish")
 
     async with _LAUNCH_LOCK:
-        # Re-check inside the lock (race with another concurrent call)
+        # Re-check inside the lock (race with another concurrent call).
+        # Reusing a live browser is not just an optimisation: starting a second
+        # Chrome against the same profile is what produces "CDP unreachable",
+        # and the half-started process is what gets orphaned.
         if BrowserState.is_up():
-            return ok(f"Browser already running with {len(BrowserState.tabs)} tab(s).")
+            try:
+                # is_up() only proves a handle exists. The socket can be gone
+                # while Chrome still runs, so make CDP actually answer.
+                _tab = BrowserState.active_tab()
+                await _wait(_tab.evaluate("1", return_by_value=True),
+                            timeout=5, what="reuse probe")
+                if url and url != "about:blank":
+                    # Honour the caller's url. Returning "already running" while
+                    # silently ignoring it left them on the wrong page believing
+                    # the navigation had happened.
+                    await _wait(_tab.get(url), what="reuse navigate")
+                    return ok(f"reusing the running browser ({len(BrowserState.tabs)} tab(s)) "
+                              f"— navigated to {url}")
+                return ok(f"reusing the running browser ({len(BrowserState.tabs)} tab(s))")
+            except Exception as e:
+                # The handle is stale. Relaunching on top of a half-dead Chrome
+                # is exactly the collision to avoid, so end it first.
+                _reap = await _ensure_browser_dead(
+                    BrowserState.browser, BrowserState.current_profile_dir)
+                BrowserState.reset()
+                if _reap.get("still_alive"):
+                    return err(
+                        f"a previous browser is unreachable ({type(e).__name__}: {e}) and its "
+                        f"PID(s) {_reap['still_alive']} could not be ended. Kill them, then "
+                        f"retry — relaunching now would collide with them."
+                    )
 
         ensure_dirs()
 
@@ -885,7 +1006,11 @@ async def browser_launch(
             await _remove_privacy_profile(privacy_profile)
             raise
         except Exception as e:
-            await _safe_stop_browser(browser)
+            # "CDP unreachable" means the process very likely STARTED and only
+            # the websocket failed — so _safe_stop_browser, which speaks CDP,
+            # cannot end it. Reaping our own PID here is the difference between
+            # a failed launch and a failed launch plus an orphan nobody owns.
+            reap = await _ensure_browser_dead(browser, profile_path if persistent else None)
             await _remove_privacy_profile(privacy_profile)
             # Diagnose common nodriver "Failed to connect to browser" — usually
             # means Chrome started but its CDP websocket couldn't be reached
@@ -896,6 +1021,13 @@ async def browser_launch(
                 holder = chrome_lock_holder_pid(profile_path) if persistent else None
                 ext = find_external_chrome_pids()
                 parts = [f"launch failed (Chrome started but CDP unreachable): {msg}"]
+                if reap.get("killed"):
+                    parts.append(
+                        f"→ Reaped the Chrome this launch started (PID(s) {reap['killed']}), "
+                        f"so it is not left behind.")
+                if reap.get("still_alive"):
+                    parts.append(
+                        f"→ WARNING: PID(s) {reap['still_alive']} survived and are orphaned.")
                 if holder is not None:
                     parts.append(f"→ Profile {profile_path} is locked by PID {holder}.")
                 elif ext:
@@ -6352,11 +6484,11 @@ async def close_instance(instance_id: str) -> str:
             _profile = BrowserState.current_profile_dir
             _privacy = BrowserState.current_privacy
             _tabs = list(BrowserState.tabs)
-            try:
-                if BrowserState.browser:
-                    BrowserState.browser.stop()
-            except Exception as e:
-                return err(f"close failed: {e}")
+            _kill = await _ensure_browser_dead(BrowserState.browser, _profile)
+            if not _kill["stopped"] and not _kill["verified"]:
+                _alive = (f"PID(s) {_kill['still_alive']} still running"
+                          if _kill["still_alive"] else "could not confirm the process ended")
+                return err(f"close failed: {_kill['detail']}; {_alive} — instance retained")
             _iid = BrowserState.current_instance_id
             BrowserState.reset()
             _clear_tab_scoped_state(_tabs)
@@ -6372,7 +6504,7 @@ async def close_instance(instance_id: str) -> str:
             elif _profile:
                 clean_profile_state(_profile)
             _ATTACHED_BROWSERS.discard(_iid)
-            return ok(f"closed current instance {instance_id!r}")
+            return ok(f"closed current instance {instance_id!r}" + _kill_note(_kill))
         if BrowserState.current_privacy:
             _profile = BrowserState.current_profile_dir
             if not await _remove_privacy_profile(_profile):
@@ -6388,13 +6520,13 @@ async def close_instance(instance_id: str) -> str:
     if snap is None:
         return err(f"instance {instance_id!r} not found")
     _tabs = list(snap.tabs)
-    try:
-        if snap.browser:
-            snap.browser.stop()
-    except Exception as e:
+    _kill = await _ensure_browser_dead(snap.browser, snap.profile_dir)
+    if not _kill["stopped"] and not _kill["verified"]:
+        _alive = (f"PID(s) {_kill['still_alive']} still running"
+                  if _kill["still_alive"] else "could not confirm the process ended")
         return err(
-            f"close failed for instance {instance_id!r}: {type(e).__name__}: {e}; "
-            "instance retained for retry"
+            f"close failed for instance {instance_id!r}: {_kill['detail']}; "
+            f"{_alive} — instance retained for retry"
         )
     # Chrome is stopped even if residue cleanup below fails. Retain a minimal
     # snapshot in that case so a second close_instance call can retry cleanup.
@@ -6410,7 +6542,7 @@ async def close_instance(instance_id: str) -> str:
         return err(f"closed browser but failed to remove privacy profile {snap.profile_dir}")
     BrowserState.instances.pop(instance_id, None)
     _ATTACHED_BROWSERS.discard(instance_id)
-    return ok(f"closed instance {instance_id!r}")
+    return ok(f"closed instance {instance_id!r}" + _kill_note(_kill))
 
 
 @mcp.tool()

@@ -1021,3 +1021,59 @@ def test_compat_patch_status_is_visible():
     assert st["healthy"] is True
     assert "cookie_same_party" in st["applied"]
     assert "client_security_state" in st["applied"]
+
+
+def test_close_kills_the_process_when_cdp_cannot(monkeypatch):
+    """A dead CDP socket must not turn into an orphaned Chrome.
+
+    browser.stop() speaks CDP. When the websocket is already gone it can return
+    without raising while Chrome keeps running — trusting it reports a clean
+    close, drops the handle, and leaves a process nobody owns. Death has to be
+    confirmed out-of-band and signalled directly when it is not.
+    """
+    import asyncio
+    import os
+
+    import mcp_stealth_chrome.server as srv
+
+    class _Browser:
+        _process_pid = 424242
+        def stop(self):
+            return None            # the silent-failure case: no exception
+
+    alive = {424242}
+    signalled = []
+
+    def fake_kill(pid, sig):
+        if sig == 0:
+            if pid in alive:
+                return None
+            raise ProcessLookupError(pid)
+        signalled.append((pid, sig))
+        alive.discard(pid)         # the signal is what actually ends it
+
+    monkeypatch.setattr(os, "kill", fake_kill)
+    report = asyncio.run(srv._ensure_browser_dead(_Browser(), None, grace=0))
+
+    assert report["pid"] == 424242
+    assert 424242 in report["killed"], "a surviving process must be signalled"
+    assert report["still_alive"] == []
+    assert report["verified"] is True
+    assert "signalled PID(s)" in srv._kill_note(report)
+
+
+def test_unverifiable_death_is_never_reported_as_clean():
+    """No PID and no profile to scan means no proof — and no proof is not success."""
+    import asyncio
+
+    import mcp_stealth_chrome.server as srv
+
+    class _Broken:
+        _process_pid = None
+        def stop(self):
+            raise RuntimeError("websocket already closed")
+
+    report = asyncio.run(srv._ensure_browser_dead(_Broken(), None, grace=0))
+    assert report["stopped"] is False
+    assert report["verified"] is False, "absence of evidence is not evidence of death"
+    assert srv._kill_note(report) == ""
