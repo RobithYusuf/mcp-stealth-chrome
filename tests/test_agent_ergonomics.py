@@ -1077,3 +1077,42 @@ def test_unverifiable_death_is_never_reported_as_clean():
     assert report["stopped"] is False
     assert report["verified"] is False, "absence of evidence is not evidence of death"
     assert srv._kill_note(report) == ""
+
+
+def test_window_placement_refuses_states_that_would_hide_the_window(tmp_path, monkeypatch):
+    """Placement memory must never recreate the invisible-window bug.
+
+    wipe_window_state() exists because a corrupt saved placement produces a
+    window that is open and unusable — 0x0, or parked off every display. Keeping
+    our own copy is only safe if it refuses the same shapes.
+    """
+    import asyncio
+
+    import mcp_stealth_chrome.server as srv
+
+    monkeypatch.setattr(srv, "_window_state_path", lambda iid: tmp_path / f"{iid}.json")
+
+    def saved(**over):
+        base = {"left": 100, "top": 100, "width": 1000, "height": 700,
+                "window_state": "normal"}
+        base.update(over)
+        (tmp_path / "w.json").write_text(json.dumps(base))
+
+    saved(width=0, height=0)
+    out = asyncio.run(srv._restore_window_bounds("w", None))
+    assert out["restored"] is False and "implausible size" in out["reason"]
+
+    saved(width=40, height=30)
+    out = asyncio.run(srv._restore_window_bounds("w", None))
+    assert out["restored"] is False, "a tiny window is as unusable as a zero one"
+
+    # Minimised/fullscreen are states, not placements — restoring them would
+    # hide the window or seize the screen without being asked.
+    saved(window_state="minimized")
+    out = asyncio.run(srv._restore_window_bounds("w", None))
+    assert out["restored"] is False and "minimized" in out["reason"]
+
+    # Nothing saved yet is a normal condition, not a failure.
+    (tmp_path / "w.json").unlink()
+    out = asyncio.run(srv._restore_window_bounds("w", None))
+    assert out["restored"] is False and out["reason"] == "no saved placement"

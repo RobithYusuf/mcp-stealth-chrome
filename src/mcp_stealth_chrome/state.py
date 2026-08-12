@@ -26,6 +26,10 @@ EXPORT_DIR = HOME / ".mcp-stealth" / "exports"
 STORAGE_STATE_DIR = HOME / ".mcp-stealth" / "storage-states"
 IDENTITIES_DIR = HOME / ".mcp-stealth" / "identities"
 PRIVACY_PROFILE_ROOT = HOME / ".mcp-stealth" / "privacy-profiles"
+# Where a window was last placed, per instance. Kept in our own file rather than
+# relying on Chrome's Preferences, because wipe_window_state() deliberately
+# clears Chrome's copy to cure the corrupt-placement / invisible-window bug.
+WINDOW_STATE_DIR = HOME / ".mcp-stealth" / "window-state"
 
 DEFAULT_IDLE_TIMEOUT = int(os.environ.get("BROWSER_IDLE_TIMEOUT", "600"))  # 10 min
 IDLE_REAPER_INTERVAL = int(os.environ.get("BROWSER_IDLE_REAPER_INTERVAL", "60"))
@@ -473,6 +477,7 @@ def ensure_dirs() -> None:
         EXPORT_DIR,
         STORAGE_STATE_DIR,
         IDENTITIES_DIR,
+        WINDOW_STATE_DIR,
         PRIVACY_PROFILE_ROOT,
     ):
         d.mkdir(parents=True, exist_ok=True)

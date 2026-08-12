@@ -113,6 +113,111 @@ def _trim_index(index: dict) -> None:
             index.pop(key, None)
 
 
+def _window_state_path(instance_id: str) -> Path:
+    """Where this instance's last window placement is remembered."""
+    from .state import WINDOW_STATE_DIR
+    return _direct_child(WINDOW_STATE_DIR, f"{instance_id}.json", "instance_id")
+
+
+async def _read_window_bounds(tab) -> Optional[dict]:
+    """Current window rect via CDP, or None if it cannot be read."""
+    try:
+        from nodriver.cdp import browser as cdp_browser
+        target_id = getattr(getattr(tab, "target", None), "target_id", None)
+        window_id, bounds = await _wait(
+            tab.send(cdp_browser.get_window_for_target(target_id=target_id)),
+            timeout=5, what="get_window_for_target")
+        state = getattr(bounds, "window_state", None)
+        return {
+            "left": getattr(bounds, "left", None),
+            "top": getattr(bounds, "top", None),
+            "width": getattr(bounds, "width", None),
+            "height": getattr(bounds, "height", None),
+            "window_state": getattr(state, "value", None) or (str(state) if state else "normal"),
+            "window_id": window_id,
+        }
+    except Exception:
+        return None
+
+
+async def _save_window_bounds(instance_id: str, tab) -> bool:
+    """Remember where this window currently sits. Best-effort."""
+    rect = await _read_window_bounds(tab)
+    if not rect or not rect.get("width") or not rect.get("height"):
+        return False
+    try:
+        ensure_dirs()
+        path = _window_state_path(instance_id)
+        payload = {k: rect[k] for k in ("left", "top", "width", "height", "window_state")}
+        payload["saved_at"] = int(time.time())
+        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
+async def _restore_window_bounds(instance_id: str, tab) -> dict:
+    """Put the window back where it was, and report what actually happened.
+
+    The monitor it was on may be gone. Rather than querying the display layout —
+    which needs a platform API and can still be stale — the saved rect is applied
+    and then read BACK: Chrome clamps a window to a connected display, so a
+    read-back that does not match is itself the signal that the screen changed.
+    That makes the check self-validating and impossible to get wrong by guessing.
+    """
+    result = {"restored": False, "reason": None, "requested": None, "actual": None}
+    try:
+        path = _window_state_path(instance_id)
+        if not path.exists():
+            result["reason"] = "no saved placement"
+            return result
+        saved = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        result["reason"] = f"unreadable saved placement: {type(e).__name__}"
+        return result
+
+    width, height = saved.get("width") or 0, saved.get("height") or 0
+    if width < 200 or height < 200:
+        # The exact corruption wipe_window_state() exists to cure: a 0x0 or
+        # tiny rect produces a window that is technically open and invisible.
+        result["reason"] = f"refused implausible size {width}x{height}"
+        return result
+    if (saved.get("window_state") or "normal") != "normal":
+        # Minimised/fullscreen are states, not placements; restoring them would
+        # hide the window or take over the screen unasked.
+        result["reason"] = f"saved state was {saved.get('window_state')}, not restoring"
+        return result
+
+    try:
+        from nodriver.cdp import browser as cdp_browser
+        target_id = getattr(getattr(tab, "target", None), "target_id", None)
+        window_id, _ = await _wait(
+            tab.send(cdp_browser.get_window_for_target(target_id=target_id)),
+            timeout=5, what="get_window_for_target")
+        want = cdp_browser.Bounds(
+            left=int(saved["left"]), top=int(saved["top"]),
+            width=int(width), height=int(height))
+        result["requested"] = {"left": want.left, "top": want.top,
+                               "width": want.width, "height": want.height}
+        await _wait(tab.send(cdp_browser.set_window_bounds(window_id=window_id, bounds=want)),
+                    timeout=5, what="set_window_bounds")
+        got = await _wait(tab.send(cdp_browser.get_window_bounds(window_id=window_id)),
+                          timeout=5, what="get_window_bounds")
+        actual = {"left": got.left, "top": got.top, "width": got.width, "height": got.height}
+        result["actual"] = actual
+        moved = abs((actual["left"] or 0) - want.left) > 40 or abs((actual["top"] or 0) - want.top) > 40
+        result["restored"] = True
+        result["reason"] = (
+            "saved monitor is gone — Chrome clamped the window onto a connected "
+            "display, so it is visible rather than off-screen"
+            if moved else "restored to the saved position"
+        )
+        result["clamped"] = moved
+    except Exception as e:
+        result["reason"] = f"could not apply placement: {type(e).__name__}: {e}"
+    return result
+
+
 async def _ensure_browser_dead(browser, profile_dir=None, grace: float = 1.5) -> dict:
     """Stop a browser and VERIFY the OS process actually died.
 
@@ -1151,10 +1256,29 @@ async def browser_launch(
                 verify_suffix = await asyncio.wait_for(_auto_verify_cf(main), timeout=25.0)
             except Exception:
                 verify_suffix = ""
+
+        # Put the window back where it was last time. Headless has no window to
+        # place, and an explicit --window-position means the caller has already
+        # decided — neither should be overridden.
+        place_suffix = ""
+        if not headless and not any(
+            (a or "").startswith("--window-position=") for a in merged_extra_args
+        ):
+            try:
+                placed = await _restore_window_bounds(BrowserState.current_instance_id, main)
+                if placed.get("restored"):
+                    act = placed.get("actual") or {}
+                    place_suffix = (
+                        f" [window {'clamped to a connected display' if placed.get('clamped') else 'restored'}"
+                        f" at ({act.get('left')},{act.get('top')}) {act.get('width')}x{act.get('height')}]"
+                    )
+            except Exception:
+                pass  # placement is a convenience; never fail a launch over it
+
         return ok(
             f"Browser launched (headless={headless}, persistent={persistent}, "
             f"privacy={privacy}, identity={identity_source}). "
-            f"Loaded {url}{suffix}{verify_suffix}{health_suffix}"
+            f"Loaded {url}{suffix}{verify_suffix}{health_suffix}{place_suffix}"
         )
 
 
@@ -1184,11 +1308,18 @@ async def browser_close() -> str:
     )
     closed_profile = BrowserState.current_profile_dir
     closed_tabs = list(BrowserState.tabs)
-    try:
-        if BrowserState.browser:
-            BrowserState.browser.stop()
-    except Exception as e:
-        return err(f"close failed: {e}")
+    # Remember the placement while the window still exists, so the next launch
+    # can return to the monitor it was actually on.
+    if not BrowserState.current_headless and closed_tabs:
+        try:
+            await _save_window_bounds(BrowserState.current_instance_id, closed_tabs[0])
+        except Exception:
+            pass
+    _kill = await _ensure_browser_dead(BrowserState.browser, closed_profile)
+    if not _kill["stopped"] and not _kill["verified"]:
+        _alive = (f"PID(s) {_kill['still_alive']} still running"
+                  if _kill["still_alive"] else "could not confirm the process ended")
+        return err(f"close failed: {_kill['detail']}; {_alive}")
     # Capture the id BEFORE reset() (which may change current_instance_id) so
     # we can drop any attached-browser bookkeeping for it.
     _closed_iid = BrowserState.current_instance_id
@@ -6484,6 +6615,13 @@ async def close_instance(instance_id: str) -> str:
             _profile = BrowserState.current_profile_dir
             _privacy = BrowserState.current_privacy
             _tabs = list(BrowserState.tabs)
+            # Remember the placement before the window goes away, so the next
+            # launch can land on the same monitor instead of the primary one.
+            try:
+                await _save_window_bounds(BrowserState.current_instance_id,
+                                          BrowserState.tabs[0] if BrowserState.tabs else None)
+            except Exception:
+                pass
             _kill = await _ensure_browser_dead(BrowserState.browser, _profile)
             if not _kill["stopped"] and not _kill["verified"]:
                 _alive = (f"PID(s) {_kill['still_alive']} still running"
@@ -6520,6 +6658,10 @@ async def close_instance(instance_id: str) -> str:
     if snap is None:
         return err(f"instance {instance_id!r} not found")
     _tabs = list(snap.tabs)
+    try:
+        await _save_window_bounds(instance_id, snap.tabs[0] if snap.tabs else None)
+    except Exception:
+        pass
     _kill = await _ensure_browser_dead(snap.browser, snap.profile_dir)
     if not _kill["stopped"] and not _kill["verified"]:
         _alive = (f"PID(s) {_kill['still_alive']} still running"
