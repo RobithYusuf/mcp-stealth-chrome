@@ -678,10 +678,6 @@ social_research(
 # use your imported session. Read the posts to judge sentiment / rank sellers.
 ```
 
-> 📘 The full OSINT method this tool encodes — paraphrase-union, platform-fit,
-> `site:` vs native trade-offs, and **honest limits** — is documented in
-> [`docs/RESEARCH_METHOD.md`](docs/RESEARCH_METHOD.md).
-
 ## Architecture
 
 ```
