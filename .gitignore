@@ -36,8 +36,11 @@ test-*.log
 # Generated data (user-specific, shouldn't be in repo)
 # Note: ~/.mcp-stealth/ lives outside repo so no pattern needed
 
-# Local-only docs (per user preference — not pushed to repo)
+# AGENTS.md is the single agent guide and IS committed.
+# CLAUDE.md is a symlink to it so Claude Code finds it under its own name.
 CLAUDE.md
-AGENTS.md
+
+# Credentials — never committed. The PyPI token lives in the macOS Keychain
+# (service: mcp-stealth-chrome-pypi), not on disk.
 .pypi-token
 *.token

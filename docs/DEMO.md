@@ -251,7 +251,7 @@ Any vision-enabled LLM with `/v1/chat/completions`:
 
 ## Reproducing These Demos
 
-1. Install mcp-stealth-chrome (see [INSTALL.md](../INSTALL.md))
+1. Install mcp-stealth-chrome (see [INSTALL.md](INSTALL.md))
 2. In Claude/Cursor, prompt:
    > "Use stealth-chrome to navigate to `dash.cloudflare.com/login` then call click_turnstile"
 3. Screenshot saved to `~/.mcp-stealth/screenshots/`

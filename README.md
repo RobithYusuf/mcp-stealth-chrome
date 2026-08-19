@@ -145,7 +145,7 @@ claude mcp add stealth-chrome --scope user -- uvx mcp-stealth-chrome@latest
 
 No Chrome? Server gives a friendly error with install instructions before failing.
 
-See [INSTALL.md](INSTALL.md) for detailed per-client setup + troubleshooting. Per-client snippets below:
+See [INSTALL.md](docs/INSTALL.md) for detailed per-client setup + troubleshooting. Per-client snippets below:
 
 <details>
 <summary><b>Claude Code</b></summary>
