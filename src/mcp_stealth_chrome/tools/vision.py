@@ -27,7 +27,7 @@ import json
 import os
 import re as _re
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 import httpx
 
@@ -667,5 +667,121 @@ async def vision_locate(
                 return err(f"located ({x},{y}) but click failed: {e}")
         result["clicked"] = bool(click)
         return ok(json.dumps(result, ensure_ascii=False))
+    except Exception as e:
+        return err(str(e))
+
+
+async def _vision_text(image_b64: str, prompt: str, provider: str, base_url: str,
+                       api_key: str, model: str) -> str:
+    """Ask the configured vision provider for free-form image analysis."""
+    if provider == "anthropic":
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
+                         "content-type": "application/json"},
+                json={"model": model, "max_tokens": 2000, "messages":[{"role":"user", "content":[
+                    {"type":"image", "source":{"type":"base64", "media_type":"image/png", "data":image_b64}},
+                    {"type":"text", "text":prompt},
+                ]}]},
+            )
+            if resp.status_code >= 400:
+                raise RuntimeError(f"vision API {resp.status_code}: {resp.text[:300]}")
+            return str((resp.json().get("content") or [{}])[0].get("text", ""))
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(
+            base_url.rstrip("/") + "/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type":"application/json"},
+            json={"model":model, "max_tokens":2000, "temperature":0,
+                  "messages":[{"role":"user", "content":[{"type":"text", "text":prompt},
+                      {"type":"image_url", "image_url":{"url":f"data:image/png;base64,{image_b64}"}}]}]},
+        )
+        if resp.status_code >= 400:
+            raise RuntimeError(f"vision API {resp.status_code}: {resp.text[:300]}")
+        content = (resp.json().get("choices") or [{}])[0].get("message", {}).get("content", "")
+        return "".join(str(part.get("text", "")) for part in content) if isinstance(content, list) else str(content)
+
+
+async def _vision_scope(scope: str, selector: Optional[str], tab: Any) -> tuple[bytes, str]:
+    """Capture a requested page scope without confusing it with asset inspection."""
+    ensure_dirs()
+    if scope not in ("viewport", "page"):
+        raise ValueError("scope must be 'viewport' or 'page'")
+    path = SCREENSHOT_DIR / ts_filename("vision-scope", "png")
+    if selector:
+        element = await tab.query_selector(selector)
+        if element is None:
+            raise ValueError(f"selector not found: {selector}")
+        await element.save_screenshot(filename=str(path), format="png")
+    else:
+        await tab.save_screenshot(filename=str(path), format="png", full_page=scope == "page")
+    data = path.read_bytes()
+    if not data:
+        raise ValueError(f"vision scope screenshot is empty: {path}")
+    return data, str(path)
+
+
+@mcp.tool()
+async def vision_describe(
+    scope: Literal["viewport", "page"] = "viewport",
+    prompt: str = "Describe the visual design, layout, typography, colors, and notable issues.",
+    selector: Optional[str] = None,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+) -> str:
+    """Describe a screenshot or element; unlike vision_locate, this is captioning."""
+    try:
+        resolved = _resolve_vision_provider(provider, base_url, api_key, model)
+        tab = BrowserState.active_tab()
+        data, path = await _vision_scope(scope, selector, tab)
+        answer = await _vision_text(_b64.b64encode(data).decode(), prompt, *resolved)
+        if not answer.strip():
+            return err("vision model returned an empty description")
+        return ok(json.dumps({"scope": scope, "selector": selector, "screenshot": path, "description": answer}, ensure_ascii=False))
+    except Exception as e:
+        return err(str(e))
+
+
+@mcp.tool()
+async def vision_ocr(
+    scope: Literal["viewport", "page"] = "viewport",
+    selector: Optional[str] = None,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+) -> str:
+    """Extract visible text from a screenshot or element with a vision model."""
+    return await vision_describe(scope=scope, selector=selector,
+        prompt='Extract all visible text exactly. Return only the text, preserving line breaks.',
+        api_key=api_key, base_url=base_url, model=model, provider=provider)
+
+
+@mcp.tool()
+async def vision_check(
+    criteria: str,
+    scope: Literal["viewport", "page"] = "viewport",
+    selector: Optional[str] = None,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+) -> str:
+    """Check visual criteria and return validated pass/fail JSON, never an invented pass."""
+    try:
+        resolved = _resolve_vision_provider(provider, base_url, api_key, model)
+        tab = BrowserState.active_tab()
+        data, path = await _vision_scope(scope, selector, tab)
+        prompt = ("Evaluate this screenshot against these criteria: " + criteria +
+                  " Return ONLY JSON: {\"pass\":true|false,\"findings\":[string]}.")
+        answer = await _vision_text(_b64.b64encode(data).decode(), prompt, *resolved)
+        match = _re.search(r"\{.*\}", answer, _re.DOTALL)
+        parsed = parse_json(match.group(0), None) if match else None
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("pass"), bool) or not isinstance(parsed.get("findings"), list):
+            return err("vision_check returned malformed result; pass/fail is unknown")
+        return ok(json.dumps({"criteria": criteria, "scope": scope, "screenshot": path,
+                              "pass": parsed["pass"], "findings": parsed["findings"]}, ensure_ascii=False))
     except Exception as e:
         return err(str(e))

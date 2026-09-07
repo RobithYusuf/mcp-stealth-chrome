@@ -39,17 +39,23 @@ from .helpers import (
     ok,
     parse_json,
     resolve_ref,
+    select_tab,
     target_key,
+    transport_lost,
     ts_filename,
 )
+from .result_types import structured_json
 from .humanize import humanized_click, humanized_move, humanized_scroll, humanized_type
 from .snapshot import (
     SNAPSHOT_JS,
     SNAPSHOT_JS_FAST,
     SNAPSHOT_JS_VIEWPORT,
+    build_snapshot_js,
     element_fingerprint,
     format_snapshot,
     snapshot_hash,
+    snapshot_options,
+    snapshot_scope_signature,
 )
 from .state import (
     DEFAULT_IDLE_TIMEOUT,
@@ -72,6 +78,7 @@ from .state import (
     find_chrome_binary,
     find_external_chrome_pids,
     is_chrome_profile_locked,
+    per_process_profile,
     resolve_default_profile,
 )
 
@@ -326,26 +333,33 @@ def _target_key(tab) -> str:
 
 
 async def _wait(coro, timeout: Optional[float] = None, what: str = "operation"):
-    """Wrap a CDP coroutine with a hard timeout — surfaces a clean error
-    instead of letting a stuck page freeze the whole tool call. Re-raises
-    asyncio.TimeoutError as a regular exception with a useful message."""
+    """Await a CDP operation with an honest timeout and typed transport errors."""
+    limit = TOOL_ACTION_TIMEOUT if timeout is None else timeout
     try:
-        return await asyncio.wait_for(coro, timeout=timeout or TOOL_ACTION_TIMEOUT)
+        return await asyncio.wait_for(coro, timeout=limit)
     except asyncio.TimeoutError as e:
         raise TimeoutError(
-            f"{what} timed out after {timeout or TOOL_ACTION_TIMEOUT}s — "
-            f"page JS may be stuck or blocked. Try reload, or close+launch."
+            f"{what} timed out after {limit}s — page JS may be stuck or blocked. "
+            "Try reload, or close+launch."
         ) from e
     except Exception as e:
-        # A dropped CDP session surfaces as an opaque "-32001" with no hint of
-        # what to do next; every subsequent call then fails the same way. Name
-        # the condition and the exact recovery, once, at the point it happens.
         msg = str(e)
-        if "-32001" in msg or "Session with given id not found" in msg:
+        low = msg.lower()
+        if "inspected target navigated" in low or "target navigated" in low:
             raise RuntimeError(
-                f"{what} failed: CDP session lost (Chrome closed the target or the "
-                f"websocket dropped). Recover with: browser_recover() then "
-                f"browser_launch(). Your profile — and its logins — are preserved."
+                f"{what} interrupted by target navigation; the expression/action outcome "
+                "is unknown. Inspect the new page before retrying."
+            ) from e
+        if "target closed" in low or "target was closed" in low:
+            raise RuntimeError(
+                f"{what} target closed; the action outcome is unknown. "
+                "Call browser_recover() then browser_launch()."
+            ) from e
+        if transport_lost(msg):
+            raise RuntimeError(
+                f"{what} failed: CDP transport lost. Recover with: browser_recover() "
+                "then browser_launch(). Your profile and logins are preserved; "
+                "the action outcome is unknown."
             ) from e
         raise
 
@@ -806,6 +820,7 @@ async def _auto_verify_cf(tab: Tab, max_attempts: int = 2) -> str:
     return f" [auto-verify: {' → '.join(actions)}]"
 
 from ._app import mcp  # single FastMCP instance shared with tools/* submodules
+from . import image_output as _image_output  # registers native image inspection tools
 
 
 # ── Utility: ensure active tab after operations that may shift tabs ────────
@@ -820,6 +835,192 @@ async def _refresh_tabs() -> None:
 # 1. LIFECYCLE
 # ══════════════════════════════════════════════════════════════════════════
 
+# ── Deterministic profile selection ───────────────────────────────────────
+# A launch that quietly lands on a different profile than the caller believes
+# hands them a different cookie jar: the logins are all still there, in a
+# directory nobody named, and the session reads as wiped. So the profile in use
+# is always reported (actual_profile + session_state_source), a conflict is
+# resolved by a policy the caller picked, and nothing that already exists on
+# disk is ever deleted or overwritten to make room.
+
+# Regenerable, large, and rebuilt by Chrome on first run — skipping them keeps a
+# conflict clone fast enough to be worth doing at launch time.
+_CLONE_SKIP_DIRS = {
+    "cache", "code cache", "gpucache", "dawnwebgpucache", "dawngraphitecache",
+    "graphitedawncache", "grshadercache", "media cache", "service worker",
+    "component_crx_cache", "extensions_crx_cache", "gpupersistentcache",
+    "shared dictionary", "safe browsing", "componentupdater", "downloadedupdates",
+}
+_CLONE_SKIP_FILES = {
+    "singletonlock", "singletoncookie", "singletonsocket", "lock", "lockfile",
+}
+
+
+def _safe_profile_clone(source: Path, instance_id: str) -> tuple[Optional[Path], dict]:
+    """Copy a busy profile into a FRESH directory so a launch can proceed.
+
+    The source is only ever read: this is the directory holding the developer's
+    real logins, so the clone lands in a new timestamped path and nothing
+    existing is deleted or overwritten. SQLite databases go through
+    `_sqlite_snapshot`, which copies the -wal/-shm companions and integrity-checks
+    the copy — a torn cookie jar is indistinguishable from a good one until a
+    login fails hours later, so a suspect copy is reported and the launch is
+    refused rather than started on top of it.
+
+    Returns (clone_path, report); clone_path is None when the copy is not
+    trustworthy, and the partial copy is left in place for inspection.
+    """
+    report: dict[str, Any] = {
+        "source": str(source),
+        "files": 0,
+        "sqlite_verified": [],
+        "sqlite_suspect": [],
+        "errors": [],
+    }
+    target = PROFILES_ROOT / f"{instance_id}-clone-{int(time.time())}"
+    if target.exists():
+        report["errors"].append(f"clone target already exists: {target}")
+        return None, report
+    report["target"] = str(target)
+    for root, dirs, files in os.walk(source):
+        rel = Path(root).relative_to(source)
+        dirs[:] = [d for d in dirs if d.lower() not in _CLONE_SKIP_DIRS]
+        dest_dir = target / rel
+        try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            report["errors"].append(f"{rel}: {type(exc).__name__}: {exc}")
+            dirs[:] = []
+            continue
+        for name in files:
+            lowered = name.lower()
+            if lowered in _CLONE_SKIP_FILES or lowered.endswith("-journal"):
+                continue
+            if lowered.endswith(("-wal", "-shm")):
+                continue  # _sqlite_snapshot copies these beside their database
+            src_file = Path(root) / name
+            dst_file = dest_dir / name
+            try:
+                if src_file.is_symlink() or not src_file.is_file():
+                    continue
+                if _is_sqlite(src_file):
+                    where = str(rel / name) if str(rel) != "." else name
+                    if _sqlite_snapshot(src_file, dst_file):
+                        report["sqlite_verified"].append(where)
+                    else:
+                        report["sqlite_suspect"].append(where)
+                else:
+                    shutil.copy2(src_file, dst_file)
+                report["files"] += 1
+            except Exception as exc:
+                report["errors"].append(f"{name}: {type(exc).__name__}")
+    if report["sqlite_suspect"]:
+        return None, report
+    try:
+        clean_profile_state(target)
+    except Exception:
+        pass
+    return target, report
+
+
+def _resolve_launch_profile(
+    instance_id: str,
+    *,
+    persistent: bool,
+    profile_conflict: str,
+) -> tuple[Optional[Path], dict]:
+    """Pick browser_launch's user-data dir and say where its session state came from.
+
+    Deterministic in two ways the old flow was not. A non-"main" instance gets
+    its own profile instead of silently sharing main's cookie jar. And a
+    conflict over a locked profile is resolved by the policy the caller chose
+    rather than by an unannounced fallback:
+
+      fallback (default, legacy behaviour) — use a per-process profile and say
+          loudly that the expected logins are NOT in it
+      fail     — refuse, naming the PID holding the profile
+      clone    — launch from a read-only, integrity-checked copy of it
+
+    "main" keeps the legacy path plus process affinity: that profile holds the
+    real logins, and migrating it looks exactly like a wipe.
+    """
+    from .state import get_profile_affinity
+
+    info: dict[str, Any] = {"profile_conflict_policy": profile_conflict}
+    if profile_conflict not in ("fallback", "fail", "clone"):
+        info["error"] = (
+            f"profile_conflict must be 'fallback', 'fail' or 'clone', not {profile_conflict!r}"
+        )
+        return None, info
+    if not persistent:
+        info["actual_profile"] = None
+        info["session_state_source"] = (
+            "ephemeral — Chrome temp dir, discarded on close (no saved logins)"
+        )
+        return None, info
+
+    desired = PROFILE_DIR if instance_id == "main" else PROFILES_ROOT / instance_id
+    info["desired_profile"] = str(desired)
+
+    pinned = get_profile_affinity()
+    if instance_id == "main" and pinned is not None and not is_chrome_profile_locked(pinned):
+        pinned.mkdir(parents=True, exist_ok=True)
+        info["actual_profile"] = str(pinned)
+        info["session_state_source"] = (
+            f"persistent profile {pinned.name}" if pinned == desired
+            else f"profile affinity — this process settled on {pinned.name} earlier "
+                 f"and stays there so its logins remain visible"
+        )
+        return pinned, info
+
+    holder = chrome_lock_holder_pid(desired) if desired.exists() else None
+    if holder is None:
+        desired.mkdir(parents=True, exist_ok=True)
+        info["actual_profile"] = str(desired)
+        info["session_state_source"] = f"persistent profile {desired.name}"
+        return desired, info
+
+    info["conflict_with_pid"] = holder
+    if profile_conflict == "fail":
+        info["error"] = (
+            f"profile {desired} is held by Chrome PID {holder} (profile_conflict='fail'). "
+            f"Close that browser, or relaunch with profile_conflict='clone' to run from "
+            f"a verified read-only copy, or profile_conflict='fallback' for a separate "
+            f"empty profile (its logins will NOT be the ones in {desired.name})."
+        )
+        return None, info
+    if profile_conflict == "clone":
+        clone, clone_report = _safe_profile_clone(desired, instance_id)
+        info["clone"] = clone_report
+        if clone is None:
+            info["error"] = (
+                f"could not take a trustworthy copy of {desired}: "
+                f"suspect={clone_report.get('sqlite_suspect')} "
+                f"errors={clone_report.get('errors')[:3]}. The partial copy at "
+                f"{clone_report.get('target')} was kept for inspection and nothing in "
+                f"the source profile was touched."
+            )
+            return None, info
+        info["actual_profile"] = str(clone)
+        info["session_state_source"] = (
+            f"read-only clone of {desired} taken while Chrome PID {holder} held it — "
+            f"logins are a point-in-time copy; new logins here do NOT reach the original"
+        )
+        return clone, info
+
+    fallback = (
+        per_process_profile() if instance_id == "main"
+        else PROFILES_ROOT / f"{instance_id}-pid{os.getpid()}"
+    )
+    fallback.mkdir(parents=True, exist_ok=True)
+    info["actual_profile"] = str(fallback)
+    info["session_state_source"] = (
+        f"FALLBACK profile {fallback.name} — {desired} is held by Chrome PID {holder}. "
+        f"Logins saved in {desired.name} are NOT visible here. Use "
+        f"profile_conflict='clone' to carry them over, or 'fail' to refuse instead."
+    )
+    return fallback, info
+
 
 @mcp.tool()
 async def browser_launch(
@@ -829,7 +1030,7 @@ async def browser_launch(
     user_agent: Optional[str] = None,
     window_width: int = 1280,
     window_height: int = 800,
-    persistent: bool = True,
+    persistent: Optional[bool] = None,
     lang: str = "en-US",
     extra_args: Optional[list[str]] = None,
     storage_state_path: Optional[str] = None,
@@ -839,8 +1040,16 @@ async def browser_launch(
     profile_directory: Optional[str] = None,
     fingerprint: Optional[dict] = None,
     privacy: bool = False,
+    profile_conflict: str = "fallback",
+    expect_url: Optional[str] = None,
+    expect_status: Optional[int] = None,
 ) -> str:
     """Launch stealth Chrome via nodriver. Creates persistent profile by default.
+
+    Reports which profile it actually used (actual_profile, session_state_source)
+    and the observed postconditions of the initial load (final_url,
+    redirect_chain, status, ready_state) — reporting the requested URL after a
+    redirect is what left callers reading a page they never asked for.
 
     Args:
         url: initial URL to load
@@ -848,7 +1057,11 @@ async def browser_launch(
         proxy: "http://user:pass@host:port" or "socks5://host:port"
         user_agent: override UA string
         window_width, window_height: viewport size
-        persistent: reuse profile at ~/.mcp-stealth/profile
+        persistent: reuse the profile at ~/.mcp-stealth/profile (for the "main"
+            instance; other instances get ~/.mcp-stealth/profiles/<id>).
+            Left unset it defaults to True — EXCEPT under testing_mode, which
+            defaults to an ephemeral throwaway profile. Pass persistent=True
+            explicitly to keep state during a testing_mode run.
         lang: browser language
         extra_args: additional Chromium flags
         storage_state_path: load cookies/localStorage from JSON before first nav
@@ -873,10 +1086,30 @@ async def browser_launch(
             platform, timezone). Overrides a pinned identity for this launch.
         privacy: use a fresh fingerprint and a disposable profile that is
             deleted by browser_close. Incompatible with user_data_dir.
+        profile_conflict: what to do when the profile is already held by another
+            Chrome. "fallback" (default, legacy behaviour) uses a separate
+            per-process profile and says so; "fail" refuses with the holding
+            PID; "clone" launches from an integrity-checked read-only copy of
+            it. Nothing on disk is ever deleted or overwritten either way.
+        expect_url, expect_status: validate the initial load — see navigate().
+            An unmeasured value fails the check rather than passing it.
     """
-    if BrowserState.is_up():
-        return ok(f"Browser already running with {len(BrowserState.tabs)} tab(s).")
-    if BrowserState.current_privacy and BrowserState.current_profile_dir:
+    # Local testing wants a clean room by default: a testing_mode run that
+    # silently accumulated state in the real login profile was both a surprise
+    # and a slow way to make tests depend on each other.
+    if persistent is None:
+        persistent = not testing_mode
+        persistent_source = (
+            "default (testing_mode → ephemeral; pass persistent=true to keep state)"
+            if testing_mode else "default"
+        )
+    else:
+        persistent_source = "explicit"
+    # No early "already running" return here. It short-circuited the reuse path
+    # below — the one that probes CDP and honours the caller's url — so a launch
+    # against a live browser answered "already running" and left the caller on
+    # whatever page happened to be open, believing the navigation had happened.
+    if not BrowserState.is_up() and BrowserState.current_privacy and BrowserState.current_profile_dir:
         stale_profile = BrowserState.current_profile_dir
         if not await _remove_privacy_profile(stale_profile):
             return err(f"could not remove stale privacy profile before relaunch: {stale_profile}")
@@ -900,14 +1133,32 @@ async def browser_launch(
                 _tab = BrowserState.active_tab()
                 await _wait(_tab.evaluate("1", return_by_value=True),
                             timeout=5, what="reuse probe")
-                if url and url != "about:blank":
-                    # Honour the caller's url. Returning "already running" while
-                    # silently ignoring it left them on the wrong page believing
-                    # the navigation had happened.
-                    await _wait(_tab.get(url), what="reuse navigate")
-                    return ok(f"reusing the running browser ({len(BrowserState.tabs)} tab(s)) "
-                              f"— navigated to {url}")
-                return ok(f"reusing the running browser ({len(BrowserState.tabs)} tab(s))")
+                reuse_head = f"reusing the running browser ({len(BrowserState.tabs)} tab(s))"
+                _doc_state, _disarm = await _arm_document_watch(_tab)
+                try:
+                    if url and url != "about:blank":
+                        # Honour the caller's url. Returning "already running" while
+                        # silently ignoring it left them on the wrong page believing
+                        # the navigation had happened.
+                        await _wait(_tab.get(url), what="reuse navigate")
+                        try:
+                            await _wait(_tab.wait(), timeout=10, what="reuse settle")
+                        except Exception:
+                            pass
+                    # The reuse path is a navigation too: its redirects were
+                    # exactly as invisible as a fresh launch's.
+                    _observed = await _observe_navigation(_tab, url, _disarm())
+                finally:
+                    _disarm()
+                _observed["profile"] = {
+                    "actual_profile": str(BrowserState.current_profile_dir)
+                    if BrowserState.current_profile_dir else None,
+                    "session_state_source": "reused running browser — profile unchanged",
+                }
+                return _nav_result(
+                    reuse_head, _observed,
+                    expect_url=expect_url, expect_status=expect_status,
+                )
             except Exception as e:
                 # The handle is stale. Relaunching on top of a half-dead Chrome
                 # is exactly the collision to avoid, so end it first.
@@ -1479,6 +1730,295 @@ async def browser_recover() -> str:
 # 2. NAVIGATION
 # ══════════════════════════════════════════════════════════════════════════
 
+# ── Navigation postconditions ─────────────────────────────────────────────
+# Reporting the URL a caller ASKED for is the same class of lie as a click that
+# reports "clicked" without hit-testing: browser_launch said it had loaded
+# /admin while the tab had already been redirected to /, and every read after
+# that described the wrong page with no way to tell. So every navigation entry
+# point reports what was OBSERVED afterwards — final_url, the redirect chain,
+# the document status, readyState — and marks a field `unmeasured` rather than
+# guessing when it could not see it. An unmeasured status is never treated as a
+# passing expect_status.
+
+
+def _cdp_resource_type(event: Any) -> str:
+    """Resource type of a CDP network event as a plain string ('Document', …).
+
+    nodriver hands back a ResourceType enum whose str() is 'ResourceType.DOCUMENT',
+    so comparing str(event.type_) to 'Document' silently never matches.
+    """
+    value = getattr(event, "type_", None)
+    return str(getattr(value, "value", value) or "")
+
+
+async def _arm_document_watch(tab: Tab) -> tuple[dict, Any]:
+    """Watch the main-frame document response for ONE navigation on `tab`.
+
+    Returns (state, disarm). CDP dispatches Network.* only while the domain is
+    enabled on that tab, so when the enable fails the state says so and the
+    status is reported as unmeasured — never as "no redirect, status unknown but
+    probably fine". The handlers close over `state` and never read module state
+    at event time, and disarm() removes exactly these three closures: nodriver's
+    remove_handler(evt, fn) drops the whole handler list for the event, which
+    would silently kill a concurrent network_start / auth_capture capture.
+
+    Network stays enabled afterwards on purpose — it is idempotent, and
+    disabling it here would stop any capture the caller armed earlier.
+    """
+    from nodriver.cdp import network as cdp_network
+
+    state: dict[str, Any] = {
+        "armed": False,
+        "arm_error": None,
+        "request_id": None,
+        "redirects": [],
+        "status": None,
+        "status_text": "",
+        "document_url": None,
+        "failure": None,
+    }
+    # In Chrome the main frame's id IS the page target id, so this filters out
+    # iframe documents without an extra Page.getFrameTree round-trip.
+    main_frame = str(getattr(getattr(tab, "target", None), "target_id", "") or "")
+
+    def _mine(event: Any) -> bool:
+        if state["request_id"] is not None:
+            return str(getattr(event, "request_id", "")) == state["request_id"]
+        if _cdp_resource_type(event) != "Document":
+            return False
+        frame = str(getattr(event, "frame_id", "") or "")
+        # Without a known frame id, fall back to the first document request —
+        # that is the navigation the caller just triggered.
+        return not main_frame or not frame or frame == main_frame
+
+    async def on_request(event: Any) -> None:
+        try:
+            if not _mine(event):
+                return
+            request_id = str(getattr(event, "request_id", ""))
+            redirect = getattr(event, "redirect_response", None)
+            if redirect is not None and state["request_id"] == request_id:
+                # CDP reuses the request id across a redirect and describes the
+                # PREVIOUS hop in redirect_response — that is the only place the
+                # intermediate status codes ever appear.
+                state["redirects"].append({
+                    "url": str(getattr(redirect, "url", "") or ""),
+                    "status": getattr(redirect, "status", None),
+                })
+            elif state["request_id"] is None:
+                state["request_id"] = request_id
+            request = getattr(event, "request", None)
+            state["document_url"] = str(getattr(request, "url", "") or "") or state["document_url"]
+        except Exception:
+            pass
+
+    async def on_response(event: Any) -> None:
+        try:
+            if state["request_id"] is None:
+                return
+            if str(getattr(event, "request_id", "")) != state["request_id"]:
+                return
+            response = getattr(event, "response", None)
+            state["status"] = getattr(response, "status", None)
+            state["status_text"] = str(getattr(response, "status_text", "") or "")
+            state["document_url"] = (
+                str(getattr(response, "url", "") or "") or state["document_url"]
+            )
+        except Exception:
+            pass
+
+    async def on_failed(event: Any) -> None:
+        try:
+            if state["request_id"] is None:
+                return
+            if str(getattr(event, "request_id", "")) != state["request_id"]:
+                return
+            state["failure"] = str(getattr(event, "error_text", "") or "loading failed")
+        except Exception:
+            pass
+
+    handlers = (
+        (cdp_network.RequestWillBeSent, on_request),
+        (cdp_network.ResponseReceived, on_response),
+        (cdp_network.LoadingFailed, on_failed),
+    )
+    try:
+        await _wait(tab.send(cdp_network.enable()), timeout=5, what="Network.enable")
+        state["armed"] = True
+    except Exception as exc:
+        state["arm_error"] = f"{type(exc).__name__}: {exc}"
+    if state["armed"]:
+        for event_type, handler in handlers:
+            tab.add_handler(event_type, handler)
+
+    def disarm() -> dict:
+        for event_type, handler in handlers:
+            try:
+                tab.handlers[event_type].remove(handler)
+            except (KeyError, ValueError):
+                pass
+        return state
+
+    return state, disarm
+
+
+def _build_nav_observation(
+    requested_url: Optional[str],
+    doc_state: dict,
+    final_url: Optional[str],
+    ready_state: Optional[str],
+    probe_error: Optional[str] = None,
+) -> dict:
+    """Assemble the observed postconditions, naming what could not be measured."""
+    redirects = [hop for hop in doc_state.get("redirects", []) if hop.get("url")]
+    status = doc_state.get("status")
+    observed: dict[str, Any] = {
+        "requested_url": requested_url,
+        "final_url": final_url or None,
+        "redirect_chain": redirects,
+        "redirected": bool(redirects),
+        "status": status,
+        "ready_state": ready_state or None,
+    }
+    if doc_state.get("status_text"):
+        observed["status_text"] = doc_state["status_text"]
+    if doc_state.get("failure"):
+        observed["load_failure"] = doc_state["failure"]
+
+    unmeasured: list[str] = []
+    if not final_url:
+        unmeasured.append("final_url")
+    if not ready_state:
+        unmeasured.append("ready_state")
+    if status is None:
+        unmeasured.append("status")
+        if not doc_state.get("armed"):
+            reason = (
+                f"Network domain could not be enabled ({doc_state.get('arm_error')})"
+                if doc_state.get("arm_error")
+                else "the document response was not watched"
+            )
+        elif doc_state.get("failure"):
+            reason = f"the document request failed: {doc_state['failure']}"
+        elif doc_state.get("request_id") is None:
+            reason = (
+                "no main-frame document request was seen — about:blank, a "
+                "same-document (history/hash) navigation, or a page served "
+                "entirely from the back-forward cache emits none"
+            )
+        else:
+            reason = "the document request never reported a response"
+        observed["status_source"] = "unmeasured"
+        observed["status_note"] = reason
+    else:
+        observed["status_source"] = "cdp:Network.responseReceived"
+    if probe_error:
+        observed["probe_error"] = probe_error
+    if unmeasured:
+        observed["unmeasured"] = unmeasured
+    return observed
+
+
+async def _observe_navigation(
+    tab: Tab,
+    requested_url: Optional[str],
+    doc_state: dict,
+) -> dict:
+    """Read back where the tab ACTUALLY ended up, after the navigation."""
+    final_url = ""
+    ready_state = ""
+    probe_error = None
+    try:
+        probe = await _wait(
+            tab.evaluate(
+                "JSON.stringify([window.location.href, document.readyState])",
+                return_by_value=True,
+            ),
+            timeout=5,
+            what="navigation postcondition probe",
+        )
+        probe = probe.value if hasattr(probe, "value") and not isinstance(probe, str) else probe
+        final_url, ready_state = json.loads(probe)
+    except Exception as exc:
+        probe_error = f"{type(exc).__name__}: {exc}"
+    return _build_nav_observation(
+        requested_url, doc_state, final_url, ready_state, probe_error
+    )
+
+
+def _nav_url_matches(pattern: str, url: str) -> bool:
+    """expect_url rule: glob when the pattern holds * ? or [, else prefix match.
+
+    Prefix (rather than equality) is what makes the common case usable — an
+    expected "https://site/admin" still matches "https://site/admin?tab=1".
+    """
+    if not pattern:
+        return True
+    if any(ch in pattern for ch in "*?["):
+        return fnmatch.fnmatch(url, pattern)
+    return url == pattern or url.startswith(pattern)
+
+
+def _nav_expectation_failures(
+    observed: dict,
+    expect_url: Optional[str],
+    expect_status: Optional[int],
+) -> list[str]:
+    """Check the caller's expectations against MEASURED values only.
+
+    An unmeasured value fails the expectation instead of passing it: reporting
+    "expect_status 200 ok" from a status nobody ever read is exactly the quiet
+    lie the postconditions exist to remove.
+    """
+    failures: list[str] = []
+    final_url = observed.get("final_url")
+    status = observed.get("status")
+    if expect_url:
+        if not final_url:
+            failures.append(
+                f"expect_url {expect_url!r} could not be checked — final_url is "
+                f"unmeasured ({observed.get('probe_error') or 'no URL read back'})"
+            )
+        elif not _nav_url_matches(expect_url, final_url):
+            failures.append(f"expect_url {expect_url!r} != final_url {final_url!r}")
+    if expect_status is not None:
+        if status is None:
+            failures.append(
+                f"expect_status {expect_status} could not be checked — status is "
+                f"unmeasured ({observed.get('status_note')})"
+            )
+        elif int(status) != int(expect_status):
+            failures.append(f"expect_status {expect_status} != status {status}")
+    return failures
+
+
+def _nav_result(
+    action: str,
+    observed: dict,
+    *,
+    expect_url: Optional[str] = None,
+    expect_status: Optional[int] = None,
+    suffix: str = "",
+) -> str:
+    """Render a navigation result: one summary line, then the postconditions."""
+    final_url = observed.get("final_url") or "(final_url unmeasured)"
+    status = observed.get("status")
+    status_part = f"status {status}" if status is not None else "status unmeasured"
+    hops = len(observed.get("redirect_chain") or [])
+    redirect_part = f", {hops} redirect(s)" if hops else ""
+    ready = observed.get("ready_state") or "unmeasured"
+    body = json.dumps(observed, indent=2, default=str)
+    failures = _nav_expectation_failures(observed, expect_url, expect_status)
+    if failures:
+        return err(
+            f"{action} postcondition failed: " + "; ".join(failures)
+            + f"\n{body}"
+        )
+    return ok(
+        f"{action}: {final_url} [{status_part}{redirect_part}, ready_state {ready}]"
+        f"{suffix}\n{body}"
+    )
+
 
 @mcp.tool()
 async def navigate(
@@ -1486,8 +2026,14 @@ async def navigate(
     wait_until: str = "load",
     auto_verify: bool = True,
     focus: bool = True,
+    expect_url: Optional[str] = None,
+    expect_status: Optional[int] = None,
 ) -> str:
     """Navigate the active tab to url. wait_until: load|none.
+
+    Reports the OBSERVED postconditions — requested_url, final_url,
+    redirect_chain, status, ready_state — because a redirect otherwise leaves
+    the caller reading a page it never asked for while the tool claims success.
 
     auto_verify: if True (default), automatically detect Cloudflare /
     Turnstile challenges after load and click the checkbox naturally
@@ -1499,10 +2045,19 @@ async def navigate(
     Chrome already open, MCP-driven navigation can be invisible to the
     eye even though it succeeded internally. Set False to navigate
     silently (background scraping flows).
+
+    expect_url: fail when final_url does not match. Glob when the pattern
+        contains * ? or [ ; otherwise a prefix match, so "https://x/admin"
+        accepts "https://x/admin?tab=1". A final_url that could not be read
+        FAILS the check rather than passing it.
+    expect_status: fail when the document HTTP status differs. An unmeasured
+        status (about:blank, same-document navigation) also fails — the tool
+        will not claim an expectation it never verified.
     """
     if not BrowserState.is_up():
         return err("Browser not running. Call browser_launch first.")
     tab = BrowserState.active_tab()
+    doc_state, disarm = await _arm_document_watch(tab)
     try:
         await tab.get(url)
         if wait_until != "none":
@@ -1522,9 +2077,15 @@ async def navigate(
                 verify_suffix = await asyncio.wait_for(_auto_verify_cf(tab), timeout=25.0)
             except Exception:
                 verify_suffix = ""
-        return ok(f"Navigated to {await get_url(tab)}{verify_suffix}")
+        observed = await _observe_navigation(tab, url, disarm())
+        return _nav_result(
+            "Navigated", observed,
+            expect_url=expect_url, expect_status=expect_status, suffix=verify_suffix,
+        )
     except Exception as e:
         return err(str(e))
+    finally:
+        disarm()
 
 
 @mcp.tool()
@@ -1740,37 +2301,82 @@ async def wait_for_human(
         return err(str(e))
 
 
-@mcp.tool()
-async def go_back() -> str:
-    """Go back in history."""
+async def _history_navigation(
+    action: str,
+    move,
+    requested_url: Optional[str],
+    expect_url: Optional[str],
+    expect_status: Optional[int],
+) -> str:
+    """Shared body for go_back / go_forward / reload.
+
+    History moves are navigations like any other and get the same observed
+    postconditions. A back/forward served from the back-forward cache emits no
+    document request at all, so its status comes back explicitly unmeasured
+    rather than silently absent.
+    """
+    if not BrowserState.is_up():
+        return err("Browser not running. Call browser_launch first.")
+    tab = BrowserState.active_tab()
+    doc_state, disarm = await _arm_document_watch(tab)
     try:
-        tab = BrowserState.active_tab()
-        await tab.back()
-        return ok(f"At {await get_url(tab)}")
+        await move(tab)
+        try:
+            await _wait(tab.wait(), timeout=10, what=f"{action} settle")
+        except Exception:
+            pass  # settle is best-effort; the postcondition probe is the truth
+        observed = await _observe_navigation(tab, requested_url, disarm())
+        return _nav_result(
+            action, observed, expect_url=expect_url, expect_status=expect_status,
+        )
     except Exception as e:
         return err(str(e))
+    finally:
+        disarm()
 
 
 @mcp.tool()
-async def go_forward() -> str:
-    """Go forward in history."""
-    try:
-        tab = BrowserState.active_tab()
-        await tab.forward()
-        return ok(f"At {await get_url(tab)}")
-    except Exception as e:
-        return err(str(e))
+async def go_back(
+    expect_url: Optional[str] = None,
+    expect_status: Optional[int] = None,
+) -> str:
+    """Go back in history. Reports final_url / redirect_chain / status /
+    ready_state observed afterwards; requested_url is null because history
+    decides the destination. See navigate() for the expect_* rules."""
+    return await _history_navigation(
+        "Went back", lambda tab: tab.back(), None, expect_url, expect_status,
+    )
 
 
 @mcp.tool()
-async def reload() -> str:
-    """Reload the active tab."""
+async def go_forward(
+    expect_url: Optional[str] = None,
+    expect_status: Optional[int] = None,
+) -> str:
+    """Go forward in history. Reports the observed postconditions; see
+    navigate() for the expect_* rules."""
+    return await _history_navigation(
+        "Went forward", lambda tab: tab.forward(), None, expect_url, expect_status,
+    )
+
+
+@mcp.tool()
+async def reload(
+    expect_url: Optional[str] = None,
+    expect_status: Optional[int] = None,
+) -> str:
+    """Reload the active tab. Reports the observed postconditions — a reload
+    that lands on a login redirect is otherwise indistinguishable from one that
+    reloaded the page you were on. See navigate() for the expect_* rules."""
+    if not BrowserState.is_up():
+        return err("Browser not running. Call browser_launch first.")
     try:
-        tab = BrowserState.active_tab()
-        await tab.reload()
-        return ok(f"Reloaded {await get_url(tab)}")
-    except Exception as e:
-        return err(str(e))
+        before = await get_url(BrowserState.active_tab())
+    except Exception:
+        before = ""
+    return await _history_navigation(
+        "Reloaded", lambda tab: tab.reload(), before or None, expect_url, expect_status,
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1780,77 +2386,169 @@ async def reload() -> str:
 
 @mcp.tool()
 async def browser_snapshot(
-    mode: Literal["full", "fast", "viewport"] = "full",
-    diff_from_last: bool = False,
+    mode: Literal["interactive_compact", "full", "fast", "viewport"] = "interactive_compact",
+    diff_from_last: bool = True,
     delta: bool = True,
+    max_elements: int = 100,
+    container_selector: Optional[str] = None,
+    viewport_only: bool = False,
+    role: Optional[str] = None,
+    name_contains: Optional[str] = None,
+    include_hidden: bool = False,
 ) -> str:
-    """Inject SNAPSHOT_JS and return a ref-indexed list of interactive elements.
+    """Ref-indexed list of the interactive elements on the active tab.
 
-    Refs (e0, e1, ...) are attached via data-mcp-ref and valid until next nav.
+    Refs (e0, e1, ...) are attached via data-mcp-ref. EVERY snapshot clears the
+    previous snapshot's refs before assigning new ones: a scoped or capped
+    snapshot would otherwise leave e0 on an old element and put e0 on a new one,
+    and resolve_ref would silently act on whichever came first in the document.
+    So a ref is valid until the next snapshot (or the next navigation), and a ref
+    that has been superseded fails loudly instead of hitting the wrong element.
 
-    Modes (performance vs completeness tradeoff):
-      full      — default; same shape as mcp-camoufox (computed-style visibility + full attrs)
-      fast      — skip getComputedStyle + minimal attrs (2-3× faster, less info per element)
-      viewport  — full fidelity but only elements inside current scroll viewport
-                  (5-10× faster on long feeds/SERPs, pair with scroll for segment-by-segment)
+    Modes:
+      interactive_compact — default. Full fidelity, minus non-interactive
+                  elements that carry no accessible name (the nameless
+                  ``<img alt="">`` that made a real admin page report ~190
+                  elements). Every drop is counted in the report.
+      full      — same shape as mcp-camoufox; keeps the unnamed decorative
+                  elements compact drops.
+      fast      — reduced selector, no getComputedStyle, minimal attrs (2-3×
+                  faster, less info per element)
+      viewport  — full fidelity, only elements inside the current scroll
+                  viewport (pair with scroll for segment-by-segment reading)
 
-    diff_from_last=True caches a DOM hash per tab; if the hash matches the previous
-    call on the same URL, returns "unchanged" without re-serializing the element list
-    (near-instant for re-check loops).
+    Scoping (all compose, all reported):
+      max_elements      cap on RETURNED elements; 0 = no cap. Elements past the
+                        cap are counted as `omitted`, never dropped in silence.
+      container_selector  measure only inside the elements matching this CSS.
+                        A selector that matches nothing is reported as an empty
+                        scope, not as an empty page. Invalid CSS is an error —
+                        note that `:has-text()` is a Playwright-ism, not CSS.
+      viewport_only     drop elements fully outside the current viewport.
+      role              comma-separated roles to keep, matched against the
+                        explicit role or the implicit one ("button,link").
+      name_contains     case-insensitive substring of the accessible name
+                        (aria-label / alt / title / text / value / placeholder).
+      include_hidden    also return elements that are not rendered, each marked
+                        `hidden`. They are counted either way.
+
+    The report always states matched / measured / eligible / returned / omitted
+    for the same DOM walk that produced the list, so a filtered result can never
+    be read as "this page has nothing on it".
+
+    diff_from_last=True (default) caches the DOM hash per tab AND per option
+    scope; when the same scope on the same document and URL hashes the same, the
+    element list is not re-serialized. It is scoped per option set because a
+    compact and a full snapshot measure different sets — sharing one cache entry
+    would answer "unchanged" to a call that would have returned a different list.
+    The cache also keys on a per-document token, so a reload or a return to the
+    same URL never reports "unchanged": the refs the caller holds died with the
+    old document even when the hash is identical.
 
     delta=True prefixes elements added or changed since this tab's previous
-    snapshot with ``*``. A tab's first snapshot marks every element.
+    snapshot IN THE SAME SCOPE with ``*``. A scope's first snapshot marks
+    everything.
     """
     try:
         tab = BrowserState.active_tab()
-        js = {
-            "full": SNAPSHOT_JS,
-            "fast": SNAPSHOT_JS_FAST,
-            "viewport": SNAPSHOT_JS_VIEWPORT,
-        }.get(mode, SNAPSHOT_JS)
-        raw = await _wait(tab.evaluate(js, return_by_value=True), what="browser_snapshot")
+        options = snapshot_options(
+            mode=mode,
+            container_selector=container_selector,
+            viewport_only=viewport_only,
+            role=role,
+            name_contains=name_contains,
+            include_hidden=include_hidden,
+            max_elements=max_elements,
+        )
+        raw = await _wait(
+            tab.evaluate(build_snapshot_js(options), return_by_value=True),
+            what="browser_snapshot",
+        )
         raw = raw.value if hasattr(raw, "value") and not isinstance(raw, str) else raw
         try:
-            elements = raw if isinstance(raw, list) else json.loads(raw)
+            payload = raw if isinstance(raw, (dict, list)) else json.loads(raw)
         except (TypeError, json.JSONDecodeError) as e:
             return err(f"snapshot script returned invalid JSON: {e}")
+        if isinstance(payload, list):
+            # Legacy array shape (the fixed SNAPSHOT_JS constants) — no counts.
+            payload = {"elements": payload}
+        if not isinstance(payload, dict):
+            return err("snapshot script returned an invalid element list")
+        if payload.get("ok") is False:
+            return err(payload.get("error") or "snapshot script refused the scope")
+        elements = payload.get("elements")
         if not isinstance(elements, list) or any(
             not isinstance(element, dict) for element in elements
         ):
             return err("snapshot script returned an invalid element list")
+        counts = {
+            key: payload.get(key)
+            for key in (
+                "matched", "measured", "eligible", "returned", "omitted",
+                "truncated", "hidden_skipped", "offscreen_skipped",
+                "excluded", "container",
+            )
+        }
         url = await get_url(tab)
         title = await get_title(tab)
         h = snapshot_hash(elements)
+        doc_token = str(payload.get("doc") or "")
         cache_key = _target_key(tab)
-        last = _SNAPSHOT_CACHE.get(cache_key)
-        if diff_from_last and last and last["url"] == url and last["hash"] == h:
+        scope_sig = snapshot_scope_signature(options)
+        scopes = _SNAPSHOT_CACHE.setdefault(cache_key, {})
+        last = scopes.get(scope_sig)
+        # A matching hash on a DIFFERENT document is not "unchanged": the page
+        # was reloaded or navigated, every ref was reissued, and answering
+        # "unchanged; details omitted" would leave the caller holding refs that
+        # no longer exist while believing nothing moved.
+        same_document = bool(doc_token) and bool(last) and last.get("doc") == doc_token
+        if (
+            diff_from_last
+            and last
+            and same_document
+            and last["url"] == url
+            and last["hash"] == h
+        ):
             return ok(format_snapshot(
                 [], url, title, mode=mode, unchanged_from=h,
                 changed_fingerprints=set() if delta else None,
                 total_count=int(last.get("count", len(elements))),
+                options=options,
             ))
         fingerprints = {element_fingerprint(el) for el in elements}
-        previous = set(last.get("fingerprints", ())) if last else set()
-        changed = fingerprints - previous if last else fingerprints
-        _SNAPSHOT_CACHE[cache_key] = {
+        # Only compare against a previous snapshot of the SAME document; after a
+        # reload every element is legitimately new.
+        previous = set(last.get("fingerprints", ())) if same_document else set()
+        changed = fingerprints - previous if same_document else fingerprints
+        scopes[scope_sig] = {
             "url": url,
             "hash": h,
+            "doc": doc_token,
             "fingerprints": fingerprints,
             "count": len(elements),
         }
+        # Bound the per-target cache: distinct option sets are cheap to create
+        # and would otherwise accumulate for the life of the tab.
+        while len(scopes) > _SNAPSHOT_CACHE_SCOPES_PER_TAB:
+            scopes.pop(next(iter(scopes)))
         return ok(format_snapshot(
             elements,
             url,
             title,
             mode=mode,
             changed_fingerprints=changed if delta else None,
+            counts=counts,
+            options=options,
         ))
     except Exception as e:
         return err(str(e))
 
 
-# Per-tab snapshot hash cache for diff_from_last (cleared on browser_close / reset)
-_SNAPSHOT_CACHE: dict[str, dict[str, Any]] = {}
+# Per-tab snapshot state for diff_from_last (cleared on browser_close / reset).
+# Two levels: target key -> option-scope signature -> {url, hash, doc,
+# fingerprints, count}. _clear_tab_scoped_state pops the whole target.
+_SNAPSHOT_CACHE: dict[str, dict[str, dict[str, Any]]] = {}
+_SNAPSHOT_CACHE_SCOPES_PER_TAB = 8
 
 
 @mcp.tool()
@@ -1863,6 +2561,8 @@ async def screenshot(
     region: Optional[dict] = None,
     region_selector: Optional[str] = None,
     max_dimension: int = 1920,
+    output_mode: Literal["artifact", "inline_image", "path", "base64"] = "artifact",
+    tab: Optional[int] = None,
 ) -> str:
     """Screenshot active tab. Saves to ~/.mcp-stealth/screenshots/.
 
@@ -1888,7 +2588,9 @@ async def screenshot(
             captures or hi-DPR device emulation. Pass 0 to disable resizing.
     """
     try:
-        tab = BrowserState.active_tab()
+        if output_mode not in ("artifact", "inline_image", "path", "base64"):
+            return err("output_mode must be artifact, inline_image, path, or base64")
+        tab = select_tab(tab)
         ensure_dirs()
         fname = filename or ts_filename("shot", "png")
         path = confined_output_path(SCREENSHOT_DIR, fname)
@@ -2043,60 +2745,27 @@ async def screenshot(
             except Exception:
                 # Resizing is best-effort; original file is already saved.
                 pass
-
-        if return_base64:
-            data = path.read_bytes()
-            # base64 inflates by 4/3, and an oversized blob gets the whole tool
-            # result rejected — the call is wasted. Refusing was honest but still
-            # cost a round trip, and a smaller image is nearly always acceptable,
-            # so shrink the INLINE copy until it fits. The saved file keeps its
-            # original quality; only the inlined bytes are reduced.
-            def _b64_len(raw: bytes) -> int:
-                return (len(raw) + 2) // 3 * 4
-
-            shrink_note = ""
-            if _b64_len(data) > B64_INLINE_LIMIT:
-                try:
-                    import cv2
-                    img = cv2.imread(str(path), cv2.IMREAD_COLOR)
-                    if img is not None:
-                        h0, w0 = img.shape[:2]
-                        for dim, q in ((1280, 70), (1024, 60), (800, 55),
-                                       (640, 50), (480, 40), (360, 35)):
-                            longest = max(h0, w0)
-                            if longest > dim:
-                                scale = dim / longest
-                                small = cv2.resize(
-                                    img, (max(1, int(w0 * scale)), max(1, int(h0 * scale))),
-                                    interpolation=cv2.INTER_AREA)
-                            else:
-                                small = img
-                            okimg, buf = cv2.imencode(
-                                ".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, q])
-                            if not okimg:
-                                continue
-                            candidate = buf.tobytes()
-                            if _b64_len(candidate) <= B64_INLINE_LIMIT:
-                                sh, sw = small.shape[:2]
-                                data = candidate
-                                shrink_note = (f" [inline copy auto-shrunk to "
-                                               f"{sw}×{sh} jpeg q{q} to fit the "
-                                               f"{B64_INLINE_LIMIT:,}-char limit; "
-                                               f"the saved file is untouched]")
-                                break
-                except Exception:
-                    pass
-            if _b64_len(data) > B64_INLINE_LIMIT:
-                return ok(
-                    f"{path}{resized_info}\n"
-                    f"[base64 omitted: ~{_b64_len(data):,} chars still exceeds the "
-                    f"{B64_INLINE_LIMIT:,} inline limit even after downscaling] "
-                    f"Read the file above directly, lower max_dimension, or narrow "
-                    f"the shot with region_selector='css'."
+        data = path.read_bytes()
+        mode = "base64" if return_base64 else output_mode
+        if mode == "base64":
+            inline, inline_mime, note = _image_output.shrink_for_inline(
+                data, "image/png" if fmt == "png" else "image/jpeg", limit=B64_INLINE_LIMIT
+            )
+            if inline is None:
+                return _image_output.image_response(
+                    path, data, mode="path", notes=[note, "base64 omitted after bounded downscaling"]
                 )
-            return ok(f"{path}{resized_info}{shrink_note}\n"
-                      f"---base64---\n{base64.b64encode(data).decode()}")
-        return ok(f"{path}{resized_info}")
+            notes = [resized_info.strip()] if resized_info else []
+            if note:
+                notes.insert(0, "auto-shrunk: " + note)
+            return _image_output.image_response(
+                path, data, mode="base64", mime=inline_mime, b64_body=inline, notes=notes
+            )
+        return _image_output.image_response(
+            path, data, mode=mode, mime=("image/png" if fmt == "png" else "image/jpeg"),
+            facts={"full_page": full_page, "region": bool(region), "tab": tab},
+            notes=[resized_info.strip()] if resized_info else None,
+        )
     except Exception as e:
         return err(str(e))
 
@@ -2119,40 +2788,31 @@ async def _visible_text_of(tab, el) -> str:
 
 
 @mcp.tool()
-async def get_text(selector: Optional[str] = None, ref: Optional[str] = None,
-                   raw: bool = False) -> str:
-    """Return the VISIBLE text of an element (by selector or ref) or the whole document.
-
-    Uses innerText semantics, so non-rendered nodes (`<script>`, `<style>`,
-    `<noscript>`, `<template>`, `display:none`) are excluded — you get what a human
-    reads, not inlined GTM/JSON bootstrap payloads. This matters on script-heavy
-    sites where textContent can be tens of thousands of wasted characters.
-
-    Args:
-        selector: CSS selector of the element to read (default: whole body)
-        ref: element ref from a snapshot (takes precedence over selector)
-        raw: if True, return textContent instead — includes script/style source.
-            Only use when you deliberately want the non-rendered content too.
-    """
+async def get_text(
+    selector: Optional[str] = None,
+    ref: Optional[str] = None,
+    raw: bool = False,
+    tab: Optional[int] = None,
+) -> str:
+    """Return visible text without changing active tab selection or focus."""
     try:
-        tab = BrowserState.active_tab()
+        page = select_tab(tab)
         if ref:
-            el = await resolve_ref(ref)
+            el = await resolve_ref(ref, page)
             if el is None:
                 return err(f"ref {ref} not found")
             if raw:
                 return ok(el.text_all or "")
-            return ok(await _visible_text_of(tab, el))
+            return ok(await _visible_text_of(page, el))
         if selector:
-            el = await tab.query_selector(selector)
+            el = await page.query_selector(selector)
             if el is None:
                 return err(f"selector not found: {selector}")
             if raw:
                 return ok(el.text_all or "")
-            return ok(await _visible_text_of(tab, el))
+            return ok(await _visible_text_of(page, el))
         expr = "document.body.textContent" if raw else "document.body.innerText"
-        result = await tab.evaluate(expr, return_by_value=True)
-        # Unwrap RemoteObject (nodriver returns the wrapper for falsy values).
+        result = await _wait(page.evaluate(expr, return_by_value=True), what="get_text")
         text = result.value if hasattr(result, "value") and not isinstance(result, str) else result
         return ok(str(text or ""))
     except Exception as e:
@@ -3070,19 +3730,40 @@ async def tab_list() -> str:
 
 
 @mcp.tool()
-async def tab_new(url: str = "about:blank") -> str:
-    """Open a new tab and make it active."""
+async def tab_new(
+    url: str = "about:blank",
+    expect_url: Optional[str] = None,
+    expect_status: Optional[int] = None,
+) -> str:
+    """Open a new tab and make it active.
+
+    Reports the same observed postconditions as navigate() — a new tab that
+    redirects is otherwise reported as sitting on the URL you asked for.
+    See navigate() for the expect_* rules.
+    """
     try:
         if not BrowserState.browser:
             return err("browser not running")
         # Apply the instance identity before the destination sees any script.
         new_tab = await BrowserState.browser.get("about:blank", new_tab=True)
         await _apply_fingerprint_to_tab(new_tab, BrowserState.current_fingerprint)
-        if url != "about:blank":
-            await new_tab.get(url)
+        doc_state, disarm = await _arm_document_watch(new_tab)
+        try:
+            if url != "about:blank":
+                await new_tab.get(url)
+                try:
+                    await _wait(new_tab.wait(), timeout=10, what="tab_new settle")
+                except Exception:
+                    pass
+            observed = await _observe_navigation(new_tab, url, disarm())
+        finally:
+            disarm()
         await _refresh_tabs()
         BrowserState.active_tab_index = BrowserState.tabs.index(new_tab)
-        return ok(f"opened tab [{BrowserState.active_tab_index}] {url}")
+        return _nav_result(
+            f"opened tab [{BrowserState.active_tab_index}]", observed,
+            expect_url=expect_url, expect_status=expect_status,
+        )
     except Exception as e:
         return err(str(e))
 
@@ -3647,31 +4328,96 @@ async def indexeddb_delete(database_name: str) -> str:
 
 
 @mcp.tool()
-async def evaluate(expression: str, await_promise: bool = True) -> str:
-    """Execute arbitrary JS expression in page context. Returns stringified result.
+async def evaluate(
+    expression: str,
+    await_promise: bool = True,
+    timeout_ms: int = 30000,
+    survive_navigation: bool = False,
+    tab: Optional[int] = None,
+) -> str:
+    """Execute JavaScript with an explicit bounded timeout.
 
-    Args:
-        expression: JS to evaluate. May be an async IIFE or any Promise-returning
-            expression — it is awaited by default, so
-            `(async () => { await x; return 'done' })()` returns "done", not null.
-        await_promise: if True (default) a returned Promise is resolved before the
-            value comes back. Pass False for fire-and-forget (returns immediately
-            with the pending Promise's placeholder instead of its value).
+    ``survive_navigation`` explicitly retries once after a navigation interruption;
+    callers must only use it for idempotent expressions because arbitrary JavaScript
+    may have side effects before navigation starts.
     """
+    if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int) or not 1 <= timeout_ms <= 600_000:
+        return err("timeout_ms must be an integer between 1 and 600000")
     try:
-        tab = BrowserState.active_tab()
-        result = await _wait(
-            tab.evaluate(expression, await_promise=await_promise, return_by_value=True),
-            what="evaluate",
-        )
-        # Unwrap nodriver RemoteObject if returned (happens for some primitives)
-        if hasattr(result, "value") and not isinstance(result, (str, int, float, bool, list, dict)):
-            result = result.value
-        if result is None:
-            return ok("null")
-        if isinstance(result, (dict, list)):
-            return ok(json.dumps(result, indent=2, default=str))
-        return ok(str(result))
+        page = select_tab(tab)
+        attempts = 2 if survive_navigation else 1
+        for attempt in range(attempts):
+            try:
+                result = await _wait(
+                    page.evaluate(expression, await_promise=await_promise, return_by_value=True),
+                    timeout=timeout_ms / 1000,
+                    what="evaluate",
+                )
+                if hasattr(result, "value") and not isinstance(result, (str, int, float, bool, list, dict)):
+                    result = result.value
+                if result is None:
+                    return ok("null")
+                if isinstance(result, (dict, list)):
+                    return ok(json.dumps(result, indent=2, default=str))
+                return ok(str(result))
+            except RuntimeError as exc:
+                message = str(exc).lower()
+                interrupted = "interrupted by target navigation" in message
+                if not interrupted or attempt + 1 >= attempts:
+                    raise
+                await _wait(
+                    page.evaluate("document.readyState === 'complete' || document.readyState === 'interactive'", return_by_value=True),
+                    timeout=min(timeout_ms / 1000, 30),
+                    what="navigation recovery",
+                )
+        return err("evaluate did not produce a result")
+    except Exception as e:
+        return err(str(e))
+
+
+@mcp.tool()
+async def wait_for_function(
+    expression: str,
+    timeout_ms: int = 120000,
+    poll_ms: int = 500,
+    tab: Optional[int] = None,
+) -> str:
+    """Poll a JavaScript predicate and return its truthy value.
+
+    The expression is evaluated in the selected tab without changing active focus.
+    It must be a predicate or a side-effect-free value expression.
+    """
+    if (isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int)
+            or not 1 <= timeout_ms <= 600_000):
+        return err("timeout_ms must be an integer between 1 and 600000")
+    if (isinstance(poll_ms, bool) or not isinstance(poll_ms, int)
+            or not 10 <= poll_ms <= 60_000):
+        return err("poll_ms must be an integer between 10 and 60000")
+    try:
+        page = select_tab(tab)
+        deadline = time.monotonic() + timeout_ms / 1000
+        wrapped = ("(async () => { const value = await (" + expression + "); "
+                   "return JSON.stringify({truthy: Boolean(value), value: value ?? null}); })()")
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return err(f"wait_for_function timed out after {timeout_ms}ms")
+            try:
+                raw = await _wait(
+                    page.evaluate(wrapped, await_promise=True, return_by_value=True),
+                    timeout=min(remaining, max(0.1, poll_ms / 1000)),
+                    what="wait_for_function",
+                )
+            except TimeoutError:
+                continue
+            raw = raw.value if hasattr(raw, "value") and not isinstance(raw, (str, dict)) else raw
+            state = parse_json(raw)
+            if not isinstance(state, dict):
+                return err("wait_for_function predicate returned an unserializable value")
+            if state.get("truthy"):
+                value = state.get("value")
+                return ok(json.dumps(value, indent=2, default=str) if isinstance(value, (dict, list)) else str(value))
+            await asyncio.sleep(min(poll_ms / 1000, max(0, deadline - time.monotonic())))
     except Exception as e:
         return err(str(e))
 
@@ -3913,12 +4659,27 @@ async def fill_form(fields: list[dict], submit_ref: Optional[str] = None) -> str
 
 
 @mcp.tool()
-async def navigate_and_snapshot(url: str) -> str:
-    """Navigate then immediately snapshot — common pattern."""
-    nav = await navigate(url)
+async def navigate_and_snapshot(
+    url: str,
+    expect_url: Optional[str] = None,
+    expect_status: Optional[int] = None,
+) -> str:
+    """Navigate then immediately snapshot — common pattern.
+
+    The navigation's observed postconditions are kept above the snapshot: a
+    snapshot of a page you were redirected to reads exactly like a snapshot of
+    the page you asked for. A failed expect_url / expect_status aborts before
+    the snapshot rather than describing the wrong page. See navigate().
+    """
+    nav = await navigate(url, expect_url=expect_url, expect_status=expect_status)
     if str(nav).startswith("Error:"):
         return nav
-    return await browser_snapshot()
+    snapshot = await browser_snapshot()
+    if str(snapshot).startswith("Error:"):
+        # A failed snapshot does not make the navigation unobserved — keep its
+        # postconditions rather than dropping them with the failure.
+        return err(f"navigated, then the snapshot failed.\n{nav}\n{snapshot}")
+    return ok(f"{nav}\n\n{snapshot}")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -5410,38 +6171,55 @@ async def extract_table(selector: str = "table", include_headers: bool = True) -
 
 
 @mcp.tool()
-async def scrape_page(only_main_content: bool = True, max_chars: int = 8000) -> str:
-    """Clean readable text extraction — drops nav, footer, scripts, styles.
+async def scrape_page(
+    only_main_content: bool = True,
+    max_chars: int = 8000,
+    return_mode: Literal["auto", "json", "text", "markdown"] = "auto",
+) -> str:
+    """Extract readable content, preserving JSON endpoints as native structured data.
 
-    Smart-truncates at paragraph boundary (not mid-word).
+    ``return_mode=json`` requires a valid JSON document and returns its parsed value;
+    ``auto`` selects that mode when the document content type is JSON. ``text`` and
+    ``markdown`` retain the readable envelope used by existing callers.
     """
+    if return_mode not in ("auto", "json", "text", "markdown"):
+        return err("return_mode must be auto, json, text, or markdown")
     try:
         tab = BrowserState.active_tab()
-        js = r"""
-        (() => {
-          var main = """ + str(only_main_content).lower() + r""";
-          var root = main ? (document.querySelector('main,article,[role=main]') || document.body) : document.body;
-          var clone = root.cloneNode(true);
-          clone.querySelectorAll('script,style,nav,footer,aside,noscript').forEach(e=>e.remove());
-          var title = document.title;
-          var url = location.href;
-          var text = clone.innerText.replace(/\n{3,}/g, '\n\n').trim();
-          var links = [...document.querySelectorAll('a[href]')]
-            .slice(0,30).map(a => ({text: a.innerText.trim().slice(0,80), href: a.href}));
-          return JSON.stringify({title, url, text, links});
-        })()
-        """
-        raw = await tab.evaluate(js, return_by_value=True)
-        data = parse_json(raw, {})
-        text = data.get("text", "") if isinstance(data, dict) else ""
-        if len(text) > max_chars:
-            cut = text.rfind("\n", 0, max_chars)
-            if cut == -1:
-                cut = max_chars
-            text = text[:cut] + f"\n\n[truncated at {cut}/{len(text)} chars]"
-            if isinstance(data, dict):
-                data["text"] = text
-        return ok(json.dumps(data, indent=2, default=str))
+        raw = await _wait(tab.evaluate(
+            "(() => { const root = " + ("document.querySelector(\'main,article,[role=main]\') || document.body" if only_main_content else "document.body") + "; return JSON.stringify({contentType: document.contentType || \'\', title: document.title, url: location.href, body: root ? root.innerText : \'\'}); })()",
+            return_by_value=True,
+        ), what="scrape_page")
+        raw = raw.value if hasattr(raw, "value") and not isinstance(raw, str) else raw
+        page = parse_json(raw, {})
+        if not isinstance(page, dict):
+            return err("scrape_page returned invalid page metadata")
+        content_type = str(page.get("contentType") or "").lower()
+        body = str(page.get("body") or "")
+        wants_json = return_mode == "json" or (return_mode == "auto" and "application/json" in content_type)
+        if wants_json:
+            value = parse_json(body)
+            if value is None and body.strip() not in ("null",):
+                return err("JSON response could not be parsed; use return_mode='text' to inspect it")
+            return structured_json({
+                "data": value,
+                "status": None,
+                "headers": {},
+                "url": page.get("url"),
+                "content_type": page.get("contentType"),
+                "status_measured": False,
+            })
+        if return_mode == "markdown":
+            return ok(body[:max_chars] if max_chars > 0 else body)
+        text = body
+        if max_chars > 0 and len(text) > max_chars:
+            cut = text.rfind("\n", 0, max_chars) or max_chars
+            text = text[:cut] + f"\n\n[truncated at {cut}/{len(body)} chars]"
+        return ok(json.dumps({
+            "title": page.get("title"), "url": page.get("url"), "text": text,
+            "content_type": page.get("contentType"), "status": None,
+            "status_measured": False,
+        }, indent=2, default=str))
     except Exception as e:
         return err(str(e))
 
@@ -6121,15 +6899,15 @@ async def mouse_replay(path_json: str, speed: float = 1.0) -> str:
 # ══════════════════════════════════════════════════════════════════════════
 # 21. ⭐⭐ AI VISION CAPTCHA SOLVER — moved to tools/vision.py (v0.4.1)
 # ══════════════════════════════════════════════════════════════════════════
-from .tools import vision as _vision  # noqa: F401  -- registers solve_recaptcha_ai + vision_locate
-# Re-export private helpers AND tool callables. Tools must remain in server's
-# globals() because workflow_run.dispatch_table looks them up by name there.
+from .tools import vision as _vision  # noqa: F401  -- registers all vision tools
+# Re-export private helpers AND tool callables. Tools must remain in server globals
+# because workflow_run.dispatch_table looks them up by name there.
 from .tools.vision import (  # noqa: F401
     _PROMPT_TEMPLATE, _VISION_LOCATE_PROMPT,
     _parse_tile_indices, _parse_vision_response,
     _claude_vision_pick_tiles, _openai_compat_vision_pick_tiles,
     _resolve_vision_provider,
-    solve_recaptcha_ai, vision_locate,
+    solve_recaptcha_ai, vision_locate, vision_describe, vision_ocr, vision_check,
 )
 
 
@@ -6140,7 +6918,8 @@ from .tools import network_http as _network_http  # noqa: F401
 # Re-export so workflow_run + http_request_with_session find them in globals().
 from .tools.network_http import (  # noqa: F401
     _get_browser_cookies_for_url,
-    http_request, http_session_cookies, session_warmup, detect_anti_bot,
+    http_request, http_request_cancel, http_request_retry, http_request_status,
+    http_session_cookies, session_warmup, detect_anti_bot,
 )
 
 
@@ -8289,6 +9068,8 @@ async def http_request_with_session(
     impersonate: str = "chrome",
     return_mode: str = "auto",
     timeout: float = 30.0,
+    wait_timeout: Optional[float] = None,
+    connect_timeout: Optional[float] = None,
 ) -> str:
     """⭐ Authenticated HTTP request that piggybacks on the BROWSER's session.
 
@@ -8301,8 +9082,10 @@ async def http_request_with_session(
         request — call network_start once at session begin.
 
     Args:
-        url, method, json_body, data, impersonate, return_mode, timeout:
-            same as http_request
+        url, method, json_body, data, impersonate, return_mode, timeout,
+        wait_timeout, connect_timeout: same as http_request — including the
+            tracked lifecycle, so a slow authenticated call hands back a
+            request_id for http_request_status instead of a dead end
         extra_headers: merged on top of auto-detected ones
         auth_header: explicit bearer / basic value, e.g. "Bearer eyJ..."
 
@@ -8311,7 +9094,10 @@ async def http_request_with_session(
     headers = dict(extra_headers or {})
     if auth_header:
         headers.setdefault("Authorization", auth_header)
-    elif "Authorization" not in {k.lower() for k in headers}:
+    elif not any(k.lower() == "authorization" for k in headers):
+        # Case-fold BOTH sides. Comparing "Authorization" against a lowercased
+        # key set never matched, so a caller who passed their own Authorization
+        # in extra_headers had it silently overwritten by the sniffed token.
         candidate = _latest_auth_header_for(url)
         if candidate:
             headers["Authorization"] = candidate
@@ -8322,7 +9108,8 @@ async def http_request_with_session(
         url=url, method=method, impersonate=impersonate,
         use_browser_cookies=True, headers=headers,
         data=data, json_body=json_body, timeout=timeout,
-        return_mode=return_mode,
+        return_mode=return_mode, wait_timeout=wait_timeout,
+        connect_timeout=connect_timeout,
     )
 
 

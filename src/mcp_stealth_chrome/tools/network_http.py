@@ -4,24 +4,118 @@ UNIQUE in MCP ecosystem — combine browser (for login/rendering) with
 curl_cffi (for high-volume API scraping with real browser JA3/JA4 fingerprint).
 
 Tools:
-- http_request: TLS-perfect HTTP via curl_cffi
+- http_request: TLS-perfect HTTP via curl_cffi, tracked and pollable
+- http_request_status: poll / list a tracked request
+- http_request_cancel: stop waiting on one (client-side only — never a rollback)
+- http_request_retry: explicit, opt-in replay; nothing here retries on its own
 - http_session_cookies: inspect which browser cookies a request would send
 - session_warmup: visit homepage / referer chain / natural-browse before target
 - detect_anti_bot: classify Cloudflare / DataDome / PerimeterX / Akamai / etc.
 
 Internal helpers re-exported by server.py for backward compat:
 - _get_browser_cookies_for_url
+
+Concurrency
+-----------
+Every request gets its OWN curl_cffi AsyncSession, so N http_request calls run
+in parallel without interfering — nothing in the transfer path shares a browser
+tab or the single CDP connection. That is the opposite of the browser tools,
+which all drive one tab and must not be fanned out silently. The one place that
+DOES touch the browser is the cookie snapshot, and it is taken once, up front,
+under a lock — see _snapshot_browser_cookies.
+
+Honest outcomes
+---------------
+A failed HTTP call is not one thing. `connect_timeout` and `dns_error` mean the
+server never saw the request, so replaying it cannot duplicate a side effect.
+`read_timeout` means the request WAS delivered and the reply never came back:
+the outcome is genuinely unknown, and this module says `unknown` rather than
+guessing. Cancelling only stops the client from waiting; no rollback is
+performed or claimed.
 """
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
+import os
+import time
+import uuid
+from dataclasses import dataclass, field
 from typing import Literal, Optional
+from urllib.parse import urlparse
 
 from .._app import mcp
 from ..helpers import err, get_url, ok, parse_json
 from ..humanize import humanized_move
 from ..state import BrowserState
+
+# ── Bounds ─────────────────────────────────────────────────────────────────
+# Tracked requests outlive the tool call that started them, so every one of
+# these is a ceiling on memory or on how long a forgotten request may run.
+HTTP_TRACK_MAX = int(os.environ.get("HTTP_TRACK_MAX", "50"))        # retained records
+HTTP_TRACK_TTL = float(os.environ.get("HTTP_TRACK_TTL", "900"))     # settled-record age
+HTTP_MAX_INFLIGHT = int(os.environ.get("HTTP_MAX_INFLIGHT", "16"))  # concurrent tracked
+HTTP_BODY_MAX = int(os.environ.get("HTTP_BODY_MAX", "20000"))       # retained body chars
+HTTP_MAX_TIMEOUT = float(os.environ.get("HTTP_MAX_TIMEOUT", "900"))  # per-request cap
+HTTP_DEFAULT_CONNECT_TIMEOUT = float(os.environ.get("HTTP_CONNECT_TIMEOUT", "10"))
+HTTP_DEADLINE_GRACE = float(os.environ.get("HTTP_DEADLINE_GRACE", "10"))
+HTTP_COOKIE_TIMEOUT = float(os.environ.get("HTTP_COOKIE_TIMEOUT", "5"))
+
+# Retrying these cannot duplicate a side effect even when the first attempt's
+# outcome is unknown. Everything else needs the caller to say so explicitly.
+_SAFE_METHODS = {"GET", "HEAD", "OPTIONS", "TRACE"}
+
+# libcurl error codes, split by what they prove about the SERVER, not about us.
+# not-executed: the bytes never left for a server that could act on them.
+_CURL_NOT_EXECUTED = {1, 3, 5, 6, 7, 8, 9, 35, 53, 54, 58, 59, 60, 66, 77, 83,
+                      90, 91, 97, 98, 101}
+# unknown: the connection was up and the request may well have been processed.
+_CURL_UNKNOWN = {18, 23, 26, 27, 47, 52, 55, 56, 92, 95, 96}
+
+
+# ── Local / private targets take a direct transport ────────────────────────
+
+_DIRECT_SUFFIXES = (".localhost", ".local", ".internal", ".test", ".home.arpa")
+
+
+def _is_direct_target(url: str) -> tuple[bool, str]:
+    """True when `url` points at loopback / a private network / a local name.
+
+    Those must not be proxied. libcurl reads http_proxy / HTTPS_PROXY / ALL_PROXY
+    straight out of the environment whenever CURLOPT_PROXY is unset, so a
+    localhost call made from a shell that exports a corporate proxy is dialled
+    at the proxy and dies on a connect timeout with nothing to show for it —
+    exactly the "three parallel localhost requests timed out, outcome unknown"
+    report this came from.
+    """
+    try:
+        host = (urlparse(url).hostname or "").strip("[]")
+    except Exception:
+        return False, ""
+    if not host:
+        return False, ""
+    low = host.lower()
+    if low == "localhost" or low.endswith(_DIRECT_SUFFIXES):
+        return True, f"local hostname ({host})"
+    try:
+        ip = ipaddress.ip_address(low)
+    except ValueError:
+        return False, ""
+    if ip.is_loopback:
+        return True, f"loopback address ({host})"
+    if ip.is_link_local:
+        return True, f"link-local address ({host})"
+    if ip.is_private:
+        return True, f"private address ({host})"
+    return False, ""
+
+
+# ── Browser cookie snapshot ────────────────────────────────────────────────
+
+# The CDP connection is single — N parallel http_request calls would otherwise
+# fire N concurrent cookies.get_all() at the same socket. Queue them instead.
+_COOKIE_LOCK = asyncio.Lock()
 
 
 async def _get_browser_cookies_for_url(url: str) -> list[dict]:
@@ -29,7 +123,6 @@ async def _get_browser_cookies_for_url(url: str) -> list[dict]:
     if not BrowserState.browser:
         return []
     try:
-        from urllib.parse import urlparse
         parsed = urlparse(url)
         target_host = parsed.hostname or ""
         all_cookies = await BrowserState.browser.cookies.get_all()
@@ -48,6 +141,318 @@ async def _get_browser_cookies_for_url(url: str) -> list[dict]:
         return []
 
 
+async def _snapshot_browser_cookies(url: str) -> tuple[dict[str, str], dict]:
+    """Read the browser's cookies for `url` ONCE, before the request starts.
+
+    Taken up front and BY VALUE. A tracked request outlives the tool call that
+    started it, and switch_instance() rebinds BrowserState's class attributes
+    mid-flight — reading cookies from inside the request task would hand
+    instance B's jar to a request that belongs to instance A. Snapshotting here
+    pins the jar to the instance that was current when the caller asked.
+
+    Returns (cookie dict, meta). `measured` distinguishes "no cookies apply"
+    from "we never got to look".
+    """
+    meta = {
+        "measured": False,
+        "instance": BrowserState.current_instance_id,
+        "count": 0,
+        "reason": None,
+    }
+    if not BrowserState.browser:
+        meta["reason"] = "no browser running — cookie-less request"
+        return {}, meta
+    try:
+        async with _COOKIE_LOCK:
+            cookies = await asyncio.wait_for(
+                _get_browser_cookies_for_url(url), timeout=HTTP_COOKIE_TIMEOUT
+            )
+    except asyncio.TimeoutError:
+        meta["reason"] = (
+            f"browser cookie read timed out after {HTTP_COOKIE_TIMEOUT}s — "
+            "request sent WITHOUT browser cookies"
+        )
+        return {}, meta
+    except Exception as e:
+        meta["reason"] = f"browser cookie read failed: {e} — request sent WITHOUT them"
+        return {}, meta
+    jar = {c["name"]: c["value"] for c in cookies}
+    meta["measured"] = True
+    meta["count"] = len(jar)
+    return jar, meta
+
+
+# ── Failure classification ─────────────────────────────────────────────────
+
+
+def _classify_http_error(exc: BaseException) -> dict:
+    """Turn a curl_cffi failure into what it actually proves about the server.
+
+    curl reports both timeout phases as error 28; only libcurl's own message
+    separates them, and that separation is the whole point — a connect timeout
+    is safe to replay, a read timeout is not.
+    """
+    code = getattr(exc, "code", None)
+    msg = str(exc)
+    low = msg.lower()
+    kind = "request_error"
+    server_reached: Optional[bool] = None
+    outcome = "unknown"
+
+    if code == 28 or "timed out" in low:
+        if "connection timed out" in low or "resolving timed out" in low:
+            kind, server_reached, outcome = "connect_timeout", False, "not_executed"
+        else:
+            # "Operation timed out after N ms with M bytes received"
+            kind, server_reached, outcome = "read_timeout", True, "unknown"
+    elif code in _CURL_NOT_EXECUTED:
+        server_reached, outcome = False, "not_executed"
+        kind = {5: "proxy_error", 6: "dns_error", 7: "connect_failed",
+                97: "proxy_error"}.get(code, "connect_failed")
+        if code in (35, 53, 54, 58, 59, 60, 66, 77, 83, 90, 91, 98, 101):
+            kind = "tls_error"
+    elif code in _CURL_UNKNOWN:
+        kind, server_reached, outcome = "transport_error", True, "unknown"
+
+    retry_safe = outcome == "not_executed"
+    return {
+        "error_class": kind,
+        "curl_code": code,
+        "server_reached": server_reached,
+        "outcome": outcome,
+        "retry_safe_any_method": retry_safe,
+        "message": msg,
+    }
+
+
+# ── Tracked request lifecycle ──────────────────────────────────────────────
+
+
+@dataclass
+class _Tracked:
+    """One in-flight or settled http_request, addressable by request_id."""
+
+    request_id: str
+    method: str
+    url: str
+    created_at: float
+    operation_deadline: float          # seconds the request may keep running
+    spec: dict = field(default_factory=dict)   # everything needed to replay it
+    state: str = "pending"             # pending | succeeded | failed | cancelled
+    outcome: str = "pending"           # pending | completed | not_executed | unknown
+    result: Optional[str] = None       # the settled ok()/err() payload
+    detail: dict = field(default_factory=dict)
+    task: Optional[asyncio.Task] = None
+    sent: bool = False                 # request handed to curl at least once
+    finished_at: Optional[float] = None
+
+    def public(self) -> dict:
+        return {
+            "request_id": self.request_id,
+            "method": self.method,
+            "url": self.url,
+            "state": self.state,
+            "outcome": self.outcome,
+            "age_s": round(time.time() - self.created_at, 2),
+            "operation_deadline_s": round(self.operation_deadline, 1),
+            "detail": self.detail or None,
+        }
+
+
+_TRACKED: dict[str, _Tracked] = {}
+
+
+def _prune_tracked() -> None:
+    """Keep the registry bounded — settled records age out, newest kept."""
+    now = time.time()
+    for rid, rec in list(_TRACKED.items()):
+        if rec.state != "pending" and rec.finished_at and (
+            now - rec.finished_at > HTTP_TRACK_TTL
+        ):
+            _TRACKED.pop(rid, None)
+    overflow = len(_TRACKED) - HTTP_TRACK_MAX
+    if overflow > 0:
+        # Evict oldest SETTLED records only; a pending one still owns a task and
+        # a caller holding its id. Dicts preserve insertion order.
+        for rid, rec in list(_TRACKED.items()):
+            if overflow <= 0:
+                break
+            if rec.state != "pending":
+                _TRACKED.pop(rid, None)
+                overflow -= 1
+
+
+def _inflight() -> int:
+    return sum(1 for r in _TRACKED.values() if r.state == "pending")
+
+
+async def _perform(rec: _Tracked) -> str:
+    """Run one curl_cffi request and render its settled response string."""
+    from curl_cffi.requests import AsyncSession
+
+    spec = rec.spec
+    connect_timeout = float(spec["connect_timeout"])
+    read_budget = max(0.1, float(spec["timeout"]) - connect_timeout)
+    session_kwargs: dict = {"impersonate": spec["impersonate"]}
+    if spec["direct"]:
+        # Explicit CURLOPT_PROXY="" — the ONLY thing that stops libcurl reading
+        # http_proxy out of the environment. trust_env=False does not: it is
+        # curl_cffi's own flag and never reaches this decision (verified).
+        session_kwargs["proxies"] = {"all": ""}
+
+    started = time.monotonic()
+    async with AsyncSession(**session_kwargs) as session:
+        kwargs = {
+            "timeout": (connect_timeout, read_budget),
+            "allow_redirects": spec["follow_redirects"],
+        }
+        if spec.get("params"):
+            kwargs["params"] = spec["params"]
+        if spec.get("headers"):
+            kwargs["headers"] = spec["headers"]
+        if spec.get("cookies"):
+            kwargs["cookies"] = spec["cookies"]
+        # json_body takes precedence — curl_cffi overwrites the data-derived
+        # body with the JSON body anyway, so make that explicit and never
+        # pass both (which would also clobber the Content-Type).
+        if spec.get("json_body") is not None:
+            kwargs["json"] = spec["json_body"]
+        elif spec.get("data") is not None:
+            kwargs["data"] = spec["data"]
+
+        rec.sent = True
+        resp = await session.request(rec.method, spec["url"], **kwargs)
+
+        return_mode = spec["return_mode"]
+        body_text = ""
+        if return_mode != "meta":
+            try:
+                body_text = resp.text
+            except Exception:
+                body_text = "<binary>"
+            if len(body_text) > HTTP_BODY_MAX:
+                body_text = (
+                    body_text[:HTTP_BODY_MAX]
+                    + f"\n\n[truncated — full size {len(resp.content)} bytes]"
+                )
+
+        elapsed_ms = None
+        if hasattr(resp, "elapsed") and resp.elapsed is not None:
+            try:
+                # curl_cffi returns float seconds OR timedelta depending on version
+                e = resp.elapsed
+                elapsed_ms = (int(e.total_seconds() * 1000)
+                              if hasattr(e, "total_seconds") else int(float(e) * 1000))
+            except Exception:
+                elapsed_ms = None
+        if elapsed_ms is None:
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+
+        meta = {
+            "status": resp.status_code,
+            "url": str(resp.url),
+            "elapsed_ms": elapsed_ms,
+            "headers": dict(resp.headers),
+            "cookies_sent": len(spec.get("cookies") or {}),
+            "cookie_snapshot": spec.get("cookie_meta"),
+            "impersonate": spec["impersonate"],
+            "request_id": rec.request_id,
+            "outcome": "completed",
+            "transport": spec["transport"],
+        }
+
+        if return_mode == "json":
+            try:
+                return ok(json.dumps({"meta": meta, "body": resp.json()},
+                                     indent=2, default=str)[:25000])
+            except Exception:
+                return ok(json.dumps({"meta": meta, "body_text": body_text},
+                                     indent=2, default=str)[:25000])
+        if return_mode == "text":
+            return ok(f"{json.dumps(meta, indent=2, default=str)}\n\n--- BODY ---\n{body_text}")
+        if return_mode == "meta":
+            return ok(json.dumps(meta, indent=2, default=str))
+        # auto mode
+        try:
+            parsed = resp.json()
+            return ok(json.dumps({"meta": meta, "body": parsed},
+                                 indent=2, default=str)[:25000])
+        except Exception:
+            return ok(f"{json.dumps(meta, indent=2, default=str)}"
+                      f"\n\n--- BODY (text) ---\n{body_text}")
+
+
+async def _run_tracked(rec: _Tracked) -> str:
+    """Own one request end to end and record what actually happened."""
+    try:
+        result = await asyncio.wait_for(_perform(rec), timeout=rec.operation_deadline)
+    except asyncio.CancelledError:
+        rec.state = "cancelled"
+        # Cancelling stops US waiting. If the bytes already went out, the server
+        # may have acted on them and nothing here undid that.
+        rec.outcome = "unknown" if rec.sent else "not_executed"
+        rec.detail = {
+            "error_class": "cancelled",
+            "server_reached": True if rec.sent else False,
+            "outcome": rec.outcome,
+            "note": ("cancelled client-side; NO rollback was performed or requested "
+                     "of the server" if rec.sent else
+                     "cancelled before the request was handed to curl"),
+        }
+        rec.result = err(
+            f"http_request {rec.request_id} cancelled — client stopped waiting.\n"
+            + json.dumps(rec.detail, indent=2, default=str)
+        )
+        rec.finished_at = time.time()
+        raise
+    except asyncio.TimeoutError:
+        rec.state = "failed"
+        rec.outcome = "unknown"
+        rec.detail = {
+            "error_class": "operation_deadline",
+            "server_reached": rec.sent,
+            "outcome": "unknown",
+            "message": (f"request exceeded its operation deadline of "
+                        f"{rec.operation_deadline:.1f}s and was abandoned"),
+        }
+        rec.result = err(
+            f"http_request {rec.request_id} hit its operation deadline "
+            f"({rec.operation_deadline:.1f}s) — outcome UNKNOWN.\n"
+            + json.dumps(rec.detail, indent=2, default=str)
+        )
+    except ImportError:
+        rec.state = "failed"
+        rec.outcome = "not_executed"
+        rec.detail = {"error_class": "missing_dependency", "outcome": "not_executed"}
+        rec.result = err("curl-cffi not installed — pip install curl-cffi")
+    except Exception as e:
+        detail = _classify_http_error(e)
+        rec.state = "failed"
+        rec.outcome = detail["outcome"]
+        detail["request_id"] = rec.request_id
+        detail["next"] = (
+            "http_request_retry(request_id=...) — safe, the server never saw this"
+            if detail["outcome"] == "not_executed" else
+            "http_request_retry(request_id=..., confirm_side_effects=True) — the "
+            "server may already have processed the first attempt"
+        )
+        rec.detail = detail
+        rec.result = err(
+            f"http_request: {detail['error_class']} ({rec.method} {rec.url}) — "
+            f"outcome {detail['outcome']}.\n"
+            + json.dumps(detail, indent=2, default=str)
+        )
+    else:
+        rec.state = "succeeded"
+        rec.outcome = "completed"
+        rec.result = result
+        rec.detail = {}
+    finally:
+        if rec.finished_at is None:
+            rec.finished_at = time.time()
+    return rec.result or ""
+
+
 @mcp.tool()
 async def http_request(
     url: str,
@@ -61,113 +466,303 @@ async def http_request(
     timeout: float = 30.0,
     follow_redirects: bool = True,
     return_mode: str = "auto",
+    wait_timeout: Optional[float] = None,
+    connect_timeout: Optional[float] = None,
+    direct: Optional[bool] = None,
 ) -> str:
     """HTTP request with TLS-perfect browser fingerprint via curl_cffi.
     Use for API scraping after browser login — same stealth as real Chrome's JA3/JA4.
 
+    Each call gets its own curl session, so parallel calls are safe — nothing
+    shares a browser tab. Localhost / private-network targets bypass the
+    environment proxy automatically.
+
+    Every call is tracked: if it does not settle within `wait_timeout` you get a
+    request_id back instead of a dead end, the request keeps running until
+    `timeout`, and http_request_status / http_request_cancel take it from there.
+
     Args:
         url, method: target URL and HTTP verb
         impersonate: chrome, chrome124, firefox, safari, edge (default chrome)
-        use_browser_cookies: auto-inject cookies from active browser tab
+        use_browser_cookies: snapshot cookies from the active browser instance
+            BEFORE the request starts (a later switch_instance cannot leak in)
         headers, params: extra headers/query params
         data: raw body string (form-urlencoded or custom)
         json_body: JSON body dict (sets Content-Type automatically)
-        timeout, follow_redirects: usual HTTP options
+        timeout: total request budget in seconds, and the operation deadline —
+            the request keeps running this long even after wait_timeout returns
+        follow_redirects: usual HTTP option
         return_mode: auto (json if parseable else text), json, text, or meta (status+headers only)
+        wait_timeout: how long THIS call blocks. Default None = the whole
+            timeout. Set it lower to get a request_id back early and poll.
+        connect_timeout: connect-phase budget (default 10s, capped by timeout).
+            Separating it is what lets a failure say "never reached the server"
+            instead of a bare timeout.
+        direct: force (True) or forbid (False) the proxy-bypassing direct
+            transport. Default None auto-detects loopback / private targets.
     """
     try:
-        from curl_cffi.requests import AsyncSession
+        from curl_cffi.requests import AsyncSession  # noqa: F401
     except ImportError:
         return err("curl-cffi not installed — pip install curl-cffi")
 
-    cookies_dict = {}
+    method = method.upper()
+    timeout = max(0.1, min(float(timeout), HTTP_MAX_TIMEOUT))
+    conn = HTTP_DEFAULT_CONNECT_TIMEOUT if connect_timeout is None else float(connect_timeout)
+    conn = max(0.1, min(conn, timeout * 0.9))
+    wait = timeout if wait_timeout is None else max(0.0, float(wait_timeout))
+
+    auto_direct, direct_reason = _is_direct_target(url)
+    use_direct = auto_direct if direct is None else bool(direct)
+    if use_direct:
+        transport = ("curl_cffi direct — proxy bypassed"
+                     + (f" ({direct_reason})" if direct_reason else " (forced)")
+                     + "; independent session, safe in parallel")
+    else:
+        transport = ("curl_cffi via environment proxy settings if any; "
+                     "independent session, safe in parallel")
+
+    _prune_tracked()
+    if _inflight() >= HTTP_MAX_INFLIGHT:
+        return err(
+            f"{_inflight()} http_request calls are already in flight "
+            f"(limit HTTP_MAX_INFLIGHT={HTTP_MAX_INFLIGHT}). Nothing was sent. "
+            "Cancel one with http_request_cancel or wait for it to settle."
+        )
+
+    cookies_dict: dict[str, str] = {}
+    cookie_meta: dict = {"measured": False, "reason": "use_browser_cookies=False"}
     if use_browser_cookies:
-        browser_cookies = await _get_browser_cookies_for_url(url)
-        for c in browser_cookies:
-            cookies_dict[c["name"]] = c["value"]
+        cookies_dict, cookie_meta = await _snapshot_browser_cookies(url)
 
-    hdrs = dict(headers or {})
+    request_id = f"hreq_{uuid.uuid4().hex[:12]}"
+    rec = _Tracked(
+        request_id=request_id,
+        method=method,
+        url=url,
+        created_at=time.time(),
+        operation_deadline=timeout + HTTP_DEADLINE_GRACE,
+        spec={
+            "url": url,
+            "impersonate": impersonate,
+            "headers": dict(headers or {}),
+            "params": params,
+            "data": data,
+            "json_body": json_body,
+            "cookies": cookies_dict,
+            "cookie_meta": cookie_meta,
+            "timeout": timeout,
+            "connect_timeout": conn,
+            "follow_redirects": follow_redirects,
+            "return_mode": return_mode,
+            "direct": use_direct,
+            "transport": transport,
+            "use_browser_cookies": use_browser_cookies,
+        },
+    )
+    _TRACKED[request_id] = rec
+    rec.task = asyncio.ensure_future(_run_tracked(rec))
 
-    try:
-        async with AsyncSession(impersonate=impersonate) as session:
-            kwargs = {
-                "timeout": timeout,
-                "allow_redirects": follow_redirects,
-            }
-            if params:
-                kwargs["params"] = params
-            if hdrs:
-                kwargs["headers"] = hdrs
-            if cookies_dict:
-                kwargs["cookies"] = cookies_dict
-            # json_body takes precedence — curl_cffi overwrites the data-derived
-            # body with the JSON body anyway, so make that explicit and never
-            # pass both (which would also clobber the Content-Type).
-            if json_body is not None:
-                kwargs["json"] = json_body
-            elif data is not None:
-                kwargs["data"] = data
+    done, _ = await asyncio.wait({rec.task}, timeout=wait)
+    if rec.task in done:
+        try:
+            return rec.task.result()
+        except asyncio.CancelledError:
+            return rec.result or err(f"http_request {request_id} cancelled")
+        except Exception as e:  # _run_tracked handles its own; belt and braces
+            return err(f"http_request: {e}")
 
-            resp = await session.request(method.upper(), url, **kwargs)
+    return err(
+        f"http_request still running after {wait:.1f}s — outcome UNKNOWN, not failed.\n"
+        + json.dumps({
+            "request_id": request_id,
+            "state": "pending",
+            "outcome": "unknown",
+            "method": method,
+            "url": url,
+            "waited_s": round(wait, 2),
+            "operation_deadline_s": round(rec.operation_deadline, 1),
+            "note": ("the request is still in flight and keeps running until the "
+                     "deadline; poll for the eventual response instead of resending"),
+            "transport": transport,
+            "next": [
+                f'http_request_status(request_id="{request_id}", wait_timeout=30)',
+                f'http_request_cancel(request_id="{request_id}")',
+            ],
+        }, indent=2, default=str)
+    )
 
-            body_text = ""
-            if return_mode != "meta":
-                try:
-                    body_text = resp.text
-                except Exception:
-                    body_text = "<binary>"
-                if len(body_text) > 20_000:
-                    body_text = body_text[:20_000] + f"\n\n[truncated — full size {len(resp.content)} bytes]"
 
-            elapsed_ms = None
-            if hasattr(resp, "elapsed") and resp.elapsed is not None:
-                try:
-                    # curl_cffi returns float seconds OR timedelta depending on version
-                    e = resp.elapsed
-                    elapsed_ms = int(e.total_seconds() * 1000) if hasattr(e, "total_seconds") else int(float(e) * 1000)
-                except Exception:
-                    elapsed_ms = None
-            meta = {
-                "status": resp.status_code,
-                "url": str(resp.url),
-                "elapsed_ms": elapsed_ms,
-                "headers": dict(resp.headers),
-                "cookies_sent": len(cookies_dict),
-                "impersonate": impersonate,
-            }
+@mcp.tool()
+async def http_request_status(
+    request_id: Optional[str] = None,
+    wait_timeout: float = 0.0,
+    forget: bool = False,
+) -> str:
+    """⭐ Poll a tracked http_request — or list every one this session remembers.
 
-            if return_mode == "json":
-                try:
-                    return ok(json.dumps({"meta": meta, "body": resp.json()}, indent=2, default=str)[:25000])
-                except Exception:
-                    return ok(json.dumps({"meta": meta, "body_text": body_text}, indent=2, default=str)[:25000])
-            if return_mode == "text":
-                return ok(f"{json.dumps(meta, indent=2, default=str)}\n\n--- BODY ---\n{body_text}")
-            if return_mode == "meta":
-                return ok(json.dumps(meta, indent=2, default=str))
-            # auto mode
-            try:
-                parsed = resp.json()
-                return ok(json.dumps({"meta": meta, "body": parsed}, indent=2, default=str)[:25000])
-            except Exception:
-                return ok(f"{json.dumps(meta, indent=2, default=str)}\n\n--- BODY (text) ---\n{body_text}")
-    except Exception as e:
-        return err(f"http_request: {e}")
+    An http_request that outran its wait_timeout is still running. This is how
+    you collect its eventual response instead of firing a duplicate.
+
+    Args:
+        request_id: which request. Omit to list all tracked requests.
+        wait_timeout: block up to this long for a pending request to settle
+            (0 = read the current state and return immediately)
+        forget: drop the record after returning it (frees the buffer early)
+    """
+    _prune_tracked()
+    if request_id is None:
+        return ok(json.dumps({
+            "tracked": len(_TRACKED),
+            "in_flight": _inflight(),
+            "retention": {"max_records": HTTP_TRACK_MAX, "ttl_s": HTTP_TRACK_TTL,
+                          "max_in_flight": HTTP_MAX_INFLIGHT},
+            "requests": [r.public() for r in _TRACKED.values()],
+        }, indent=2, default=str))
+
+    rec = _TRACKED.get(request_id)
+    if rec is None:
+        return err(
+            f"unknown request_id {request_id!r} — it settled more than "
+            f"{HTTP_TRACK_TTL:.0f}s ago, was forgotten, or never existed. "
+            "The request's outcome is NOT knowable from here."
+        )
+
+    if rec.state == "pending" and wait_timeout > 0 and rec.task is not None:
+        await asyncio.wait({rec.task}, timeout=wait_timeout)
+
+    if rec.state == "pending":
+        return err(
+            f"http_request {request_id} still pending after "
+            f"{time.time() - rec.created_at:.1f}s — outcome UNKNOWN.\n"
+            + json.dumps(rec.public(), indent=2, default=str)
+        )
+
+    payload = rec.result or err(f"http_request {request_id}: no result recorded")
+    if forget:
+        _TRACKED.pop(request_id, None)
+    return payload
+
+
+@mcp.tool()
+async def http_request_cancel(request_id: str) -> str:
+    """⭐ Stop waiting on a tracked http_request.
+
+    This is a CLIENT-SIDE cancel and nothing more. If the request already went
+    out, the server may have processed it in full; no rollback is performed,
+    requested, or implied. The reply says which of the two it was.
+    """
+    rec = _TRACKED.get(request_id)
+    if rec is None:
+        return err(f"unknown request_id {request_id!r} — nothing to cancel")
+    if rec.state != "pending":
+        return ok(json.dumps({
+            "request_id": request_id,
+            "cancelled": False,
+            "reason": f"already {rec.state}",
+            "state": rec.state,
+            "outcome": rec.outcome,
+            "hint": f'http_request_status(request_id="{request_id}") for the result',
+        }, indent=2, default=str))
+
+    sent = rec.sent
+    if rec.task is not None:
+        rec.task.cancel()
+        try:
+            await asyncio.wait({rec.task}, timeout=5.0)
+        except Exception:
+            pass
+    return ok(json.dumps({
+        "request_id": request_id,
+        "cancelled": True,
+        "scope": "client-side only",
+        "request_was_sent": sent,
+        "server_effect": (
+            "UNKNOWN — the request had already been handed to the network; it may "
+            "have been received and executed. No rollback was performed."
+            if sent else
+            "none — the request was never handed to the network"
+        ),
+        "outcome": rec.outcome,
+    }, indent=2, default=str))
+
+
+@mcp.tool()
+async def http_request_retry(
+    request_id: str,
+    confirm_side_effects: bool = False,
+    wait_timeout: Optional[float] = None,
+) -> str:
+    """⭐ Explicitly replay a tracked http_request. Nothing here ever auto-retries.
+
+    Refused when the first attempt's outcome is UNKNOWN and the method can have
+    side effects — a POST that timed out on read may already have been applied,
+    and replaying it silently would double it. Pass confirm_side_effects=True to
+    say you have decided that is acceptable.
+
+    Browser cookies are re-snapshotted so an expired session does not replay a
+    stale jar; everything else (headers, body, transport) is reused verbatim.
+
+    Returns a NEW request_id — the original record is left untouched.
+    """
+    rec = _TRACKED.get(request_id)
+    if rec is None:
+        return err(f"unknown request_id {request_id!r} — nothing to retry")
+    if rec.state == "pending":
+        return err(
+            f"http_request {request_id} is still in flight — poll it with "
+            "http_request_status, or cancel it before retrying"
+        )
+
+    risky = rec.outcome != "not_executed" and rec.method not in _SAFE_METHODS
+    if risky and not confirm_side_effects:
+        return err(
+            f"refusing to replay {rec.method} {rec.url}: the first attempt's outcome "
+            f"is {rec.outcome!r}, so the server may already have applied it. "
+            "Re-send only if a duplicate is acceptable: "
+            f'http_request_retry(request_id="{request_id}", confirm_side_effects=True)'
+        )
+
+    spec = rec.spec
+    return await http_request(
+        url=spec["url"],
+        method=rec.method,
+        impersonate=spec["impersonate"],
+        use_browser_cookies=spec["use_browser_cookies"],
+        headers=spec["headers"] or None,
+        params=spec["params"],
+        data=spec["data"],
+        json_body=spec["json_body"],
+        timeout=spec["timeout"],
+        follow_redirects=spec["follow_redirects"],
+        return_mode=spec["return_mode"],
+        wait_timeout=wait_timeout,
+        connect_timeout=spec["connect_timeout"],
+        direct=spec["direct"],
+    )
 
 
 @mcp.tool()
 async def http_session_cookies(url: str) -> str:
     """⭐ Inspect which browser cookies would be sent with a request to URL.
 
-    Helpful to verify session sharing works before making requests.
+    Helpful to verify session sharing works before making requests. `measured`
+    separates "no cookies apply to this URL" from "the browser never answered",
+    which is the same distinction http_request records on the request itself.
     """
     if not BrowserState.is_up():
         return err("browser_launch first")
+    jar, meta = await _snapshot_browser_cookies(url)
+    if not meta["measured"]:
+        return err(f"cookies not measured for {url}: {meta['reason']}")
     cookies = await _get_browser_cookies_for_url(url)
     return ok(json.dumps({
         "url": url,
-        "count": len(cookies),
-        "cookies": [{"name": c["name"], "domain": c["domain"], "path": c["path"]} for c in cookies],
+        "instance": meta["instance"],
+        "measured": True,
+        "count": len(jar),
+        "cookies": [{"name": c["name"], "domain": c["domain"], "path": c["path"]}
+                    for c in cookies],
     }, indent=2))
 
 

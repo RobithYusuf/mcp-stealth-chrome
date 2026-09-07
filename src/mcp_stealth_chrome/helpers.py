@@ -17,12 +17,34 @@ def target_key(tab: Any) -> str:
     return str(getattr(target, "target_id", None) or id(tab))
 
 
-async def resolve_ref(ref: str) -> Element | None:
+def select_tab(index: int | None = None) -> Tab:
+    """Resolve a tab index without changing active selection or OS focus."""
+    active = BrowserState.active_tab()
+    if index is None:
+        return active
+    if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < len(BrowserState.tabs):
+        raise ValueError(f"tab index {index!r} out of range (0..{len(BrowserState.tabs) - 1})")
+    return BrowserState.tabs[index]
+
+
+def transport_lost(text: str) -> bool:
+    """Recognize CDP transport failures, not ordinary page JavaScript errors."""
+    message = text.lower()
+    return any(marker in message for marker in (
+        "no close frame received", "connectionclosed", "websocket is closed",
+        "websocket connection is closed", "session with given id not found",
+        "cdp session lost", "cdp websocket lost", "-32001",
+    ))
+
+
+async def resolve_ref(ref: str, tab: Tab | None = None) -> Element | None:
     """Find element by data-mcp-ref attribute set via SNAPSHOT_JS."""
-    tab = BrowserState.active_tab()
+    tab = tab if tab is not None else BrowserState.active_tab()
     try:
         return await tab.query_selector(f'[data-mcp-ref="{ref}"]')
-    except Exception:
+    except Exception as exc:
+        if transport_lost(str(exc)):
+            raise
         return None
 
 
@@ -66,7 +88,11 @@ def ok(text: str) -> str:
 
 
 def err(text: str) -> str:
-    """Error response — prefixed so callers can detect."""
+    """Error response with recovery guidance on the first transport failure."""
+    if transport_lost(text) and "browser_recover()" not in text:
+        text += (" — CDP transport lost. Call browser_recover() then browser_launch(); "
+                 "persistent profiles and logins are preserved. The action outcome is unknown; "
+                 "do not blindly retry side effects.")
     return f"Error: {text}"
 
 

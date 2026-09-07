@@ -625,17 +625,15 @@ class BrowserState:
         # Check if browser process died (websocket dead, Chrome crashed, user closed window).
         # Without this check, stale references cause confusing "HTTP 500" on every subsequent call.
         if not cls._browser_alive():
-            cls.reset()
             return False
         return True
 
     @classmethod
     def active_tab(cls) -> Tab:
         if cls.browser is not None and not cls._browser_alive():
-            cls.reset()
             raise RuntimeError(
-                "Browser died (Chrome closed or CDP websocket lost). State auto-reset — "
-                "call browser_launch to start a fresh session."
+                "Browser died (Chrome closed or CDP websocket lost). Handle retained for "
+                "verified cleanup: call browser_recover() then browser_launch()."
             )
         if not cls.is_up():
             raise RuntimeError("Browser not running. Call browser_launch first.")

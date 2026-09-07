@@ -11,7 +11,7 @@ both surfaced by the registry gate).
 """
 import sys
 
-EXPECTED_COUNT = 160
+EXPECTED_COUNT = 169
 EXPECTED_TOOLS = {
     # Lifecycle
     "browser_launch", "browser_close", "browser_recover",
@@ -22,6 +22,7 @@ EXPECTED_TOOLS = {
     "navigate", "go_back", "go_forward", "reload",
     # DOM / content
     "browser_snapshot", "screenshot", "get_text", "get_html", "get_url",
+    "screenshot_element", "inspect_image",
     "save_pdf",
     # Interaction
     "click", "click_text", "click_role", "assert_clickable", "hover", "fill", "type_text",
@@ -29,7 +30,7 @@ EXPECTED_TOOLS = {
     "mouse_click_xy", "mouse_move", "drag_and_drop",
     # Wait
     "wait_for", "wait_for_change", "wait_for_navigation", "wait_for_url", "wait_for_response",
-    "wait_for_request",
+    "wait_for_request", "wait_for_function",
     # Tabs
     "tab_list", "tab_new", "tab_select", "tab_close",
     # Storage
@@ -65,7 +66,8 @@ EXPECTED_TOOLS = {
     "solve_recaptcha_ai",
     # HTTP / behavioral
     "http_request", "http_session_cookies", "session_warmup",
-    "detect_anti_bot", "http_request_with_session",
+    "detect_anti_bot", "http_request_with_session", "http_request_status",
+    "http_request_cancel", "http_request_retry",
     # Multi-instance
     "spawn_browser", "list_instances", "switch_instance", "instance_describe",
     "close_instance", "close_all_instances",
@@ -80,7 +82,7 @@ EXPECTED_TOOLS = {
     # LLM-optimized kit
     "describe_page", "smart_fill",
     "assert_text_present", "assert_url_matches", "assert_element_visible",
-    "vision_locate",
+    "vision_locate", "vision_describe", "vision_ocr", "vision_check",
     "workflow_run", "detect_and_bypass",
     # 0.4.0 additions
     "paste_text", "auth_capture", "click_and_wait", "form_introspect",

@@ -2,7 +2,7 @@
 
 # MCP Stealth Chrome
 
-**160 tools** for AI agents that bypass Cloudflare, Turnstile, reCAPTCHA, and modern anti-bot systems — with an LLM-optimized action kit (`describe_page`, `smart_fill`, `workflow_run`, vision-LLM element locator) and a self-sufficient web-research kit (`web_search`, `scrape_markdown`, `deep_research`, `social_research`) layered on top of standard automation.
+**169 tools** for AI agents that bypass Cloudflare, Turnstile, reCAPTCHA, and modern anti-bot systems — with configurable long waits, scoped snapshots, tracked HTTP requests, native image artifacts, an LLM-optimized action kit (`describe_page`, `smart_fill`, `workflow_run`, vision-LLM review and element locator) and a self-sufficient web-research kit (`web_search`, `scrape_markdown`, `deep_research`, `social_research`) layered on top of standard automation.
 
 [![PyPI version](https://img.shields.io/pypi/v/mcp-stealth-chrome.svg)](https://pypi.org/project/mcp-stealth-chrome/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -263,10 +263,11 @@ Settings → Extensions → MCP Servers, or edit `~/.config/zed/settings.json`:
 
 ## 🔑 BYOK (Bring Your Own Key) — Optional
 
-`mcp-stealth-chrome` is **fully functional without any API key** — 157 of 160 tools work out of the box, including `click_turnstile` (Cloudflare Turnstile bypass), TLS-perfect HTTP, multi-instance, DevTools-level perf/coverage/emulation, the full LLM-optimized kit (`describe_page` / `smart_fill` / `workflow_run`), the web-research kit (`web_search` / `scrape_markdown` / `deep_research` / `social_research` — no search-API key needed), and all scraping tools.
+`mcp-stealth-chrome` is **fully functional without any API key** — 164 of 169 tools work out of the box, including `click_turnstile` (Cloudflare Turnstile bypass), TLS-perfect HTTP, tracked request polling/cancellation, scoped snapshots, native image artifacts, multi-instance, DevTools-level perf/coverage/emulation, the full LLM-optimized kit (`describe_page` / `smart_fill` / `workflow_run`), the web-research kit (`web_search` / `scrape_markdown` / `deep_research` / `social_research` — no search-API key needed), and all scraping tools.
 
-**API keys are optional — only needed for 3 vision/solver tools:**
+**API keys are optional — only needed for 5 vision/solver tools:**
 
+- `solve_recaptcha_ai`, `vision_locate`, `vision_describe`, `vision_ocr`, `vision_check`
 | Tool | Purpose | Required key | Cost |
 |------|---------|--------------|------|
 | `solve_recaptcha_ai` | reCAPTCHA v2 image challenges via AI vision | Any vision-capable LLM (OpenAI-compat / Claude / Ollama) | ~$0.005-0.03 per solve |
@@ -423,8 +424,13 @@ New diagnostics: **`assert_clickable`** (would a click reach this? what's in the
 way? — without clicking) and **`wait_for_change`** (click-then-wait in one call,
 with an honest timeout). `screenshot(region_selector="css")` measures the crop box
 for you, removing the CSS-px-vs-device-px guesswork.
+## Reliability and review primitives
 
-## Tool Categories (160)
+Long-running pages no longer require manual sleep loops. `evaluate(timeout_ms=600000, survive_navigation=True, tab=1)` raises the per-call ceiling explicitly, while `wait_for_function(expression, timeout_ms, poll_ms, tab)` polls a side-effect-free predicate without changing focus. Navigation reports requested/final URLs, redirect chain, HTTP status, and ready state; `expect_url` and `expect_status` turn redirects into explicit failures.
+
+`browser_snapshot()` defaults to `interactive_compact` with `max_elements`, `container_selector`, `viewport_only`, `role`, `name_contains`, and measured omission counts. `screenshot(output_mode="artifact|inline_image|path|base64", tab=...)` keeps base64 opt-in. `screenshot_element(exact_bounds=True)` captures an element, and `inspect_image` reports native dimensions, MIME, byte size, checksum, and a managed artifact.
+
+Slow HTTP calls return a request ID for `http_request_status` polling or `http_request_cancel`; connection, read, and unknown outcomes remain distinct. Same-tab long operations are rejected while the target is busy instead of racing CDP.
 
 ### ⭐⭐⭐ Self-Sufficient Web Research (new) — replaces firecrawl/tavily for most tasks
 Browserless-first (curl_cffi), escalates to the stealth browser only when a page is anti-bot blocked. Runs fully headless/API-mode and is ~10–12× lighter than driving Chrome for normal pages (verified: HTTP path 10–12× faster than headless render on example.com / Wikipedia).
@@ -444,7 +450,8 @@ Browserless-first (curl_cffi), escalates to the stealth browser only when a page
 ### ⭐⭐⭐ Dual-Mode HTTP (unique)
 | Tool | Purpose |
 |------|---------|
-| `http_request` | TLS-perfect HTTP via curl_cffi (chrome/firefox/safari impersonation) |
+| `http_request` | TLS-perfect HTTP via curl_cffi (chrome/firefox/safari impersonation), direct transport for localhost/private targets, typed timeouts, and tracked request IDs |
+| `http_request_status` / `http_request_cancel` / `http_request_retry` | Poll, client-cancel, or explicitly replay a tracked request; retries never happen silently and side-effecting unknown outcomes require confirmation |
 | `http_session_cookies` | Inspect which browser cookies match a URL |
 | `session_warmup` | Natural browsing pattern (homepage/referer/scroll) before target |
 | `detect_anti_bot` | Identify CF/DataDome/PerimeterX/Kasada/Imperva on current page |
@@ -462,9 +469,11 @@ Browserless-first (curl_cffi), escalates to the stealth browser only when a page
 
 ### ⭐⭐ AI Vision Solver (unique)
 | Tool | Purpose |
-|------|---------|
 | `solve_recaptcha_ai` | Vision LLM picks matching tiles — solve image challenges (auto-clicks anchor checkbox in v0.2.10+) |
-| `vision_locate` | NL → element coordinates: `"the red Create button at bottom right"` (optional `click=True`) |
+| `vision_locate` | NL → element coordinates; this tool locates only and does not caption |
+| `vision_describe` | Describe a viewport, page, or selector screenshot with a vision model |
+| `vision_ocr` | Extract visible text from a viewport, page, or selector screenshot |
+| `vision_check` | Validate criteria into `{pass, findings}`; malformed model output is reported as unknown |
 
 ### ⭐⭐⭐ AI-Agent Action Kit (LLM-optimized, new in v0.3.0)
 Designed for LLM-driven workflows — token-efficient page summaries, label-fuzzy form filling, verification primitives, resumable orchestration.
