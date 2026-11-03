@@ -292,7 +292,8 @@ Sites change, so read these as results from the screenshots below and not as a g
 | `bot.sannysoft.com` | Fingerprint tests | ✅ All passed |
 | `browserscan.net/bot-detection` | WebDriver, Selenium, CDP, headless | ✅ All "Normal" |
 | `arh.antoinevastel.com` areyouheadless | Headless Chrome | ✅ "You are not Chrome headless" |
-| `2captcha.com/demo/cloudflare-turnstile` | Turnstile widget | ✅ Passed with `click_turnstile` |
+| `2captcha.com/demo/cloudflare-turnstile` | Turnstile widget, with Cloudflare's test key | ✅ Checkbox reaches "Success!" with `click_turnstile` |
+| `nopecha.com/demo/cloudflare` | Full-page "Just a moment..." challenge | ❌ Stays on the challenge, 2 of 2 tries |
 | `google.com/recaptcha/api2/demo` | reCAPTCHA v2 images | ✅ 5 of 5 runs with `solve_recaptcha_ai` |
 | `tls.browserleaks.com` | JA3 and JA4 | ✅ Shows the JA3 of the browser it impersonates |
 
@@ -300,10 +301,10 @@ Sites change, so read these as results from the screenshots below and not as a g
 
 <img src="https://raw.githubusercontent.com/RobithYusuf/mcp-stealth-chrome/main/docs/images/turnstile.jpg" alt="Cloudflare Turnstile widget showing Success" width="500">
 
-One call moves the checkbox from "Verify you are human" to "Success!".
+One call moves the checkbox from "Verify you are human" to "Success!". This demo uses Cloudflare's test sitekey and returns a dummy token, so it shows that the click lands on the widget. It does not show that a protected site lets you through.
 
-- ✅ Works on the embedded widget (`.cf-turnstile`, `[data-sitekey]`, or a `challenges.cloudflare.com` iframe), such as `2captcha.com/demo/cloudflare-turnstile`, the `dash.cloudflare.com` login and `nopecha.com/captcha/turnstile`
-- ❌ Does not work on Cloudflare's full-page "Just a moment..." challenge. There, use `solve_captcha` or a saved session
+- ✅ Finds and clicks the embedded widget (`.cf-turnstile`, `[data-sitekey]`, or a `challenges.cloudflare.com` iframe). Earlier runs also passed the `dash.cloudflare.com` login and `nopecha.com/captcha/turnstile`, not retested since
+- ❌ Does not get through Cloudflare's full-page "Just a moment..." challenge. On `nopecha.com/demo/cloudflare`, the click earned a `cf_clearance` cookie, but the page stayed at status 403, in 2 of 2 tries from one machine and IP. `solve_captcha` and a saved session are the alternatives to try. Neither was tested on this page
 
 ### bot.sannysoft.com
 
