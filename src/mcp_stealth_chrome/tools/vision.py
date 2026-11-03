@@ -144,8 +144,7 @@ async def _openai_compat_vision_pick_tiles(
 ) -> tuple[str, list[int]]:
     """OpenAI-compatible vision tile picker. Returns (grid_detected, tiles).
 
-    Works with: OpenAI (gpt-4o, gpt-5.x), Groq (llama3.2-vision),
-    Ollama (llava local), Together.ai, custom LLM gateways — any /v1/chat/completions
+    Works with OpenAI, Groq, local Ollama, Together.ai and custom LLM gateways: any /v1/chat/completions
     endpoint that supports image_url content.
     """
     url = base_url.rstrip("/") + "/chat/completions"
@@ -196,10 +195,7 @@ def _resolve_vision_provider(
       4. ANTHROPIC_API_KEY / ANTHROPIC_MODEL                      (Claude)
 
     ⚠️ Model MUST be multimodal (vision-capable):
-      - OpenAI: gpt-4o, gpt-4o-mini, gpt-4-vision-preview, gpt-5.x
-      - Anthropic: claude-opus-4-7, claude-sonnet-*
-      - Local Ollama: llava, llava-llama3, bakllava, llama3.2-vision
-      - Groq: llama-3.2-90b-vision-preview
+      any current model from OpenAI, Anthropic, Groq or local Ollama that accepts images
 
     Returns (provider, base_url, api_key, model).
     Raises ValueError if no key is available anywhere.
@@ -275,7 +271,7 @@ def _resolve_vision_provider(
         "No vision provider configured. Set one of:\n"
         "  • OPENAI_API_KEY (+ optional OPENAI_BASE_URL, OPENAI_MODEL) — OpenAI-compat\n"
         "  • ANTHROPIC_API_KEY (+ optional ANTHROPIC_MODEL) — Claude\n"
-        "Model must support multimodal/vision input (gpt-4o, claude-opus-4-7, llava, etc.)"
+        "Model must accept images. Text-only models fail."
     )
 
 
@@ -290,12 +286,11 @@ async def solve_recaptcha_ai(
 ) -> str:
     """Solve reCAPTCHA v2 image challenge using a vision-enabled LLM.
 
-    Supports Anthropic (Claude) OR any OpenAI-compatible API (gpt-4o, gpt-5.x,
-    Groq llama3.2-vision, local Ollama llava, Together.ai, Fireworks, etc).
+    Supports Anthropic (Claude) or any OpenAI-compatible API (OpenAI, Groq,
+    local Ollama, Together.ai, Fireworks and others).
 
     ⚠️ MODEL MUST BE MULTIMODAL (vision-capable) — text-only models fail silently.
-    ✅ Supported: gpt-4o, gpt-5.x, claude-opus-4-7, llava, llama-3.2-90b-vision-preview
-    ❌ NOT: gpt-3.5-turbo, llama3 (non-vision), claude-3-haiku
+    Supported: any current model that accepts images. Text-only models fail.
 
     Env vars (OpenAI SDK standard — priority checked if args omitted):
         OPENAI_API_KEY + OPENAI_BASE_URL + OPENAI_MODEL  → OpenAI-compat
@@ -306,7 +301,7 @@ async def solve_recaptcha_ai(
         provider="anthropic" | "openai"
         base_url="https://your-provider.example.com/v1"
         api_key="..."
-        model="gpt-4o" | "claude-opus-4-7" | ...
+        model="your-vision-model"
 
     Cost: varies by provider (~$0.005-0.03 per solve).
     """
@@ -556,7 +551,7 @@ async def vision_locate(
 
     Uses the same provider as solve_recaptcha_ai (OPENAI_* / ANTHROPIC_* env).
     Reuses solve_recaptcha_ai's vision plumbing so any vision-capable model
-    works (gpt-4o, gpt-5.x, claude, llava, llama-3.2-vision).
+    works.
 
     Args:
         description: NL description, e.g. "the red Create button at bottom right"

@@ -487,15 +487,17 @@ These run without a browser and without a search API key, and use the stealth br
 Add the key to the `env` block of the server config. Use one of these:
 
 ```json
-"env": { "OPENAI_API_KEY": "sk-...", "OPENAI_MODEL": "gpt-4o" }
-"env": { "ANTHROPIC_API_KEY": "sk-ant-...", "ANTHROPIC_MODEL": "claude-opus-4-7" }
-"env": { "OPENAI_BASE_URL": "https://api.groq.com/openai/v1", "OPENAI_API_KEY": "gsk_...", "OPENAI_MODEL": "a-vision-model" }
-"env": { "OPENAI_BASE_URL": "http://localhost:11434/v1", "OPENAI_API_KEY": "ollama", "OPENAI_MODEL": "llava:latest" }
+"env": { "OPENAI_API_KEY": "sk-...", "OPENAI_MODEL": "your-vision-model" }
+"env": { "ANTHROPIC_API_KEY": "sk-ant-...", "ANTHROPIC_MODEL": "your-vision-model" }
+"env": { "OPENAI_BASE_URL": "https://api.groq.com/openai/v1", "OPENAI_API_KEY": "gsk_...", "OPENAI_MODEL": "your-vision-model" }
+"env": { "OPENAI_BASE_URL": "http://localhost:11434/v1", "OPENAI_API_KEY": "ollama", "OPENAI_MODEL": "your-local-vision-model" }
 "env": { "CAPSOLVER_KEY": "CAP-..." }
 ```
 
-- ✅ Works: models that accept images, such as `gpt-4o`, `claude-opus-4-7`, `llava` or `llama3.2-vision`
-- ❌ Fails: text-only models such as `gpt-3.5-turbo`
+- ✅ Works: any current model that accepts images
+- ❌ Fails: text-only models
+
+Always set the model name. The built-in fallback may be out of date.
 
 Any provider with `/v1/chat/completions` and `image_url` support works.
 
