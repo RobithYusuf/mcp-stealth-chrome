@@ -197,3 +197,14 @@ def test_process_match_does_not_cover_sibling_profiles(tmp_path, monkeypatch):
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: _Result())
     assert state.find_chrome_pids_by_profile(root / "profile") == [101, 104]
     assert state.find_chrome_pids_by_profile(root / "profiles" / "work") == [102]
+
+
+def test_clearing_cache_does_not_make_a_profile_look_recently_used(home):
+    from mcp_stealth_chrome.tools import profiles as P
+
+    profile = home / "profile"
+    (profile / "Default" / "Preferences").write_text("{}")
+    for path in (profile / "Default" / "Preferences", profile / "Default" / "Network" / "Cookies"):
+        os.utime(path, (1_000_000, 1_000_000))
+    cleanup("clear_cache", ["profile"], confirm=True)
+    assert P._last_used(profile) == 1_000_000

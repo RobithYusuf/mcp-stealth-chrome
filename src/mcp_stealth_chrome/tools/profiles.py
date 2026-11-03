@@ -73,9 +73,13 @@ def _cache_dirs(profile: Path) -> list[Path]:
 
 
 def _last_used(profile: Path) -> float:
-    """Newest change among the files Chrome touches in every session."""
+    """Newest change among the files Chrome touches in every session.
+
+    Files only. A directory's time also moves when clear_cache removes something from
+    it, which would make every cleaned profile look as if it was just used.
+    """
     newest = 0.0
-    for candidate in (profile, profile / "Local State", profile / "Default",
+    for candidate in (profile / "Local State",
                       profile / "Default" / "Preferences",
                       profile / "Default" / "Network" / "Cookies",
                       profile / "Default" / "Cookies"):
