@@ -269,6 +269,14 @@ async def _debug_port_closed(browser: Any, grace: float) -> bool:
         await asyncio.sleep(0.2)
 
 
+def _process_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+    return True
+
+
 async def _ensure_browser_dead(browser, profile_dir=None, grace: float = 1.5) -> dict:
     """Stop a browser and VERIFY the OS process actually died.
 
@@ -361,6 +369,11 @@ async def _ensure_browser_dead(browser, profile_dir=None, grace: float = 1.5) ->
                 os.kill(target, _signal.SIGKILL)
             except Exception:
                 report["still_alive"].append(target)
+        # SIGKILL takes a moment, and the verdict below decides whether the handle is kept.
+        for _ in range(20):
+            if not any(_process_exists(target) for target in report["killed"]):
+                break
+            await asyncio.sleep(0.1)
     for target in candidates:
         try:
             os.kill(target, 0)
@@ -387,6 +400,22 @@ def _kill_note(report: dict) -> str:
     if report.get("stopped") and not report.get("verified") and not report.get("still_alive"):
         bits.append("stop was requested, but no process could be checked to confirm it ended")
     return (" (" + "; ".join(bits) + ")") if bits else ""
+
+
+def _close_incomplete(report: dict) -> bool:
+    """True when a close must not be reported as done and the handle must be kept.
+
+    stop() returning cleanly while a PID survives both signals is the case that matters:
+    dropping the handle then leaves a live Chrome nothing can reach, and a privacy profile
+    would be deleted from under it.
+    """
+    return bool(report.get("still_alive")) or not (report.get("stopped") or report.get("verified"))
+
+
+def _close_failure(report: dict) -> str:
+    alive = (f"PID(s) {report['still_alive']} still running"
+             if report.get("still_alive") else "could not confirm the process ended")
+    return f"{report['detail']}; {alive}" if report.get("detail") else alive
 
 
 def _target_key(tab) -> str:
@@ -550,6 +579,17 @@ def _normalize_fingerprint(value: Optional[dict]) -> dict[str, str]:
     return normalized
 
 
+def _mask_proxy_password(proxy: Any) -> Any:
+    """user:password@host becomes user:***@host, for anything printed."""
+    if not isinstance(proxy, str):
+        return proxy
+    return re.sub(r"(?<=://)([^:/@\s|]+):[^@\s|]+@", r"\1:***@", proxy)
+
+
+def _identity_for_report(identity: dict, reveal: bool = False) -> dict:
+    return identity if reveal else {**identity, "proxy": _mask_proxy_password(identity.get("proxy"))}
+
+
 def _identity_path(instance_id: str) -> Path:
     """Resolve an identity file without allowing instance IDs to escape its root."""
     _validate_instance_id(instance_id)
@@ -613,6 +653,18 @@ def _launch_identity(
     return effective_proxy, effective_fp, source
 
 
+def _ua_metadata_param(hints: dict[str, Any]) -> Any:
+    """identity.ua_metadata_fields output as the CDP object setUserAgentOverride takes."""
+    from nodriver.cdp import emulation as cdp_emulation
+
+    make = cdp_emulation.UserAgentBrandVersion
+    return cdp_emulation.UserAgentMetadata(**{
+        **hints,
+        "brands": [make(**b) for b in hints["brands"]],
+        "full_version_list": [make(**b) for b in hints["full_version_list"]],
+    })
+
+
 async def _apply_fingerprint_to_tab(tab: Tab, fingerprint: dict[str, str]) -> None:
     """Apply a resolved identity to a tab, keeping its fields consistent.
 
@@ -649,14 +701,7 @@ async def _apply_fingerprint_to_tab(tab: Tab, fingerprint: dict[str, str]) -> No
             kwargs["platform"] = platform
         hints = ua_metadata_fields(user_agent, platform, real_version)
         if hints:
-            make = cdp_emulation.UserAgentBrandVersion
-            kwargs["user_agent_metadata"] = cdp_emulation.UserAgentMetadata(
-                **{
-                    **hints,
-                    "brands": [make(**b) for b in hints["brands"]],
-                    "full_version_list": [make(**b) for b in hints["full_version_list"]],
-                }
-            )
+            kwargs["user_agent_metadata"] = _ua_metadata_param(hints)
         await tab.send(cdp_network.set_user_agent_override(**kwargs))
         if language:
             # Weights Chrome would not produce itself can only be sent as an explicit
@@ -871,6 +916,18 @@ _CF_CHALLENGE_PROBE_ACTIVE_JS = """
 """
 
 
+async def _cf_challenge_state(tab: Tab, *, active: bool = False) -> Optional[bool]:
+    """_has_cf_challenge, with None when the page could not be asked at all."""
+    js = _CF_CHALLENGE_PROBE_ACTIVE_JS if active else _CF_CHALLENGE_PROBE_INITIAL_JS
+    try:
+        v = await asyncio.wait_for(
+            tab.evaluate(js, return_by_value=True), timeout=3.0
+        )
+        return bool(v.value if hasattr(v, "value") else v)
+    except Exception:
+        return None
+
+
 async def _has_cf_challenge(tab: Tab, *, active: bool = False) -> bool:
     """Detect a Cloudflare/Turnstile challenge.
 
@@ -880,14 +937,7 @@ async def _has_cf_challenge(tab: Tab, *, active: bool = False) -> bool:
     active=True: strict detection used BETWEEN click attempts. Returns True
         only when visible challenge UI is still on the page (not just the
         post-solve dormant markers)."""
-    js = _CF_CHALLENGE_PROBE_ACTIVE_JS if active else _CF_CHALLENGE_PROBE_INITIAL_JS
-    try:
-        v = await asyncio.wait_for(
-            tab.evaluate(js, return_by_value=True), timeout=3.0
-        )
-        return bool(v.value if hasattr(v, "value") else v)
-    except Exception:
-        return False
+    return bool(await _cf_challenge_state(tab, active=active))
 
 
 async def _attempt_turnstile_click(tab: Tab, offset_x: int = 30) -> Optional[tuple[int, int]]:
@@ -1085,9 +1135,13 @@ def _safe_profile_clone(source: Path, instance_id: str) -> tuple[Optional[Path],
                 else:
                     shutil.copy2(src_file, dst_file)
                 report["files"] += 1
+            except FileNotFoundError:
+                continue  # removed by the live browser since the listing, so not in this copy
             except Exception as exc:
                 report["errors"].append(f"{name}: {type(exc).__name__}")
-    if report["sqlite_suspect"]:
+    # A file that exists and could not be copied leaves a clone missing part of the profile,
+    # which reads as a working copy until the session that needed it fails.
+    if report["sqlite_suspect"] or report["errors"]:
         return None, report
     try:
         clean_profile_state(target)
@@ -1330,12 +1384,14 @@ async def browser_launch(
         # Chrome against the same profile is what produces "CDP unreachable",
         # and the half-started process is what gets orphaned.
         if BrowserState.is_up():
+            _answered = False
             try:
                 # is_up() only proves a handle exists. The socket can be gone
                 # while Chrome still runs, so make CDP actually answer.
                 _tab = BrowserState.active_tab()
                 await _wait(_tab.evaluate("1", return_by_value=True),
                             timeout=5, what="reuse probe")
+                _answered = True
                 reuse_head = f"reusing the running browser ({len(BrowserState.tabs)} tab(s))"
                 if profile_mode != "default":
                     reuse_head += (f"; profile_mode={profile_mode!r} NOT applied, it only "
@@ -1366,6 +1422,13 @@ async def browser_launch(
                     expect_url=expect_url, expect_status=expect_status,
                 )
             except Exception as e:
+                # The browser answered, so what failed was the navigation: a bad or slow
+                # URL. Ending it here would lose every tab over a typo.
+                if _answered and not transport_lost(str(e)):
+                    return err(
+                        f"the running browser could not load {url}: {_exc_text(e)}. "
+                        f"It was left open, with its tabs."
+                    )
                 # The handle is stale. Relaunching on top of a half-dead Chrome
                 # is exactly the collision to avoid, so end it first.
                 _reap = await _ensure_browser_dead(
@@ -1636,11 +1699,18 @@ async def browser_launch(
             await asyncio.sleep(0.5)
             main = await _first_live_tab(BrowserState.browser)
             await _apply_fingerprint_to_tab(main, effective_fingerprint)
-            await asyncio.wait_for(main.get(url), timeout=BROWSER_NAV_TIMEOUT)
+            _doc_state, _disarm = await _arm_document_watch(main)
             try:
-                await asyncio.wait_for(main.wait(t=3), timeout=BROWSER_NAV_TIMEOUT)
-            except asyncio.TimeoutError:
-                pass  # initial load wait is best-effort
+                await asyncio.wait_for(main.get(url), timeout=BROWSER_NAV_TIMEOUT)
+                try:
+                    await asyncio.wait_for(main.wait(t=3), timeout=BROWSER_NAV_TIMEOUT)
+                except asyncio.TimeoutError:
+                    pass  # initial load wait is best-effort
+                # Saying "Loaded /admin" after a redirect to /login leaves the caller
+                # reading a page it never asked for, and expect_* went unchecked.
+                _launch_observed = await _observe_navigation(main, url, _disarm())
+            finally:
+                _disarm()
         except asyncio.TimeoutError:
             await _safe_stop_browser(BrowserState.browser)
             BrowserState.reset()
@@ -1742,17 +1812,21 @@ async def browser_launch(
             except Exception:
                 pass  # placement is a convenience; never fail a launch over it
 
-        return ok(
+        return _nav_result(
             f"Browser launched (headless={headless}, persistent={persistent}, "
-            f"privacy={privacy}, identity={identity_source}). "
-            f"Loaded {url}{suffix}{verify_suffix}{health_suffix}{place_suffix}"
+            f"privacy={privacy}, identity={identity_source}). Loaded",
+            _launch_observed,
+            expect_url=expect_url, expect_status=expect_status,
+            suffix=f"{suffix}{verify_suffix}{health_suffix}{place_suffix}",
         )
 
 
 @mcp.tool()
 async def browser_close() -> str:
     """Close the browser and free the profile lock."""
-    if not BrowserState.is_up():
+    # The handle, not is_up(): closing the last tab makes is_up() false while Chrome
+    # still runs and holds the profile, and that is not "not running".
+    if BrowserState.browser is None:
         stale_privacy_profile = (
             BrowserState.current_profile_dir if BrowserState.current_privacy else None
         )
@@ -1770,6 +1844,7 @@ async def browser_close() -> str:
         if stale_privacy_profile is not None:
             return ok("Browser was not running; stale privacy profile removed.")
         return ok("Browser was not running.")
+    was_up = BrowserState.is_up()
     privacy_profile = (
         BrowserState.current_profile_dir if BrowserState.current_privacy else None
     )
@@ -1783,10 +1858,8 @@ async def browser_close() -> str:
         except Exception:
             pass
     _kill = await _ensure_browser_dead(BrowserState.browser, closed_profile)
-    if not _kill["stopped"] and not _kill["verified"]:
-        _alive = (f"PID(s) {_kill['still_alive']} still running"
-                  if _kill["still_alive"] else "could not confirm the process ended")
-        return err(f"close failed: {_kill['detail']}; {_alive}")
+    if _close_incomplete(_kill):
+        return err(f"close failed: {_close_failure(_kill)}; handle kept so a retry can reach it")
     # Capture the id BEFORE reset() (which may change current_instance_id) so
     # we can drop any attached-browser bookkeeping for it.
     _closed_iid = BrowserState.current_instance_id
@@ -1811,7 +1884,9 @@ async def browser_close() -> str:
             )
     elif closed_profile is not None:
         clean_profile_state(closed_profile)
-    return ok("Browser closed; privacy profile removed." if privacy_profile else "Browser closed.")
+    head = "Browser closed" if was_up else "Browser had no live tabs or had already exited; ended it"
+    return ok(f"{head}; privacy profile removed.{_kill_note(_kill)}" if privacy_profile
+              else f"{head}.{_kill_note(_kill)}")
 
 
 @mcp.tool()
@@ -1919,8 +1994,14 @@ async def browser_recover() -> str:
     except Exception:
         pass
     cleared = 0
+    in_use = 0
     healed = {"prefs": 0, "sessions": 0, "files": 0}
     for pdir in sweep_dirs:
+        # A locked profile belongs to a browser that is still running, perhaps another
+        # instance or another session's. Its Sessions/ and Preferences are not ours.
+        if is_chrome_profile_locked(pdir):
+            in_use += 1
+            continue
         try:
             clean_profile_state(pdir)  # only removes locks with dead PIDs
             cleared += 1
@@ -1933,7 +2014,7 @@ async def browser_recover() -> str:
             healed["files"] += r.get("files", 0)
         except Exception:
             pass
-    steps.append(f"swept {cleared}/{len(sweep_dirs)} profile dirs")
+    steps.append(f"swept {cleared}/{len(sweep_dirs)} profile dirs, left {in_use} in use alone")
     steps.append(
         f"healed window state: {healed['prefs']} prefs, "
         f"{healed['sessions']} sessions, {healed['files']} blobs"
@@ -2819,13 +2900,11 @@ async def screenshot(
         # Region clip → use raw CDP; nodriver's save_screenshot doesn't expose clip
         if region:
             from nodriver.cdp import page as cdp_page
-            clip = cdp_page.Viewport(
-                x=float(region.get("x", 0)),
-                y=float(region.get("y", 0)),
-                width=float(region["width"]),
-                height=float(region["height"]),
-                scale=1.0,
-            )
+            # capture_beyond_viewport makes the clip PAGE space, and region is viewport
+            # space, so on a scrolled page the raw numbers capture some other strip.
+            page_box = _image_output.viewport_clip(
+                region, await _image_output.viewport_context(tab))
+            clip = cdp_page.Viewport(**page_box, scale=1.0)
             kwargs: dict[str, Any] = {"format_": fmt, "clip": clip, "capture_beyond_viewport": True}
             if fmt == "jpeg" and quality is not None:
                 kwargs["quality"] = int(quality)
@@ -3226,7 +3305,9 @@ async def _page_sig(tab, el=None) -> dict:
 def _blocked_reason(p: dict) -> Optional[str]:
     """Human-readable reason the probe says a click can't land — or None."""
     if not p:
-        return None
+        # An empty probe is an unanswered question, not a pass. Clicking anyway would
+        # dispatch real input at a point nothing checked.
+        return "the hit test could not run (element gone or its page context was lost)"
     if not p.get("sized"):
         return "element has zero size"
     if p.get("hidden"):
@@ -3365,6 +3446,32 @@ def _click_outcome(head: str, detail: str, before: dict, after: dict) -> str:
     )
 
 
+# The probe above tests the centre. A humanized click lands elsewhere in the box, where an
+# overlay can cover part of the element, so the spot actually chosen is tested too. Fractions
+# of the element's own box, because a frame's elementFromPoint is local to that frame.
+_POINT_HIT_JS = """
+function() {
+  const r = this.getBoundingClientRect();
+  const x = r.left + r.width * %f, y = r.top + r.height * %f;
+  const scope = this.getRootNode();
+  const top = (scope.elementFromPoint ? scope : document).elementFromPoint(x, y);
+  return !!top && (top === this || this.contains(top) || top.contains(this));
+}
+"""
+
+
+async def _humanized_point(el, pos, centre_x: float, centre_y: float) -> tuple[float, float]:
+    """A random spot inside the element that passed a hit test, else the tested centre."""
+    for _ in range(5):
+        fx, fy = random.uniform(0.3, 0.7), random.uniform(0.3, 0.7)
+        x, y = pos.left + pos.width * fx, pos.top + pos.height * fy
+        with contextlib.suppress(Exception):
+            if (await el.apply(_POINT_HIT_JS % (fx, fy)) is True
+                    and await outer_blocker(el, x, y) is None):
+                return x, y
+    return centre_x, centre_y
+
+
 async def _settled_position(el):
     """The element's position once it stops moving (smooth scroll, entry animation).
 
@@ -3425,9 +3532,11 @@ async def _click_and_report(
             reason = "element has no on-screen position"
     if reason is None:
         x, y = pos.left + pos.width / 2, pos.top + pos.height / 2
-        # Re-probe: the hit test above ran before the page finished moving.
-        probe = await _click_probe(el) or probe
-        reason = _blocked_reason(probe) or await outer_blocker(el, x, y)
+        # Re-probe: the hit test above ran before the page finished moving, so its pass
+        # does not carry over when this one cannot run.
+        recheck = await _click_probe(el)
+        reason = _blocked_reason(recheck) or await outer_blocker(el, x, y)
+        probe = recheck or probe
 
     target = f"target=<{probe.get('target') or 'unknown'}>"
     if reason is not None:
@@ -3450,8 +3559,9 @@ async def _click_and_report(
 
     before = await _page_sig(tab, el) if verify else {}
     if humanize:
-        await humanized_click(tab, el, last_pos_ref=BrowserState.last_mouse_xy)
-        where = "humanized point inside the element"
+        hx, hy = await _humanized_point(el, pos, x, y)
+        await humanized_click(tab, el, last_pos_ref=BrowserState.last_mouse_xy, point=(hx, hy))
+        where = f"humanized point ({int(hx)},{int(hy)}) inside the element"
     else:
         await move_pointer(tab, x, y)
         await tab.mouse_click(x, y)
@@ -3552,8 +3662,9 @@ async def click_role(role: str, name: Optional[str] = None, verify: bool = True)
         el = None
         tried: list[str] = []
         if name:
-            for sel in (f'[role="{role}"][aria-label*="{name}"]',
-                        f'[role="{role}"][title*="{name}"]'):
+            quoted = name.replace("\\", "\\\\").replace('"', '\\"')
+            for sel in (f'[role="{role}"][aria-label*="{quoted}"]',
+                        f'[role="{role}"][title*="{quoted}"]'):
                 tried.append(sel)
                 try:
                     el = await tab.query_selector(sel)
@@ -3561,7 +3672,18 @@ async def click_role(role: str, name: Optional[str] = None, verify: bool = True)
                     el = None
                 if el is not None:
                     break
-        if el is None:
+            if el is None:
+                # A name was asked for, so the first element of that role will not do:
+                # click_role("button", name="Save") must never reach a Delete button.
+                tried.append(f'[role="{role}"] with text {name!r}')
+                try:
+                    for candidate in await tab.query_selector_all(f'[role="{role}"]'):
+                        if name.lower() in (candidate.text_all or "").lower():
+                            el = candidate
+                            break
+                except Exception:
+                    el = None
+        else:
             tried.append(f'[role="{role}"]')
             try:
                 el = await tab.query_selector(f'[role="{role}"]')
@@ -3694,8 +3816,10 @@ async def fill(ref: Optional[str] = None, selector: Optional[str] = None,
             "function() { return this.isContentEditable ? this.innerText : this.value; }"
         )
         if isinstance(actual, str) and actual.strip() != str(value).strip():
+            is_secret = (await el.apply("function() { return this.type === 'password'; }")) is True
+            shown = f"{len(actual)} chars" if is_secret else repr(actual[:80])
             return err(
-                f"typed, but the field reads {actual[:80]!r} rather than the "
+                f"typed, but the field reads {shown} rather than the "
                 f"{len(str(value))}-char value sent. The page rewrote or rejected it "
                 f"(input mask, maxlength, framework state)."
             )
@@ -4538,8 +4662,6 @@ async def cookie_import(
             return err("no cookies to import")
         from nodriver.cdp import network as cdp_network
         tab = BrowserState.active_tab()
-        if clear_first:
-            await tab.send(cdp_network.clear_browser_cookies())
 
         # CDP type coercion — required because CookieParam.to_json() iterates
         # fields and calls .to_json() on each, which crashes for plain strings
@@ -4626,7 +4748,11 @@ async def cookie_import(
             except Exception:
                 skipped += 1
         if not params:
-            return err(f"no valid cookies (skipped {skipped} entries)")
+            return err(f"no valid cookies (skipped {skipped} entries)"
+                       + ("; nothing was cleared" if clear_first else ""))
+        # Only now: malformed input must not cost the caller every login in the browser.
+        if clear_first:
+            await tab.send(cdp_network.clear_browser_cookies())
         await tab.send(cdp_network.set_cookies(cookies=params))
         msg = f"imported {len(params)} cookies (clear_first={clear_first})"
         if skipped:
@@ -4634,6 +4760,10 @@ async def cookie_import(
         return ok(msg)
     except Exception as e:
         return err(str(e))
+
+
+def _enum_value(value: Any) -> Any:
+    return getattr(value, "value", value)
 
 
 @mcp.tool()
@@ -4661,7 +4791,9 @@ async def cookie_export(filename: Optional[str] = None,
             **_cookie_value_fields(c.value, reveal_values), "name": c.name,
             "domain": c.domain, "path": c.path, "expires": c.expires,
             "httpOnly": c.http_only, "secure": c.secure,
-            "sameSite": getattr(c, "same_site", None),
+            # The enum's value: default=str wrote "CookieSameSite.NONE", which cookie_import
+            # cannot map, so the imported cookie silently lost its SameSite.
+            "sameSite": _enum_value(getattr(c, "same_site", None)),
         } for c in cookies]
         ensure_dirs()
         fname = filename or ts_filename("cookies", "json")
@@ -5396,6 +5528,7 @@ async def dialog_handle(action: str = "accept", text: Optional[str] = None) -> s
     pre_cfg = _instance_dialog_cfg("pre")
     pre_cfg["action"] = action
     pre_cfg["text"] = text
+    pre_cfg["pending"] = True
     try:
         tab = BrowserState.active_tab()
         from nodriver.cdp import page as cdp_page
@@ -5406,6 +5539,11 @@ async def dialog_handle(action: str = "accept", text: Optional[str] = None) -> s
             return ok(f"dialog handler re-armed ({action})")
 
         async def handle(_event):
+            # Armed for the NEXT dialog only. Answering every later one would accept a
+            # destructive confirm nobody decided on.
+            if not pre_cfg.get("pending"):
+                return
+            pre_cfg["pending"] = False
             try:
                 await tab.send(cdp_page.handle_java_script_dialog(
                     accept=(pre_cfg["action"] == "accept"),
@@ -5477,8 +5615,8 @@ def _clear_tab_scoped_state(tabs: list[Any]) -> None:
         if watchdog is not None and not watchdog.done():
             watchdog.cancel()
         _INTERCEPT.update({
-            "active": False, "tab": None, "handler": None, "watchdog": None,
-            "stop_reason": "target closed",
+            "active": False, "tab": None, "handler": None, "handler_tab": None,
+            "watchdog": None, "stop_reason": "target closed",
         })
     try:
         from .tools import devtools as _dt
@@ -5625,6 +5763,7 @@ async def console_start() -> str:
     try:
         tab = BrowserState.active_tab()
         BrowserState.console_logs.clear()
+        BrowserState.page_errors.clear()
         BrowserState.capture_console = True
         _CONSOLE_STARTED_AT = _now_iso()
         tid = _target_key(tab)
@@ -5635,8 +5774,9 @@ async def console_start() -> str:
             # idempotent and cheap, and it is what makes a re-call actually help.
             try:
                 await tab.send(cdp_runtime.enable())
-            except Exception:
-                pass
+            except Exception as exc:
+                BrowserState.capture_console = False
+                return err(f"console capture NOT re-armed, Runtime.enable failed: {_exc_text(exc)}")
             return ok("console capture re-armed (handler already bound to this tab)")
 
         # Bind the sink NOW, to the instance being armed. Reading
@@ -5644,9 +5784,14 @@ async def console_start() -> str:
         # instance happens to be current, so a switch mid-capture would file this
         # browser's messages under another one — and stop filling this one.
         sink = BrowserState.console_logs
+        error_sink = BrowserState.page_errors
 
         async def handle(event):
             try:
+                # console.clear() is an instruction, not a message. Kept, console_clear
+                # would leave its own "clear" behind in the buffer it just emptied.
+                if str(getattr(event, "type_", "")) == "clear":
+                    return
                 args = []
                 for a in (event.args or []):
                     val = getattr(a, "value", None)
@@ -5672,11 +5817,12 @@ async def console_start() -> str:
                 text = getattr(d, "text", "") or ""
                 exc = getattr(d, "exception", None)
                 desc = getattr(exc, "description", None) if exc else None
-                sink.append({
-                    "type": "exception",
-                    "text": (desc or text or "uncaught exception")[:500],
-                })
+                message = (desc or text or "uncaught exception")[:500]
+                sink.append({"type": "exception", "text": message})
                 _trim_capture(sink)
+                error_sink.append({"text": message, "url": getattr(d, "url", None),
+                                   "line": getattr(d, "line_number", None)})
+                _trim_capture(error_sink)
             except Exception:
                 pass
 
@@ -5693,10 +5839,17 @@ async def console_start() -> str:
         with contextlib.suppress(Exception):
             await tab.send(cdp_page.enable())
         tab.add_handler(cdp_page.FrameNavigated, on_navigated)
+        # After the handlers, so the messages Chrome replays on enable are not missed.
         try:
             await tab.send(cdp_runtime.enable())
-        except Exception:
-            pass
+        except Exception as exc:
+            # No events will come. Claiming attached here makes an empty list read as a
+            # quiet page.
+            _drop_handlers(tab, [(cdp_runtime.ConsoleAPICalled, handle),
+                                 (cdp_runtime.ExceptionThrown, handle_exception),
+                                 (cdp_page.FrameNavigated, on_navigated)])
+            BrowserState.capture_console = False
+            return err(f"console capture NOT started, Runtime.enable failed: {_exc_text(exc)}")
         _CONSOLE_ARMED_TAB_IDS.add(tid)
         return ok("console capture started (console + uncaught exceptions)")
     except Exception as e:
@@ -5731,7 +5884,7 @@ async def console_get(limit: int = 100) -> str:
         "returned": len(logs),
         "messages": logs,
     }
-    if not armed:
+    if not (armed and BrowserState.capture_console):
         payload["note"] = (
             "NOT listening on the active tab — an empty 'messages' here means "
             "'nothing was monitored', not 'no errors'. Call console_start() "
@@ -5751,21 +5904,22 @@ async def network_start(capture_bodies: bool = True) -> str:
     """
     try:
         tab = BrowserState.active_tab()
+        from nodriver.cdp import network as cdp_network
+        tid = _target_key(tab)
+        # Network.enable so events arrive at all, and so getResponseBody works later. If it
+        # fails nothing is captured, and an empty log must not read as a quiet page.
+        try:
+            await tab.send(cdp_network.enable())
+        except Exception as exc:
+            BrowserState.capture_network = False
+            return err(f"network capture NOT started, Network.enable failed: {_exc_text(exc)}")
         BrowserState.network_logs.clear()
         BrowserState.network_index.clear()
         BrowserState.capture_network = True
-        from nodriver.cdp import network as cdp_network
-        tid = _target_key(tab)
         # The handler is installed once per target, but this option is mutable:
         # a later network_start(capture_bodies=True) must change what that
         # existing handler indexes instead of merely claiming that it did.
         _NETWORK_CAPTURE_BODIES[tid] = bool(capture_bodies)
-
-        # Enable Network domain so getResponseBody works later
-        try:
-            await tab.send(cdp_network.enable())
-        except Exception:
-            pass
 
         # Bound now, to the instance being armed — see console_start for why
         # reading the class attribute at event time cross-files the capture.
@@ -5945,8 +6099,22 @@ async def server_status() -> str:
 
 @mcp.tool()
 async def get_page_errors() -> str:
-    """Retrieve JS errors caught on active tab."""
-    return ok(json.dumps(BrowserState.page_errors, indent=2, default=str))
+    """Uncaught JS exceptions captured since console_start(), WITH the capture status.
+
+    Returns {attached, total, errors}. `attached` false + empty means NOT MONITORED, not
+    "no errors": exceptions are only seen on a tab console_start() has armed.
+    """
+    try:
+        tab = BrowserState.active_tab()
+    except Exception:
+        tab = None
+    attached = tab is not None and _target_key(tab) in _CONSOLE_ARMED_TAB_IDS
+    payload: dict[str, Any] = {"attached": attached, "total": len(BrowserState.page_errors),
+                               "errors": BrowserState.page_errors}
+    if not attached:
+        payload["note"] = ("NOT listening on the active tab. An empty list here means nothing "
+                           "was monitored. Call console_start().")
+    return ok(json.dumps(payload, indent=2, default=str))
 
 
 # Headers Chrome recomputes per connection. Replaying them verbatim is worse
@@ -6346,6 +6514,7 @@ _INTERCEPT: dict[str, Any] = {
     "log": [],
     "max_events": 500,
     "handler": None,
+    "handler_tab": None,      # where `handler` is installed; outlives `tab` on a failed disable
     "tab": None,
     "watchdog": None,
     "expires_at": 0.0,
@@ -6356,23 +6525,51 @@ _INTERCEPT: dict[str, Any] = {
 _MUTATING_METHODS = ("POST", "PUT", "PATCH", "DELETE")
 
 
+def _drop_handlers(tab: Any, pairs: Any) -> None:
+    """Remove exactly these closures. tab.remove_handler(evt, fn) drops the whole list for
+    the event on nodriver 0.48.1, which would kill a concurrent capture."""
+    for event_type, handler in pairs:
+        with contextlib.suppress(KeyError, ValueError, AttributeError):
+            tab.handlers[event_type].remove(handler)
+
+
+def _intercept_drop_handler() -> None:
+    """Take the RequestPaused handler off its tab, or a restart stacks a second one and one
+    paused request gets two answers."""
+    handler_tab, handler = _INTERCEPT.get("handler_tab"), _INTERCEPT.get("handler")
+    if handler_tab is not None and handler is not None:
+        from nodriver.cdp import fetch as cdp_fetch
+        _drop_handlers(handler_tab, [(cdp_fetch.RequestPaused, handler)])
+    _INTERCEPT["handler_tab"] = None
+    _INTERCEPT["handler"] = None
+
+
 async def _intercept_disable(reason: str = "stopped") -> None:
     """Turn interception off and release the page. Safe to call twice."""
     state = _INTERCEPT
     watchdog = state.get("watchdog")
-    if watchdog is not None and not watchdog.done():
+    # On the deadline path this runs INSIDE the watchdog. Cancelling the current task makes
+    # the next await raise CancelledError, so the state below was never updated: `active`
+    # stayed true with no stop_reason, and other sessions were told it was in use forever.
+    if watchdog is not None and not watchdog.done() and watchdog is not asyncio.current_task():
         watchdog.cancel()
     state["watchdog"] = None
     tab = state.get("tab")
-    if tab is not None:
-        try:
+    try:
+        if tab is not None:
             from nodriver.cdp import fetch as cdp_fetch
-            await tab.send(cdp_fetch.disable())
-        except Exception:
-            pass
-    state["active"] = False
-    state["tab"] = None
-    state["stop_reason"] = reason
+            try:
+                await tab.send(cdp_fetch.disable())
+            except Exception:
+                # Fetch may still be pausing requests, and only this handler answers them.
+                # intercept_start removes it before installing the next one.
+                pass
+            else:
+                _intercept_drop_handler()
+    finally:
+        state["active"] = False
+        state["tab"] = None
+        state["stop_reason"] = reason
 
 
 def _intercept_matches(url: str, pattern: str) -> bool:
@@ -6516,8 +6713,10 @@ async def intercept_start(
                     except Exception:
                         pass
 
+        _intercept_drop_handler()
         tab.add_handler(cdp_fetch.RequestPaused, on_paused)
         state["handler"] = on_paused
+        state["handler_tab"] = tab
         await tab.send(cdp_fetch.enable(patterns=[
             cdp_fetch.RequestPattern(url_pattern=url_pattern or "*")
         ]))
@@ -6856,7 +7055,9 @@ async def scrape_page(
             return ok(body[:max_chars] if max_chars > 0 else body)
         text = body
         if max_chars > 0 and len(text) > max_chars:
-            cut = text.rfind("\n", 0, max_chars) or max_chars
+            cut = text.rfind("\n", 0, max_chars)
+            if cut <= 0:  # no newline in range: -1 would slice almost the whole body back
+                cut = max_chars
             text = text[:cut] + f"\n\n[truncated at {cut}/{len(body)} chars]"
         return ok(json.dumps({
             "title": page.get("title"), "url": page.get("url"), "text": text,
@@ -6872,22 +7073,36 @@ async def scrape_page(
 # ══════════════════════════════════════════════════════════════════════════
 
 
-async def _apply_storage_state(browser: Browser, path: str) -> None:
-    """Load cookies+localStorage from a JSON file into browser."""
+async def _apply_storage_state(browser: Browser, path: str) -> dict:
+    """Load cookies+localStorage from a JSON file into browser. Returns what happened.
+
+    Raises when the file had cookies and none could be set: a session that did not
+    load must not read as one that did.
+    """
     data = json.loads(Path(path).read_text())
-    # Cookies
     from nodriver.cdp import network as cdp_network
     tab = browser.tabs[0] if browser.tabs else await browser.get("about:blank")
+    report: dict[str, Any] = {"cookies_set": 0, "cookies_failed": 0,
+                              "origins_set": 0, "origins_failed": 0, "first_error": None}
     for c in data.get("cookies", []):
         try:
+            # CookieParam calls expires.to_json(), which a plain number from the file does
+            # not have. Session cookies are saved as -1 and must stay session cookies.
+            raw_expires = c.get("expires")
+            expires = None
+            if raw_expires is not None and float(raw_expires) > 0:
+                expires = cdp_network.TimeSinceEpoch(float(raw_expires))
             await tab.send(cdp_network.set_cookie(
                 name=c.get("name"), value=c.get("value"),
                 domain=c.get("domain"), path=c.get("path", "/"),
-                secure=c.get("secure", False), http_only=c.get("http_only", False),
-                expires=c.get("expires"),
+                secure=c.get("secure", False),
+                http_only=c.get("http_only", c.get("httpOnly", False)),
+                expires=expires,
             ))
-        except Exception:
-            continue
+            report["cookies_set"] += 1
+        except Exception as exc:
+            report["cookies_failed"] += 1
+            report["first_error"] = report["first_error"] or _exc_text(exc)
     # LocalStorage — one evaluate per origin (was one round-trip PER KEY).
     for origin, pairs in (data.get("origins") or {}).items():
         try:
@@ -6898,8 +7113,16 @@ async def _apply_storage_state(browser: Browser, path: str) -> None:
                     f"for (const k in d) localStorage.setItem(k, d[k]); }})()",
                     return_by_value=True,
                 )
-        except Exception:
-            continue
+            report["origins_set"] += 1
+        except Exception as exc:
+            report["origins_failed"] += 1
+            report["first_error"] = report["first_error"] or _exc_text(exc)
+    if report["cookies_failed"] and not report["cookies_set"]:
+        raise RuntimeError(
+            f"none of the {report['cookies_failed']} cookies could be set: "
+            f"{report['first_error']}"
+        )
+    return report
 
 
 @mcp.tool()
@@ -6956,8 +7179,13 @@ async def storage_state_load(file_path: str) -> str:
     try:
         if not BrowserState.browser:
             return err("browser not running — launch first")
-        await _apply_storage_state(BrowserState.browser, file_path)
-        return ok(f"storage state loaded from {file_path}")
+        report = await _apply_storage_state(BrowserState.browser, file_path)
+        line = (f"storage state from {file_path}: {report['cookies_set']} cookies set, "
+                f"{report['origins_set']} origins restored")
+        if report["cookies_failed"] or report["origins_failed"]:
+            line += (f"; NOT applied: {report['cookies_failed']} cookies, "
+                     f"{report['origins_failed']} origins ({report['first_error']})")
+        return ok(line)
     except Exception as e:
         return err(str(e))
 
@@ -6995,20 +7223,30 @@ async def solve_captcha(
         )
     except CapSolverError as e:
         return err(f"CapSolver: {e}")
-    # Inject if requested
-    if inject_selector and BrowserState.is_up():
+    if not inject_selector:
+        return ok(f"token: {token}")
+    # A caller that asked for injection goes on to submit the form, so a token that never
+    # reached it has to read as a failure. The token is kept: it was paid for.
+    why_not = f"no element matches {inject_selector!r}"
+    injected = False
+    if not BrowserState.is_up():
+        why_not = "no browser running"
+    else:
         try:
             tab = BrowserState.active_tab()
-            await tab.evaluate(
+            raw = await tab.evaluate(
                 f'(() => {{ var el = document.querySelector({json.dumps(inject_selector)}); '
                 f'if (el) {{ el.value = {json.dumps(token)}; '
                 f'el.dispatchEvent(new Event("input",{{bubbles:true}})); '
                 f'el.dispatchEvent(new Event("change",{{bubbles:true}})); return true; }} return false; }})()',
                 return_by_value=True,
             )
-        except Exception:
-            pass
-    return ok(f"token: {token}")
+            injected = (raw.value if hasattr(raw, "value") else raw) is True
+        except Exception as exc:
+            why_not = _exc_text(exc)
+    if injected:
+        return ok(f"token: {token}\ninjected: true ({inject_selector})")
+    return err(f"token: {token}\ninjected: false ({why_not})")
 
 
 @mcp.tool()
@@ -7064,14 +7302,15 @@ async def identity_pin(
         # Private before the first byte: a pin can hold a proxy URL with credentials.
         _write_private(tmp, json.dumps(payload, indent=2) + "\n")
         os.replace(tmp, path)
-        return ok(json.dumps(payload, indent=2))
+        return ok(json.dumps(_identity_for_report(payload), indent=2))
     except Exception as e:
         return err(str(e))
 
 
 @mcp.tool()
-async def identity_show(instance_id: Optional[str] = None) -> str:
-    """Show the persisted identity pin for an instance."""
+async def identity_show(instance_id: Optional[str] = None, reveal_values: bool = False) -> str:
+    """Show the persisted identity pin for an instance. A proxy password reads as ***
+    unless reveal_values=True."""
     try:
         iid = instance_id or BrowserState.current_instance_id
         foreign = BrowserState.foreign_instance(iid)
@@ -7080,7 +7319,7 @@ async def identity_show(instance_id: Optional[str] = None) -> str:
         identity = _load_identity(iid)
         if identity is None:
             return err(f"no pinned identity for instance {iid!r}")
-        return ok(json.dumps(identity, indent=2))
+        return ok(json.dumps(_identity_for_report(identity, reveal_values), indent=2))
     except Exception as e:
         return err(str(e))
 
@@ -7840,7 +8079,7 @@ async def _sweep_idle_instances() -> None:
         # would leak a live Chrome with no remaining handle.
         if snap.browser:
             _dead = await _ensure_browser_dead(snap.browser, snap.profile_dir)
-            if not _dead["stopped"] and not _dead["verified"]:
+            if _close_incomplete(_dead):
                 continue
         # Mark profile cleanly exited (matches close_instance) so the
         # next launch doesn't hit a "Restore pages?" / stale-lock state.
@@ -7863,7 +8102,7 @@ async def _sweep_idle_instances() -> None:
         _cur_tabs = list(BrowserState.tabs)
         if BrowserState.browser:
             _dead = await _ensure_browser_dead(BrowserState.browser, _cur_profile)
-            if not _dead["stopped"] and not _dead["verified"]:
+            if _close_incomplete(_dead):
                 # State must remain reachable so the next sweep can retry.
                 return
         BrowserState.reset()
@@ -8142,7 +8381,8 @@ async def close_instance(instance_id: str) -> str:
     BrowserState.claim_released(instance_id)
     # Close current
     if instance_id == BrowserState.current_instance_id:
-        if BrowserState.is_up():
+        # The handle, not is_up(): see browser_close.
+        if BrowserState.browser is not None:
             _profile = BrowserState.current_profile_dir
             _privacy = BrowserState.current_privacy
             _tabs = list(BrowserState.tabs)
@@ -8154,10 +8394,8 @@ async def close_instance(instance_id: str) -> str:
             except Exception:
                 pass
             _kill = await _ensure_browser_dead(BrowserState.browser, _profile)
-            if not _kill["stopped"] and not _kill["verified"]:
-                _alive = (f"PID(s) {_kill['still_alive']} still running"
-                          if _kill["still_alive"] else "could not confirm the process ended")
-                return err(f"close failed: {_kill['detail']}; {_alive} — instance retained")
+            if _close_incomplete(_kill):
+                return err(f"close failed: {_close_failure(_kill)} — instance retained")
             _iid = BrowserState.current_instance_id
             BrowserState.reset()
             _clear_tab_scoped_state(_tabs)
@@ -8194,12 +8432,10 @@ async def close_instance(instance_id: str) -> str:
     except Exception:
         pass
     _kill = await _ensure_browser_dead(snap.browser, snap.profile_dir)
-    if not _kill["stopped"] and not _kill["verified"]:
-        _alive = (f"PID(s) {_kill['still_alive']} still running"
-                  if _kill["still_alive"] else "could not confirm the process ended")
+    if _close_incomplete(_kill):
         return err(
-            f"close failed for instance {instance_id!r}: {_kill['detail']}; "
-            f"{_alive} — instance retained for retry"
+            f"close failed for instance {instance_id!r}: {_close_failure(_kill)}"
+            f" — instance retained for retry"
         )
     # Chrome is stopped even if residue cleanup below fails. Retain a minimal
     # snapshot in that case so a second close_instance call can retry cleanup.
@@ -8228,8 +8464,8 @@ async def close_all_instances() -> str:
         _tabs = list(snap.tabs)
         if snap.browser:
             _kill = await _ensure_browser_dead(snap.browser, snap.profile_dir)
-            if not _kill["stopped"] and not _kill["verified"]:
-                failures.append(f"{iid}: {_kill['detail'] or 'stop failed'}; instance retained")
+            if _close_incomplete(_kill):
+                failures.append(f"{iid}: {_close_failure(_kill)}; instance retained")
                 continue
         snap.browser = None
         snap.tabs = []
@@ -8242,16 +8478,16 @@ async def close_all_instances() -> str:
             clean_profile_state(snap.profile_dir)
         BrowserState.instances.pop(iid, None)
         closed.append(iid)
-    # Close current
-    if BrowserState.is_up():
+    # Close current. The handle, not is_up(): see browser_close.
+    if BrowserState.browser is not None:
         _current_profile = BrowserState.current_profile_dir
         _current_privacy = BrowserState.current_privacy
         _current_tabs = list(BrowserState.tabs)
         _kill = await _ensure_browser_dead(BrowserState.browser, _current_profile)
-        if not _kill["stopped"] and not _kill["verified"]:
+        if _close_incomplete(_kill):
             failures.append(
                 f"{BrowserState.current_instance_id}: "
-                f"{_kill['detail'] or 'stop failed'}; instance retained"
+                f"{_close_failure(_kill)}; instance retained"
             )
         else:
             _clear_tab_scoped_state(_current_tabs)
@@ -8748,6 +8984,7 @@ _DESCRIBE_PAGE_JS = """
     let value;
     if (type === 'checkbox' || type === 'radio') value = !!el.checked;
     else if (type === 'select') value = el.value;
+    else if (el.type === 'password') value = el.value ? '(password set, not shown)' : '';
     else value = el.value || '';
     fields.push({
       label: labelOf(el),
@@ -9026,14 +9263,31 @@ async def smart_fill(fields: dict, submit_label: Optional[str] = None) -> str:
             # more reliable than .focus() across React/Vue components that
             # listen for native events.
             try:
-                await tab.mouse_click(int(best["x"]), int(best["y"]))
-                await asyncio.sleep(0.1)
-                # Native value setter so React/Vue see the change
+                # Not for a <select>: clicking one opens a native popup that stays open and
+                # takes the next click, and its value is set directly below.
+                if best.get("type") != "select":
+                    await tab.mouse_click(int(best["x"]), int(best["y"]))
+                    await asyncio.sleep(0.1)
+                # Native value setter so React/Vue see the change. Each element type has its
+                # own: HTMLInputElement's throws on a <select> or <textarea>.
                 setter_js = f"""
                 function() {{
+                  const wanted = {json.dumps(str(value))};
+                  if (this.tagName === 'SELECT') {{
+                    const options = [...this.options];
+                    const lower = wanted.trim().toLowerCase();
+                    const option = options.find(o => o.value === wanted)
+                      || options.find(o => o.text.trim().toLowerCase() === lower);
+                    if (!option) return this.value;
+                    Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')
+                      .set.call(this, option.value);
+                    this.dispatchEvent(new Event('input', {{bubbles: true}}));
+                    this.dispatchEvent(new Event('change', {{bubbles: true}}));
+                    return this.value === option.value ? wanted : this.value;
+                  }}
                   const proto = this.tagName === 'TEXTAREA'
                     ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-                  Object.getOwnPropertyDescriptor(proto, 'value').set.call(this, {json.dumps(str(value))});
+                  Object.getOwnPropertyDescriptor(proto, 'value').set.call(this, wanted);
                   this.dispatchEvent(new Event('input', {{bubbles: true}}));
                   this.dispatchEvent(new Event('change', {{bubbles: true}}));
                   return this.value;
@@ -9056,19 +9310,24 @@ async def smart_fill(fields: dict, submit_label: Optional[str] = None) -> str:
                 results.append({"label": label, "ok": False, "error": str(e)})
             finally:
                 await release_group(tab, group)
+        any_failed = any(not r.get("ok") for r in results)
         # Optional submit
         submit_result = None
-        if submit_label:
+        if submit_label and any_failed:
+            # Submitting a half-filled form is an action the caller did not ask for.
+            submit_result = "NOT clicked: a field above failed"
+        elif submit_label:
             try:
                 # Reuse click_text fuzzy logic
-                r = await click_text(submit_label, exact=False)
-                submit_result = str(r)[:200]
+                r = str(await click_text(submit_label, exact=False))
+                submit_result = r[:200]
+                any_failed = r.startswith("Error:")
             except Exception as e:
                 submit_result = f"submit failed: {e}"
+                any_failed = True
         out = {"results": results}
         if submit_result is not None:
             out["submit"] = submit_result
-        any_failed = any(not r.get("ok") for r in results)
         return (err if any_failed else ok)(json.dumps(out, indent=2, ensure_ascii=False))
     except Exception as e:
         return err(str(e))
@@ -9314,9 +9573,13 @@ async def storage_snapshot(name: str = "default") -> str:
 
 
 @mcp.tool()
-async def storage_diff(name: str = "default") -> str:
+async def storage_diff(name: str = "default", reveal_values: bool = False) -> str:
     """⭐ Compare current state vs an earlier storage_snapshot. Returns JSON
     showing what changed (added/removed/modified per area + url change).
+
+    Diffing across a login is exactly when new values are session tokens, and this
+    output lands in the transcript. So values read "*** (N chars)" unless
+    reveal_values=True; whether something changed is reported either way.
 
     Pattern:
       storage_snapshot("before")
@@ -9333,27 +9596,35 @@ async def storage_diff(name: str = "default") -> str:
         before = _STORAGE_SNAPSHOTS[_snapshot_key(name)]
         after = await _take_storage_snapshot(tab)
 
+        def _shown(value: Any, cap: int = 200) -> Any:
+            if reveal_values:
+                return value[:cap] if isinstance(value, str) else value
+            return f"*** ({len(str(value or ''))} chars)"
+
         def _kvdiff(b: dict, a: dict) -> dict:
             keys_b, keys_a = set(b), set(a)
             return {
-                "added": {k: a[k][:200] if isinstance(a[k], str) else a[k]
-                           for k in keys_a - keys_b},
+                "added": {k: _shown(a[k]) for k in keys_a - keys_b},
                 "removed": list(keys_b - keys_a),
-                "modified": {k: {"before": (b[k][:200] if isinstance(b[k], str) else b[k]),
-                                  "after": (a[k][:200] if isinstance(a[k], str) else a[k])}
+                "modified": {k: {"before": _shown(b[k]), "after": _shown(a[k])}
                               for k in keys_b & keys_a if b[k] != a[k]},
             }
 
         # Cookies — by (name, domain) tuple
-        b_cookies = {(c["name"], c["domain"]): c["value"] for c in before["cookies"]}
-        a_cookies = {(c["name"], c["domain"]): c["value"] for c in after["cookies"]}
+        # Path is part of a cookie's identity: SID at /admin and SID at / are two cookies,
+        # and keying without it let one overwrite the other, hiding a change.
+        b_cookies = {(c["name"], c["domain"], c.get("path", "/")): c["value"]
+                     for c in before["cookies"]}
+        a_cookies = {(c["name"], c["domain"], c.get("path", "/")): c["value"]
+                     for c in after["cookies"]}
         cookie_diff = {
-            "added": [{"name": n, "domain": d, "value": (a_cookies[(n, d)][:60] if a_cookies[(n, d)] else "")}
-                       for (n, d) in set(a_cookies) - set(b_cookies)],
-            "removed": [{"name": n, "domain": d} for (n, d) in set(b_cookies) - set(a_cookies)],
-            "modified": [{"name": n, "domain": d}
-                          for (n, d) in set(b_cookies) & set(a_cookies)
-                          if b_cookies[(n, d)] != a_cookies[(n, d)]],
+            "added": [{"name": n, "domain": d, "path": p, "value": _shown(a_cookies[(n, d, p)], 60)}
+                       for (n, d, p) in set(a_cookies) - set(b_cookies)],
+            "removed": [{"name": n, "domain": d, "path": p}
+                        for (n, d, p) in set(b_cookies) - set(a_cookies)],
+            "modified": [{"name": n, "domain": d, "path": p}
+                          for (n, d, p) in set(b_cookies) & set(a_cookies)
+                          if b_cookies[(n, d, p)] != a_cookies[(n, d, p)]],
         }
 
         diff = {
@@ -9546,11 +9817,15 @@ async def detect_and_bypass() -> str:
         if "cloudflare" in det_lower:
             # Try our automated CF Turnstile flow.
             verify = await _auto_verify_cf(tab, max_attempts=2)
-            if verify and "auto-verify" in verify:
-                result["bypassed"] = True
+            if verify:
                 result["method"] = "auto_verify_cf"
                 result["details"] = verify.strip()
-            else:
+                # The page decides. Every outcome of _auto_verify_cf, including "no clickable
+                # widget found", says auto-verify, and a click attempt is not a solved wall.
+                still = await _cf_challenge_state(tab, active=True)
+                result["challenge_still_present"] = still  # None: could not be checked
+                result["bypassed"] = still is False and "no clickable widget" not in verify
+            if not result["bypassed"]:
                 result["next_steps"].append(
                     "If still blocked: solve_captcha(kind='turnstile', ...) with CAPSOLVER_KEY, "
                     "or storage_state_load a previously-saved session."
@@ -9683,7 +9958,8 @@ async def paste_text(
               }}
               // 5. change event for blur-validators
               el.dispatchEvent(new Event('change', {{bubbles: true}}));
-              return JSON.stringify({{ok: true, value: el.value}});
+              return JSON.stringify({{ok: true, value:
+                el.type === 'password' ? `(password, ${{el.value.length}} chars)` : el.value}});
             }}
             """,
         ), what="paste_text")
@@ -9814,22 +10090,29 @@ async def auth_capture(
 
 
 def _latest_auth_header_for(url: str) -> Optional[str]:
-    """Pick the most recent Authorization header from network_index for
-    requests whose URL shares the host of the target. Used by
-    http_request_with_session as a fallback when the caller doesn't pass
-    headers explicitly."""
+    """Pick the most recent Authorization header from network_index for requests to the
+    target's exact origin. Used by http_request_with_session as a fallback when the
+    caller doesn't pass headers explicitly.
+
+    Origin, not host: a token seen on https://x must not travel to http://x:8080 in
+    plaintext, or to another service on that host."""
     try:
         from urllib.parse import urlparse
-        target_host = urlparse(url).hostname or ""
-        if not target_host:
+
+        def _origin(address: str) -> tuple:
+            parts = urlparse(address)
+            port = parts.port or {"https": 443, "http": 80}.get(parts.scheme)
+            return parts.scheme, parts.hostname or "", port
+
+        target = _origin(url)
+        if not target[1]:
             return None
         # Iterate in insertion order — index is dict keyed by request_id and
         # Python dicts preserve insertion order, so the last matching entry
         # is the freshest.
         latest = None
         for entry in BrowserState.network_index.values():
-            host = urlparse(entry.get("url", "")).hostname or ""
-            if host != target_host:
+            if _origin(entry.get("url", "")) != target:
                 continue
             headers = entry.get("request_headers") or {}
             for k, v in headers.items():
@@ -9900,6 +10183,86 @@ async def http_request_with_session(
 # ── wait_for_request ───────────────────────────────────────────────────────
 
 
+async def _arm_request_watch(
+    tab: Any, url_pattern: str, method: Optional[str], require_response: bool,
+) -> dict:
+    """Subscribe for a matching request NOW. Returns {match, pending, done, disarm}.
+
+    Separate from the waiting so click_and_wait can subscribe before it clicks: a fast API
+    call completes before anything subscribed afterwards can see it. Every matching request
+    is tracked, because the first one to get a response is the answer, and it need not be
+    the last one to have started. Raises when Network cannot be enabled, since no event
+    would ever arrive and the wait would read as "nothing matched".
+    """
+    from nodriver.cdp import network as cdp_network
+
+    await tab.send(cdp_network.enable())
+    match: dict = {}
+    pending: dict[str, dict] = {}
+    done = asyncio.Event()
+
+    async def on_req(event):
+        if done.is_set():
+            return
+        try:
+            req = event.request
+            url = getattr(req, "url", "")
+            if url_pattern not in url:
+                return
+            if method and getattr(req, "method", "").upper() != method.upper():
+                return
+            rid = str(event.request_id)
+            pending[rid] = {
+                "request_id": rid,
+                "url": url,
+                "method": getattr(req, "method", ""),
+                "request_headers": dict(getattr(req, "headers", None) or {}),
+                "request_body": getattr(req, "post_data", None),
+            }
+            if not require_response:
+                match.update(pending[rid])
+                done.set()
+        except Exception:
+            pass
+
+    async def on_res(event):
+        if done.is_set():
+            return
+        try:
+            rid = str(event.request_id)
+            if rid not in pending:
+                return
+            resp = event.response
+            match.update(pending[rid])
+            match["status"] = getattr(resp, "status", None)
+            match["response_headers"] = dict(getattr(resp, "headers", None) or {})
+            match["mime"] = getattr(resp, "mime_type", None)
+            done.set()
+        except Exception:
+            pass
+
+    handlers = [(cdp_network.RequestWillBeSent, on_req)]
+    if require_response:
+        handlers.append((cdp_network.ResponseReceived, on_res))
+    for event_type, handler in handlers:
+        tab.add_handler(event_type, handler)
+    return {"match": match, "pending": pending, "done": done,
+            "disarm": lambda: _drop_handlers(tab, handlers)}
+
+
+async def _await_request_watch(
+    watch: dict, url_pattern: str, method: Optional[str], timeout: float,
+) -> str:
+    try:
+        await asyncio.wait_for(watch["done"].wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        pending = watch["pending"]
+        what = (f"{len(pending)} request(s) matched {url_pattern!r} but none got a response"
+                if pending else f"no request matched {url_pattern!r}")
+        return err(what + (f" method={method}" if method else "") + f" within {timeout}s")
+    return ok(json.dumps(watch["match"], indent=2, default=str))
+
+
 @mcp.tool()
 async def wait_for_request(
     url_pattern: str,
@@ -9921,80 +10284,64 @@ async def wait_for_request(
     """
     try:
         tab = BrowserState.active_tab()
-        from nodriver.cdp import network as cdp_network
+        watch = await _arm_request_watch(tab, url_pattern, method, require_response)
         try:
-            await tab.send(cdp_network.enable())
-        except Exception:
-            pass
-        match: dict = {}
-        done = asyncio.Event()
-        active = {"flag": True}
-
-        async def on_req(event):
-            if not active["flag"]:
-                return
-            try:
-                req = event.request
-                url = getattr(req, "url", "")
-                if url_pattern not in url:
-                    return
-                if method and getattr(req, "method", "").upper() != method.upper():
-                    return
-                rid = str(event.request_id)
-                match.update({
-                    "request_id": rid,
-                    "url": url,
-                    "method": getattr(req, "method", ""),
-                    "request_headers": dict(getattr(req, "headers", None) or {}),
-                    "request_body": getattr(req, "post_data", None),
-                })
-                if not require_response:
-                    active["flag"] = False
-                    done.set()
-            except Exception:
-                pass
-
-        async def on_res(event):
-            if not active["flag"]:
-                return
-            try:
-                rid = str(event.request_id)
-                if match.get("request_id") != rid:
-                    return
-                resp = event.response
-                match["status"] = getattr(resp, "status", None)
-                match["response_headers"] = dict(getattr(resp, "headers", None) or {})
-                match["mime"] = getattr(resp, "mime_type", None)
-                active["flag"] = False
-                done.set()
-            except Exception:
-                pass
-
-        tab.add_handler(cdp_network.RequestWillBeSent, on_req)
-        if require_response:
-            tab.add_handler(cdp_network.ResponseReceived, on_res)
-        try:
-            await asyncio.wait_for(done.wait(), timeout=timeout)
-        except asyncio.TimeoutError:
-            return err(
-                f"no request matched {url_pattern!r}"
-                + (f" method={method}" if method else "")
-                + f" within {timeout}s"
-            )
+            return await _await_request_watch(watch, url_pattern, method, timeout)
         finally:
-            active["flag"] = False
-            # Remove ONLY our closures (not tab.remove_handler, which under
-            # nodriver 0.48.1 nukes the whole event's handler list and would
-            # kill a concurrent network_start capture).
-            for _evt, _fn in ((cdp_network.RequestWillBeSent, on_req),
-                              (cdp_network.ResponseReceived, on_res)):
-                try:
-                    tab.handlers[_evt].remove(_fn)
-                except (KeyError, ValueError):
-                    pass
-        return ok(json.dumps(match, indent=2, default=str))
+            watch["disarm"]()
     except Exception as e:
         return err(str(e))
+
+
+# ── in-flight tracking ─────────────────────────────────────────────────────
+
+# Types that stay open by design: waiting on them would mean no page using one ever idles.
+_NEVER_FINISHED_TYPES = ("EventSource", "WebSocket")
+
+
+async def _arm_inflight_tracker(tab: Any) -> tuple[dict, Any]:
+    """Count this tab's requests in flight from CDP events. Returns (tracker, disarm).
+
+    Sees every kind of request, loading images and scripts included, and writes nothing to
+    the page. CDP does not list what is already running, so a request started before arming
+    is noticed only through its later response, data or finish events, which count as
+    activity; one that stays silent throughout cannot be seen. Raises when Network cannot be
+    enabled, because silence would then look like idle.
+    """
+    from nodriver.cdp import network as cdp_network
+
+    await tab.send(cdp_network.enable())
+    tracker: dict[str, Any] = {"inflight": {}, "seen": 0, "last_change": time.monotonic()}
+
+    async def on_request(event: Any) -> None:
+        if _cdp_resource_type(event) in _NEVER_FINISHED_TYPES:
+            return
+        tracker["inflight"][str(event.request_id)] = str(getattr(event.request, "url", ""))
+        tracker["seen"] += 1
+        tracker["last_change"] = time.monotonic()
+
+    async def on_activity(_event: Any) -> None:
+        tracker["last_change"] = time.monotonic()
+
+    async def on_finished(event: Any) -> None:
+        tracker["inflight"].pop(str(event.request_id), None)
+        tracker["last_change"] = time.monotonic()
+
+    handlers = [
+        (cdp_network.RequestWillBeSent, on_request),
+        (cdp_network.ResponseReceived, on_activity),
+        (cdp_network.DataReceived, on_activity),
+        (cdp_network.LoadingFinished, on_finished),
+        (cdp_network.LoadingFailed, on_finished),
+    ]
+    for event_type, handler in handlers:
+        tab.add_handler(event_type, handler)
+    return tracker, lambda: _drop_handlers(tab, handlers)
+
+
+def _inflight_quiet(tracker: dict, idle_s: float) -> bool:
+    return (not tracker["inflight"]
+            and time.monotonic() - tracker["last_change"] >= idle_s)
 
 
 # ── click_and_wait ─────────────────────────────────────────────────────────
@@ -10035,9 +10382,32 @@ async def click_and_wait(
     import time as _time
     if not (ref or selector or text):
         return err("click_and_wait: pass ref=, selector=, or text=")
+    # Before the click. An error reply after it invites the caller to fix the argument and
+    # retry, and that retry submits twice.
+    if expect not in ("auto", "navigation", "url", "text", "selector", "request", "network_idle"):
+        return err(f"click_and_wait: unknown expect={expect!r}; nothing was clicked")
+    required = {"url": ("expect_url_pattern", expect_url_pattern),
+                "text": ("expect_text", expect_text),
+                "selector": ("expect_selector", expect_selector),
+                "request": ("expect_request_pattern", expect_request_pattern)}
+    if expect in required and not required[expect][1]:
+        return err(f"expect={expect!r} requires {required[expect][0]}=; nothing was clicked")
+    request_watch = None
+    disarm_inflight = None
     try:
         tab = BrowserState.active_tab()
         url_before = await get_url(tab, strict=True)
+        # Also before the click: whatever it triggers can finish before the call returns.
+        if expect == "request":
+            request_watch = await _arm_request_watch(tab, expect_request_pattern, None, True)
+        inflight = None
+        if expect in ("auto", "network_idle"):
+            try:
+                inflight, disarm_inflight = await _arm_inflight_tracker(tab)
+            except Exception as exc:
+                if expect == "network_idle":
+                    return err(f"network_idle cannot be measured ({_exc_text(exc)}); "
+                               f"nothing was clicked")
         t0 = _time.monotonic()
         # Dispatch the click — reuse existing tools
         if text:
@@ -10064,43 +10434,39 @@ async def click_and_wait(
                             break
                         await asyncio.sleep(0.2)
                 elif mode == "url":
-                    if not expect_url_pattern:
-                        return err("expect='url' requires expect_url_pattern=")
                     res = await assert_url_matches(expect_url_pattern, timeout=timeout)
                     if not str(res).startswith("Error:"):
                         observed = {"what": "url", "evidence": str(res)[:200]}
                 elif mode == "text":
-                    if not expect_text:
-                        return err("expect='text' requires expect_text=")
                     res = await assert_text_present(expect_text, timeout=timeout)
                     if not str(res).startswith("Error:"):
                         observed = {"what": "text", "evidence": str(res)[:200]}
                 elif mode == "selector":
-                    if not expect_selector:
-                        return err("expect='selector' requires expect_selector=")
                     res = await assert_element_visible(selector=expect_selector, timeout=timeout)
                     if not str(res).startswith("Error:"):
                         observed = {"what": "selector", "evidence": str(res)[:200]}
                 elif mode == "request":
-                    if not expect_request_pattern:
-                        return err("expect='request' requires expect_request_pattern=")
-                    res = await wait_for_request(expect_request_pattern, timeout=timeout)
+                    res = await _await_request_watch(
+                        request_watch, expect_request_pattern, None, timeout)
                     if not str(res).startswith("Error:"):
                         observed = {"what": "request", "evidence": str(res)[:300]}
                 elif mode == "network_idle":
-                    # Quick network-idle: no in-flight CDP requests for 500ms
+                    # From real request and finish events, armed before the click. The log
+                    # length used here stays flat with capture off, requests in flight or not.
+                    if inflight is None:
+                        observed["network_idle"] = "not measured: Network could not be enabled"
+                        continue
                     deadline = _time.monotonic() + timeout
-                    last_count = len(BrowserState.network_logs)
-                    last_change = _time.monotonic()
                     while _time.monotonic() < deadline:
-                        cur = len(BrowserState.network_logs)
-                        if cur != last_count:
-                            last_count = cur
-                            last_change = _time.monotonic()
-                        elif _time.monotonic() - last_change >= 0.5:
-                            observed = {"what": "network_idle", "evidence": f"{cur} events"}
+                        if _inflight_quiet(inflight, 0.5):
+                            observed = {"what": "network_idle",
+                                        "evidence": f"{inflight['seen']} request(s) since the "
+                                                    f"click, none in flight for 500ms"}
                             break
-                        await asyncio.sleep(0.1)
+                        await asyncio.sleep(0.05)
+                    if not observed.get("what"):
+                        observed["network_idle"] = (
+                            f"never idle: {len(inflight['inflight'])} request(s) still in flight")
             except Exception as e:
                 observed["error"] = str(e)
             if observed.get("what"):
@@ -10111,6 +10477,7 @@ async def click_and_wait(
             return err(json.dumps({
                 "clicked": click_str[:200],
                 "observed": "no matching expect signal",
+                **({"detail": observed["network_idle"]} if "network_idle" in observed else {}),
                 "elapsed_ms": elapsed_ms,
                 "hint": "the click registered but no side-effect was detected — "
                         "form may be invalid; check describe_page errors[]",
@@ -10122,6 +10489,11 @@ async def click_and_wait(
         }, indent=2, default=str))
     except Exception as e:
         return err(str(e))
+    finally:
+        if request_watch is not None:
+            request_watch["disarm"]()
+        if disarm_inflight is not None:
+            disarm_inflight()
 
 
 # ── form_introspect ────────────────────────────────────────────────────────
@@ -10177,7 +10549,9 @@ _FORM_INTROSPECT_JS = """
       type: tag === 'input' ? (el.type || 'text') : tag,
       name: el.name || null,
       id: el.id || null,
-      value: typeof el.value === 'string' ? el.value.slice(0, 200) : el.value,
+      value: el.type === 'password'
+        ? (el.value ? '(password set, not shown)' : '')
+        : (typeof el.value === 'string' ? el.value.slice(0, 200) : el.value),
       required: !!el.required,
       disabled: !!el.disabled,
       readonly: !!el.readOnly,

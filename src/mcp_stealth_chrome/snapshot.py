@@ -17,13 +17,11 @@ import json
 def snapshot_hash(elements: list[dict]) -> str:
     """Stable fingerprint of snapshot content — used for diff detection.
 
-    Only hashes keys that matter for UI state (tag/text/disabled/checked/href),
-    skips volatile fields like ref (reassigned each call).
+    Covers every field a snapshot displays, via element_fingerprint: an icon button going
+    from aria-label Save to Delete must not read as "unchanged". The ref is left out
+    because it is reassigned each call.
     """
-    keys = ("tag", "role", "text", "alt", "href", "checked", "disabled", "frame", "shadow")
-    rows = []
-    for el in elements:
-        rows.append("|".join(str(el.get(k, "")) for k in keys))
+    rows = [element_fingerprint(el) for el in elements]
     return hashlib.sha1("\n".join(rows).encode("utf-8")).hexdigest()[:16]
 
 
@@ -232,13 +230,20 @@ _SNAPSHOT_JS_TEMPLATE = r"""(() => {
     return '';
   }
 
+  // What is typed into a password field stays out of every report: this output goes
+  // straight into the agent's transcript.
+  function safeValue(el) {
+    if (typeof el.value !== 'string') return '';
+    return (el.getAttribute('type') || '').toLowerCase() === 'password' ? '' : el.value;
+  }
+
   function accName(el) {
     var parts = [
       el.getAttribute('aria-label'),
       el.getAttribute('alt'),
       el.getAttribute('title'),
       el.innerText,
-      (typeof el.value === 'string' ? el.value : ''),
+      safeValue(el),
       el.getAttribute('placeholder'),
       el.getAttribute('name')
     ];
@@ -324,13 +329,13 @@ _SNAPSHOT_JS_TEMPLATE = r"""(() => {
       if (CFG.minimal) {
         entry = {
           tag: el.tagName.toLowerCase(),
-          text: (el.innerText || el.value || '').trim().slice(0, CFG.text_cap)
+          text: (el.innerText || safeValue(el) || '').trim().slice(0, CFG.text_cap)
         };
       } else {
         entry = {
           tag: el.tagName.toLowerCase(),
           role: role,
-          text: (el.innerText || el.value || '').trim().slice(0, CFG.text_cap),
+          text: (el.innerText || safeValue(el) || '').trim().slice(0, CFG.text_cap),
           type: el.getAttribute('type') || '',
           name: el.getAttribute('name') || '',
           placeholder: el.getAttribute('placeholder') || '',

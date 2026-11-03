@@ -92,6 +92,8 @@ conclusions. Each rule below replaced a real lie.
   `clicked but NO page change detected` when nothing moved. The fingerprint includes the element's own
   tree and state, or an iframe, shadow tree or checkbox change reads as no change. A real click focuses its
   target by itself, so focus landing on the clicked element is not a change.
+- An empty `_click_probe` is an unanswered question, not a pass: `_blocked_reason({})` refuses. `humanize=True`
+  presses a random spot rather than the tested centre, so that spot gets its own hit test first.
 - `Element.click()` in nodriver is a JS `el.click()` (`isTrusted=false`) preceded by `flash()`, which
   inserts a node into the page. Never call it. Use `_click_and_report`, which dispatches real input at
   the settled position; a JS click only happens with `js_fallback=True` and the result says so.
@@ -129,6 +131,13 @@ conclusions. Each rule below replaced a real lie.
 - Capture buffers are handed between snapshot and restore **by reference, never copied**. A CDP
   handler binds its sink when capture is armed; copying on switch orphans that handler, so the
   instance's later events land in a list nobody reads while the list the user reads stops growing.
+- `console_start` and `network_start` return an error when their domain cannot be enabled, and
+  `wait_for_network_idle` and `wait_for_request` do too. No event will ever arrive, so carrying on turns the
+  failure into a quiet page. `console.clear()` fires a `consoleAPICalled` of type `clear`, which is not a
+  message; keeping it left one behind in the buffer `console_clear` had just emptied.
+- Subscribe before the action, not after. A fast request finishes before `click` returns, so
+  `click_and_wait` arms its watch first. CDP does not list requests already running: a request started before
+  arming is seen only through its later events, which is the stated limit of `wait_for_network_idle`.
 - Handlers bind their sink at arm time and never read `BrowserState.console_logs` at event time.
   Reading the class attribute inside a handler files instance A's messages under whichever instance
   happens to be current.
@@ -150,7 +159,12 @@ conclusions. Each rule below replaced a real lie.
 - `browser.stop()` speaks CDP and can return **without raising** when the socket is gone. Close paths
   go through `_ensure_browser_dead()`, which verifies the process really died and signals the PID
   nodriver recorded at launch when it did not. Reporting a clean close is what creates an orphan: it
-  drops the only handle that knew the process existed.
+  drops the only handle that knew the process existed. So a close with anything in `still_alive` is an error
+  and keeps the handle (`_close_incomplete`), and the privacy profile stays until the process is gone.
+- `is_up()` false does not mean Chrome stopped: closing the last tab empties `tabs` while the process runs and
+  holds the profile. Close paths branch on `BrowserState.browser is None`, never on `is_up()`.
+- `clean_profile_state` and `browser_recover` leave a locked profile completely alone, Preferences included.
+  The lock can belong to another instance or another session, and `browser_recover` sweeps every profile dir.
 - Window placement is remembered per instance in `~/.mcp-stealth/window-state/`. Validation applies
   the saved rect and reads it BACK — Chrome clamps a window onto a connected display, so a mismatched
   read-back is itself proof the monitor is gone. No display API is queried. Implausible sizes and
@@ -203,6 +217,10 @@ conclusions. Each rule below replaced a real lie.
   the exception path, ends in exactly one `continue`/`fail`/`fulfill`.
 - Interception disables itself on a deadline, and `_clear_tab_scoped_state` releases it when its
   target closes. A stale intercept would otherwise pause requests on the next browser launched.
+- The deadline runs `_intercept_disable` inside the watchdog task, so it must not cancel the current task, or
+  the next await raises and `active` stays true forever. Disabling removes the `RequestPaused` handler, or a
+  restart answers each pause twice, except after a failed `Fetch.disable`: requests may still be pausing and
+  nothing else would answer them, so `intercept_start` removes it instead.
 
 ## Chrome, CDP and nodriver facts
 

@@ -133,6 +133,31 @@ def ua_metadata_fields(
     }
 
 
+_ANDROID_UA = re.compile(r"Android ([\d.]+); ([^;)]+)")
+
+
+def device_ua_metadata_fields(
+    user_agent: str, real_version: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """ua_metadata_fields for an emulated phone. Android's hints name the device rather
+    than the desktop this is running on. None for a Safari UA, which has no hints."""
+    hints = ua_metadata_fields(user_agent, real_version=real_version)
+    found = _ANDROID_UA.search(user_agent or "")
+    if hints is None or found is None:
+        return hints
+    return {**hints, "platform": "Android", "platform_version": found.group(1),
+            "model": found.group(2).strip(), "mobile": True,
+            "architecture": "", "bitness": ""}
+
+
+def device_navigator_platform(user_agent: str) -> Optional[str]:
+    """navigator.platform on the device a mobile UA names."""
+    for marker, platform in (("iPhone", "iPhone"), ("iPad", "iPad"), ("Android", "Linux armv81")):
+        if marker in (user_agent or ""):
+            return platform
+    return None
+
+
 def navigator_languages(accept_language: str) -> list[str]:
     """The language tags in an Accept-Language value, without weights or duplicates.
 

@@ -223,3 +223,21 @@ def test_symlinked_main_or_named_root_is_not_a_managed_profile(tmp_path, monkeyp
     make_profile(outside_named / "work")
     (root / "profiles").symlink_to(outside_named)
     assert P._named_profiles() == []
+
+
+@pytest.mark.parametrize("command,expected", [
+    ("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --flag", True),
+    ("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", True),
+    ("/Applications/Brave Browser.app/Contents/MacOS/Brave Browser --x", True),
+    ("/usr/bin/google-chrome-stable --x", True),
+    ("/usr/lib/chromium/chromium --x", True),
+    ("/Users/x/.local/share/uv/tools/mcp-stealth-chrome/bin/python /Users/x/.local/bin/mcp-stealth-chrome", False),
+    ("node /x/node_modules/.bin/chrome-devtools-mcp", False),
+    ("/x/.remotion/chrome-headless-shell/mac-arm64/chrome-headless-shell --a", False),
+    ("/Applications/Google Chrome.app/Contents/Frameworks/x/Google Chrome Helper --type=renderer", False),
+    ("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --type=gpu-process", False),
+    ("grep chrome", False),
+])
+def test_only_a_browsers_own_main_process_counts_as_external(command, expected):
+    """It reported this server and other tools as "external Chrome" in its warning."""
+    assert state._is_browser_main_process(command) is expected

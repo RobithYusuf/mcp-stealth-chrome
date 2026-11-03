@@ -115,17 +115,21 @@ _CHALLENGE_MARKERS = (
 
 
 async def _browser_render(tab, url: str, max_wait: float = 16.0,
-                          settle: float = 1.0) -> str:
+                          settle: float = 1.0, raise_nav_error: bool = False) -> str:
     """Navigate then WAIT OUT any JS challenge until real content renders.
 
     Polls page HTML; treats a tiny body or a known challenge marker as
     "still challenging" and keeps waiting up to max_wait. Returns the final HTML
     (real content if the challenge cleared, else the last challenge/block page so
-    _looks_blocked can flag a genuine hard block).
+    _looks_blocked can flag a genuine hard block). A failed navigation returns "" for the
+    best-effort social readers; a caller reporting a fetch passes raise_nav_error=True,
+    because an empty page is not a fetched one.
     """
     try:
         await tab.get(url)
     except Exception:
+        if raise_nav_error:
+            raise
         return ""
     start = time.monotonic()
     deadline = start + max_wait
@@ -818,12 +822,13 @@ async def scrape_markdown(
             return err("use_browser=True but no browser — call browser_launch first")
         try:
             tab = BrowserState.active_tab()
-            html = await _browser_render(tab, u)   # waits out JS challenges
+            html = await _browser_render(tab, u, raise_nav_error=True)   # waits out JS challenges
         except Exception as e:
             return err(f"browser fetch failed: {type(e).__name__}: {e}")
         md = _html_to_markdown(html, base_url=u, max_chars=max_chars)
         return ok(json.dumps({
-            "url": u, "path": "browser", "status": 200,
+            # This path never sees the document response, so a 403 page must not read as 200.
+            "url": u, "path": "browser", "status": None, "status_measured": False,
             "chars": len(md), "elapsed_ms": int((time.monotonic() - t0) * 1000),
             "markdown": md,
         }, ensure_ascii=False))
@@ -881,7 +886,8 @@ async def smart_fetch(
     if BrowserState.is_up():
         try:
             tab = BrowserState.active_tab()
-            html = await _browser_render(tab, u)   # waits out JS challenges (Reddit/CF)
+            # waits out JS challenges (Reddit/CF)
+            html = await _browser_render(tab, u, raise_nav_error=True)
         except Exception as e:
             return err(f"browser escalation failed: {type(e).__name__}: {e}")
         md = _html_to_markdown(html, base_url=u, max_chars=max_chars)
@@ -895,8 +901,8 @@ async def smart_fetch(
             hint = ("near-empty after render — page may be login-walled or still "
                     "hydrating; import a session cookie or retry once.")
         return ok(json.dumps({
-            "url": u, "path": "browser", "status": 200, "chars": len(md),
-            "escalated_from_http_status": status,
+            "url": u, "path": "browser", "status": None, "status_measured": False,
+            "chars": len(md), "escalated_from_http_status": status,
             "elapsed_ms": int((time.monotonic() - t0) * 1000),
             "hint": hint,
             "markdown": md,
@@ -1207,7 +1213,9 @@ async def github_read(
         st, txt, _ = await _fetch_http(
             base + f"/issues?state=open&sort=created&direction=desc&per_page={lim}",
             headers=hdrs, proxy=proxy)
-        data = _safe_list(parse_json(txt, None) if st == 200 else None)
+        if st != 200:
+            return err(f"issues fetch failed (HTTP {st}) — repo private/missing or rate-limited")
+        data = _safe_list(parse_json(txt, None))
         issues = [{"number": i.get("number"), "title": i.get("title"),
                    "user": (i.get("user") or {}).get("login"),
                    "comments": i.get("comments"), "created": i.get("created_at"),
@@ -1218,7 +1226,9 @@ async def github_read(
 
     if resource == "releases":
         st, txt, _ = await _fetch_http(base + f"/releases?per_page={lim}", headers=hdrs, proxy=proxy)
-        data = _safe_list(parse_json(txt, None) if st == 200 else None)
+        if st != 200:
+            return err(f"releases fetch failed (HTTP {st}) — repo private/missing or rate-limited")
+        data = _safe_list(parse_json(txt, None))
         rels = [{"tag": r.get("tag_name"), "name": r.get("name"),
                  "published": r.get("published_at"), "prerelease": r.get("prerelease")}
                 for r in data if isinstance(r, dict)]

@@ -119,26 +119,46 @@ _COOKIE_LOCK = asyncio.Lock()
 
 
 async def _get_browser_cookies_for_url(url: str) -> list[dict]:
-    """Extract cookies from browser that apply to URL."""
+    """Extract cookies from browser that apply to URL.
+
+    A failed read raises. Returning [] made it "no cookies apply": an authenticated
+    request then went out without them, reported as measured.
+    """
     if not BrowserState.browser:
         return []
-    try:
-        parsed = urlparse(url)
-        target_host = parsed.hostname or ""
-        all_cookies = await BrowserState.browser.cookies.get_all()
-        matching = []
-        for c in all_cookies:
-            domain = (c.domain or "").lstrip(".")
-            if target_host == domain or target_host.endswith("." + domain):
-                matching.append({
-                    "name": c.name,
-                    "value": c.value,
-                    "domain": c.domain,
-                    "path": c.path or "/",
-                })
-        return matching
-    except Exception:
-        return []
+    parsed = urlparse(url)
+    all_cookies = await BrowserState.browser.cookies.get_all()
+    matching = []
+    for c in all_cookies:
+        if _cookie_applies(c, parsed):
+            matching.append({
+                "name": c.name,
+                "value": c.value,
+                "domain": c.domain,
+                "path": c.path or "/",
+            })
+    # Most specific path first, as a browser sends them: a name-keyed jar keeps the
+    # first, so /admin's cookie is not replaced by the site-wide one of that name.
+    matching.sort(key=lambda c: len(c["path"]), reverse=True)
+    return matching
+
+
+def _cookie_applies(cookie: Any, parsed_url: Any) -> bool:
+    """Would a browser send this cookie to this URL? RFC 6265 domain, path and Secure."""
+    host = (parsed_url.hostname or "").lower()
+    raw_domain = (cookie.domain or "").lower()
+    domain = raw_domain.lstrip(".")
+    if raw_domain.startswith("."):
+        if not (host == domain or host.endswith("." + domain)):
+            return False
+    elif host != domain:  # no leading dot: a host-only cookie, never for subdomains
+        return False
+    cookie_path = cookie.path or "/"
+    request_path = parsed_url.path or "/"
+    if not (request_path == cookie_path
+            or request_path.startswith(cookie_path.rstrip("/") + "/")):
+        return False
+    return not getattr(cookie, "secure", False) or parsed_url.scheme == "https"
 
 
 async def _snapshot_browser_cookies(url: str) -> tuple[dict[str, str], dict]:
@@ -176,7 +196,9 @@ async def _snapshot_browser_cookies(url: str) -> tuple[dict[str, str], dict]:
     except Exception as e:
         meta["reason"] = f"browser cookie read failed: {e} — request sent WITHOUT them"
         return {}, meta
-    jar = {c["name"]: c["value"] for c in cookies}
+    jar: dict[str, str] = {}
+    for c in cookies:
+        jar.setdefault(c["name"], c["value"])
     meta["measured"] = True
     meta["count"] = len(jar)
     return jar, meta
@@ -185,8 +207,12 @@ async def _snapshot_browser_cookies(url: str) -> tuple[dict[str, str], dict]:
 # ── Failure classification ─────────────────────────────────────────────────
 
 
-def _classify_http_error(exc: BaseException) -> dict:
+def _classify_http_error(exc: BaseException, may_have_redirected: bool = False) -> dict:
     """Turn a curl_cffi failure into what it actually proves about the server.
+
+    may_have_redirected: curl reports the LAST hop. A connect failure after following a
+    redirect does not show the first server never got the request, so a POST it already
+    processed must not be called safe to replay.
 
     curl reports both timeout phases as error 28; only libcurl's own message
     separates them, and that separation is the whole point — a connect timeout
@@ -214,6 +240,8 @@ def _classify_http_error(exc: BaseException) -> dict:
     elif code in _CURL_UNKNOWN:
         kind, server_reached, outcome = "transport_error", True, "unknown"
 
+    if may_have_redirected and outcome == "not_executed":
+        server_reached, outcome = None, "unknown"
     retry_safe = outcome == "not_executed"
     return {
         "error_class": kind,
@@ -385,11 +413,9 @@ async def _perform(rec: _Tracked) -> str:
 
         if return_mode == "json":
             try:
-                return ok(json.dumps({"meta": meta, "body": resp.json()},
-                                     indent=2, default=str)[:25000])
+                return ok(_bounded_result(meta, "body", resp.json()))
             except Exception:
-                return ok(json.dumps({"meta": meta, "body_text": body_text},
-                                     indent=2, default=str)[:25000])
+                return ok(_bounded_result(meta, "body_text", body_text))
         if return_mode == "text":
             return ok(f"{json.dumps(meta, indent=2, default=str)}\n\n--- BODY ---\n{body_text}")
         if return_mode == "meta":
@@ -397,11 +423,36 @@ async def _perform(rec: _Tracked) -> str:
         # auto mode
         try:
             parsed = resp.json()
-            return ok(json.dumps({"meta": meta, "body": parsed},
-                                 indent=2, default=str)[:25000])
+            return ok(_bounded_result(meta, "body", parsed))
         except Exception:
             return ok(f"{json.dumps(meta, indent=2, default=str)}"
                       f"\n\n--- BODY (text) ---\n{body_text}")
+
+
+_RESULT_LIMIT = 25000
+
+
+def _bounded_result(meta: dict, key: str, body: Any) -> str:
+    """{"meta", key: body} as JSON, at most _RESULT_LIMIT chars and always parseable.
+
+    Slicing the document cut it mid-string with no marker, so a large response came back
+    as invalid JSON. Over the limit the body becomes a shortened string under body_text,
+    and meta says so.
+    """
+    whole = json.dumps({"meta": meta, key: body}, indent=2, default=str)
+    if len(whole) <= _RESULT_LIMIT:
+        return whole
+    raw = body if isinstance(body, str) else json.dumps(body, default=str)
+    meta = {**meta, "truncated": True, "original_length": len(raw), "returned_length": len(raw)}
+    # Escaping can more than double a string, so fit the ENCODED form, shrinking in
+    # proportion. Each pass is strictly smaller, because the encoded length exceeded room.
+    frame = json.dumps({"meta": meta, "body_text": ""}, indent=2, default=str)
+    room = max(0, _RESULT_LIMIT - len(frame))
+    keep = min(len(raw), room)
+    while keep > 0 and len(json.dumps(raw[:keep])) > room:
+        keep = keep * room // len(json.dumps(raw[:keep]))
+    meta["returned_length"] = keep
+    return json.dumps({"meta": meta, "body_text": raw[:keep]}, indent=2, default=str)
 
 
 async def _run_tracked(rec: _Tracked) -> str:
@@ -448,7 +499,11 @@ async def _run_tracked(rec: _Tracked) -> str:
         rec.detail = {"error_class": "missing_dependency", "outcome": "not_executed"}
         rec.result = err("curl-cffi not installed — pip install curl-cffi")
     except Exception as e:
-        detail = _classify_http_error(e)
+        detail = _classify_http_error(
+            e,
+            may_have_redirected=bool(rec.spec.get("follow_redirects"))
+            and rec.method.upper() not in ("GET", "HEAD", "OPTIONS"),
+        )
         rec.state = "failed"
         rec.outcome = detail["outcome"]
         detail["request_id"] = rec.request_id
@@ -778,7 +833,10 @@ async def http_session_cookies(url: str) -> str:
     jar, meta = await _snapshot_browser_cookies(url)
     if not meta["measured"]:
         return err(f"cookies not measured for {url}: {meta['reason']}")
-    cookies = await _get_browser_cookies_for_url(url)
+    try:
+        cookies = await _get_browser_cookies_for_url(url)
+    except Exception as e:
+        return err(f"cookies not measured for {url}: {e}")
     return ok(json.dumps({
         "url": url,
         "instance": meta["instance"],

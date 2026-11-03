@@ -426,8 +426,9 @@ async def emulate_device(preset: str = "desktop") -> str:
     """Emulate a device via CDP Emulation.setDeviceMetricsOverride + UA override.
 
     Presets: iphone-15, iphone-se, pixel-8, galaxy-s23, ipad, desktop (reset).
-    Also sets the matching User-Agent string so UA-sniffing backends respond
-    with the mobile variant.
+    Also sets the matching User-Agent string and client hints so UA-sniffing backends
+    respond with the mobile variant. desktop clears the metrics and restores this
+    instance's own identity, UA included.
     """
     preset_lc = preset.lower().replace("_", "-")
     if preset_lc not in _DEVICE_PRESETS:
@@ -437,24 +438,46 @@ async def emulate_device(preset: str = "desktop") -> str:
         )
     try:
         tab = BrowserState.active_tab()
+        from nodriver.cdp import browser as cdp_browser
         from nodriver.cdp import emulation as cdp_emu
         from nodriver.cdp import network as cdp_net
+        from ..identity import device_navigator_platform, device_ua_metadata_fields, strip_headless
+        from ..server import _apply_fingerprint_to_tab, _ua_metadata_param
         p = _DEVICE_PRESETS[preset_lc]
+        version = await tab.send(cdp_browser.get_version())
         if preset_lc == "desktop":
-            # Clear all overrides — back to real device
+            # clearDeviceMetricsOverride leaves the UA override alone, so "reset" kept
+            # answering as an iPhone. Back to the identity this instance launched with,
+            # which falls back to the real browser's own UA.
             await tab.send(cdp_emu.clear_device_metrics_override())
-            return ok("device: reset to desktop (overrides cleared)")
+            identity = dict(BrowserState.current_fingerprint or {})
+            identity["user_agent"] = identity.get("user_agent") or strip_headless(version[3])
+            await _apply_fingerprint_to_tab(tab, identity)
+            return ok(f"device: reset to desktop (metrics cleared, User-Agent is "
+                      f"{identity['user_agent']})")
         await tab.send(cdp_emu.set_device_metrics_override(
             width=int(p["width"]),
             height=int(p["height"]),
             device_scale_factor=float(p["dpr"]),
             mobile=bool(p["mobile"]),
         ))
+        note = ""
         if p.get("ua"):
-            await tab.send(cdp_net.set_user_agent_override(user_agent=p["ua"]))
+            kwargs: dict[str, Any] = {"user_agent": p["ua"]}
+            platform = device_navigator_platform(p["ua"])
+            if platform:
+                kwargs["platform"] = platform
+            # Without metadata navigator.userAgentData.brands comes back empty.
+            hints = device_ua_metadata_fields(p["ua"], version[1].rsplit("/", 1)[-1])
+            if hints:
+                kwargs["user_agent_metadata"] = _ua_metadata_param(hints)
+            else:
+                note = ("; navigator.userAgentData remains present with empty brands, where "
+                        "real Safari has none (CDP cannot remove it)")
+            await tab.send(cdp_net.set_user_agent_override(**kwargs))
         return ok(
             f"device: {preset_lc} {p['width']}×{p['height']} "
-            f"DPR={p['dpr']} mobile={p['mobile']}"
+            f"DPR={p['dpr']} mobile={p['mobile']}{note}"
         )
     except Exception as e:
         return err(str(e))
@@ -641,62 +664,42 @@ async def wait_for_network_idle(
 ) -> str:
     """Wait until no network request has been in-flight for idle_ms.
 
-    More robust than wait_for(selector) for JS-heavy SPAs. Implementation polls
-    performance.getEntriesByType('resource') + a custom fetch/XHR tracker
-    injected once per tab.
+    More robust than wait_for(selector) for JS-heavy SPAs. Counts requests from CDP
+    Network events, every type including images and scripts, and also waits for
+    document.readyState to reach "complete". Nothing is injected into the page.
+
+    Limit: CDP cannot list what is already running. A request started before this call is
+    noticed only through its later response, data or finish events, so one that stays
+    silent for the whole idle window is not seen. To cover a click's own requests use
+    click_and_wait(expect="network_idle"), which starts counting before it clicks.
     """
     try:
+        from ..server import _arm_inflight_tracker, _inflight_quiet
+
         tab = BrowserState.active_tab()
-        # Install per-tab tracker (idempotent). Uses a per-XHR flag so
-        # reused XHR instances (axios, jQuery) don't register duplicate listeners.
-        await tab.evaluate(
-            r"""
-            (() => {
-              if (window.__mcp_netidle) return;
-              window.__mcp_netidle = { active: 0, last_active: performance.now() };
-              const tracker = window.__mcp_netidle;
-              const origFetch = window.fetch;
-              window.fetch = function(...args) {
-                tracker.active++; tracker.last_active = performance.now();
-                return origFetch.apply(this, args).finally(() => {
-                  tracker.active--; tracker.last_active = performance.now();
-                });
-              };
-              const origSend = XMLHttpRequest.prototype.send;
-              XMLHttpRequest.prototype.send = function(...args) {
-                // Attach loadend listener exactly once per XHR instance
-                // (reused instances would otherwise get N listeners after N opens).
-                if (!this.__mcp_netidle_tracked) {
-                  this.__mcp_netidle_tracked = true;
-                  this.addEventListener('loadend', () => {
-                    tracker.active--; tracker.last_active = performance.now();
-                  });
-                }
-                tracker.active++; tracker.last_active = performance.now();
-                return origSend.apply(this, args);
-              };
-            })()
-            """,
-            return_by_value=True,
-        )
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            raw = await tab.evaluate(
-                "JSON.stringify({"
-                "active:(window.__mcp_netidle||{}).active||0,"
-                "idle_ms:performance.now()-((window.__mcp_netidle||{}).last_active||0)"
-                "})",
-                return_by_value=True,
-            )
-            info = parse_json(raw, {"active": 0, "idle_ms": 0})
-            if (isinstance(info, dict) and info.get("active", 0) == 0
-                    and info.get("idle_ms", 0) >= idle_ms):
-                return ok(
-                    f"network idle for {int(info['idle_ms'])}ms "
-                    f"(active=0)"
-                )
-            await asyncio.sleep(0.1)
-        return err(f"timeout after {timeout}s — network never idled for {idle_ms}ms")
+        tracker, disarm = await _arm_inflight_tracker(tab)
+        try:
+            deadline = time.time() + timeout
+            ready = False
+            while time.time() < deadline:
+                if _inflight_quiet(tracker, idle_ms / 1000):
+                    # Subresources of a load that began before this call show up here.
+                    raw = await tab.evaluate("document.readyState", return_by_value=True)
+                    ready = (raw.value if hasattr(raw, "value") else raw) == "complete"
+                    if ready:
+                        return ok(
+                            f"network idle for {idle_ms}ms (active=0, {tracker['seen']} "
+                            f"request(s) seen during this call; one already running before "
+                            f"it and silent throughout would not be seen)"
+                        )
+                await asyncio.sleep(0.05)
+            stuck = list(tracker["inflight"].values())[:5]
+            why = (f"{len(tracker['inflight'])} request(s) still in flight: {stuck}" if stuck
+                   else "document never reached readyState=complete" if not ready
+                   else "activity never stopped")
+            return err(f"timeout after {timeout}s — network never idled for {idle_ms}ms: {why}")
+        finally:
+            disarm()
     except Exception as e:
         return err(str(e))
 
@@ -713,6 +716,8 @@ async def console_clear() -> str:
             except Exception:
                 pass
         await tab.evaluate("console.clear()", return_by_value=True)
+        # In place: the CDP handler keeps writing to this very list.
+        BrowserState.console_logs.clear()
         return ok("console cleared")
     except Exception as e:
         return err(str(e))

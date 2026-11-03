@@ -294,6 +294,13 @@ def test_resume_inside_a_branch_stays_in_that_branch():
     assert calls == [("retry_me", {})]
 
 
+def test_branch_record_only_appears_when_a_resume_may_need_it():
+    steps = [{"if": {"value": True, "truthy": True}, "then": [{"tool": "a"}]}]
+    assert "__branches__" not in run(steps)[0].get("vars", {})
+    failed, _ = run(steps, {"a": "Error: no"})
+    assert failed["vars"]["__branches__"] == {"0": "then"}
+
+
 def test_a_fresh_run_still_evaluates_its_conditions():
     steps = [{"if": {"value": "${x}", "truthy": True}, "then": [{"tool": "a"}], "else": [{"tool": "b"}]}]
     assert run(steps, variables={"x": True, "__branches__": {"0": "else"}})[1] == [("a", {})]
@@ -307,3 +314,22 @@ def test_last_describes_a_step_that_raised():
               "then": [{"tool": "success_only"}], "else": [{"tool": "cleanup"}]}]
     _, calls = run(steps, {"boom": RuntimeError("no")}, stop_on_error=False)
     assert [c[0] for c in calls] == ["first", "boom", "cleanup"]
+
+
+@pytest.mark.parametrize("bad_step", [
+    {"tool": "forbidden"},          # the allowlist rejection
+    "not a dict",
+    {"neither": 1},
+    {"tool": "a", "args": {"x": "${missing}"}},
+    {"if": {"value": "${missing}", "truthy": True}, "then": []},
+    {"foreach": 3, "steps": []},
+])
+def test_last_describes_a_step_that_was_rejected(bad_step):
+    """A rejected step left ${last.ok} true from the success before it, so with
+    stop_on_error=False the success branch ran."""
+    steps = [{"tool": "first"}, bad_step,
+             {"if": {"value": "${last.ok}", "truthy": True},
+              "then": [{"tool": "success_only"}], "else": [{"tool": "cleanup"}]}]
+    _, calls = run(steps, stop_on_error=False)
+    names = [c[0] for c in calls]
+    assert "success_only" not in names and names[-1] == "cleanup"

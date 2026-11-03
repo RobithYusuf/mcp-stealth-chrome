@@ -241,6 +241,19 @@ def chrome_lock_holder_pid(profile_path: Path) -> Optional[int]:
     return pid if _pid_alive(pid) else None
 
 
+# A Chromium-family browser's own executable. Matching "chrome" anywhere in the command
+# counted this server (mcp-stealth-chrome), chrome-devtools-mcp and every helper process.
+_BROWSER_EXECUTABLE = re.compile(
+    r"(?:^|/)(?:Google Chrome(?: Canary| Beta| Dev)?|Chromium|chrome|chromium|chromium-browser"
+    r"|google-chrome(?:-stable|-beta)?|Brave Browser|brave|brave-browser|Microsoft Edge|msedge)"
+    r"(?:\s|$)"
+)
+
+
+def _is_browser_main_process(command: str) -> bool:
+    return "--type=" not in command and _BROWSER_EXECUTABLE.search(command) is not None
+
+
 def find_external_chrome_pids() -> list[int]:
     """Find PIDs of running Chrome processes NOT spawned by this MCP server.
     Returns up to 10 PIDs. Empty list on error or non-POSIX without `pgrep`."""
@@ -278,14 +291,12 @@ def find_external_chrome_pids() -> list[int]:
             line = line.strip()
             if not line:
                 continue
-            low = line.lower()
-            if "chrome" not in low and "chromium" not in low:
+            head, _, command = line.partition(" ")
+            if not head.isdigit() or not _is_browser_main_process(command):
                 continue
-            if f"--user-data-dir={mcp_root}" in line:
-                continue  # spawned by this MCP server — not "external"
-            head = line.split(None, 1)[0]
-            if head.isdigit():
-                pids.append(int(head))
+            if f"--user-data-dir={mcp_root}" in line or "/uc_" in line:
+                continue  # spawned by an MCP server here — not "external"
+            pids.append(int(head))
             if len(pids) >= 10:
                 break
         return pids
@@ -504,11 +515,11 @@ def clean_profile_state(profile_dir: Path | str | None = None) -> None:
             return True
         return False
 
-    _update_prefs(pdir / "Default" / "Preferences", _mark_clean)
-    # Don't blindly nuke locks — if a sibling MCP process owns them, that
-    # would corrupt its session. Only remove when stale.
+    # A running browser owns this profile, its Preferences included, and rewrites them
+    # itself. Same for its locks: nuking a sibling MCP process's would corrupt its session.
     if is_chrome_profile_locked(pdir):
         return
+    _update_prefs(pdir / "Default" / "Preferences", _mark_clean)
     for lock_name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
         lock = pdir / lock_name
         try:

@@ -83,6 +83,9 @@ async def solve(
                 raise CapSolverError(f"getTaskResult: {rdata.get('errorDescription', rdata)}")
             if rdata.get("status") == "ready":
                 sol = rdata.get("solution", {})
-                return sol.get("token") or sol.get("gRecaptchaResponse") or ""
+                token = sol.get("token") or sol.get("gRecaptchaResponse")
+                if not token:
+                    raise CapSolverError(f"Task {task_id} reported ready with no token")
+                return token
 
     raise CapSolverError(f"Task {task_id} did not resolve within {timeout}s")

@@ -1368,3 +1368,1728 @@ def test_identity_pin_temp_file_is_private_from_the_first_byte(tmp_path, monkeyp
         instance_id="pin_mode", fingerprint={"timezone": "UTC"}))
     assert not out.startswith("Error:"), out
     assert seen == [0o600]
+
+
+# ── High-severity findings from the seeded benchmark ──────────────────────
+
+
+class _CookieAt:
+    def __init__(self, name, domain, path="/", secure=False, value="v"):
+        self.name, self.domain, self.path, self.secure, self.value = name, domain, path, secure, value
+
+
+@pytest.mark.parametrize("cookie,url,sent", [
+    (_CookieAt("a", ".x.test"), "https://sub.x.test/", True),
+    (_CookieAt("a", "x.test"), "https://x.test/", True),
+    (_CookieAt("a", "x.test"), "https://sub.x.test/", False),
+    (_CookieAt("a", "x.test", path="/admin"), "https://x.test/public", False),
+    (_CookieAt("a", "x.test", path="/admin"), "https://x.test/admin/users", True),
+    (_CookieAt("a", "x.test", path="/admin"), "https://x.test/administrator", False),
+    (_CookieAt("a", "x.test", secure=True), "http://x.test/", False),
+    (_CookieAt("a", "x.test", secure=True), "https://x.test/", True),
+    (_CookieAt("a", ".x.test"), "https://notx.test/", False),
+])
+def test_http_requests_only_send_cookies_a_browser_would(cookie, url, sent):
+    from urllib.parse import urlparse
+
+    from mcp_stealth_chrome.tools.network_http import _cookie_applies
+
+    assert _cookie_applies(cookie, urlparse(url)) is sent
+
+
+def test_same_name_cookie_keeps_the_most_specific_path(monkeypatch):
+    import asyncio
+
+    from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import network_http as nh
+
+    class _Jar:
+        async def get_all(self):
+            return [_CookieAt("sid", "x.test", "/", value="site"),
+                    _CookieAt("sid", "x.test", "/admin", value="admin")]
+
+    class _Browser:
+        cookies = _Jar()
+
+    monkeypatch.setattr(server.BrowserState, "browser", _Browser())
+    jar, _meta = asyncio.run(nh._snapshot_browser_cookies("https://x.test/admin/a"))
+    assert jar == {"sid": "admin"}
+
+
+def test_sniffed_token_only_goes_back_to_its_exact_origin(monkeypatch):
+    from mcp_stealth_chrome import server
+
+    monkeypatch.setattr(server.BrowserState, "network_index", {
+        "1": {"url": "https://x.test/api", "request_headers": {"Authorization": "Bearer secret"}},
+    })
+    assert server._latest_auth_header_for("https://x.test/other") == "Bearer secret"
+    assert server._latest_auth_header_for("https://x.test:443/other") == "Bearer secret"
+    assert server._latest_auth_header_for("http://x.test:8080/") is None
+    assert server._latest_auth_header_for("http://x.test/") is None
+    assert server._latest_auth_header_for("https://x.test:8443/") is None
+
+
+def test_redirected_post_failure_is_not_called_safe_to_replay():
+    from mcp_stealth_chrome.tools.network_http import _classify_http_error
+
+    class _Dead(Exception):
+        code = 7
+
+    assert _classify_http_error(_Dead("connect failed"))["outcome"] == "not_executed"
+    after_redirect = _classify_http_error(_Dead("connect failed"), may_have_redirected=True)
+    assert after_redirect["outcome"] == "unknown"
+    assert after_redirect["retry_safe_any_method"] is False
+
+
+@pytest.mark.parametrize("proxy,shown", [
+    ("http://user:s3cret@host:8080", "http://user:***@host:8080"),
+    ("socks5://u:p@h:1|http://a:b@c:2", "socks5://u:***@h:1|http://a:***@c:2"),
+    ("http://host:8080", "http://host:8080"),
+    (None, None),
+])
+def test_proxy_password_is_masked(proxy, shown):
+    from mcp_stealth_chrome import server
+
+    assert server._mask_proxy_password(proxy) == shown
+
+
+def test_identity_show_masks_unless_asked(tmp_path, monkeypatch):
+    import asyncio
+    import json as _json
+
+    from mcp_stealth_chrome import server
+
+    monkeypatch.setattr(server, "IDENTITIES_DIR", tmp_path)
+    (tmp_path / "with_proxy.json").write_text(_json.dumps(
+        {"instance_id": "with_proxy", "fingerprint": {}, "proxy": "http://u:s3cret@h:1"}))
+    show = server.mcp._tool_manager._tools["identity_show"].fn
+    assert "s3cret" not in asyncio.run(show("with_proxy"))
+    assert "s3cret" in asyncio.run(show("with_proxy", reveal_values=True))
+
+
+def test_storage_diff_masks_new_credentials_unless_asked(monkeypatch):
+    import asyncio
+    import json as _json
+
+    from mcp_stealth_chrome import server
+
+    empty = {"url": "u", "title": "t", "cookies": [], "localStorage": {"k": "old"},
+             "sessionStorage": {}, "errors": {},
+             "measured": {"url": True, "cookies": True, "localStorage": True, "sessionStorage": True}}
+    after = {**empty, "cookies": [{"name": "SID", "domain": "x", "value": "TOKENVALUE"}],
+             "localStorage": {"k": "NEWSECRET", "jwt": "JWTSECRET"}}
+
+    async def fake_snapshot(_tab):
+        return after
+
+    monkeypatch.setattr(server, "_take_storage_snapshot", fake_snapshot)
+    monkeypatch.setattr(server.BrowserState, "active_tab", classmethod(lambda cls: object()))
+    monkeypatch.setitem(server._STORAGE_SNAPSHOTS, "login", empty)
+    diff = server.mcp._tool_manager._tools["storage_diff"].fn
+    masked = asyncio.run(diff("login"))
+    for secret in ("TOKENVALUE", "NEWSECRET", "JWTSECRET", "old"):
+        assert secret not in masked
+    assert _json.loads(masked)["cookies"]["added"][0]["name"] == "SID"
+    assert "TOKENVALUE" in asyncio.run(diff("login", reveal_values=True))
+
+
+def test_storage_state_load_really_sets_cookies_and_reports_counts(tmp_path, monkeypatch):
+    """A numeric expires raised inside set_cookie, was swallowed, and it said "loaded"."""
+    import asyncio
+    import json as _json
+
+    from mcp_stealth_chrome import server
+
+    state_file = tmp_path / "s.json"
+    state_file.write_text(_json.dumps({"cookies": [
+        {"name": "a", "value": "1", "domain": "x.test", "expires": 1893456000.0},
+        {"name": "b", "value": "2", "domain": "x.test", "expires": -1.0},
+    ]}))
+    sent = []
+
+    class _Tab:
+        async def send(self, command):
+            sent.append(next(command))  # the real generator: this is what raised
+
+    class _Browser:
+        tabs = [_Tab()]
+
+    monkeypatch.setattr(server.BrowserState, "browser", _Browser())
+    out = asyncio.run(server.mcp._tool_manager._tools["storage_state_load"].fn(str(state_file)))
+    assert "2 cookies set" in out and "NOT applied" not in out
+    assert sent[0]["params"]["expires"] == 1893456000.0
+    assert "expires" not in sent[1]["params"]
+
+
+def test_storage_state_load_says_so_when_nothing_could_be_set(tmp_path, monkeypatch):
+    import asyncio
+    import json as _json
+
+    from mcp_stealth_chrome import server
+
+    state_file = tmp_path / "s.json"
+    state_file.write_text(_json.dumps({"cookies": [{"name": "a", "value": "1", "domain": "x"}]}))
+
+    class _Tab:
+        async def send(self, _command):
+            raise RuntimeError("rejected")
+
+    class _Browser:
+        tabs = [_Tab()]
+
+    monkeypatch.setattr(server.BrowserState, "browser", _Browser())
+    out = asyncio.run(server.mcp._tool_manager._tools["storage_state_load"].fn(str(state_file)))
+    assert out.startswith("Error:") and "none of the 1 cookies" in out
+
+
+def test_dialog_handle_answers_only_the_next_dialog(monkeypatch):
+    """It went on accepting every later dialog, a destructive confirm included."""
+    import asyncio
+
+    from mcp_stealth_chrome import server
+
+    class _Target:
+        target_id = "ONE-SHOT"
+
+    class _Tab:
+        target = _Target()
+
+        def __init__(self):
+            self.handlers, self.answers = [], []
+
+        def add_handler(self, _event, handler):
+            self.handlers.append(handler)
+
+        async def send(self, command):
+            request = next(command)
+            if request["method"] == "Page.handleJavaScriptDialog":
+                self.answers.append(request["params"]["accept"])
+
+    tab = _Tab()
+    monkeypatch.setattr(server.BrowserState, "active_tab", classmethod(lambda cls: tab))
+    server._dialog_pre_action["_registered_tab_ids"].discard("ONE-SHOT")
+    dialog = server.mcp._tool_manager._tools["dialog_handle"].fn
+    try:
+        asyncio.run(dialog(action="accept"))
+        asyncio.run(tab.handlers[0](None))
+        asyncio.run(tab.handlers[0](None))
+        assert tab.answers == [True]
+        asyncio.run(dialog(action="dismiss"))  # arming again works, on the same handler
+        asyncio.run(tab.handlers[0](None))
+        assert tab.answers == [True, False]
+    finally:
+        server._dialog_pre_action["_registered_tab_ids"].discard("ONE-SHOT")
+
+
+# ── Medium-severity findings from the seeded benchmark ────────────────────
+
+
+def _tool(name):
+    from mcp_stealth_chrome import server
+
+    return server.mcp._tool_manager._tools[name].fn
+
+
+class _CdpTab:
+    """Enough of a nodriver Tab to run the real CDP generators and fire events back."""
+
+    def __init__(self, target_id="T1", fail=()):
+        from types import SimpleNamespace
+
+        self.target = SimpleNamespace(target_id=target_id)
+        self.handlers, self.sent, self.fail = {}, [], fail
+
+    def add_handler(self, event_type, handler):
+        self.handlers.setdefault(event_type, []).append(handler)
+
+    async def send(self, command):
+        import asyncio
+
+        request = next(command)
+        await asyncio.sleep(0)  # a real send suspends, which is where a self-cancel lands
+        if request["method"] in self.fail or "*" in self.fail:
+            raise RuntimeError(f"{request['method']} refused")
+        self.sent.append(request)
+        return None
+
+    async def fire(self, event_type, **fields):
+        from types import SimpleNamespace
+
+        for handler in list(self.handlers.get(event_type, [])):
+            await handler(SimpleNamespace(**fields))
+
+    def methods(self):
+        return [r["method"] for r in self.sent]
+
+
+def _active(monkeypatch, tab):
+    from mcp_stealth_chrome import server
+
+    monkeypatch.setattr(server.BrowserState, "active_tab", classmethod(lambda cls: tab))
+    return tab
+
+
+# ── I and K: close paths ──
+
+
+class _LiveBrowser:
+    """A handle whose process exists, so is_up() depends only on the tabs."""
+
+    stopped = False
+    _process = object()
+
+    def stop(self):
+        return None
+
+
+def _running(monkeypatch, tabs, profile=None, privacy=False):
+    from mcp_stealth_chrome import server
+
+    browser = _LiveBrowser()
+    for name, value in (("browser", browser), ("tabs", tabs), ("current_headless", True),
+                        ("current_profile_dir", profile), ("current_privacy", privacy),
+                        ("current_instance_id", "main"), ("instances", {})):
+        monkeypatch.setattr(server.BrowserState, name, value)
+    return browser
+
+
+def _death_report(monkeypatch, **fields):
+    from mcp_stealth_chrome import server
+
+    report = {"stopped": True, "verified": True, "pid": 1, "killed": [], "still_alive": [], "detail": ""}
+    report.update(fields)
+    calls = []
+
+    async def fake(browser, profile_dir=None, grace=1.5):
+        calls.append(browser)
+        return report
+
+    monkeypatch.setattr(server, "_ensure_browser_dead", fake)
+    return calls
+
+
+def _privacy_removal(monkeypatch):
+    from mcp_stealth_chrome import server
+
+    removed = []
+
+    async def fake(profile):
+        removed.append(profile)
+        return True
+
+    monkeypatch.setattr(server, "_remove_privacy_profile", fake)
+    return removed
+
+
+@pytest.mark.parametrize("name,args", [
+    ("browser_close", ()), ("close_instance", ("main",)), ("close_all_instances", ()),
+])
+def test_a_surviving_process_keeps_its_handle_and_its_privacy_profile(monkeypatch, tmp_path, name, args):
+    """stop() returning with a PID still alive read as closed: the handle was dropped,
+    leaving a Chrome nothing could reach, and its privacy profile was deleted under it."""
+    import asyncio
+
+    from mcp_stealth_chrome import server
+
+    browser = _running(monkeypatch, [_CdpTab()], tmp_path / "p", privacy=True)
+    _death_report(monkeypatch, verified=False, still_alive=[4242], killed=[4242])
+    removed = _privacy_removal(monkeypatch)
+    out = asyncio.run(_tool(name)(*args))
+    assert out.startswith("Error:") and "4242" in out, out
+    assert server.BrowserState.browser is browser
+    assert removed == []
+
+
+def test_a_stored_instance_with_a_surviving_process_is_kept(monkeypatch):
+    import asyncio
+
+    from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.state import InstanceSnapshot
+
+    snap = InstanceSnapshot(instance_id="worker", browser=_LiveBrowser(), tabs=[_CdpTab()])
+    monkeypatch.setattr(server.BrowserState, "instances", {"worker": snap})
+    monkeypatch.setattr(server.BrowserState, "current_instance_id", "main")
+    _death_report(monkeypatch, verified=False, still_alive=[4242])
+    out = asyncio.run(_tool("close_instance")("worker"))
+    assert out.startswith("Error:") and "4242" in out
+    assert server.BrowserState.instances["worker"] is snap and snap.browser is not None
+
+
+def test_browser_close_says_when_it_had_to_signal_the_process(monkeypatch):
+    import asyncio
+
+    _running(monkeypatch, [_CdpTab()])
+    _death_report(monkeypatch, killed=[4242])
+    out = asyncio.run(_tool("browser_close")())
+    assert out.startswith("Browser closed") and "signalled PID(s) [4242]" in out
+
+
+def test_a_clean_close_reads_as_it_always_did(monkeypatch):
+    import asyncio
+
+    from mcp_stealth_chrome import server
+
+    _running(monkeypatch, [_CdpTab()])
+    _death_report(monkeypatch)
+    assert asyncio.run(_tool("browser_close")()) == "Browser closed."
+    assert server.BrowserState.browser is None
+
+
+@pytest.mark.parametrize("name,args", [
+    ("browser_close", ()), ("close_instance", ("main",)), ("close_all_instances", ()),
+])
+def test_last_tab_closed_still_ends_chrome_before_touching_its_profile(monkeypatch, tmp_path, name, args):
+    """No tabs made is_up() false, so close said "not running" and deleted the privacy
+    profile from under a live Chrome without stopping it."""
+    import asyncio
+
+    from mcp_stealth_chrome import server
+
+    browser = _running(monkeypatch, [], tmp_path / "p", privacy=True)
+    assert not server.BrowserState.is_up()
+    ended = _death_report(monkeypatch)
+    removed = _privacy_removal(monkeypatch)
+    out = asyncio.run(_tool(name)(*args))
+    assert ended == [browser]
+    assert removed == [tmp_path / "p"]
+    assert "not running" not in out, out
+    assert server.BrowserState.browser is None
+
+
+def test_no_handle_at_all_is_still_not_running(monkeypatch):
+    import asyncio
+
+    from mcp_stealth_chrome import server
+
+    monkeypatch.setattr(server.BrowserState, "browser", None)
+    monkeypatch.setattr(server.BrowserState, "current_privacy", False)
+    called = _death_report(monkeypatch)
+    assert asyncio.run(_tool("browser_close")()) == "Browser was not running."
+    assert called == []
+
+
+# ── AB and AA: interception ──
+
+
+@pytest.fixture()
+def intercept(monkeypatch):
+    from mcp_stealth_chrome import server
+
+    fresh = dict(server._INTERCEPT, log=[], counts=dict(server._INTERCEPT["counts"]),
+                 active=False, tab=None, handler=None, handler_tab=None, watchdog=None, session=None)
+    monkeypatch.setattr(server, "_INTERCEPT", fresh)
+    return fresh
+
+
+def test_interception_deadline_really_ends_it(monkeypatch, intercept):
+    """The watchdog cancelled itself, so state never updated: active stayed true forever
+    and every other session was told interception was in use."""
+    import asyncio
+    import json as _json
+
+    tab = _active(monkeypatch, _CdpTab())
+
+    async def scenario():
+        await _tool("intercept_start")(auto_disable_after=0.01)
+        watchdog = intercept["watchdog"]
+        await asyncio.wait_for(asyncio.wait({watchdog}), 2)
+        return _json.loads(await _tool("intercept_log")())
+
+    log = asyncio.run(scenario())
+    assert log["active"] is False
+    assert log["stop_reason"] == "auto-disabled on deadline"
+    assert "Fetch.disable" in tab.methods()
+
+
+def _paused():
+    from types import SimpleNamespace
+
+    from nodriver.cdp import fetch as cdp_fetch
+
+    return dict(request_id=cdp_fetch.RequestId("r1"),
+                request=SimpleNamespace(method="GET", url="https://x.test/", headers={}, post_data=None))
+
+
+def test_restarting_interception_answers_each_pause_once(monkeypatch, intercept):
+    """start, stop, start left two handlers, so one pause got two continueRequest calls."""
+    import asyncio
+
+    from nodriver.cdp import fetch as cdp_fetch
+
+    tab = _active(monkeypatch, _CdpTab())
+
+    async def scenario():
+        await _tool("intercept_start")(auto_disable_after=0)
+        await _tool("intercept_stop")()
+        assert tab.handlers[cdp_fetch.RequestPaused] == []
+        await _tool("intercept_start")(auto_disable_after=0)
+        await tab.fire(cdp_fetch.RequestPaused, **_paused())
+        await _tool("intercept_stop")()
+
+    asyncio.run(scenario())
+    assert tab.methods().count("Fetch.continueRequest") == 1
+    assert len(intercept["log"]) == 1
+
+
+def test_a_failed_disable_keeps_answering_then_a_restart_replaces_the_handler(monkeypatch, intercept):
+    """Fetch may still be pausing requests, and nothing else would answer them."""
+    import asyncio
+
+    from nodriver.cdp import fetch as cdp_fetch
+
+    tab = _active(monkeypatch, _CdpTab(fail=("Fetch.disable",)))
+
+    async def scenario():
+        await _tool("intercept_start")(auto_disable_after=0)
+        await _tool("intercept_stop")()
+        assert len(tab.handlers[cdp_fetch.RequestPaused]) == 1
+        await tab.fire(cdp_fetch.RequestPaused, **_paused())
+        assert tab.methods().count("Fetch.continueRequest") == 1
+        await _tool("intercept_start")(auto_disable_after=0)
+        assert len(tab.handlers[cdp_fetch.RequestPaused]) == 1
+
+    asyncio.run(scenario())
+    assert intercept["active"] is True
+
+
+# ── T and S: what a click tests ──
+
+
+class _Pos:
+    left, top, width, height = 100.0, 100.0, 100.0, 40.0
+
+
+class _ClickEl:
+    """An element whose right half is covered by something else."""
+
+    def __init__(self, probe_results=None):
+        self.probe_results = probe_results
+        self.point_checks = []
+
+    async def get_position(self):
+        return _Pos()
+
+    async def apply(self, js):
+        import json as _json
+        import re
+
+        from mcp_stealth_chrome import server
+
+        if js == server._CLICK_PROBE_JS:
+            if self.probe_results is not None:
+                result = self.probe_results.pop(0)
+                if isinstance(result, Exception):
+                    raise result
+                return result
+            return _json.dumps({"sized": True, "in_viewport": True, "hit": True, "target": "button"})
+        fx = float(re.search(r"r\.width \* ([\d.]+)", js).group(1))
+        self.point_checks.append(fx)
+        return fx < 0.5
+
+
+class _MouseTab:
+    def __init__(self):
+        self.clicks = []
+
+    async def mouse_click(self, x, y):
+        self.clicks.append((x, y))
+
+    async def send(self, _command):
+        return None
+
+
+def _quick_clicks(monkeypatch):
+    import mcp_stealth_chrome.humanize as hz
+    from mcp_stealth_chrome import server
+
+    async def settled(el):
+        return await el.get_position()
+
+    async def no_move(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(server, "_settled_position", settled)
+    monkeypatch.setattr(hz, "humanized_move", no_move)
+
+
+def test_humanized_click_only_presses_a_point_that_passed_a_hit_test(monkeypatch):
+    """The centre was tested, then a random point elsewhere in the box was clicked, which
+    could be on an overlay covering part of the element."""
+    import asyncio
+    import itertools
+    import random
+
+    from mcp_stealth_chrome import server
+
+    _quick_clicks(monkeypatch)
+    # Scripted, not left to chance: the first spot is on the covered half, the second is not.
+    samples = itertools.cycle([0.6, 0.4, 0.4, 0.5])
+    monkeypatch.setattr(random, "uniform", lambda _low, _high: next(samples))
+    el, tab = _ClickEl(), _MouseTab()
+    out = asyncio.run(server._click_and_report(tab, el, "c", False, humanize=True))
+    assert "clicked" in out
+    assert el.point_checks == [0.6, 0.4], "each sampled spot must be tested until one passes"
+    assert tab.clicks == [(140, 120)], f"pressed somewhere other than the spot that passed: {tab.clicks}"
+
+
+def test_humanized_click_falls_back_to_the_tested_centre(monkeypatch):
+    import asyncio
+
+    from mcp_stealth_chrome import server
+
+    _quick_clicks(monkeypatch)
+
+    class _Covered(_ClickEl):
+        async def apply(self, js):
+            result = await super().apply(js)
+            return False if result is True else result
+
+    el, tab = _Covered(), _MouseTab()
+    asyncio.run(server._click_and_report(tab, el, "c", False, humanize=True))
+    assert tab.clicks == [(150, 120)]
+
+
+@pytest.mark.parametrize("probes", [
+    [RuntimeError("context lost")] * 3,
+    # The first passes, then the page moves and the check that counts cannot run.
+    ['{"sized": true, "in_viewport": true, "hit": true}', RuntimeError("context lost")],
+])
+def test_a_probe_that_cannot_run_refuses_rather_than_clicks(monkeypatch, probes):
+    """An empty probe counted as a pass, and real input went out at an untested point."""
+    import asyncio
+
+    from mcp_stealth_chrome import server
+
+    _quick_clicks(monkeypatch)
+    tab = _MouseTab()
+    out = asyncio.run(server._click_and_report(tab, _ClickEl(list(probes)), "c", False))
+    assert tab.clicks == []
+    assert out.startswith("Error:") and "NOT clicked" in out and "hit test could not run" in out
+
+
+# ── L and P: profiles ──
+
+
+def _profile_with_window_state(root, locked=False):
+    import json as _json
+    import os
+
+    default = root / "Default"
+    (default / "Sessions").mkdir(parents=True)
+    (default / "Sessions" / "Session_1").write_text("tabs")
+    prefs = {"browser": {"window_placement": {"left": 1}}, "profile": {"exit_type": "Crashed"}}
+    (default / "Preferences").write_text(_json.dumps(prefs))
+    if locked:
+        # This test process is alive, so the lock reads as held.
+        (root / "SingletonLock").symlink_to(f"testhost-{os.getpid()}")
+    return root
+
+
+def test_recover_leaves_a_running_profile_alone(monkeypatch, tmp_path):
+    """Recovering instance A wiped running B's Sessions/ and rewrote its Preferences."""
+    import asyncio
+    import json as _json
+
+    from mcp_stealth_chrome import server, state
+
+    profiles = tmp_path / "profiles"
+    busy = _profile_with_window_state(profiles / "busy", locked=True)
+    idle = _profile_with_window_state(profiles / "idle")
+    monkeypatch.setattr(state, "PROFILES_ROOT", profiles)
+    monkeypatch.setattr(state, "PROFILE_DIR", tmp_path / "main")
+    monkeypatch.setattr(state, "per_process_profile", lambda: tmp_path / "pid")
+    monkeypatch.setattr(server.BrowserState, "browser", None)
+    monkeypatch.setattr(server.BrowserState, "current_profile_dir", None)
+    before = (busy / "Default" / "Preferences").read_text()
+
+    out = asyncio.run(_tool("browser_recover")())
+
+    assert "left 1 in use" in out, out
+    assert (busy / "Default" / "Sessions" / "Session_1").exists()
+    assert (busy / "Default" / "Preferences").read_text() == before
+    assert not (idle / "Default" / "Sessions" / "Session_1").exists()
+    assert "window_placement" not in _json.loads(
+        (idle / "Default" / "Preferences").read_text()).get("browser", {})
+
+
+def test_clean_profile_state_never_rewrites_a_locked_profile(tmp_path):
+    from mcp_stealth_chrome.state import clean_profile_state
+
+    busy = _profile_with_window_state(tmp_path / "busy", locked=True)
+    before = (busy / "Default" / "Preferences").read_text()
+    clean_profile_state(busy)
+    assert (busy / "Default" / "Preferences").read_text() == before
+    assert (busy / "SingletonLock").is_symlink()
+
+
+def test_conflict_clone_refuses_a_copy_with_errors(monkeypatch, tmp_path):
+    """A failed copy of a non-SQLite file came back as a usable point-in-time copy."""
+    import shutil
+
+    from mcp_stealth_chrome import server
+
+    source = tmp_path / "src"
+    (source / "Default").mkdir(parents=True)
+    (source / "Default" / "Preferences").write_text("{}")
+    (source / "Local State").write_text("{}")
+    monkeypatch.setattr(server, "PROFILES_ROOT", tmp_path / "out")
+    real = shutil.copy2
+
+    def flaky(src, dst):
+        if str(src).endswith("Local State"):
+            raise PermissionError("nope")
+        return real(src, dst)
+
+    monkeypatch.setattr(shutil, "copy2", flaky)
+    clone, report = server._safe_profile_clone(source, "x")
+    assert clone is None
+    assert any("Local State" in e for e in report["errors"])
+
+
+def test_conflict_clone_tolerates_a_file_the_live_browser_just_removed(monkeypatch, tmp_path):
+    """Chrome rotates files while it runs. One gone since the listing is not in this copy,
+    and treating it as an error would make the policy fail on any busy profile."""
+    import shutil
+
+    from mcp_stealth_chrome import server
+
+    source = tmp_path / "src"
+    (source / "Default").mkdir(parents=True)
+    (source / "Default" / "Preferences").write_text("{}")
+    (source / "Default" / "tmp123").write_text("x")
+    monkeypatch.setattr(server, "PROFILES_ROOT", tmp_path / "out")
+    real = shutil.copy2
+
+    def vanishing(src, dst):
+        if str(src).endswith("tmp123"):
+            raise FileNotFoundError(src)
+        return real(src, dst)
+
+    monkeypatch.setattr(shutil, "copy2", vanishing)
+    clone, report = server._safe_profile_clone(source, "x")
+    assert clone is not None and report["errors"] == []
+
+
+# ── H: browser cookies ──
+
+
+def test_a_failed_cookie_read_is_not_a_measured_zero(monkeypatch):
+    """The exception was swallowed into [], so the caller's failure branch was unreachable
+    and an authenticated request went out cookie-less, reported as measured."""
+    import asyncio
+
+    from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import network_http as nh
+
+    class _Jar:
+        async def get_all(self):
+            raise RuntimeError("cdp gone")
+
+    class _Browser:
+        cookies = _Jar()
+
+    monkeypatch.setattr(server.BrowserState, "browser", _Browser())
+    jar, meta = asyncio.run(nh._snapshot_browser_cookies("https://x.test/"))
+    assert jar == {} and meta["measured"] is False
+    assert "cdp gone" in meta["reason"]
+
+
+# ── AC, AD, BG: click_and_wait; BA: wait_for_request ──
+
+
+def _click_and_wait_page(monkeypatch, tab, during_click=None):
+    from mcp_stealth_chrome import server
+
+    _active(monkeypatch, tab)
+    clicks = []
+
+    async def fake_url(_tab, strict=False):
+        return "https://x.test/"
+
+    async def fake_click(**kwargs):
+        clicks.append(kwargs)
+        if during_click:
+            await during_click()
+        return "click: clicked"
+
+    monkeypatch.setattr(server, "get_url", fake_url)
+    monkeypatch.setattr(server, "click", fake_click)
+    return clicks
+
+
+def _request_events(tab, rid="r1", url="https://x.test/api/save"):
+    from types import SimpleNamespace
+
+    from nodriver.cdp import network as cdp_network
+
+    async def started():
+        await tab.fire(cdp_network.RequestWillBeSent, request_id=rid, type_="XHR",
+                       request=SimpleNamespace(url=url, method="POST", headers={}, post_data=None))
+
+    async def responded():
+        await tab.fire(cdp_network.ResponseReceived, request_id=rid,
+                       response=SimpleNamespace(status=201, headers={}, mime_type="application/json"))
+
+    async def finished():
+        await tab.fire(cdp_network.LoadingFinished, request_id=rid)
+
+    return started, responded, finished
+
+
+def test_click_and_wait_sees_a_request_fired_during_the_click(monkeypatch):
+    """Subscribing after the click missed a fast API call and reported a timeout, and the
+    caller's retry then repeated the action."""
+    import asyncio
+    import json as _json
+
+    from nodriver.cdp import network as cdp_network
+
+    tab = _CdpTab()
+    started, responded, _finished = _request_events(tab)
+
+    async def during():
+        await started()
+        await responded()
+
+    clicks = _click_and_wait_page(monkeypatch, tab, during)
+    out = asyncio.run(_tool("click_and_wait")(
+        selector="#s", expect="request", expect_request_pattern="/api/save", timeout=0.3))
+    assert not out.startswith("Error:"), out
+    assert _json.loads(out)["observed"]["what"] == "request"
+    assert '\\"status\\": 201' in out and "_pending" not in out
+    assert len(clicks) == 1
+    assert tab.handlers[cdp_network.RequestWillBeSent] == []
+
+
+@pytest.mark.parametrize("kwargs,named", [
+    ({"expect": "url"}, "expect_url_pattern"),
+    ({"expect": "text"}, "expect_text"),
+    ({"expect": "selector"}, "expect_selector"),
+    ({"expect": "request"}, "expect_request_pattern"),
+    ({"expect": "typo"}, "unknown expect"),
+])
+def test_click_and_wait_checks_its_arguments_before_clicking(monkeypatch, kwargs, named):
+    """The error came after the click, so correcting it and retrying submitted twice."""
+    import asyncio
+
+    clicks = _click_and_wait_page(monkeypatch, _CdpTab())
+    out = asyncio.run(_tool("click_and_wait")(selector="#submit", **kwargs))
+    assert out.startswith("Error:") and named in out
+    assert clicks == []
+
+
+def test_click_and_wait_does_not_call_a_page_with_requests_in_flight_idle(monkeypatch):
+    """With capture off the log stays empty, so this reported network_idle after 500ms
+    regardless of what the page was doing."""
+    import asyncio
+    import json as _json
+    import time
+
+    from nodriver.cdp import network as cdp_network
+
+    tab = _CdpTab()
+    started, _responded, finished = _request_events(tab)
+    _click_and_wait_page(monkeypatch, tab, started)
+    t0 = time.monotonic()
+
+    async def scenario():
+        waiter = asyncio.ensure_future(_tool("click_and_wait")(
+            selector="#s", expect="network_idle", timeout=4))
+        await asyncio.sleep(0.8)
+        assert not waiter.done(), "reported idle with a request in flight"
+        await finished()
+        return await waiter
+
+    out = asyncio.run(scenario())
+    assert _json.loads(out)["observed"]["what"] == "network_idle"
+    assert time.monotonic() - t0 >= 1.2  # the finish, plus 500ms quiet
+    assert tab.handlers[cdp_network.LoadingFinished] == []
+
+
+def test_click_and_wait_times_out_honestly_on_a_stuck_request(monkeypatch):
+    import asyncio
+
+    tab = _CdpTab()
+    started, _r, _f = _request_events(tab)
+    _click_and_wait_page(monkeypatch, tab, started)
+    out = asyncio.run(_tool("click_and_wait")(selector="#s", expect="network_idle", timeout=0.3))
+    assert out.startswith("Error:") and "still in flight" in out
+
+
+def test_click_and_wait_auto_does_not_claim_idle_it_could_not_measure(monkeypatch):
+    import asyncio
+    import json as _json
+
+    tab = _CdpTab(fail=("Network.enable",))
+    clicks = _click_and_wait_page(monkeypatch, tab)
+    out = asyncio.run(_tool("click_and_wait")(selector="#s", timeout=0.1))
+    observed = _json.loads(out)["observed"]
+    assert observed["what"] is None and "not measured" in observed["network_idle"]
+    assert len(clicks) == 1
+    refused = asyncio.run(_tool("click_and_wait")(selector="#s", expect="network_idle"))
+    assert refused.startswith("Error:") and len(clicks) == 1
+
+
+def test_wait_for_request_settles_on_whichever_match_responds_first(monkeypatch):
+    """Only the latest match was kept: A starts, B starts, A responds, and it timed out
+    saying no request matched."""
+    import asyncio
+    import json as _json
+
+    tab = _active(monkeypatch, _CdpTab())
+    start_a, respond_a, _ = _request_events(tab, "a", "https://x.test/api/a")
+    start_b, _, _ = _request_events(tab, "b", "https://x.test/api/b")
+
+    async def scenario():
+        waiter = asyncio.ensure_future(_tool("wait_for_request")("/api/", timeout=1))
+        await asyncio.sleep(0.01)
+        await start_a()
+        await start_b()
+        await respond_a()
+        return await waiter
+
+    out = _json.loads(asyncio.run(scenario()))
+    assert out["url"].endswith("/api/a") and out["status"] == 201
+
+
+def test_wait_for_request_separates_seen_without_response_from_never_seen(monkeypatch):
+    import asyncio
+
+    tab = _active(monkeypatch, _CdpTab())
+    start, _, _ = _request_events(tab)
+
+    async def scenario():
+        waiter = asyncio.ensure_future(_tool("wait_for_request")("/api/", timeout=0.1))
+        await asyncio.sleep(0.01)
+        await start()
+        return await waiter
+
+    assert "none got a response" in asyncio.run(scenario())
+    assert "no request matched" in asyncio.run(_tool("wait_for_request")("/api/", timeout=0.01))
+
+
+def test_wait_for_request_reports_a_network_domain_it_could_not_enable(monkeypatch):
+    import asyncio
+
+    _active(monkeypatch, _CdpTab(fail=("Network.enable",)))
+    out = asyncio.run(_tool("wait_for_request")("/api/", timeout=0.01))
+    assert out.startswith("Error:") and "Network.enable" in out
+
+
+# ── AE: wait_for_network_idle ──
+
+
+class _IdleTab(_CdpTab):
+    ready_state = "complete"
+
+    async def evaluate(self, _expr, return_by_value=True):
+        return self.ready_state
+
+
+def test_wait_for_network_idle_counts_every_request_from_cdp(monkeypatch):
+    """It patched fetch and XHR in the page: an image was invisible, a body still downloading
+    counted as finished, and window.__mcp_netidle was left for any script to read."""
+    import asyncio
+
+    tab = _active(monkeypatch, _IdleTab())
+    started, _r, finished = _request_events(tab)
+
+    async def scenario():
+        waiter = asyncio.ensure_future(_tool("wait_for_network_idle")(idle_ms=100, timeout=3))
+        await asyncio.sleep(0.01)
+        await started()
+        await asyncio.sleep(0.3)
+        assert not waiter.done(), "reported idle with a request in flight"
+        await finished()
+        return await waiter
+
+    out = asyncio.run(scenario())
+    assert not out.startswith("Error:") and "active=0" in out, out
+    assert "1 request(s)" in out
+
+
+def test_wait_for_network_idle_waits_for_the_document_and_names_what_stuck(monkeypatch):
+    import asyncio
+
+    tab = _active(monkeypatch, _IdleTab())
+    tab.ready_state = "loading"
+    out = asyncio.run(_tool("wait_for_network_idle")(idle_ms=10, timeout=0.2))
+    assert out.startswith("Error:") and "readyState" in out
+
+    tab2 = _active(monkeypatch, _IdleTab())
+    started, _r, _f = _request_events(tab2)
+
+    async def scenario():
+        waiter = asyncio.ensure_future(_tool("wait_for_network_idle")(idle_ms=10, timeout=0.2))
+        await asyncio.sleep(0.01)
+        await started()
+        return await waiter
+
+    stuck = asyncio.run(scenario())
+    assert "still in flight" in stuck and "/api/save" in stuck
+
+
+def test_wait_for_network_idle_ignores_streams_that_never_finish(monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+
+    from nodriver.cdp import network as cdp_network
+
+    tab = _active(monkeypatch, _IdleTab())
+    event_source = SimpleNamespace(value="EventSource")
+
+    async def scenario():
+        waiter = asyncio.ensure_future(_tool("wait_for_network_idle")(idle_ms=50, timeout=1))
+        await asyncio.sleep(0.01)
+        await tab.fire(cdp_network.RequestWillBeSent, request_id="s", type_=event_source,
+                       request=SimpleNamespace(url="https://x.test/stream"))
+        return await waiter
+
+    assert not asyncio.run(scenario()).startswith("Error:")
+
+
+# ── AR and AS: research ──
+
+
+class _NavFailTab:
+    async def get(self, _url):
+        raise RuntimeError("net::ERR_NAME_NOT_RESOLVED")
+
+
+def test_a_failed_browser_navigation_is_an_error_not_status_200(monkeypatch):
+    import asyncio
+
+    from mcp_stealth_chrome import server
+
+    monkeypatch.setattr(server.BrowserState, "is_up", classmethod(lambda cls: True))
+    _active(monkeypatch, _NavFailTab())
+    out = asyncio.run(_tool("scrape_markdown")("https://x.test/", use_browser=True))
+    assert out.startswith("Error:") and "ERR_NAME_NOT_RESOLVED" in out
+    out = asyncio.run(_tool("smart_fetch")("https://x.test/", force_browser=True))
+    assert out.startswith("Error:") and "ERR_NAME_NOT_RESOLVED" in out
+
+
+def test_best_effort_readers_still_get_an_empty_page_from_a_failed_navigation():
+    import asyncio
+
+    from mcp_stealth_chrome.tools.research import _browser_render
+
+    assert asyncio.run(_browser_render(_NavFailTab(), "https://x.test/")) == ""
+
+
+def test_browser_fetch_never_claims_a_status_it_did_not_see(monkeypatch):
+    """A real 403 page read as status 200."""
+    import asyncio
+    import json as _json
+
+    from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import research
+
+    async def rendered(_tab, _url, **_kwargs):
+        return "<html><body><p>Forbidden</p></body></html>"
+
+    monkeypatch.setattr(research, "_browser_render", rendered)
+    monkeypatch.setattr(server.BrowserState, "is_up", classmethod(lambda cls: True))
+    _active(monkeypatch, object())
+    for out in (asyncio.run(_tool("scrape_markdown")("https://x.test/", use_browser=True)),
+                asyncio.run(_tool("smart_fetch")("https://x.test/", force_browser=True))):
+        data = _json.loads(out)
+        assert data["status"] is None and data["status_measured"] is False
+
+
+@pytest.mark.parametrize("resource", ["issues", "releases"])
+def test_github_errors_are_not_an_empty_list(monkeypatch, resource):
+    """A 403 rate limit read the same as a repo with no issues."""
+    import asyncio
+
+    from mcp_stealth_chrome.tools import research
+
+    async def forbidden(*_a, **_k):
+        return 403, "rate limited", {}
+
+    monkeypatch.setattr(research, "_fetch_http", forbidden)
+    out = asyncio.run(_tool("github_read")("o/r", resource=resource))
+    assert out.startswith("Error:") and "403" in out
+
+
+def test_github_success_still_lists(monkeypatch):
+    import asyncio
+    import json as _json
+
+    from mcp_stealth_chrome.tools import research
+
+    async def fine(*_a, **_k):
+        return 200, _json.dumps([{"number": 1, "title": "t", "tag_name": "v1"}]), {}
+
+    monkeypatch.setattr(research, "_fetch_http", fine)
+    assert _json.loads(asyncio.run(_tool("github_read")("o/r", resource="issues")))["count"] == 1
+    assert _json.loads(asyncio.run(_tool("github_read")("o/r", resource="releases")))["count"] == 1
+
+
+# ── AT: detect_and_bypass ──
+
+
+@pytest.mark.parametrize("verify,challenge,bypassed,still", [
+    (" [auto-verify: CF detected but no clickable widget found]", True, False, True),
+    (" [auto-verify: CF detected but no clickable widget found]", False, False, False),
+    (" [auto-verify: DOM@(1, 2)]", True, False, True),
+    (" [auto-verify: DOM@(1, 2)]", False, True, False),
+    (" [auto-verify: DOM@(1, 2)]", RuntimeError("navigating"), False, None),
+    ("", False, False, None),
+])
+def test_bypassed_comes_from_the_page_not_the_message(monkeypatch, verify, challenge, bypassed, still):
+    """Every outcome string contains "auto-verify", so an explicit failure read as bypassed."""
+    import asyncio
+    import json as _json
+
+    from mcp_stealth_chrome import server
+
+    class _Tab:
+        async def evaluate(self, _js, return_by_value=True):
+            if isinstance(challenge, Exception):
+                raise challenge
+            return challenge
+
+    async def detected():
+        return "cloudflare challenge"
+
+    async def verified(_tab, max_attempts=2):
+        return verify
+
+    monkeypatch.setattr(server.BrowserState, "is_up", classmethod(lambda cls: True))
+    _active(monkeypatch, _Tab())
+    monkeypatch.setattr(server, "detect_anti_bot", detected)
+    monkeypatch.setattr(server, "_auto_verify_cf", verified)
+    out = _json.loads(asyncio.run(_tool("detect_and_bypass")()))
+    assert out["bypassed"] is bypassed
+    assert out.get("challenge_still_present") is still
+    assert bool(out["next_steps"]) is not bypassed
+
+
+# ── AX and CG: cookie files ──
+
+
+def test_samesite_survives_export_and_import(monkeypatch, tmp_path):
+    """default=str wrote "CookieSameSite.NONE", which the importer could not map, so a
+    SameSite=None login cookie silently fell back to Chrome's default."""
+    import asyncio
+    import json as _json
+    from types import SimpleNamespace
+
+    from nodriver.cdp import network as cdp_network
+
+    from mcp_stealth_chrome import server
+
+    cookie = SimpleNamespace(
+        name="sid", value="v", domain="x.test", path="/", expires=-1.0, http_only=True,
+        secure=True, same_site=cdp_network.CookieSameSite.NONE)
+
+    class _Jar:
+        async def get_all(self):
+            return [cookie]
+
+    class _Browser:
+        cookies = _Jar()
+
+    monkeypatch.setattr(server.BrowserState, "browser", _Browser())
+    monkeypatch.setattr(server, "STORAGE_STATE_DIR", tmp_path)
+    monkeypatch.setattr(server, "ensure_dirs", lambda: None)
+    assert not asyncio.run(_tool("cookie_export")("c.json")).startswith("Error:")
+    saved = _json.loads((tmp_path / "c.json").read_text())
+    assert saved[0]["sameSite"] == "None"
+
+    tab = _active(monkeypatch, _CdpTab())
+    asyncio.run(_tool("cookie_import")(file_path=str(tmp_path / "c.json")))
+    sent = [r for r in tab.sent if r["method"] == "Network.setCookies"][0]
+    assert sent["params"]["cookies"][0]["sameSite"] == "None"
+
+
+def test_clear_first_does_not_wipe_the_jar_for_malformed_input(monkeypatch):
+    """clear_first wiped every cookie in the browser, then answered "no valid cookies"."""
+    import asyncio
+
+    from mcp_stealth_chrome import server
+
+    monkeypatch.setattr(server.BrowserState, "browser", object())
+    tab = _active(monkeypatch, _CdpTab())
+    out = asyncio.run(_tool("cookie_import")(cookies=[{"nope": 1}, "garbage"], clear_first=True))
+    assert out.startswith("Error:") and "nothing was cleared" in out
+    assert tab.sent == []
+
+    out = asyncio.run(_tool("cookie_import")(
+        cookies=[{"name": "a", "value": "1", "domain": "x.test"}], clear_first=True))
+    assert not out.startswith("Error:")
+    assert tab.methods() == ["Network.clearBrowserCookies", "Network.setCookies"]
+
+
+# ── AJ: screenshot region ──
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"region_selector": "#band"},
+    {"region": {"x": 10, "y": 20, "width": 30, "height": 40}},
+])
+def test_screenshot_region_is_converted_to_page_space(monkeypatch, tmp_path, kwargs):
+    """capture_beyond_viewport makes a clip page-space, so with the page scrolled 500px the
+    viewport numbers captured some other strip, which still looked valid."""
+    import asyncio
+    import base64
+    import json as _json
+
+    from mcp_stealth_chrome import server
+
+    class _Tab(_CdpTab):
+        async def evaluate(self, expr, return_by_value=True):
+            if "getBoundingClientRect" in expr:
+                return _json.dumps({"x": 10, "y": 20, "width": 30, "height": 40})
+            return _json.dumps({"pageLeft": 7, "pageTop": 500, "dpr": 1, "innerW": 800, "innerH": 600})
+
+        async def send(self, command):
+            request = next(command)
+            self.sent.append(request)
+            return base64.b64encode(b"not really a png").decode()
+
+    tab = _active(monkeypatch, _Tab())
+    monkeypatch.setattr(server, "SCREENSHOT_DIR", tmp_path)
+    monkeypatch.setattr(server, "ensure_dirs", lambda: None)
+    asyncio.run(_tool("screenshot")(filename="s.png", max_dimension=0, **kwargs))
+    clip = tab.sent[0]["params"]["clip"]
+    assert (clip["x"], clip["y"], clip["width"], clip["height"]) == (17, 520, 30, 40)
+
+
+# ── AY: scrape_page ──
+
+
+def test_scrape_page_truncates_a_body_with_no_newline(monkeypatch):
+    """rfind returned -1, which is truthy, so text[:-1] handed back nearly everything."""
+    import asyncio
+    import json as _json
+
+    class _Tab:
+        async def evaluate(self, _js, return_by_value=True):
+            return _json.dumps({"contentType": "text/html", "title": "t", "url": "u", "body": "x" * 25})
+
+    _active(monkeypatch, _Tab())
+    out = _json.loads(asyncio.run(_tool("scrape_page")(return_mode="text", max_chars=5)))
+    assert out["text"].startswith("xxxxx\n") and "truncated at 5/25" in out["text"]
+
+
+def test_scrape_page_still_cuts_at_a_newline(monkeypatch):
+    import asyncio
+    import json as _json
+
+    class _Tab:
+        async def evaluate(self, _js, return_by_value=True):
+            return _json.dumps({"contentType": "text/html", "title": "t", "url": "u", "body": "ab\ncdefgh"})
+
+    _active(monkeypatch, _Tab())
+    out = _json.loads(asyncio.run(_tool("scrape_page")(return_mode="text", max_chars=5)))
+    assert "truncated at 2/9" in out["text"]
+
+
+# ── AP: http_request results ──
+
+
+def _bounded(body, key="body"):
+    import json as _json
+
+    from mcp_stealth_chrome.tools.network_http import _RESULT_LIMIT, _bounded_result
+
+    text = _bounded_result({"status": 200}, key, body)
+    assert len(text) <= _RESULT_LIMIT
+    return _json.loads(text)  # the point: it always parses
+
+
+def test_a_large_result_with_many_headers_still_fits():
+    """Indenting nested meta adds characters per line, so it has to be measured in place."""
+    import json as _json
+
+    from mcp_stealth_chrome.tools.network_http import _RESULT_LIMIT, _bounded_result
+
+    meta = {"status": 200, "headers": {f"x-header-{i}": "v" * 20 for i in range(60)}}
+    text = _bounded_result(meta, "body", {"rows": ["x" * 100] * 400})
+    assert len(text) <= _RESULT_LIMIT
+    assert _json.loads(text)["meta"]["truncated"] is True
+
+
+def test_a_process_that_takes_a_moment_to_die_after_sigkill_counts_as_dead(monkeypatch):
+    """Checked at once, it read as still alive, and that now keeps the handle and fails the close."""
+    import asyncio
+    import os
+    import signal
+
+    from mcp_stealth_chrome import server
+
+    class _Browser:
+        _process_pid = 424243
+
+        def stop(self):
+            return None
+
+    state = {"killed_at": None, "polls_after": 0}
+
+    def fake_kill(pid, sig):
+        if sig == signal.SIGKILL:
+            state["killed_at"] = True
+        elif sig == 0 and state["killed_at"]:
+            state["polls_after"] += 1
+            if state["polls_after"] > 3:
+                raise ProcessLookupError(pid)
+
+    monkeypatch.setattr(os, "kill", fake_kill)
+    report = asyncio.run(server._ensure_browser_dead(_Browser(), None, grace=0))
+    assert report["still_alive"] == [] and report["verified"] is True
+
+
+def test_a_small_result_is_untouched():
+    out = _bounded({"a": 1})
+    assert out == {"meta": {"status": 200}, "body": {"a": 1}}
+
+
+@pytest.mark.parametrize("body", [
+    {"rows": ["x" * 100] * 400},
+    "y" * 40000,
+    '"\\\n' * 20000,          # escapes to several times its length
+    "é" * 40000,              # \uXXXX under ensure_ascii
+])
+def test_a_large_result_stays_valid_json_and_says_it_was_cut(body):
+    """A 30KB response came back as 25,000 chars of invalid JSON with no marker."""
+    out = _bounded(body)
+    meta = out["meta"]
+    assert meta["truncated"] is True and meta["status"] == 200
+    assert meta["returned_length"] == len(out["body_text"]) > 1000
+    assert meta["original_length"] > meta["returned_length"]
+
+
+def test_http_request_returns_parseable_json_for_a_large_response():
+    import asyncio
+    import http.server
+    import json as _json
+    import threading
+
+    payload = _json.dumps({"rows": ["x" * 1000] * 30}).encode()
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *_a):
+            pass
+
+    server_ = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=server_.serve_forever, daemon=True).start()
+    try:
+        out = asyncio.run(_tool("http_request")(f"http://127.0.0.1:{server_.server_port}/"))
+    finally:
+        server_.shutdown()
+    parsed = _json.loads(out)
+    assert parsed["meta"]["truncated"] is True
+    assert parsed["meta"]["original_length"] == len(payload)
+
+
+# ── AH, AG, AF: capture ──
+
+
+@pytest.fixture()
+def console_state(monkeypatch):
+    from mcp_stealth_chrome import server
+
+    monkeypatch.setattr(server.BrowserState, "console_logs", [])
+    monkeypatch.setattr(server.BrowserState, "page_errors", [])
+    monkeypatch.setattr(server.BrowserState, "network_logs", [])
+    monkeypatch.setattr(server.BrowserState, "network_index", {})
+    monkeypatch.setattr(server.BrowserState, "capture_console", False)
+    monkeypatch.setattr(server.BrowserState, "capture_network", False)
+    monkeypatch.setattr(server, "_CONSOLE_ARMED_TAB_IDS", set())
+    monkeypatch.setattr(server, "_NETWORK_ARMED_TAB_IDS", set())
+    return server
+
+
+def _exception_event():
+    from types import SimpleNamespace
+
+    return dict(exception_details=SimpleNamespace(
+        text="Uncaught", url="https://x.test/a.js", line_number=3,
+        exception=SimpleNamespace(description="Error: boom")))
+
+
+def test_get_page_errors_returns_what_was_captured(monkeypatch, console_state):
+    """Nothing appended to page_errors anywhere, so it answered [] on a page that threw."""
+    import asyncio
+    import json as _json
+
+    from mcp_stealth_chrome.server import cdp_runtime
+
+    tab = _active(monkeypatch, _CdpTab())
+
+    async def scenario():
+        await _tool("console_start")()
+        await tab.fire(cdp_runtime.ExceptionThrown, **_exception_event())
+        return _json.loads(await _tool("get_page_errors")())
+
+    out = asyncio.run(scenario())
+    assert out["attached"] is True and out["total"] == 1
+    assert out["errors"][0]["text"] == "Error: boom" and out["errors"][0]["line"] == 3
+
+
+def test_get_page_errors_says_when_nothing_was_listening(monkeypatch, console_state):
+    import asyncio
+    import json as _json
+
+    _active(monkeypatch, _CdpTab())
+    out = _json.loads(asyncio.run(_tool("get_page_errors")()))
+    assert out["attached"] is False and out["errors"] == [] and "NOT listening" in out["note"]
+
+
+def test_console_clear_empties_the_buffer_in_place(monkeypatch, console_state):
+    """console_get still returned the old messages after console_clear said it cleared."""
+    import asyncio
+    import json as _json
+
+    from mcp_stealth_chrome.server import cdp_runtime
+
+    class _Tab(_CdpTab):
+        async def evaluate(self, _expr, return_by_value=True):
+            return None
+
+    tab = _active(monkeypatch, _Tab())
+
+    def message(kind, value):
+        from types import SimpleNamespace
+
+        return dict(type_=kind, args=[SimpleNamespace(value=value)])
+
+    async def scenario():
+        await _tool("console_start")()
+        buffer = console_state.BrowserState.console_logs
+        await tab.fire(cdp_runtime.ConsoleAPICalled, **message("log", "old"))
+        assert not (await _tool("console_clear")()).startswith("Error:")
+        # The page's own console.clear() event arrives too, and is not a message.
+        await tab.fire(cdp_runtime.ConsoleAPICalled, **message("clear", "console.clear"))
+        assert console_state.BrowserState.console_logs is buffer
+        assert _json.loads(await _tool("console_get")())["total"] == 0
+        # The installed handler still writes to the list people read.
+        await tab.fire(cdp_runtime.ConsoleAPICalled, **message("log", "new"))
+        return _json.loads(await _tool("console_get")())
+
+    out = asyncio.run(scenario())
+    assert [m["text"] for m in out["messages"]] == ["new"]
+
+
+def test_console_start_says_when_runtime_could_not_be_enabled(monkeypatch, console_state):
+    """It answered "started", and console_get then said attached and capturing over an
+    empty list, which reads as a quiet page."""
+    import asyncio
+    import json as _json
+
+    from mcp_stealth_chrome.server import cdp_runtime
+
+    tab = _active(monkeypatch, _CdpTab(fail=("Runtime.enable",)))
+    out = asyncio.run(_tool("console_start")())
+    assert out.startswith("Error:") and "NOT started" in out
+    status = _json.loads(asyncio.run(_tool("console_get")()))
+    assert status["attached"] is False and status["capturing"] is False
+    assert tab.handlers[cdp_runtime.ConsoleAPICalled] == []
+
+
+def test_console_restart_says_when_runtime_could_not_be_enabled(monkeypatch, console_state):
+    import asyncio
+
+    tab = _active(monkeypatch, _CdpTab())
+    asyncio.run(_tool("console_start")())
+    tab.fail = ("Runtime.enable",)
+    out = asyncio.run(_tool("console_start")())
+    assert out.startswith("Error:") and "NOT re-armed" in out
+    assert console_state.BrowserState.capture_console is False
+
+
+def test_network_start_says_when_network_could_not_be_enabled(monkeypatch, console_state):
+    import asyncio
+
+    from nodriver.cdp import network as cdp_network
+
+    tab = _active(monkeypatch, _CdpTab(fail=("Network.enable",)))
+    out = asyncio.run(_tool("network_start")())
+    assert out.startswith("Error:") and "NOT started" in out
+    assert console_state.BrowserState.capture_network is False
+    assert not tab.handlers.get(cdp_network.RequestWillBeSent)
+    assert "T1" not in console_state._NETWORK_ARMED_TAB_IDS
+
+
+# ── AU: emulate_device ──
+
+
+class _VersionTab(_CdpTab):
+    NATIVE = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/156.0.0.0 Safari/537.36"
+
+    async def send(self, command):
+        request = next(command)
+        self.sent.append(request)
+        if request["method"] == "Browser.getVersion":
+            try:
+                command.send({"protocolVersion": "1.3", "product": "Chrome/156.0.1.2",
+                              "revision": "r", "userAgent": self.NATIVE, "jsVersion": "1"})
+            except StopIteration as stop:
+                return stop.value
+        return None
+
+    def overrides(self):
+        return [r["params"] for r in self.sent if r["method"] == "Network.setUserAgentOverride"]
+
+
+def test_device_reset_restores_the_user_agent(monkeypatch):
+    """desktop cleared the metrics only and said "overrides cleared" with Safari's UA active."""
+    import asyncio
+
+    from mcp_stealth_chrome import server
+
+    monkeypatch.setattr(server.BrowserState, "current_fingerprint", {})
+    tab = _active(monkeypatch, _VersionTab())
+    out = asyncio.run(_tool("emulate_device")("desktop"))
+    assert "Emulation.clearDeviceMetricsOverride" in tab.methods()
+    assert tab.overrides()[-1]["userAgent"] == _VersionTab.NATIVE
+    assert tab.overrides()[-1]["userAgentMetadata"]["platform"] == "macOS"
+    assert _VersionTab.NATIVE in out
+
+
+def test_device_reset_returns_to_a_pinned_identity(monkeypatch):
+    import asyncio
+
+    from mcp_stealth_chrome import server
+
+    monkeypatch.setattr(server.BrowserState, "current_fingerprint",
+                        {"user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/140.0.0.0 Safari/537.36"})
+    tab = _active(monkeypatch, _VersionTab())
+    asyncio.run(_tool("emulate_device")("desktop"))
+    assert "Windows" in tab.overrides()[-1]["userAgent"]
+
+
+def test_android_device_sends_hints_that_match_the_device(monkeypatch):
+    import asyncio
+
+    tab = _active(monkeypatch, _VersionTab())
+    asyncio.run(_tool("emulate_device")("pixel-8"))
+    override = tab.overrides()[-1]
+    hints = override["userAgentMetadata"]
+    assert hints["platform"] == "Android" and hints["mobile"] is True
+    assert hints["model"] == "Pixel 8" and hints["platformVersion"] == "14"
+    assert hints["brands"], "brands empty is the defect itself"
+    assert override["platform"] == "Linux armv81"
+
+
+def test_safari_device_says_userAgentData_cannot_match(monkeypatch):
+    import asyncio
+
+    tab = _active(monkeypatch, _VersionTab())
+    out = asyncio.run(_tool("emulate_device")("iphone-15"))
+    assert "userAgentMetadata" not in tab.overrides()[-1]
+    assert tab.overrides()[-1]["platform"] == "iPhone"
+    assert "userAgentData" in out
+
+
+# ── Y: snapshot diff ──
+
+
+def test_snapshot_hash_sees_every_displayed_field():
+    """An icon button going from aria-label Save to Delete read "unchanged; details omitted"."""
+    from mcp_stealth_chrome.snapshot import snapshot_hash
+
+    base = {"tag": "button", "role": "button", "text": "", "ref": "e0", "aria": "Save",
+            "type": "", "name": "", "placeholder": "", "hidden": False}
+    assert snapshot_hash([base]) != snapshot_hash([{**base, "aria": "Delete"}])
+    for key, value in (("type", "submit"), ("name", "n"), ("placeholder", "p"), ("hidden", True)):
+        assert snapshot_hash([base]) != snapshot_hash([{**base, key: value}]), key
+    assert snapshot_hash([base]) == snapshot_hash([{**base, "ref": "e9"}])
+
+
+# ── AN: storage_diff ──
+
+
+def test_storage_diff_tells_cookies_on_different_paths_apart(monkeypatch):
+    """SID at /admin changing, with SID at / unchanged, produced an empty diff."""
+    import asyncio
+    import json as _json
+
+    from mcp_stealth_chrome import server
+
+    def snapshot(admin_value):
+        return {"url": "u", "title": "t", "localStorage": {}, "sessionStorage": {}, "errors": {},
+                "measured": {"url": True, "cookies": True, "localStorage": True, "sessionStorage": True},
+                "cookies": [{"name": "SID", "domain": "x", "path": "/admin", "value": admin_value},
+                            {"name": "SID", "domain": "x", "path": "/", "value": "site"}]}
+
+    async def fake_snapshot(_tab):
+        return snapshot("new")
+
+    monkeypatch.setattr(server, "_take_storage_snapshot", fake_snapshot)
+    _active(monkeypatch, object())
+    monkeypatch.setitem(server._STORAGE_SNAPSHOTS, "paths", snapshot("old"))
+    cookies = _json.loads(asyncio.run(_tool("storage_diff")("paths")))["cookies"]
+    assert cookies["modified"] == [{"name": "SID", "domain": "x", "path": "/admin"}]
+    assert cookies["added"] == [] and cookies["removed"] == []
+
+
+# ── BF and W: smart_fill ──
+
+
+def _smart_fill_page(monkeypatch, *, field_type="input", setter_result=lambda v: v, submit="clicked"):
+    import json as _json
+    import re
+    from types import SimpleNamespace
+
+    from mcp_stealth_chrome import server
+
+    submits, presses = [], []
+
+    class _Tab:
+        async def mouse_click(self, x, y):
+            presses.append((x, y))
+
+        async def send(self, command):
+            request = next(command)
+            wanted = re.search(r"const wanted = (\".*?\");", request["params"]["functionDeclaration"])
+            value = _json.loads(wanted.group(1)) if wanted else None
+            return SimpleNamespace(value=setter_result(value)), None
+
+    async def parts(_tab, _expr, _group):
+        best = {"label": "L", "x": 1, "y": 2, "type": field_type, "score": 1}
+        return {"json": SimpleNamespace(value=_json.dumps({"best": best, "candidates": []})),
+                "el": SimpleNamespace(object_id=server.cdp_runtime.RemoteObjectId("o"))}
+
+    async def release(*_a):
+        return None
+
+    async def click_text(label, exact=False):
+        submits.append(label)
+        return submit
+
+    _active(monkeypatch, _Tab())
+    monkeypatch.setattr(server, "evaluate_parts", parts)
+    monkeypatch.setattr(server, "release_group", release)
+    monkeypatch.setattr(server, "click_text", click_text)
+    return submits, presses
+
+
+def test_smart_fill_reports_a_failed_submit(monkeypatch):
+    """A missing submit button got an ok reply, so a workflow carried on as if submitted."""
+    import asyncio
+
+    submits, _ = _smart_fill_page(monkeypatch, submit="Error: no element with text 'Go'")
+    out = asyncio.run(_tool("smart_fill")({"Name": "x"}, submit_label="Go"))
+    assert out.startswith("Error:") and "no element with text" in out
+    assert submits == ["Go"]
+
+
+def test_smart_fill_does_not_submit_after_a_field_failed(monkeypatch):
+    import asyncio
+
+    submits, _ = _smart_fill_page(monkeypatch, setter_result=lambda _v: "masked")
+    out = asyncio.run(_tool("smart_fill")({"Name": "x"}, submit_label="Go"))
+    assert out.startswith("Error:") and "NOT clicked" in out
+    assert submits == []
+
+
+def test_smart_fill_success_still_submits(monkeypatch):
+    import asyncio
+
+    submits, _ = _smart_fill_page(monkeypatch)
+    out = asyncio.run(_tool("smart_fill")({"Name": "x"}, submit_label="Go"))
+    assert not out.startswith("Error:")
+    assert submits == ["Go"]
+
+
+def test_smart_fill_does_not_click_a_select_open(monkeypatch):
+    import asyncio
+
+    _, presses = _smart_fill_page(monkeypatch, field_type="select")
+    assert not asyncio.run(_tool("smart_fill")({"Country": "x"})).startswith("Error:")
+    assert presses == []
+
+
+# ── CD: solve_captcha ──
+
+
+def test_capsolver_ready_with_no_token_is_an_error(monkeypatch):
+    """It returned "", and the tool then answered ok("token: ")."""
+    import asyncio
+
+    from mcp_stealth_chrome import captcha
+
+    class _Response:
+        status_code = 200
+
+        def __init__(self, data):
+            self.data = data
+
+        def json(self):
+            return self.data
+
+    class _Client:
+        def __init__(self, timeout=None):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_a):
+            return False
+
+        async def post(self, url, json=None):
+            return _Response({"taskId": "t"} if "createTask" in url
+                             else {"status": "ready", "solution": {}})
+
+    real_sleep = asyncio.sleep
+
+    async def no_wait(_seconds):
+        await real_sleep(0)
+
+    monkeypatch.setattr(captcha.httpx, "AsyncClient", _Client)
+    monkeypatch.setattr(captcha.asyncio, "sleep", no_wait)
+    with pytest.raises(captcha.CapSolverError, match="no token"):
+        asyncio.run(captcha.solve("T", "https://x.test", "k", api_key="not-a-key"))
+
+
+@pytest.mark.parametrize("page,up,prefix,shown", [
+    (True, True, "token: TOK", "injected: true"),
+    (False, True, "Error: token: TOK", "injected: false"),
+    (RuntimeError("context lost"), True, "Error: token: TOK", "context lost"),
+    (True, False, "Error: token: TOK", "no browser running"),
+])
+def test_solve_captcha_reports_whether_the_token_reached_the_page(monkeypatch, page, up, prefix, shown):
+    """A missing field or a raising evaluate read as success, so the caller submitted an
+    unsolved form. The token is kept either way: it was paid for."""
+    import asyncio
+
+    from mcp_stealth_chrome import server
+
+    class _Tab:
+        async def evaluate(self, _js, return_by_value=True):
+            if isinstance(page, Exception):
+                raise page
+            return page
+
+    async def solved(**_kwargs):
+        return "TOK"
+
+    monkeypatch.setattr(server, "capsolver_solve", solved)
+    monkeypatch.setattr(server.BrowserState, "is_up", classmethod(lambda cls: up))
+    _active(monkeypatch, _Tab())
+    out = asyncio.run(_tool("solve_captcha")(
+        "turnstile", "https://x.test", "k", inject_selector="#t"))
+    assert out.startswith(prefix) and shown in out, out
+
+
+def test_solve_captcha_without_injection_is_unchanged(monkeypatch):
+    import asyncio
+
+    from mcp_stealth_chrome import server
+
+    async def solved(**_kwargs):
+        return "TOK"
+
+    monkeypatch.setattr(server, "capsolver_solve", solved)
+    assert asyncio.run(_tool("solve_captcha")("turnstile", "https://x.test", "k")) == "token: TOK"

@@ -14,6 +14,7 @@ import pathlib
 import re
 import sys
 import threading
+import time
 
 import pytest
 
@@ -175,6 +176,14 @@ class _Quiet(http.server.SimpleHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            return
+        if self.path.startswith("/slow"):
+            time.sleep(1.5)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"ok")
             return
         super().do_GET()
 
@@ -733,3 +742,286 @@ def test_close_all_really_ends_stored_browsers(loop, tmp_path):
     loop.run_until_complete(asyncio.sleep(0.5))
     left = subprocess.run(["pgrep", "-f", f"user-data-dir={tmp_path}/p"], capture_output=True, text=True)
     assert not left.stdout.strip()
+
+
+# ── High-severity findings, on real Chrome ────────────────────────────────
+
+
+@E2E
+def test_a_password_value_stays_out_of_every_report(loop, browser, base_url):
+    browser()
+    run(loop, "navigate", f"{base_url}/keys.html")
+    run(loop, "evaluate", """(() => {
+        const p = document.createElement('input'); p.type = 'password'; p.id = 'pw';
+        p.setAttribute('aria-label', 'Password'); p.value = 'HUNTER2SECRET';
+        document.getElementById('search').appendChild(p); })()""")
+    for name, kwargs in (("browser_snapshot", {"diff_from_last": False}),
+                         ("browser_snapshot", {"mode": "fast", "diff_from_last": False}),
+                         ("describe_page", {}), ("form_introspect", {})):
+        out = str(run(loop, name, **kwargs))
+        assert "HUNTER2SECRET" not in out, name
+    assert "HUNTER2SECRET" not in run(loop, "paste_text", "HUNTER2SECRET", selector="#pw")
+    assert "Password" in str(run(loop, "browser_snapshot", diff_from_last=False))
+
+
+@E2E
+def test_click_role_with_a_name_never_clicks_the_wrong_one(loop, browser, base_url):
+    """It used to fall back to the first element of that role."""
+    browser()
+    run(loop, "navigate", f"{base_url}/keys.html")
+    run(loop, "evaluate", """(() => {
+        for (const label of ['Delete', 'Save']) {
+          const b = document.createElement('div'); b.setAttribute('role', 'button');
+          b.textContent = label; b.onclick = () => { document.title = label; };
+          document.body.appendChild(b);
+        } })()""")
+    assert "clicked" in run(loop, "click_role", "button", "Save")
+    assert run(loop, "evaluate", "document.title") == "Save"
+    run(loop, "evaluate", "document.title = 'untouched'")
+    out = run(loop, "click_role", "button", "NoSuchThing")
+    assert out.startswith("Error:")
+    assert run(loop, "evaluate", "document.title") == "untouched"
+
+
+@E2E
+def test_bad_url_on_a_running_browser_keeps_it_open(loop, browser, base_url):
+    """browser_launch(url) on a live browser with a bad URL used to end it and every tab."""
+    from mcp_stealth_chrome.server import BrowserState
+
+    browser()
+    run(loop, "navigate", f"{base_url}/keys.html")
+    same_browser = BrowserState.browser
+    run(loop, "browser_launch", headless=True, persistent=False, url="not-a-valid-url://x")
+    assert BrowserState.browser is same_browser, "the browser was ended over a bad URL"
+    assert run(loop, "evaluate", "1+1") == "2"
+
+
+@E2E
+def test_fresh_launch_reports_the_page_it_actually_reached(loop, base_url):
+    """A redirect read as "Loaded <what you asked for>", and expect_* was never checked."""
+    redirect = "data:text/html,<script>location.replace('" + base_url + "/keys.html')</script>"
+    out = run(loop, "browser_launch", headless=True, persistent=False, url=redirect)
+    try:
+        assert "Browser launched" in out and "keys.html" in out, out
+    finally:
+        run(loop, "browser_close")
+    refused = run(loop, "browser_launch", headless=True, persistent=False,
+                  url=f"{base_url}/keys.html", expect_url="https://elsewhere.test/*")
+    try:
+        assert refused.startswith("Error:") and "postcondition failed" in refused, refused
+    finally:
+        run(loop, "browser_close")
+
+
+# ── Medium-severity findings, on real Chrome ──────────────────────────────
+
+
+@E2E
+def test_smart_fill_sets_a_select_by_value_or_visible_text(loop, browser, base_url):
+    """The HTMLInputElement value setter throws on a <select>, so one could never be filled."""
+    browser()
+    run(loop, "navigate", f"{base_url}/keys.html")
+    run(loop, "evaluate", """(() => {
+        const s = document.createElement('select');
+        s.setAttribute('aria-label', 'Country');
+        s.innerHTML = '<option value="">-</option><option value="fr">France</option><option value="de">Germany</option>';
+        window.changes = 0; s.addEventListener('change', () => window.changes++);
+        document.getElementById('search').appendChild(s); })()""")
+    out = run(loop, "smart_fill", {"Country": "fr"})
+    assert not out.startswith("Error:"), out
+    assert run(loop, "evaluate", "document.querySelector('select').value") == "fr"
+    out = run(loop, "smart_fill", {"Country": "Germany"})
+    assert not out.startswith("Error:"), out
+    assert run(loop, "evaluate", "document.querySelector('select').value") == "de"
+    assert run(loop, "evaluate", "window.changes") == "2"
+    out = run(loop, "smart_fill", {"Country": "Atlantis"})
+    assert out.startswith("Error:")
+    assert run(loop, "evaluate", "document.querySelector('select').value") == "de"
+
+
+@E2E
+def test_region_screenshot_of_a_scrolled_page_is_the_right_strip(loop, browser, base_url, tmp_path, monkeypatch):
+    """Viewport numbers used as page coordinates captured some other strip of the page."""
+    import cv2
+    import numpy as np
+
+    from mcp_stealth_chrome import server
+
+    monkeypatch.setattr(server, "SCREENSHOT_DIR", tmp_path)
+    browser()
+    run(loop, "navigate", f"{base_url}/keys.html")
+    run(loop, "evaluate", """(() => {
+        document.body.innerHTML = '<div style="height:900px;background:rgb(255,0,0)"></div>'
+          + '<div id="band" style="height:120px;background:rgb(0,255,0)"></div>'
+          + '<div style="height:2000px;background:rgb(0,0,255)"></div>';
+        document.body.style.margin = 0;
+        window.scrollTo(0, 800); })()""")
+    for name, kwargs in (("sel.png", {"region_selector": "#band"}),
+                         ("reg.png", {"region": {"x": 0, "y": 100, "width": 200, "height": 120}})):
+        out = run(loop, "screenshot", filename=name, **kwargs)
+        assert not str(out).startswith("Error:"), out
+        image = cv2.imread(str(tmp_path / name))
+        blue, green, red = image[image.shape[0] // 2, image.shape[1] // 2]
+        assert green > 200 and red < 50 and blue < 50, (name, blue, green, red)
+        assert np.mean(image[:, :, 1]) > 200, name
+
+
+@E2E
+def test_console_clear_and_page_errors_on_a_real_page(loop, browser, base_url):
+    browser()
+    run(loop, "navigate", f"{base_url}/keys.html")
+    assert json.loads(run(loop, "get_page_errors"))["attached"] is False
+    run(loop, "console_start")
+    run(loop, "evaluate", "console.log('old'); setTimeout(() => { throw new Error('boom-e2e'); }, 0); 1")
+    loop.run_until_complete(asyncio.sleep(0.4))
+    errors = json.loads(run(loop, "get_page_errors"))
+    assert errors["attached"] is True and "boom-e2e" in errors["errors"][0]["text"]
+    assert json.loads(run(loop, "console_get"))["total"] >= 2
+    assert run(loop, "console_clear") == "console cleared"
+    loop.run_until_complete(asyncio.sleep(0.3))
+    assert json.loads(run(loop, "console_get"))["total"] == 0, "console.clear() left a message behind"
+    run(loop, "evaluate", "console.log('new'); 1")
+    loop.run_until_complete(asyncio.sleep(0.3))
+    assert [m["text"] for m in json.loads(run(loop, "console_get"))["messages"]] == ["new"]
+
+
+@E2E
+def test_device_emulation_and_its_reset_on_a_real_page(loop, browser, base_url):
+    """desktop left Safari's UA active, and overrides left userAgentData.brands empty."""
+    browser()
+    run(loop, "navigate", f"{base_url}/keys.html")
+    native = identity(loop)
+    assert native["brands"]
+
+    run(loop, "emulate_device", "pixel-8")
+    run(loop, "reload")
+    phone = identity(loop)
+    assert "Pixel 8" in phone["ua"] and phone["hintPlatform"] == "Android"
+    assert phone["brands"], "brands empty is what no real Chrome reports"
+    assert phone["platform"] == "Linux armv81"
+
+    assert "reset to desktop" in run(loop, "emulate_device", "desktop")
+    run(loop, "reload")
+    back = identity(loop)
+    assert "Pixel" not in back["ua"] and "Mobile" not in back["ua"]
+    assert back["hintPlatform"] == native["hintPlatform"] and back["platform"] == native["platform"]
+    assert back["brands"], "reset left brands empty"
+    assert back["ua"] == strip_headless(native["ua"])
+    assert run(loop, "evaluate", "matchMedia('(pointer: coarse)').matches || innerWidth < 500") == "False"
+
+
+@E2E
+def test_wait_for_network_idle_sees_an_image_still_loading(loop, browser, base_url):
+    """The old page-side tracker only saw fetch and XHR, and left a global behind."""
+    browser()
+    run(loop, "navigate", f"{base_url}/keys.html")
+    run(loop, "evaluate", "setTimeout(() => { new Image().src = '/slow?img=' + Date.now(); }, 100); 1")
+    started = time.monotonic()
+    out = run(loop, "wait_for_network_idle", idle_ms=400, timeout=8)
+    assert not out.startswith("Error:"), out
+    assert time.monotonic() - started >= 1.5, f"idle with the image in flight: {out}"
+    assert run(loop, "evaluate", "typeof window.__mcp_netidle") == "undefined"
+    assert "native code" in run(loop, "evaluate", "window.fetch.toString()")
+
+
+@E2E
+def test_click_and_wait_network_idle_and_request_against_real_events(loop, browser, base_url):
+    browser()
+    run(loop, "navigate", f"{base_url}/keys.html")
+    run(loop, "evaluate", """(() => {
+        document.getElementById('next').onclick = () => { fetch('/slow?click=' + Date.now()); };
+        })()""")
+    started = time.monotonic()
+    out = run(loop, "click_and_wait", selector="#next", expect="network_idle", timeout=8)
+    assert not out.startswith("Error:"), out
+    assert time.monotonic() - started >= 1.5, f"idle with the fetch in flight: {out}"
+    assert json.loads(out)["observed"]["what"] == "network_idle"
+
+    out = run(loop, "click_and_wait", selector="#next", expect="request",
+              expect_request_pattern="/slow", timeout=8)
+    assert not out.startswith("Error:"), out
+    assert "/slow" in json.loads(out)["observed"]["evidence"]
+
+
+@E2E
+def test_closing_the_last_tab_then_browser_close_really_ends_chrome(loop, tmp_path):
+    """close said "not running" and left Chrome running with the profile held."""
+    from mcp_stealth_chrome.server import BrowserState
+
+    run(loop, "browser_launch", headless=True, persistent=False)
+    pid = getattr(BrowserState.browser, "_process_pid", None)
+    assert pid
+    run(loop, "tab_close")
+    out = run(loop, "browser_close")
+    assert "not running" not in out and not out.startswith("Error:"), out
+    assert BrowserState.browser is None
+    loop.run_until_complete(asyncio.sleep(0.5))
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+
+
+@E2E
+def test_interception_restart_on_a_real_page_answers_once(loop, browser, base_url):
+    """A doubled continueRequest fails on the second call, and logs and counts doubled."""
+    browser()
+    run(loop, "navigate", f"{base_url}/keys.html")
+    run(loop, "intercept_start", url_pattern="*headers*", auto_disable_after=0)
+    run(loop, "intercept_stop")
+    run(loop, "intercept_start", url_pattern="*headers*", auto_disable_after=0)
+    body = run(loop, "evaluate", "fetch('/headers').then(r => r.status)", await_promise=True)
+    assert body == "200"
+    log = json.loads(run(loop, "intercept_log"))
+    run(loop, "intercept_stop")
+    assert log["counts"]["seen"] == 1 and log["counts"]["passed"] == 1
+    assert len(log["requests"]) == 1
+
+
+@E2E
+def test_interception_deadline_fires_on_a_real_browser(loop, browser, base_url):
+    browser()
+    run(loop, "navigate", f"{base_url}/keys.html")
+    run(loop, "intercept_start", url_pattern="*headers*", auto_disable_after=0.2)
+    loop.run_until_complete(asyncio.sleep(0.6))
+    log = json.loads(run(loop, "intercept_log"))
+    assert log["active"] is False and log["stop_reason"] == "auto-disabled on deadline"
+    assert run(loop, "evaluate", "fetch('/headers').then(r => r.status)", await_promise=True) == "200"
+
+
+@E2E
+def test_humanized_click_never_lands_on_a_partial_overlay(loop, browser, base_url):
+    """The centre passed the hit test, then a random point in the box was pressed."""
+    browser()
+    run(loop, "navigate", f"{base_url}/keys.html")
+    run(loop, "evaluate", """(() => {
+        document.body.innerHTML =
+          '<button id="b" style="position:absolute;left:100px;top:100px;width:200px;height:60px">go</button>'
+          + '<div id="o" style="position:absolute;left:210px;top:90px;width:120px;height:80px;background:#000"></div>';
+        window.hits = {b: 0, o: 0};
+        document.getElementById('b').onclick = () => window.hits.b++;
+        document.getElementById('o').onclick = () => window.hits.o++; })()""")
+    for _ in range(6):
+        out = run(loop, "click", selector="#b", humanize=True, verify=False)
+        assert "clicked" in out, out
+    hits = json.loads(run(loop, "evaluate", "JSON.stringify(window.hits)"))
+    assert hits == {"b": 6, "o": 0}
+
+
+@E2E
+def test_samesite_round_trip_through_a_real_cookie_jar(loop, browser, base_url, tmp_path, monkeypatch):
+    from nodriver.cdp import network as cdp_network
+
+    from mcp_stealth_chrome import server
+
+    monkeypatch.setattr(server, "STORAGE_STATE_DIR", tmp_path)
+    browser()
+    run(loop, "navigate", f"{base_url}/keys.html")
+    tab = server.BrowserState.active_tab()
+    loop.run_until_complete(tab.send(cdp_network.set_cookie(
+        name="rt", value="v", domain="localhost", path="/", secure=True,
+        same_site=cdp_network.CookieSameSite.NONE)))
+    assert not run(loop, "cookie_export", "rt.json").startswith("Error:")
+    saved = {c["name"]: c for c in json.loads((tmp_path / "rt.json").read_text())}
+    assert saved["rt"]["sameSite"] == "None"
+    assert not run(loop, "cookie_import", file_path=str(tmp_path / "rt.json"), clear_first=True).startswith("Error:")
+    jar = loop.run_until_complete(tab.send(cdp_network.get_cookies()))
+    assert {c.name: c.same_site for c in jar}["rt"] == cdp_network.CookieSameSite.NONE

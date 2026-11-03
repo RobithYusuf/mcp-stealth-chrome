@@ -203,6 +203,7 @@ def _record(run: _Run, entry: dict) -> None:
 
 def _fail(run: _Run, path: list[int], step: Any, error: str) -> None:
     """Record a failure. Stops the run only under stop_on_error."""
+    _note_failure(run, error)
     _record(run, {"index": path[0] if len(path) == 1 else _dotted(path),
                   "tool": step.get("tool") if isinstance(step, dict) else None,
                   "ok": False, "error": error})
@@ -229,15 +230,12 @@ async def _run_tool(run: _Run, step: dict, path: list[int]) -> None:
         if not isinstance(args, dict):
             raise WorkflowError(f"args must be a dict, got {type(args).__name__}")
     except WorkflowError as exc:
-        _note_failure(run, str(exc))
         _fail(run, path, step, str(exc))
         return
     try:
         text = str(await run.dispatch(tool, args))
     except Exception as exc:
-        message = str(exc) or type(exc).__name__
-        _note_failure(run, message)
-        _fail(run, path, step, message)
+        _fail(run, path, step, str(exc) or type(exc).__name__)
         return
     failed = text.startswith("Error:")
     value = step_value(text)
@@ -354,6 +352,9 @@ async def run_workflow(
         result["failed_paths"] = run.failed_paths[:100]
     # `last` is included: resuming into a step or condition that reads it needs it.
     public_vars = dict(run.variables)
+    if run.failure is None:
+        # Only a resume needs it, and a resume only follows a failure.
+        public_vars.pop(BRANCHES_VAR, None)
     if public_vars:
         result["vars"] = public_vars
     if run.failure is not None:

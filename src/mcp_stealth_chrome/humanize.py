@@ -97,14 +97,22 @@ async def move_pointer(tab: Tab, x: float, y: float) -> None:
 async def humanized_click(
     tab: Tab, element: Element,
     last_pos_ref: Optional[dict] = None,
+    point: Optional[Tuple[float, float]] = None,
 ) -> None:
-    """Click element with Bezier approach from last-known cursor position."""
-    pos = await element.get_position()
-    if pos is None:
-        raise RuntimeError("element has no on-screen position to move the mouse to")
-    # Random spot inside element (not dead center — that's a bot tell)
-    target_x = pos.left + pos.width * random.uniform(0.3, 0.7)
-    target_y = pos.top + pos.height * random.uniform(0.3, 0.7)
+    """Click element with Bezier approach from last-known cursor position.
+
+    point: where to press, when the caller has already hit-tested a spot. A freshly
+    sampled one has passed no test and can land on an overlay covering part of the element.
+    """
+    if point is not None:
+        target_x, target_y = point
+    else:
+        pos = await element.get_position()
+        if pos is None:
+            raise RuntimeError("element has no on-screen position to move the mouse to")
+        # Random spot inside element (not dead center — that's a bot tell)
+        target_x = pos.left + pos.width * random.uniform(0.3, 0.7)
+        target_y = pos.top + pos.height * random.uniform(0.3, 0.7)
 
     # Start from last-known cursor position if available, else random nearby
     if last_pos_ref and last_pos_ref.get("x") is not None:

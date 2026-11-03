@@ -596,7 +596,7 @@ Limits to know about:
 | `emulate_network` | Preset throttles (offline / slow-3g / 3g / slow-4g / 4g / wifi) + custom |
 | `emulate_cpu` | 1–6× CPU throttle (4× = DevTools default, 6× = low-end mobile) |
 | `emulate_device` | Device presets: iphone-15, iphone-se, pixel-8, galaxy-s23, ipad, desktop |
-| `wait_for_network_idle` | SPA-safe load detection — waits for N ms of no fetch/XHR activity |
+| `wait_for_network_idle` | SPA-safe load detection — waits for N ms with no request in flight, counted from CDP events (every type, images included) |
 | `console_clear` | Reset captured console buffer |
 
 ### ⚡ Performance optimizations
