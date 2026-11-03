@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="https://raw.githubusercontent.com/RobithYusuf/mcp-stealth-chrome/main/docs/images/icon.png" alt="MCP Stealth Chrome icon" width="140">
+
 # MCP Stealth Chrome
 
 An MCP server with 172 tools that gives an AI agent a real Chrome browser and an HTTP client with Chrome's TLS fingerprint.
@@ -392,31 +394,126 @@ Results describe what was observed. A tool that reports success when nothing hap
 
 ## Tools
 
-| Group | Tools |
-|-------|-------|
-| Browser and instances | `browser_launch`, `browser_close`, `browser_recover`, `spawn_browser`, `switch_instance`, `list_instances`, `instance_describe`, `instance_release`, `close_instance`, `close_all_instances`, `attach_to_chrome`, `detach`, `list_external_chrome`, `server_status` |
-| Profiles | `list_chrome_profiles`, `clone_chrome_profile`, `profile_report`, `profile_cleanup` |
-| Navigation and tabs | `navigate`, `navigate_and_snapshot`, `go_back`, `go_forward`, `reload`, `get_url`, `tab_list`, `tab_new`, `tab_select`, `tab_close`, `tab_focus` |
-| Reading the page | `browser_snapshot`, `accessibility_snapshot`, `describe_page`, `form_introspect`, `get_text`, `get_html`, `get_attribute`, `get_links`, `inspect_element`, `query_selector_all`, `search_page`, `extract_table`, `extract_structured`, `detect_content_pattern`, `scrape_page`, `list_frames`, `frame_evaluate` |
-| Clicking and forms | `click`, `click_text`, `click_role`, `click_and_wait`, `click_element_offset`, `click_at_corner`, `click_at_image`, `hover`, `fill`, `fill_form`, `smart_fill`, `paste_text`, `type_text`, `press_key`, `select_option`, `check`, `uncheck`, `upload_file`, `drag_and_drop`, `dialog_handle`, `dialog_auto_handle`, `scroll`, `scroll_to` |
-| Several steps at once | `batch_actions`, `workflow_run` |
-| Mouse and behaviour | `mouse_click_xy`, `mouse_move`, `mouse_drift`, `mouse_record`, `mouse_replay`, `humanize_click`, `humanize_type`, `find_by_image` |
-| Waiting and checks | `wait_for`, `wait_for_change`, `wait_for_function`, `wait_for_navigation`, `wait_for_network_idle`, `wait_for_request`, `wait_for_response`, `wait_for_url`, `assert_clickable`, `assert_element_visible`, `assert_text_present`, `assert_url_matches` |
-| Handing over to a person | `request_human_help`, `wait_for_human` |
-| Images and files | `screenshot`, `screenshot_element`, `inspect_image`, `save_pdf`, `get_viewport_size`, `set_viewport_size` |
-| JavaScript | `evaluate`, `inject_init_script` |
-| Network capture | `network_start`, `network_get`, `auth_capture`, `export_curl`, `export_har` |
-| Request interception | `intercept_start`, `intercept_log`, `intercept_stop`, `dry_run` |
-| HTTP without a browser | `http_request`, `http_request_status`, `http_request_cancel`, `http_request_retry`, `http_request_with_session`, `http_session_cookies`, `session_warmup` |
-| Search and research | `web_search`, `scrape_markdown`, `smart_fetch`, `deep_research`, `social_research`, `social_digest`, `github_read`, `youtube_read` |
-| Cookies and storage | `cookie_list`, `cookie_set`, `cookie_delete`, `cookie_import`, `cookie_export`, `localstorage_get`, `localstorage_set`, `localstorage_clear`, `sessionstorage_get`, `sessionstorage_set`, `sessionstorage_clear`, `cache_clear`, `indexeddb_list`, `indexeddb_delete`, `storage_state_save`, `storage_state_load`, `storage_snapshot`, `storage_diff` |
-| Anti-bot and identity | `detect_anti_bot`, `detect_and_bypass`, `click_turnstile`, `verify_cf`, `solve_captcha`, `solve_recaptcha_ai`, `fingerprint_audit`, `fingerprint_rotate`, `identity_pin`, `identity_show` |
-| Vision | `vision_locate`, `vision_describe`, `vision_ocr`, `vision_check` |
-| DevTools | `console_start`, `console_get`, `console_clear`, `get_page_errors`, `performance_trace_start`, `performance_trace_stop`, `performance_metrics`, `performance_timeline`, `web_vitals`, `coverage_start`, `coverage_stop`, `memory_heap_snapshot`, `emulate_network`, `emulate_cpu`, `emulate_device` |
+Open a group to see its tools.
+
+<details>
+<summary><b>Browser and instances</b> (14)</summary>
+
+`browser_launch`, `browser_close`, `browser_recover`, `spawn_browser`, `switch_instance`, `list_instances`, `instance_describe`, `instance_release`, `close_instance`, `close_all_instances`, `attach_to_chrome`, `detach`, `list_external_chrome`, `server_status`
+</details>
+
+<details>
+<summary><b>Profiles</b> (4)</summary>
+
+`list_chrome_profiles`, `clone_chrome_profile`, `profile_report`, `profile_cleanup`
+</details>
+
+<details>
+<summary><b>Navigation and tabs</b> (11)</summary>
+
+`navigate`, `navigate_and_snapshot`, `go_back`, `go_forward`, `reload`, `get_url`, `tab_list`, `tab_new`, `tab_select`, `tab_close`, `tab_focus`
+</details>
+
+<details>
+<summary><b>Reading the page</b> (17)</summary>
+
+`browser_snapshot`, `accessibility_snapshot`, `describe_page`, `form_introspect`, `get_text`, `get_html`, `get_attribute`, `get_links`, `inspect_element`, `query_selector_all`, `search_page`, `extract_table`, `extract_structured`, `detect_content_pattern`, `scrape_page`, `list_frames`, `frame_evaluate`
+</details>
+
+<details>
+<summary><b>Clicking and forms</b> (23)</summary>
+
+`click`, `click_text`, `click_role`, `click_and_wait`, `click_element_offset`, `click_at_corner`, `click_at_image`, `hover`, `fill`, `fill_form`, `smart_fill`, `paste_text`, `type_text`, `press_key`, `select_option`, `check`, `uncheck`, `upload_file`, `drag_and_drop`, `dialog_handle`, `dialog_auto_handle`, `scroll`, `scroll_to`
+</details>
+
+<details>
+<summary><b>Several steps at once</b> (2)</summary>
+
+`batch_actions`, `workflow_run`
+</details>
+
+<details>
+<summary><b>Mouse and behaviour</b> (8)</summary>
+
+`mouse_click_xy`, `mouse_move`, `mouse_drift`, `mouse_record`, `mouse_replay`, `humanize_click`, `humanize_type`, `find_by_image`
+</details>
+
+<details>
+<summary><b>Waiting and checks</b> (12)</summary>
+
+`wait_for`, `wait_for_change`, `wait_for_function`, `wait_for_navigation`, `wait_for_network_idle`, `wait_for_request`, `wait_for_response`, `wait_for_url`, `assert_clickable`, `assert_element_visible`, `assert_text_present`, `assert_url_matches`
+</details>
+
+<details>
+<summary><b>Handing over to a person</b> (2)</summary>
+
+`request_human_help`, `wait_for_human`
+</details>
+
+<details>
+<summary><b>Images and files</b> (6)</summary>
+
+`screenshot`, `screenshot_element`, `inspect_image`, `save_pdf`, `get_viewport_size`, `set_viewport_size`
+</details>
+
+<details>
+<summary><b>JavaScript</b> (2)</summary>
+
+`evaluate`, `inject_init_script`
+</details>
+
+<details>
+<summary><b>Network capture</b> (5)</summary>
+
+`network_start`, `network_get`, `auth_capture`, `export_curl`, `export_har`
+</details>
+
+<details>
+<summary><b>Request interception</b> (4)</summary>
+
+`intercept_start`, `intercept_log`, `intercept_stop`, `dry_run`
+</details>
+
+<details>
+<summary><b>HTTP without a browser</b> (7)</summary>
+
+`http_request`, `http_request_status`, `http_request_cancel`, `http_request_retry`, `http_request_with_session`, `http_session_cookies`, `session_warmup`
+</details>
+
+<details>
+<summary><b>Search and research</b> (8)</summary>
+
+`web_search`, `scrape_markdown`, `smart_fetch`, `deep_research`, `social_research`, `social_digest`, `github_read`, `youtube_read`
+</details>
+
+<details>
+<summary><b>Cookies and storage</b> (18)</summary>
+
+`cookie_list`, `cookie_set`, `cookie_delete`, `cookie_import`, `cookie_export`, `localstorage_get`, `localstorage_set`, `localstorage_clear`, `sessionstorage_get`, `sessionstorage_set`, `sessionstorage_clear`, `cache_clear`, `indexeddb_list`, `indexeddb_delete`, `storage_state_save`, `storage_state_load`, `storage_snapshot`, `storage_diff`
+</details>
+
+<details>
+<summary><b>Anti-bot and identity</b> (10)</summary>
+
+`detect_anti_bot`, `detect_and_bypass`, `click_turnstile`, `verify_cf`, `solve_captcha`, `solve_recaptcha_ai`, `fingerprint_audit`, `fingerprint_rotate`, `identity_pin`, `identity_show`
+</details>
+
+<details>
+<summary><b>Vision</b> (4)</summary>
+
+`vision_locate`, `vision_describe`, `vision_ocr`, `vision_check`
+</details>
+
+<details>
+<summary><b>DevTools</b> (15)</summary>
+
+`console_start`, `console_get`, `console_clear`, `get_page_errors`, `performance_trace_start`, `performance_trace_stop`, `performance_metrics`, `performance_timeline`, `web_vitals`, `coverage_start`, `coverage_stop`, `memory_heap_snapshot`, `emulate_network`, `emulate_cpu`, `emulate_device`
+</details>
 
 ## Main features
 
-### Tools for agents
+<details>
+<summary><b>Tools for agents</b></summary>
 
 These keep token use down and remove guesswork when an agent drives a page.
 
@@ -429,8 +526,10 @@ These keep token use down and remove guesswork when an agent drives a page.
 | `click_and_wait` | Clicks and waits for one outcome: navigation, URL, text, selector, request or network idle |
 | `workflow_run` | Many steps in one call, with `foreach`, `if`, `save_as` and `${var}`. No code runs on the server, and `start_at="3.2.1"` resumes from a nested step |
 | `storage_snapshot`, `storage_diff` | Compare cookies, storage and URL before and after an action |
+</details>
 
-### Search and research
+<details>
+<summary><b>Search and research</b></summary>
 
 These run without a browser and without a search API key, and use the stealth browser only when a page looks blocked or empty.
 
@@ -442,26 +541,36 @@ These run without a browser and without a search API key, and use the stealth br
 | `deep_research` | Searches, fetches the top sources and returns markdown with citations |
 | `social_research` | Who sells or makes something and how much attention it gets, across Reddit, Threads, Facebook and X. `cookie_files` re-imports your sessions on each call, which login-walled platforms need |
 | `social_digest`, `github_read`, `youtube_read` | A Reddit community digest, GitHub repos and issues through the API, and YouTube metadata with transcripts |
+</details>
 
-### HTTP with a browser fingerprint
+<details>
+<summary><b>HTTP with a browser fingerprint</b></summary>
 
 `http_request` presents the TLS handshake of Chrome, Firefox or Safari. Slow calls return a request ID, which you follow with `http_request_status` or stop with `http_request_cancel`. `http_request_retry` replays a request only when you ask, and connection, read and unknown failures stay distinct. `http_request_with_session` reuses browser cookies and a bearer token seen earlier on the same origin. `session_warmup` browses naturally before reaching a target.
+</details>
 
-### Network capture and interception
+<details>
+<summary><b>Network capture and interception</b></summary>
 
 `network_start` and `network_get` capture requests with headers and, on demand, response bodies. `export_curl` turns a captured request into a `curl` command and an `http_request` call. Prefer the second, because plain curl sends curl's own TLS fingerprint. `export_har` writes the capture to a HAR file.
 
 `intercept_start` pauses matching requests at the CDP layer to observe, cancel or mock them, including XHR and anything a page captured before your script ran. It turns itself off after a deadline, so a forgotten intercept cannot hang the page. `dry_run` is the preset for exploring a logged-in account: it blocks POST, PUT, PATCH and DELETE and records what each would have sent, while reads keep working.
+</details>
 
-### Anti-bot
+<details>
+<summary><b>Anti-bot</b></summary>
 
 `detect_anti_bot` identifies Cloudflare, DataDome, PerimeterX, Akamai, Kasada and Imperva on the current page. `detect_and_bypass` also applies the best approach this server has. `click_turnstile` and `verify_cf` click a Turnstile checkbox, with template matching as a fallback. `fingerprint_audit` checks this browser's own fingerprint for inconsistencies, and states what it cannot see from inside a page, such as TLS or IP against timezone. `identity_pin` keeps a stable identity and proxy per instance. `mouse_drift`, `mouse_record`, `mouse_replay`, `humanize_click` and `humanize_type` add natural movement.
+</details>
 
-### DevTools
+<details>
+<summary><b>DevTools</b></summary>
 
 `performance_timeline` and `web_vitals` give load timing and Core Web Vitals without a trace. `performance_trace_start` saves a trace you can open in DevTools, and `coverage_start` shows unused JS and CSS. `memory_heap_snapshot` saves a V8 heap snapshot. `emulate_network`, `emulate_cpu` and `emulate_device` throttle and emulate, and `wait_for_network_idle` waits until no request is in flight.
+</details>
 
-### Speed, memory and disk
+<details>
+<summary><b>Speed, memory and disk</b></summary>
 
 | Option | Effect |
 |--------|--------|
@@ -472,6 +581,7 @@ These run without a browser and without a search API key, and use the stealth br
 | `browser_launch(profile_mode="light")` | No images or background Chrome services, for ordinary pages. Keep the default on protected sites |
 | `browser_launch(testing_mode=True)` | Faster regression runs, with less stealth |
 | `profile_report`, `profile_cleanup` | Size and use of every profile, and cleanup of caches. Cleanup previews unless `confirm=True`, and refuses main and named profiles and anything in use |
+</details>
 
 ## API keys
 
