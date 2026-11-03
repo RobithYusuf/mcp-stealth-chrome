@@ -761,7 +761,8 @@ def test_export_curl_uses_chrome_url_cookie_rules(monkeypatch):
     }
     try:
         export = server.mcp._tool_manager._tools["export_curl"].fn
-        out = json.loads(asyncio.run(export(request_id="1")))
+        out = json.loads(asyncio.run(export(request_id="1", reveal_values=True)))
+        hidden = asyncio.run(export(request_id="1"))
     finally:
         server.BrowserState.network_index = previous
 
@@ -769,6 +770,7 @@ def test_export_curl_uses_chrome_url_cookie_rules(monkeypatch):
     assert tab.command["params"]["urls"] == ["https://notexample.com/account"]
     assert out["cookie_status"] == "live_url_jar"
     assert "Cookie: sid=secret" in out["curl"]
+    assert "secret" not in hidden and "values_hidden" in json.loads(hidden)
 
 
 def test_cookie_domain_filter_never_sends_child_cookie_to_parent():
@@ -3093,3 +3095,190 @@ def test_solve_captcha_without_injection_is_unchanged(monkeypatch):
 
     monkeypatch.setattr(server, "capsolver_solve", solved)
     assert asyncio.run(_tool("solve_captcha")("turnstile", "https://x.test", "k")) == "token: TOK"
+
+
+class _SlowConfig:
+    def __init__(self, path):
+        self.user_data_dir = str(path)
+        self.host = None
+        self.port = None
+
+
+class _FailedBrowser:
+    """What nodriver leaves registered after Chrome spawned and the port never answered."""
+
+    _process = object()
+    _process_pid = 4242
+
+    def __init__(self, config):
+        self.config = config
+
+    def stop(self):
+        pass
+
+
+def _nodriver_start(monkeypatch, tmp_path, outcomes):
+    """A nodriver.start that treats a set host and port as nodriver does."""
+    from mcp_stealth_chrome import server, state
+
+    spawned, signalled = [], []
+    registered = set()
+    # nodriver walks its real registry at exit, which must not meet a stand-in.
+    monkeypatch.setattr(server.nodriver.core.util, "get_registered_instances", lambda: registered)
+
+    async def fake_start(config=None):
+        if config.host is None or config.port is None:
+            config.host, config.port = "127.0.0.1", 50000 + len(spawned)
+            spawned.append(config.port)
+            registered.add(_FailedBrowser(config))
+        outcome = outcomes[min(len(spawned) - 1, len(outcomes) - 1)]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    def fake_kill(pid, sig):
+        if sig:
+            signalled.append(pid)
+
+    monkeypatch.setattr(server.nodriver, "start", fake_start)
+    monkeypatch.setattr(server.os, "kill", fake_kill)
+    monkeypatch.setattr(server.asyncio, "sleep", _no_sleep)
+    monkeypatch.setattr(state, "find_chrome_pids_by_profile", lambda _p: [7777])
+    monkeypatch.setattr(server, "_pid_recycled", lambda _pid, _browser: False)
+    monkeypatch.setattr(server, "_descendant_pids", lambda _pid: [])
+    return spawned, signalled
+
+
+async def _no_sleep(_seconds=0):
+    return None
+
+
+def test_slow_chrome_is_ended_and_really_started_again(tmp_path, monkeypatch):
+    """A retry keeping nodriver's port spawns nothing, so it counts spawns, not calls."""
+    import asyncio
+
+    from mcp_stealth_chrome import server
+
+    spawned, signalled = _nodriver_start(
+        monkeypatch, tmp_path, [Exception("Failed to connect to browser"), "browser"],
+    )
+    assert asyncio.run(server._start_chrome(_SlowConfig(tmp_path))) == "browser"
+    assert len(spawned) == 2
+    assert 4242 in signalled
+
+
+def test_failed_start_never_signals_whoever_holds_the_profile(tmp_path, monkeypatch):
+    """A Chrome that hands over to the holder exits; a profile scan would hit the holder."""
+    import asyncio
+
+    from mcp_stealth_chrome import server
+
+    _spawned, signalled = _nodriver_start(
+        monkeypatch, tmp_path, [Exception("Failed to connect to browser")],
+    )
+    with pytest.raises(Exception, match="Failed to connect") as caught:
+        asyncio.run(server._start_chrome(_SlowConfig(tmp_path)))
+    assert 7777 not in signalled
+    assert "killed" in caught.value.reap_report
+
+
+def test_failed_start_only_retries_a_slow_chrome(tmp_path, monkeypatch):
+    import asyncio
+
+    from mcp_stealth_chrome import server
+
+    spawned, _signalled = _nodriver_start(monkeypatch, tmp_path, [RuntimeError("no such binary")])
+    with pytest.raises(RuntimeError):
+        asyncio.run(server._start_chrome(_SlowConfig(tmp_path)))
+    assert len(spawned) == 1
+
+
+def test_only_nodrivers_own_temp_profile_is_removed(tmp_path, monkeypatch):
+    import tempfile as _tempfile
+
+    from mcp_stealth_chrome import server
+
+    monkeypatch.setattr(_tempfile, "gettempdir", lambda: str(tmp_path))
+    temp = tmp_path / "uc_abc"
+    temp.mkdir()
+    real = tmp_path / "profile"
+    real.mkdir()
+    server._remove_temp_profile(_SlowConfig(temp))
+    server._remove_temp_profile(_SlowConfig(real))
+    assert not temp.exists() and real.exists()
+
+
+@pytest.mark.parametrize("name,secret", [
+    ("Cookie", True), ("Set-Cookie", True), ("Authorization", True), ("Proxy-Authorization", True),
+    ("X-CSRF-Token", True), ("x-api-key", True), ("X-Auth-Token", True), ("accessToken", True),
+    ("access_token", True), ("password", True), ("passwordConfirm", True), ("user[password]", True),
+    ("sessionId", True), ("apiKey", True),
+    ("Content-Type", False), ("User-Agent", False), (":authority", False), ("author", False),
+    ("sec-ch-ua", False), ("X-Forwarded-For", False), ("passenger", False), ("tokenize", False),
+])
+def test_secret_names(name, secret):
+    from mcp_stealth_chrome.helpers import is_secret_name
+
+    assert is_secret_name(name) is secret
+
+
+def test_masking_keeps_what_is_not_secret_byte_for_byte():
+    from mcp_stealth_chrome.helpers import mask_body, mask_url
+
+    for body in ('{"q":"it\'s ok"}', "page=2&q=a+b", "plain text", "<xml a=\"1\"/>", "", None):
+        assert mask_body(body) == body
+    assert mask_url("https://x.test/a?page=2&q=a%20b") == "https://x.test/a?page=2&q=a%20b"
+
+
+def test_masking_hides_secrets_at_any_depth():
+    from mcp_stealth_chrome.helpers import mask_body, mask_url
+
+    out = json.loads(mask_body(json.dumps({
+        "user": "budi", "password": "P1", "nested": [{"token": "T1", "keep": 1}],
+        "session": {"id": 5, "note": "n"}, "pin": 1234, "auth": True,
+    })))
+    assert out["user"] == "budi" and out["nested"][0]["keep"] == 1
+    assert out["password"].startswith("***") and out["nested"][0]["token"].startswith("***")
+    assert out["pin"].startswith("***") and out["auth"] is True
+    assert out["session"] == {"id": 5, "note": "n"}  # a container is searched, not erased
+    assert mask_body("user=budi&password=P1") == "user=budi&password=***"
+    assert "T1" not in mask_url("https://x.test/a?access_token=T1&page=2")
+    assert "page=2" in mask_url("https://x.test/a?access_token=T1&page=2")
+
+
+def test_handlers_are_added_all_or_none():
+    from mcp_stealth_chrome import server
+
+    class _Tab:
+        def __init__(self):
+            self.handlers = {}
+
+        def add_handler(self, event, handler):
+            if event == "second":
+                raise RuntimeError("no such domain")
+            self.handlers.setdefault(event, []).append(handler)
+
+    tab = _Tab()
+    with pytest.raises(RuntimeError):
+        server._add_all_handlers(tab, [("first", print), ("second", print)])
+    assert tab.handlers == {"first": []}
+
+
+def test_storage_state_does_not_count_a_rejected_cookie(tmp_path):
+    import asyncio
+
+    from mcp_stealth_chrome import server
+
+    class _Tab:
+        async def send(self, _command):
+            return False
+
+    class _Browser:
+        tabs = [_Tab()]
+
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({
+        "cookies": [{"name": "sid", "value": "v", "domain": "x.test"}], "origins": {},
+    }))
+    with pytest.raises(RuntimeError, match="rejected cookie 'sid'"):
+        asyncio.run(server._apply_storage_state(_Browser(), str(state)))

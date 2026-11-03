@@ -500,10 +500,10 @@ Network capture with response bodies, plus a bridge from browser session into TL
 
 | Tool | Purpose |
 |------|---------|
-| `network_start(capture_bodies=True)` + `network_get(include_body=True)` | Index every request by request_id and lazy-fetch response bodies via CDP `Network.getResponseBody` (truncated, configurable) |
-| `auth_capture` | Intercept the next N requests matching a URL pattern and return their headers (Authorization, Cookie, X-CSRF-*) — for SPAs that hold bearer tokens in JS memory |
+| `network_start(capture_bodies=True)` + `network_get(include_body=True)` | Index every request by request_id and lazy-fetch response bodies via CDP `Network.getResponseBody` (truncated, configurable) `network_get` hides credential values unless `reveal_values=True`. |
+| `auth_capture` | Intercept the next N requests matching a URL pattern and return their headers (Authorization, X-CSRF-*) — for SPAs that hold bearer tokens in JS memory Values are hidden unless `reveal_values=True`. |
 | `http_request_with_session` | Authenticated curl_cffi request that piggybacks on browser cookies + auto-extracts most recent same-host bearer from `network_index` |
-| `wait_for_request` | Block until a request matching `url_pattern` is observed (+ optional method filter, + optional response wait) — replaces `setTimeout` polling |
+| `wait_for_request` | Block until a request matching `url_pattern` is observed (+ optional method filter, + optional response wait) — replaces `setTimeout` polling Credential values are hidden unless `reveal_values=True`. |
 | `dialog_auto_handle` | Persistent native-dialog handler with type filter (alert / confirm / prompt / beforeunload). Update action without re-arming. Idempotent per tab |
 
 ### ⭐⭐ Request Interception — see a request before the server does
@@ -511,9 +511,9 @@ Network capture with response bodies, plus a bridge from browser session into TL
 |------|---------|
 | `dry_run` | **Explore a logged-in account without changing anything.** Blocks POST/PUT/PATCH/DELETE and records what each WOULD have sent (method, URL, headers, body) while reads still work — click the delete button, then read the exact request that was stopped |
 | `intercept_start` | Pause matching requests and `observe` / `cancel` / `mock` them at the CDP layer — catches XHR and anything the page captured before your script ran, which patching `window.fetch` cannot |
-| `intercept_log` | What was seen, plus whether interception is still active — an empty log cannot be mistaken for "the page sent nothing" |
+| `intercept_log` | What was seen, plus whether interception is still active — an empty log cannot be mistaken for "the page sent nothing" Credential headers and JSON or form fields read `*** (N chars)` unless `reveal_values=True`. |
 | `intercept_stop` | End it early; it also disables itself on a deadline so a forgotten intercept cannot wedge the page |
-| `export_curl` | Turn a captured request into a runnable `curl` **and** an `http_request(impersonate='chrome')` call. The second form is the point: plain curl replays with a curl TLS fingerprint, which anti-bot systems flag even when every header matches |
+| `export_curl` | Turn a captured request into a runnable `curl` **and** an `http_request(impersonate='chrome')` call. The second form is the point: plain curl replays with a curl TLS fingerprint, which anti-bot systems flag even when every header matches Credentials are hidden unless `reveal_values=True`; the `http_request` form still replays the session, because it takes cookies from the browser. |
 
 ### ⭐ Stealth Toolkit
 | Tool | Purpose |

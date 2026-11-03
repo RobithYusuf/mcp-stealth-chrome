@@ -40,6 +40,10 @@ uvx mcp-stealth-chrome → Python 3.11+ → FastMCP → nodriver → Chrome/Chro
   `reveal_values=True`, because tool output lands in the transcript, and files holding them are mode 600. The PyPI token lives in the macOS Keychain
   (`security find-generic-password -s mcp-stealth-chrome-pypi -w`), never in a file in the tree.
   Cookie and token files used during a release go to `/tmp` mode `600` and are `shred`ed after.
+- Captured requests follow the same rule. `network_get`, `intercept_log`, `wait_for_request`, `auth_capture`,
+  `export_curl` and `http_request` response headers go through `helpers.mask_*`, with `reveal_values=True` as the
+  way out where a caller needs the value. `export_curl` stays useful because its `http_request` form takes cookies
+  from the browser. Bodies other than JSON or forms cannot be read field by field and pass through.
 - `nodriver` stays capped at the newest version the E2E suites have passed on (`<0.51`): `uv.lock` hides
   breakage just as it does for `mcp`, and a fresh install gets the newest allowed. 0.50 rebuilt `Connection`
   and `Tab` around sessions, so code touching them must work on both designs (`_connect_to_target`).
@@ -103,6 +107,10 @@ conclusions. Each rule below replaced a real lie.
   another element carrying the same text that is genuinely reachable (scrolling it into view if that
   is the only problem) before giving up. On github.com the fuzzy match is a hidden marketing `<span>`;
   refusing there was truthful and still left the caller unable to click "Issues".
+- A click that opens a tab changes nothing on its own page, so `_page_sig(pages=True)` lists the browser's tabs and
+  `_click_outcome` names a new one. Without it a working popup button read as dead, and an agent clicks it again.
+- `fill_form` fails when a field fails and does not click submit. `batch_actions` counts failures by the `Error:`
+  prefix, so a tool that reports a failure through `ok()` is counted as a success.
 - An empty result must be distinguishable from "not measured". `console_get` returns
   `{attached, capturing, since, total, messages}`; `intercept_log` reports `active` and `stop_reason`;
   `storage_snapshot` marks each area `measured` and collects failures in `errors`, because a snapshot
@@ -161,6 +169,17 @@ conclusions. Each rule below replaced a real lie.
   nodriver recorded at launch when it did not. Reporting a clean close is what creates an orphan: it
   drops the only handle that knew the process existed. So a close with anything in `still_alive` is an error
   and keeps the handle (`_close_incomplete`), and the privacy profile stays until the process is gone.
+- `is_up()` false with a handle means a half-open Chrome: `browser_launch` ends it before launching, or the handle is
+  overwritten and a privacy profile is deleted under a live process that writes it back.
+- `_ensure_browser_dead` snapshots the PID's descendants before stopping it, because a launcher that does not exec is
+  the recorded PID and ending it alone orphans Chrome. It skips a PID whose command line no longer names the profile:
+  that number was recycled. Once death is verified it removes nodriver's `uc_*` temp profile, which nodriver otherwise
+  leaves for an exit hook, one per launch, that at exit on 0.48.1 stops after the first (it prints to the closed stdout).
+- nodriver stops probing for Chrome after about 2.3 seconds. `_start_chrome` waits for that same process and adopts it
+  (`config.host`/`port` set means connect, not spawn), moving `_process` across or a close would only drop the socket.
+  Only one that never answers is ended and respawned, with host and port restored first.
+- A stdio `browser_launch` sets `current_idle_timeout = 0`. Leaving the reaper off is not enough: any `spawn_browser`
+  starts it, and it then closed the browser the person was looking at, 15 minutes after its last tool call.
 - `is_up()` false does not mean Chrome stopped: closing the last tab empties `tabs` while the process runs and
   holds the profile. Close paths branch on `BrowserState.browser is None`, never on `is_up()`.
 - `clean_profile_state` and `browser_recover` leave a locked profile completely alone, Preferences included.
@@ -245,6 +264,12 @@ Platform truths, not preferences. Each one cost a release.
   host once zoomed to 90% reports 0.9. A clip still rasterises at CSS size there. E2E tests use
   `persistent=False` for this reason, and so as not to write into the real profile.
 
+- `Element.select_option()` takes no argument and selects the `<option>` it is called on, so calling it on a `<select>`
+  with a value raises. `select_option` shipped that way from 0.1.0. CDP input also wants `MouseButton`, not a string.
+- `send_keys` types character by character and a newline typed that way adds nothing. `fill` presses Enter between
+  lines, only in a textarea or contenteditable, because in a single-line field Enter submits the form.
+- `tab.evaluate` returns `ExceptionDetails` when the script throws, rather than raising. Anything reporting the
+  result checks for it, or the error reads as the value.
 - `tab.evaluate(expr, return_by_value=True)` can STILL return a `RemoteObject`. Unwrap via
   `v.value if hasattr(v, "value") ...` before casting.
 - `tab.evaluate` does not await Promises unless `await_promise=True`. Without it every async
@@ -297,6 +322,9 @@ uv run mcp-stealth-chrome --http        # one server for many clients (token req
 - A green unit suite proves nothing about the paths it skips. The E2E suites only run under
   `MCP_E2E=1`, and a message assertion inside one of them stayed wrong for a full release because
   only the fast suite was re-run after the message changed.
+- `test_registry.py` proves a tool exists, not that it works, and a fake proves only the call shape. `select_option`
+  and `drag_and_drop` failed on every call for the project's whole life with all of that green. Exercise a tool on
+  real Chrome (`tests/test_old_tools_e2e.py`) before calling it covered.
 - The E2E suites need a module-scoped event loop. A per-test `asyncio.run()` hangs: the CDP
   connection is bound to the loop that opened it.
 - Mutation-check a new guard: reintroduce the bug and confirm the test fails. Two tests in this repo

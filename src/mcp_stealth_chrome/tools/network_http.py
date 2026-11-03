@@ -46,7 +46,7 @@ from typing import Literal, Optional
 from urllib.parse import urlparse
 
 from .._app import mcp
-from ..helpers import err, get_url, ok, parse_json
+from ..helpers import err, get_url, mask_headers, ok, parse_json
 from ..humanize import humanized_move
 from ..state import SESSION_GONE_HOOKS, BrowserState
 
@@ -402,7 +402,8 @@ async def _perform(rec: _Tracked) -> str:
             "status": resp.status_code,
             "url": str(resp.url),
             "elapsed_ms": elapsed_ms,
-            "headers": dict(resp.headers),
+            # Set-Cookie carries the server's session, and this lands in the transcript.
+            "headers": mask_headers(dict(resp.headers)),
             "cookies_sent": len(spec.get("cookies") or {}),
             "cookie_snapshot": spec.get("cookie_meta"),
             "impersonate": spec["impersonate"],

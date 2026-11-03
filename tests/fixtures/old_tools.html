@@ -1,0 +1,37 @@
+<!doctype html><html><head><title>Old tools</title><style>
+#handle{width:40px;height:40px;background:#9cf;position:absolute;left:300px;top:20px}
+#dragme{width:60px;height:40px;background:#fc9}#dropzone{width:160px;height:80px;border:1px solid #333;margin-top:10px}
+</style></head><body>
+<select id="pick" onchange="window.changes=(window.changes||0)+1;log.textContent='chosen '+this.value">
+<option value="a">Satu</option><option value="b">  Dua
+ Kata </option><option value="c" disabled>Mati</option></select>
+<select id="stubborn" onchange="this.value='x'"><option value="x">X</option><option value="y">Y</option></select>
+<select id="off" disabled><option value="p">P</option></select>
+<div id="log"></div>
+<button id="popup" onclick="window.open('keys_result.html?pop=1')">Popup</button>
+<button id="dead">Dead</button>
+<form id="f" onsubmit="event.preventDefault();window.submitted=true"><input id="one"><textarea id="ta"></textarea>
+<div id="ce" contenteditable="true" style="min-height:30px;border:1px solid #ccc"></div><button id="send">Send</button></form>
+<label for="pw">Password</label><input id="pw" type="password" oninput="this.value=this.value.slice(0,3)">
+<label for="short">Shortcode</label><input id="short" maxlength="3">
+<iframe id="fr" src="keys_result.html?frame=1" width="200" height="40"></iframe>
+<label for="nick">Nickname</label><input id="nick" oninput="this.value=this.value.slice(0,3)">
+<div id="dragme" draggable="true" ondragstart="event.dataTransfer.setData('text/plain','x')">Drag</div>
+<div id="dropzone" ondragover="event.preventDefault()" ondrop="event.preventDefault();this.textContent='dropped'">Drop</div>
+<div id="handle"></div>
+<button id="call">Call</button>
+<script>
+document.getElementById('dead').addEventListener('click', () => {});
+const handle = document.getElementById('handle');
+let dragging = false;
+handle.addEventListener('mousedown', () => { dragging = true; });
+document.addEventListener('mousemove', (e) => { if (dragging && e.buttons === 1) handle.style.left = e.clientX + 'px'; });
+document.addEventListener('mouseup', () => { dragging = false; window.released = (window.released || 0) + 1; });
+document.cookie = 'pagecookie=COOKIESECRET';
+document.getElementById('call').addEventListener('click', () => {
+  fetch('api/login?access_token=QUERYSECRET&page=2', {method: 'POST',
+    headers: {'Authorization': 'Bearer AUTHSECRET', 'Content-Type': 'application/json', 'X-Plain': 'visible'},
+    body: JSON.stringify({user: 'budi', password: 'BODYSECRET'})})
+    .then((r) => r.text()).then((t) => { log.textContent = 'api done'; });
+});
+</script></body></html>

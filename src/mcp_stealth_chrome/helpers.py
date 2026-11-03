@@ -2,13 +2,106 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
+from urllib.parse import parse_qsl, quote, urlsplit
 from typing import Any
 
 from nodriver import Tab
 
 from .state import BrowserState
+
+
+# Names whose values are credentials. Matched as whole words, so "author" and the
+# ":authority" pseudo-header stay readable. Tool output lands in the agent's transcript.
+_SECRET_NAME = re.compile(
+    r"(?:^|[-_.\s\[\]])(?:auth|authentication|authorization|bearer|tokens?|jwt|secret|password"
+    r"|passwd|passphrase|passcode|pwd|pass|otp|pin|cvv|cvc|api[-_]?key|apikey|csrf|xsrf|session"
+    r"|sessionid|sid|cookies?|credentials?|signature)(?:$|[-_.\s\[\]])",
+    re.IGNORECASE,
+)
+
+
+def is_secret_name(name: Any) -> bool:
+    """Whether a header, form or JSON field of this name carries a credential."""
+    return bool(_SECRET_NAME.search(re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "-", str(name))))
+
+
+def masked_value(value: Any) -> str:
+    """Enough to see that a value exists and is non-empty, as cookie_list does."""
+    return f"*** ({len(str(value))} chars)"
+
+
+def mask_headers(headers: dict) -> dict:
+    return {k: masked_value(v) if is_secret_name(k) else v for k, v in (headers or {}).items()}
+
+
+def _mask_json(node: Any) -> Any:
+    if isinstance(node, dict):
+        return {
+            k: masked_value(v)
+            if is_secret_name(k) and v is not None and not isinstance(v, (dict, list, bool))
+            else _mask_json(v)
+            for k, v in node.items()
+        }
+    if isinstance(node, list):
+        return [_mask_json(item) for item in node]
+    return node
+
+
+def _mask_pairs(text: str) -> str | None:
+    """A query or form body with secret fields hidden, or None when it has none."""
+    pairs = parse_qsl(text, keep_blank_values=True)
+    if not any(is_secret_name(k) for k, _ in pairs):
+        return None
+    return "&".join(f"{quote(k)}={'***' if is_secret_name(k) else quote(v)}" for k, v in pairs)
+
+
+def mask_body(body: Any) -> Any:
+    """Hide credential fields in a JSON or form body; returned unchanged when it has none.
+
+    Other formats cannot be read field by field, so they pass through as they are.
+    """
+    if not isinstance(body, str) or not body:
+        return body
+    text = body.strip()
+    if text[:1] in ("{", "["):
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            return body
+        masked = _mask_json(parsed)
+        return body if masked == parsed else json.dumps(masked, ensure_ascii=False)
+    if "=" in text and "\n" not in text and not text.startswith("<"):
+        return _mask_pairs(text) or body
+    return body
+
+
+def mask_url(url: Any) -> Any:
+    """Hide credential query parameters such as ?access_token=."""
+    if not isinstance(url, str) or "?" not in url:
+        return url
+    try:
+        parts = urlsplit(url)
+        query = _mask_pairs(parts.query)
+        return parts._replace(query=query).geturl() if query else url
+    except ValueError:
+        return url
+
+
+def mask_request_entry(entry: dict) -> dict:
+    """A copy of a captured request safe to return from a tool."""
+    out = dict(entry)
+    for key in ("headers", "request_headers", "response_headers"):
+        if isinstance(out.get(key), dict):
+            out[key] = mask_headers(out[key])
+    for key in ("body", "request_body"):
+        if key in out:
+            out[key] = mask_body(out[key])
+    if "url" in out:
+        out["url"] = mask_url(out["url"])
+    return out
 
 
 def target_key(tab: Any) -> str:

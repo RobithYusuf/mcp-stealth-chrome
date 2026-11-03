@@ -38,6 +38,12 @@ from .helpers import (
     err,
     get_title,
     get_url,
+    is_secret_name,
+    mask_body,
+    mask_headers,
+    mask_request_entry,
+    mask_url,
+    masked_value,
     ok,
     PageReadError,
     parse_json,
@@ -277,6 +283,70 @@ def _process_exists(pid: int) -> bool:
     return True
 
 
+async def _discard_temp_profile(browser: Any) -> None:
+    """Remove nodriver's temp profile once its Chrome is dead.
+
+    nodriver leaves it for an exit hook, so a long-lived server gains one per launch, and
+    at exit 0.48.1 stops after the first because it prints to the closed MCP stdout.
+    """
+    config = getattr(browser, "config", None)
+    if config is None:
+        return
+    for _ in range(3):
+        _remove_temp_profile(config)
+        if not Path(str(getattr(config, "user_data_dir", "") or "")).exists():
+            return
+        await asyncio.sleep(0.2)  # a helper still exiting can write one last file
+
+
+def _process_command(pid: int) -> Optional[str]:
+    """The command line of a running PID, or None when it cannot be read."""
+    try:
+        r = subprocess.run(["ps", "-ww", "-o", "command=", "-p", str(pid)],
+                           capture_output=True, text=True, timeout=3)
+    except Exception:
+        return None
+    return (r.stdout or "").strip() or None
+
+
+def _pid_recycled(pid: int, browser: Any) -> bool:
+    """Whether a recorded PID now belongs to another program.
+
+    A handle can outlive its Chrome after a crash, and the OS hands the number out again.
+    Signalling it then kills something innocent. True only on positive evidence: a live
+    process whose command line does not name this browser's profile.
+    """
+    data_dir = getattr(getattr(browser, "config", None), "user_data_dir", None)
+    if not data_dir:
+        return False
+    command = _process_command(pid)
+    return command is not None and f"--user-data-dir={data_dir}" not in command
+
+
+def _descendant_pids(pid: int) -> list[int]:
+    """Everything started under a PID, found while the parent links still exist.
+
+    A launcher script that does not exec is the recorded PID, with Chrome as its child.
+    Ending only the script leaves Chrome running, reparented to init, and holding its profile.
+    """
+    try:
+        r = subprocess.run(["ps", "-ax", "-o", "pid=,ppid="],
+                           capture_output=True, text=True, timeout=3)
+        children: dict[int, list[int]] = {}
+        for line in (r.stdout or "").splitlines():
+            child, parent = line.split()
+            children.setdefault(int(parent), []).append(int(child))
+    except Exception:
+        return []
+    found: list[int] = []
+    pending = [pid]
+    while pending:
+        for child in children.get(pending.pop(), []):
+            found.append(child)
+            pending.append(child)
+    return found
+
+
 async def _ensure_browser_dead(browser, profile_dir=None, grace: float = 1.5) -> dict:
     """Stop a browser and VERIFY the OS process actually died.
 
@@ -302,6 +372,8 @@ async def _ensure_browser_dead(browser, profile_dir=None, grace: float = 1.5) ->
               "still_alive": [], "detail": ""}
     pid = getattr(browser, "_process_pid", None) if browser else None
     report["pid"] = pid
+    recycled = isinstance(pid, int) and pid > 0 and _pid_recycled(pid, browser)
+    family = _descendant_pids(pid) if isinstance(pid, int) and pid > 0 and not recycled else []
     # Attached: this server did not start that Chrome and has no process to signal, and
     # from nodriver 0.50 stop() only closes the socket. Ask it to quit, then look for
     # evidence, or an attached browser reads as closed while it keeps running.
@@ -323,6 +395,8 @@ async def _ensure_browser_dead(browser, profile_dir=None, grace: float = 1.5) ->
     if attached:
         if await _debug_port_closed(browser, grace):
             report["verified"] = True
+            # Connecting made nodriver create a temp profile this Chrome never used.
+            await _discard_temp_profile(browser)
         else:
             report["stopped"] = False
             report["detail"] = (
@@ -331,8 +405,14 @@ async def _ensure_browser_dead(browser, profile_dir=None, grace: float = 1.5) ->
             )
         return report
 
+    if recycled:
+        report["verified"] = True
+        report["detail"] = f"PID {pid} now belongs to another program, so it was not signalled"
+        await _discard_temp_profile(browser)
+        return report
     # Collect every PID that could still be ours.
     candidates: list[int] = [pid] if isinstance(pid, int) and pid > 0 else []
+    candidates += [child for child in family if child not in candidates]
     # The profile scan is only a fallback for when no PID was captured. With a PID the
     # target is known, and a scan can only add processes that are not ours to signal.
     if profile_dir is not None and not candidates:
@@ -382,6 +462,8 @@ async def _ensure_browser_dead(browser, profile_dir=None, grace: float = 1.5) ->
         except (ProcessLookupError, PermissionError, OSError):
             pass
     report["verified"] = not report["still_alive"]
+    if report["verified"]:
+        await _discard_temp_profile(browser)
     return report
 
 
@@ -1366,6 +1448,21 @@ async def browser_launch(
     # below — the one that probes CDP and honours the caller's url — so a launch
     # against a live browser answered "already running" and left the caller on
     # whatever page happened to be open, believing the navigation had happened.
+    if (not BrowserState.is_up() and BrowserState.browser is not None
+            and BrowserState.current_instance_id not in _ATTACHED_BROWSERS):
+        # is_up() false does not mean Chrome stopped: closing the last tab empties tabs while
+        # the process runs and holds its profile. Launching over it loses the only handle,
+        # and a privacy profile deleted now is one that Chrome simply writes back.
+        _stale_dir, _stale_privacy = BrowserState.current_profile_dir, BrowserState.current_privacy
+        _reap = await _ensure_browser_dead(BrowserState.browser, _stale_dir)
+        if _close_incomplete(_reap):
+            return err(f"the previous browser could not be ended: {_close_failure(_reap)}. "
+                       f"Its handle and profile were kept.")
+        _stale_tabs = list(BrowserState.tabs)
+        BrowserState.reset()
+        _clear_tab_scoped_state(_stale_tabs)
+        if _stale_privacy:
+            BrowserState.current_profile_dir, BrowserState.current_privacy = _stale_dir, True
     if not BrowserState.is_up() and BrowserState.current_privacy and BrowserState.current_profile_dir:
         stale_profile = BrowserState.current_profile_dir
         if not await _remove_privacy_profile(stale_profile):
@@ -1431,15 +1528,20 @@ async def browser_launch(
                     )
                 # The handle is stale. Relaunching on top of a half-dead Chrome
                 # is exactly the collision to avoid, so end it first.
+                _stale_privacy = (BrowserState.current_profile_dir
+                                  if BrowserState.current_privacy else None)
                 _reap = await _ensure_browser_dead(
                     BrowserState.browser, BrowserState.current_profile_dir)
-                BrowserState.reset()
                 if _reap.get("still_alive"):
                     return err(
                         f"a previous browser is unreachable ({type(e).__name__}: {e}) and its "
                         f"PID(s) {_reap['still_alive']} could not be ended. Kill them, then "
                         f"retry — relaunching now would collide with them."
                     )
+                BrowserState.reset()
+                if _stale_privacy is not None and not await _remove_privacy_profile(_stale_privacy):
+                    BrowserState.current_profile_dir, BrowserState.current_privacy = _stale_privacy, True
+                    return err(f"could not remove stale privacy profile before relaunch: {_stale_privacy}")
 
         ensure_dirs()
 
@@ -1628,10 +1730,7 @@ async def browser_launch(
 
         browser: Optional[Browser] = None
         try:
-            browser = await asyncio.wait_for(
-                nodriver.start(config=config),
-                timeout=BROWSER_LAUNCH_TIMEOUT,
-            )
+            browser = await _start_chrome(config)
         except asyncio.TimeoutError:
             await _safe_stop_browser(browser)
             await _remove_privacy_profile(privacy_profile)
@@ -1649,7 +1748,7 @@ async def browser_launch(
             # the websocket failed — so _safe_stop_browser, which speaks CDP,
             # cannot end it. Reaping our own PID here is the difference between
             # a failed launch and a failed launch plus an orphan nobody owns.
-            reap = await _ensure_browser_dead(browser, profile_path if persistent else None)
+            reap = getattr(e, "reap_report", {})
             await _remove_privacy_profile(privacy_profile)
             # Diagnose common nodriver "Failed to connect to browser" — usually
             # means Chrome started but its CDP websocket couldn't be reached
@@ -1672,9 +1771,11 @@ async def browser_launch(
                 elif ext:
                     parts.append(f"→ Other Chrome processes running: PIDs {ext[:5]}{'...' if len(ext)>5 else ''}.")
                 parts.append(
-                    "Fix: (1) close existing Chrome / kill stale PIDs, "
-                    "(2) use persistent=False, or "
-                    "(3) clone_chrome_profile for an isolated snapshot."
+                    "Retried once. Chrome did not open its debugging port in time, which "
+                    "usually means the machine is busy or Chrome is updating, so trying "
+                    "again shortly often works."
+                    + (" If this profile is in use, persistent=False or "
+                       "clone_chrome_profile gives an isolated one." if persistent else "")
                 )
                 hint = " ".join(parts)
             return err(hint or f"launch failed: {e}")
@@ -1736,8 +1837,12 @@ async def browser_launch(
         BrowserState.current_privacy = privacy
         BrowserState.current_fingerprint = dict(effective_fingerprint)
         BrowserState.current_proxy = effective_proxy
-        # A stdio browser_launch has never been idle-reaped, and that stays. Over HTTP a
-        # client can vanish, so the reaper is what eventually ends its browser.
+        # A stdio browser_launch is not idle-reaped: it is what the person is looking at,
+        # and the server exits with its client anyway. The timeout has to be cleared and not
+        # merely the reaper left off, because any spawn_browser starts the reaper, which
+        # then closed this browser too. Over HTTP a client can vanish, so the reaper is what
+        # eventually ends its browser.
+        BrowserState.current_idle_timeout = DEFAULT_IDLE_TIMEOUT if BrowserState.http_mode() else 0
         if BrowserState.http_mode():
             _ensure_idle_reaper_running()
         suffix = (
@@ -3280,11 +3385,12 @@ async def _click_probe(el) -> dict:
         return {}
 
 
-async def _page_sig(tab, el=None) -> dict:
+async def _page_sig(tab, el=None, pages: bool = False) -> dict:
     """Snapshot a cheap page fingerprint; {} when unavailable.
 
     With el, also fingerprints the element's own tree. That half reads as {} once
-    the element is gone, which correctly compares as a change.
+    the element is gone, which correctly compares as a change. With pages, also lists the
+    browser's open tabs, since a click that opens one changes nothing on this page.
     """
     try:
         v = await tab.evaluate(_PAGE_SIG_JS, return_by_value=True)
@@ -3299,6 +3405,14 @@ async def _page_sig(tab, el=None) -> dict:
             sig["element"] = json.loads(own) if own else {}
         except Exception:
             sig["element"] = {}
+    if pages and sig:
+        from nodriver.cdp import target as cdp_target
+        with contextlib.suppress(Exception):
+            sig["pages"] = {
+                str(info.target_id): str(info.url)
+                for info in await tab.send(cdp_target.get_targets())
+                if info.type_ == "page"
+            }
     return sig
 
 
@@ -3411,6 +3525,18 @@ async def _js_click(el) -> None:
     await el.apply("function() { this.click(); }")
 
 
+def _new_tab_note(before: dict, after: dict) -> str:
+    """What a click opened elsewhere. Left out, a working popup button reads as dead."""
+    known, now = before.get("pages"), after.get("pages")
+    if not isinstance(known, dict) or not isinstance(now, dict):
+        return ""
+    fresh = [mask_url(url) for target, url in now.items() if target not in known]
+    if not fresh:
+        return ""
+    return (f"; opened {len(fresh)} new tab(s): {', '.join(fresh[:3])} "
+            f"(the active tab did not change; tab_list and tab_select reach it)")
+
+
 def _click_outcome(head: str, detail: str, before: dict, after: dict) -> str:
     """Compare fingerprints and say what the click did, never a bare 'clicked'.
 
@@ -3421,8 +3547,9 @@ def _click_outcome(head: str, detail: str, before: dict, after: dict) -> str:
     """
     if not (before and after):
         return ok(f"{head} — {detail}")
+    opened = _new_tab_note(before, after)
     if before.get("url") != after.get("url"):
-        return ok(f"{head} — {detail}; navigated to {after.get('url')}")
+        return ok(f"{head} — {detail}; navigated to {after.get('url')}{opened}")
     own_before = {k: v for k, v in (before.get("element") or {}).items() if k != "focused"}
     own_after = {k: v for k, v in (after.get("element") or {}).items() if k != "focused"}
     # With no element fingerprint the caller clicked a raw point, and whether focus
@@ -3436,7 +3563,9 @@ def _click_outcome(head: str, detail: str, before: dict, after: dict) -> str:
     )
     if changed:
         return ok(f"{head} — {detail}; page changed "
-                  f"(nodes {before.get('nodes')}→{after.get('nodes')})")
+                  f"(nodes {before.get('nodes')}→{after.get('nodes')}){opened}")
+    if opened:
+        return ok(f"{head} — {detail}{opened}")
     if own_after.get("editable") and (after.get("element") or {}).get("focused"):
         return ok(f"{head} — {detail}; the field took focus")
     return ok(
@@ -3547,7 +3676,7 @@ async def _click_and_report(
                 f"Try: scroll_to / mouse_click_xy at a different point / dismiss the "
                 f"overlay / js_fallback=True for an untrusted JS click."
             )
-        before = await _page_sig(tab, el) if verify else {}
+        before = await _page_sig(tab, el, pages=True) if verify else {}
         await _js_click(el)
         head = (f"{label}: clicked via JS FALLBACK (isTrusted=false, real click refused: "
                 f"{reason})")
@@ -3555,9 +3684,9 @@ async def _click_and_report(
         if not verify:
             return ok(f"{head} — {detail}")
         await asyncio.sleep(0.35)
-        return _click_outcome(head, detail, before, await _page_sig(tab, el))
+        return _click_outcome(head, detail, before, await _page_sig(tab, el, pages=True))
 
-    before = await _page_sig(tab, el) if verify else {}
+    before = await _page_sig(tab, el, pages=True) if verify else {}
     if humanize:
         hx, hy = await _humanized_point(el, pos, x, y)
         await humanized_click(tab, el, last_pos_ref=BrowserState.last_mouse_xy, point=(hx, hy))
@@ -3571,7 +3700,7 @@ async def _click_and_report(
     if not verify:
         return ok(f"{head} — {detail}")
     await asyncio.sleep(0.35)  # let handlers/render settle before re-reading
-    return _click_outcome(head, detail, before, await _page_sig(tab, el))
+    return _click_outcome(head, detail, before, await _page_sig(tab, el, pages=True))
 
 
 @mcp.tool()
@@ -3607,7 +3736,7 @@ async def click_text(text: str, exact: bool = False, verify: bool = True) -> str
         # on real pages the first text match is often a hidden nav/marketing copy.
         cand = await _click_text_rescue(tab, text, exact)
         if cand.get("x") is not None:
-            before = await _page_sig(tab) if verify else {}
+            before = await _page_sig(tab, pages=True) if verify else {}
             try:
                 await move_pointer(tab, cand["x"], cand["y"])
             except Exception:
@@ -3623,7 +3752,7 @@ async def click_text(text: str, exact: bool = False, verify: bool = True) -> str
                 return ok(note)
             await asyncio.sleep(0.35)
             head, _, detail = note.partition(" — ")
-            return _click_outcome(head, detail, before, await _page_sig(tab))
+            return _click_outcome(head, detail, before, await _page_sig(tab, pages=True))
 
         if el is None and not cand.get("found"):
             if in_frame:
@@ -3808,14 +3937,36 @@ async def fill(ref: Optional[str] = None, selector: Optional[str] = None,
             await el.clear_input()
         except Exception:
             pass
+        lines = re.split(r"\r\n|\r|\n", str(value))
+        multiline = len(lines) > 1 and (await el.apply(
+            "function() { return this.tagName === 'TEXTAREA' || this.isContentEditable; }"
+        )) is True
         try:
-            await el.send_keys(value)
+            if multiline:
+                # send_keys types each character, and a newline typed that way adds nothing.
+                # Enter is what a person presses, and only here: in a single-line field it
+                # would submit the form.
+                await el.apply("function() { this.focus(); }")
+                for index, line in enumerate(lines):
+                    if index:
+                        await _dispatch_key(el.tab, key_event_params("Enter"))
+                    if line:
+                        await el.send_keys(line)
+            else:
+                await el.send_keys(value)
         except Exception:
             await el.set_value(value)
         actual = await el.apply(
             "function() { return this.isContentEditable ? this.innerText : this.value; }"
         )
-        if isinstance(actual, str) and actual.strip() != str(value).strip():
+        wanted = str(value)
+        if multiline:
+            # A contenteditable may report a paragraph break as two newlines.
+            wanted = "\n".join(lines)
+            if isinstance(actual, str):
+                actual = re.sub(r"\n+", "\n", actual)
+                wanted = re.sub(r"\n+", "\n", wanted)
+        if isinstance(actual, str) and actual.strip() != wanted.strip():
             is_secret = (await el.apply("function() { return this.type === 'password'; }")) is True
             shown = f"{len(actual)} chars" if is_secret else repr(actual[:80])
             return err(
@@ -3935,20 +4086,63 @@ async def press_key(key: str, verify: bool = True, settle_ms: int = 1000) -> str
         return err(str(e))
 
 
+_SELECT_OPTION_JS = """
+function() {
+  const wantValue = %s, wantLabel = %s;
+  if (this.tagName !== 'SELECT') {
+    return JSON.stringify({error: 'not a <select> but <' + this.tagName.toLowerCase() + '>'});
+  }
+  if (this.disabled) return JSON.stringify({error: 'the <select> is disabled'});
+  const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+  const options = [...this.options];
+  const hit = options.find((o) => wantValue !== null
+    ? o.value === wantValue
+    : clean(o.label) === clean(wantLabel) || clean(o.text) === clean(wantLabel));
+  if (!hit) {
+    return JSON.stringify({error: 'no such option', options: options.slice(0, 30).map(
+      (o) => ({value: o.value, label: clean(o.text)}))});
+  }
+  if (hit.disabled) return JSON.stringify({error: 'that option is disabled'});
+  const changed = !hit.selected;
+  hit.selected = true;
+  this.dispatchEvent(new Event('input', {bubbles: true}));
+  this.dispatchEvent(new Event('change', {bubbles: true}));
+  return JSON.stringify({value: hit.value, label: clean(hit.text), changed});
+}
+"""
+
+
 @mcp.tool()
 async def select_option(
     ref: Optional[str] = None, selector: Optional[str] = None,
     value: Optional[str] = None, label: Optional[str] = None,
 ) -> str:
-    """Select <option> by value or label."""
+    """Select an <option> of a <select> by value or by its visible label.
+
+    The native dropdown cannot be driven with page input, so this sets the option from JS
+    and fires input and change. Those events have isTrusted=false, which the result states.
+    Reads the select back afterwards, because a page can reject the choice.
+    """
     try:
+        if value is None and label is None:
+            return err("select_option: pass value= or label=")
         tab = BrowserState.active_tab()
         el = await resolve_ref(ref) if ref else (await tab.query_selector(selector) if selector else None)
         if el is None:
             return err("element not found")
-        target = value or label or ""
-        await el.select_option(target)
-        return ok(f"selected {target!r}")
+        outcome = json.loads(await el.apply(_SELECT_OPTION_JS % (json.dumps(value), json.dumps(label))))
+        if outcome.get("error"):
+            listed = outcome.get("options")
+            return err(f"select_option: {outcome['error']}"
+                       + (f". Options: {json.dumps(listed, ensure_ascii=False)}" if listed else ""))
+        await asyncio.sleep(0.05)
+        now = await el.apply("function() { return this.value; }")
+        if now != outcome["value"]:
+            return err(f"select_option: selected {outcome['value']!r} but the select now reads "
+                       f"{now!r}. The page changed it back.")
+        return ok(f"selected value={outcome['value']!r} label={outcome['label']!r} — "
+                  f"method=js_set (input and change events, isTrusted=false)"
+                  + ("" if outcome["changed"] else "; it was already selected"))
     except Exception as e:
         return err(str(e))
 
@@ -4104,36 +4298,44 @@ async def mouse_move(x: int, y: int, humanize: bool = False) -> str:
 
 @mcp.tool()
 async def drag_and_drop(start_x: int, start_y: int, end_x: int, end_y: int) -> str:
-    """Drag from (start_x, start_y) to (end_x, end_y)."""
+    """Drag from (start_x, start_y) to (end_x, end_y) with real mouse input.
+
+    Reports whether the page changed, since nothing else says the drop landed.
+    """
     try:
         tab = BrowserState.active_tab()
         from nodriver.cdp import input_ as cdp_input
+        left = cdp_input.MouseButton.LEFT
+        before = await _page_sig(tab)
         await move_pointer(tab, start_x, start_y)
         await tab.send(cdp_input.dispatch_mouse_event(
-            type_="mousePressed", x=start_x, y=start_y, button="left", click_count=1,
+            type_="mousePressed", x=start_x, y=start_y, button=left, buttons=1, click_count=1,
         ))
-        # Intermediate steps for natural drag
-        steps = 20
-        for i in range(1, steps + 1):
-            t = i / steps
+        x, y = start_x, start_y
+        try:
+            # Intermediate steps for natural drag
+            steps = 20
+            for i in range(1, steps + 1):
+                t = i / steps
+                x = int(start_x + (end_x - start_x) * t)
+                y = int(start_y + (end_y - start_y) * t)
+                await tab.send(cdp_input.dispatch_mouse_event(
+                    type_="mouseMoved", x=x, y=y, button=left, buttons=1,
+                ))
+                await asyncio.sleep(0.02)
+        finally:
+            # Always let go: a button left down turns every later move into a drag.
             await tab.send(cdp_input.dispatch_mouse_event(
-                type_="mouseMoved",
-                x=int(start_x + (end_x - start_x) * t),
-                y=int(start_y + (end_y - start_y) * t),
-                button="left",
+                type_="mouseReleased", x=x, y=y, button=left, buttons=0, click_count=1,
             ))
-            await asyncio.sleep(0.02)
-        await tab.send(cdp_input.dispatch_mouse_event(
-            type_="mouseReleased", x=end_x, y=end_y, button="left", click_count=1,
-        ))
-        return ok("dropped")
+        BrowserState.last_mouse_xy.update(x=x, y=y)
+        await asyncio.sleep(0.35)
+        return _click_outcome(
+            f"dragged ({start_x},{start_y}) to ({end_x},{end_y})", "method=cdp_mouse",
+            before, await _page_sig(tab),
+        )
     except Exception as e:
         return err(str(e))
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# 6. WAIT
-# ══════════════════════════════════════════════════════════════════════════
 
 
 @mcp.tool()
@@ -4975,6 +5177,12 @@ async def indexeddb_delete(database_name: str) -> str:
 # ══════════════════════════════════════════════════════════════════════════
 
 
+def _js_exception_text(details: Any) -> str:
+    thrown = getattr(details, "exception", None)
+    return str(getattr(thrown, "description", None) or getattr(thrown, "value", None)
+               or getattr(details, "text", "exception"))
+
+
 @mcp.tool()
 async def evaluate(
     expression: str,
@@ -5001,6 +5209,8 @@ async def evaluate(
                     timeout=timeout_ms / 1000,
                     what="evaluate",
                 )
+                if isinstance(result, cdp_runtime.ExceptionDetails):
+                    return err(f"JavaScript threw: {_js_exception_text(result)}")
                 if hasattr(result, "value") and not isinstance(result, (str, int, float, bool, list, dict)):
                     result = result.value
                 if result is None:
@@ -5058,6 +5268,8 @@ async def wait_for_function(
                 )
             except TimeoutError:
                 continue
+            if isinstance(raw, cdp_runtime.ExceptionDetails):
+                return err(f"wait_for_function: the predicate threw: {_js_exception_text(raw)}")
             raw = raw.value if hasattr(raw, "value") and not isinstance(raw, (str, dict)) else raw
             state = parse_json(raw)
             if not isinstance(state, dict):
@@ -5228,14 +5440,17 @@ async def frame_evaluate(frame_url_pattern: str, expression: str) -> str:
         pattern = re.compile(frame_url_pattern)
         # Build the matcher from a string via new RegExp(...) so slashes and
         # other regex/JS-special chars in the pattern can't break the JS literal.
+        # Awaited, or a rejected promise stringifies to "{}" and reads as a result.
         result = await tab.evaluate(
-            f"(() => {{ var re = new RegExp({json.dumps(frame_url_pattern)}); "
+            f"(async () => {{ var re = new RegExp({json.dumps(frame_url_pattern)}); "
             f"var iframes = document.querySelectorAll('iframe'); "
             f"for (var f of iframes) {{ if (re.test(f.src)) {{ "
-            f"try {{ return JSON.stringify(f.contentWindow.eval({json.dumps(expression)})); }} "
+            f"try {{ return JSON.stringify(await f.contentWindow.eval({json.dumps(expression)})); }} "
             f"catch(e){{ return 'ERR:'+e.name+':'+e.message; }} }} }} return 'no frame matched'; }})()",
-            return_by_value=True,
+            await_promise=True, return_by_value=True,
         )
+        if isinstance(result, cdp_runtime.ExceptionDetails):
+            return err(f"frame_evaluate could not run: {_js_exception_text(result)}")
         result = result.value if hasattr(result, "value") and not isinstance(result, str) else result
         text = str(result)
         cross_origin = text.startswith("ERR:") and (
@@ -5339,14 +5554,24 @@ async def fill_form(fields: list[dict], submit_ref: Optional[str] = None) -> str
     """
     if not isinstance(fields, list):
         fields = parse_json(fields, [])
+    if not fields:
+        return err("fill_form: no fields given")
     results = []
+    failed = 0
     for f in fields:
-        r = await fill(ref=f.get("ref"), selector=f.get("selector"),
-                        value=f.get("value", ""))
-        results.append(str(r)[:50])
+        r = str(await fill(ref=f.get("ref"), selector=f.get("selector"),
+                           value=f.get("value", "")))
+        failed += r.startswith("Error:")
+        results.append(f"{f.get('ref') or f.get('selector')}: {r}")
+    if failed:
+        if submit_ref:
+            results.append("submit: not clicked, because a field failed")
+        return err(f"{failed} of {len(fields)} field(s) failed\n" + "\n".join(results))
     if submit_ref:
-        r = await click(ref=submit_ref)
-        results.append(f"submit: {str(r)[:50]}")
+        r = str(await click(ref=submit_ref))
+        results.append(f"submit: {r}")
+        if r.startswith("Error:"):
+            return err("the fields were filled but the submit failed\n" + "\n".join(results))
     return ok("\n".join(results))
 
 
@@ -5381,7 +5606,7 @@ async def navigate_and_snapshot(
 
 @mcp.tool()
 async def get_viewport_size() -> str:
-    """Return current window dimensions."""
+    """Return the viewport size (innerWidth, innerHeight) and scroll position."""
     try:
         tab = BrowserState.active_tab()
         result = await tab.evaluate(
@@ -5396,11 +5621,23 @@ async def get_viewport_size() -> str:
 
 @mcp.tool()
 async def set_viewport_size(width: int, height: int) -> str:
-    """Resize the browser window."""
+    """Resize the browser window, and report the viewport that results.
+
+    The size given is the whole window, so with a visible browser the viewport comes out
+    smaller by the height of its toolbars. emulate_device sets an exact viewport.
+    """
     try:
         tab = BrowserState.active_tab()
-        await tab.set_window_size(width=width, height=height)
-        return ok(f"set to {width}x{height}")
+        # set_window_size defaults to the top left corner, which moves the window.
+        left, top = 0, 0
+        with contextlib.suppress(Exception):
+            _window, bounds = await tab.get_window()
+            left, top = bounds.left or 0, bounds.top or 0
+        await tab.set_window_size(left=left, top=top, width=width, height=height)
+        await asyncio.sleep(0.15)
+        inner = await tab.evaluate("innerWidth + 'x' + innerHeight", return_by_value=True)
+        inner = inner.value if hasattr(inner, "value") and not isinstance(inner, str) else inner
+        return ok(f"window set to {width}x{height}; viewport reads {inner}")
     except Exception as e:
         return err(str(e))
 
@@ -5943,6 +6180,7 @@ async def network_start(capture_bodies: bool = True) -> str:
                     "mime": None,
                     "size": None,
                     "timestamp": getattr(event, "timestamp", None),
+                    "wall_time": getattr(event, "wall_time", None),
                 }
                 if _NETWORK_CAPTURE_BODIES.get(tid, False):
                     index_sink[rid] = entry
@@ -5996,6 +6234,7 @@ async def network_get(
     include_body: bool = False,
     max_body_bytes: int = 10000,
     full: bool = False,
+    reveal_values: bool = False,
 ) -> str:
     """Retrieve captured network events.
 
@@ -6009,6 +6248,10 @@ async def network_get(
         full: if True, return entries with full headers + body fields
             from network_index (use this once you've called network_start).
             Default False = legacy flat event stream (backward compat).
+        reveal_values: True returns credential headers, fields and query parameters as
+            they are. By default their values read "*** (N chars)", because tool output
+            lands in the transcript. Bodies other than JSON or forms cannot be read field
+            by field and pass through.
     """
     if limit < 0:
         return err("limit must be >= 0")
@@ -6044,6 +6287,8 @@ async def network_get(
                     if body is None and isinstance(result, tuple):
                         body = result[0]
                     body_str = str(body) if body is not None else ""
+                    if not reveal_values:
+                        body_str = mask_body(body_str)
                     orig_len = len(body_str)
                     if orig_len > max_body_bytes:
                         body_str = body_str[:max_body_bytes] + (
@@ -6054,18 +6299,35 @@ async def network_get(
                     e["response_body"] = "<getResponseBody timeout>"
                 except Exception as ex:
                     e["response_body"] = f"<getResponseBody error: {ex}>"
+        if not reveal_values:
+            entries = [mask_request_entry(e) for e in entries]
         return ok(json.dumps(entries, indent=2, default=str)[:50000])
     # Legacy event-stream view
     logs = BrowserState.network_logs
     if filter_url:
         logs = [l for l in logs if filter_url in l.get("url", "")]
     selected = logs[-limit:] if limit else []
+    if not reveal_values:
+        selected = [mask_request_entry(l) for l in selected]
     return ok(json.dumps(selected, indent=2, default=str))
 
 
 # ══════════════════════════════════════════════════════════════════════════
 # 17. DEBUG / META
 # ══════════════════════════════════════════════════════════════════════════
+
+
+def _status_profile() -> str:
+    """The profile the current browser really uses, not the default it would get."""
+    if BrowserState.current_profile_dir:
+        return str(BrowserState.current_profile_dir)
+    browser = BrowserState.browser
+    if browser is None:
+        return str(PROFILE_DIR)
+    if getattr(browser, "_process", None) is None and not getattr(browser, "_process_pid", None):
+        return "(attached Chrome: profile not known)"
+    data_dir = getattr(getattr(browser, "config", None), "user_data_dir", None)
+    return f"(ephemeral) {data_dir}" if data_dir else "(ephemeral)"
 
 
 @mcp.tool()
@@ -6077,6 +6339,10 @@ async def server_status() -> str:
     it makes the CDP event listener die on the first mismatched payload, so
     console/network capture returns nothing and looks like a quiet page.
     """
+    if BrowserState.browser is not None:
+        # A tab the page opened is unknown until asked, which reported one tab too few.
+        with contextlib.suppress(Exception):
+            await _refresh_tabs()
     status = {
         "version": __version__,
         "session": BrowserState.session_key(),
@@ -6091,7 +6357,7 @@ async def server_status() -> str:
         "network_indexed": len(BrowserState.network_index),
         "page_errors": len(BrowserState.page_errors),
         "intercepting": bool(_INTERCEPT.get("active")),
-        "profile_dir": str(BrowserState.current_profile_dir or PROFILE_DIR),
+        "profile_dir": _status_profile(),
         "compat_patches": _patches.status(),
     }
     return ok(json.dumps(status, indent=2, default=str))
@@ -6363,12 +6629,15 @@ async def export_curl(
     url_contains: Optional[str] = None,
     method: Optional[str] = None,
     include_cookies: bool = True,
+    reveal_values: bool = False,
 ) -> str:
     """⭐ Turn a captured browser request into a runnable curl AND an http_request call.
 
     The browser→script bridge. After network_start() + the action you care about,
     hand this a request and get back the command that reproduces it outside the
-    browser, with the real headers and session cookies attached.
+    browser. Credentials are hidden unless reveal_values=True, because tool output lands
+    in the transcript; the http_request form still replays the session, since it takes the
+    cookies from the browser itself.
 
     The `http_request` variant is the one that matters here: replaying a captured
     request with plain curl sends a curl TLS fingerprint, which is exactly what
@@ -6384,6 +6653,8 @@ async def export_curl(
         method: additionally require this HTTP method (e.g. "POST") when searching.
         include_cookies: attach the browser's current cookies for that URL.
             Turn off to produce a shareable command with no session in it.
+        reveal_values: put real cookie and credential values in the output, which makes
+            the curl string runnable as shown.
 
     Returns the matched request, a `curl` string, and an `http_request` call.
     """
@@ -6452,30 +6723,48 @@ async def export_curl(
         if not include_cookies:
             cookie_header = None
 
-        parts = ["curl", "-X", http_method, _shq(target_url)]
-        for key, value in headers.items():
+        shown_url = target_url if reveal_values else mask_url(target_url)
+        shown_headers = headers if reveal_values else mask_headers(headers)
+        shown_body = body if reveal_values else mask_body(body)
+        shown_cookie = cookie_header
+        if cookie_header and not reveal_values:
+            shown_cookie = masked_value(cookie_header)
+
+        parts = ["curl", "-X", http_method, _shq(shown_url)]
+        for key, value in shown_headers.items():
             parts += ["-H", _shq(f"{key}: {value}")]
-        if cookie_header:
-            parts += ["-H", _shq(f"Cookie: {cookie_header}")]
-        if body:
-            parts += ["--data-raw", _shq(body)]
+        if shown_cookie:
+            parts += ["-H", _shq(f"Cookie: {shown_cookie}")]
+        if shown_body:
+            parts += ["--data-raw", _shq(shown_body)]
         parts += ["--compressed"]
 
-        replay_headers = dict(headers)
-        if cookie_header:
+        replay_headers = dict(shown_headers)
+        if cookie_header and reveal_values:
             replay_headers["Cookie"] = cookie_header
+        # With cookies hidden the browser supplies them. Otherwise they are in the headers
+        # or were declined, and http_request's default would add the session regardless.
+        browser_cookies = include_cookies and not reveal_values
         http_call = (
             "http_request(\n"
-            f"  url={target_url!r},\n"
+            f"  url={shown_url!r},\n"
             f"  method={http_method!r},\n"
             f"  headers={json.dumps(replay_headers)},\n"
-            + (f"  data={body!r},\n" if body else "")
+            + (f"  data={shown_body!r},\n" if shown_body else "")
+            + f"  use_browser_cookies={browser_cookies},\n"
             + "  impersonate='chrome',\n)"
         )
+        hidden = [k for k, v in shown_headers.items() if v != headers.get(k)]
+        if cookie_header and not reveal_values:
+            hidden.append("Cookie")
+        if shown_body != body:
+            hidden.append("(body fields)")
+        if shown_url != target_url:
+            hidden.append("(query parameters)")
 
         return ok(json.dumps({
             "request_id": entry.get("request_id"),
-            "url": target_url,
+            "url": shown_url,
             "method": http_method,
             "status": entry.get("status"),
             "header_count": len(headers),
@@ -6485,6 +6774,11 @@ async def export_curl(
             **({"cookie_error": cookie_error} if cookie_error else {}),
             "curl": " ".join(parts),
             "http_request": http_call,
+            **({"values_hidden": hidden,
+                "hidden_note": ("These read *** here, so the curl string does not run as shown. "
+                                "http_request takes the session cookies from the browser; "
+                                "reveal_values=True returns every real value.")}
+               if hidden else {}),
             "note": (
                 "Prefer the http_request form: plain curl carries a curl TLS "
                 "fingerprint, which anti-bot systems flag even when every header "
@@ -6762,12 +7056,16 @@ async def intercept_start(
 
 
 @mcp.tool()
-async def intercept_log(limit: int = 50, clear: bool = False) -> str:
+async def intercept_log(limit: int = 50, clear: bool = False, reveal_values: bool = False) -> str:
     """Read what interception saw, with its status attached.
 
     Reports whether interception is still active and why it stopped, because an
     empty log means nothing on its own: it cannot otherwise be told apart from
     "never started" or "the deadline already fired".
+
+    Credential headers, fields and query parameters read "*** (N chars)" because tool
+    output lands in the transcript; reveal_values=True returns them. Bodies other than
+    JSON or forms cannot be read field by field and pass through.
     """
     state = _INTERCEPT
     holder = state.get("session")
@@ -6785,7 +7083,7 @@ async def intercept_log(limit: int = 50, clear: bool = False) -> str:
                          if state["active"] and state["expires_at"] else None),
         "stop_reason": state.get("stop_reason"),
         "returned": len(entries),
-        "requests": entries,
+        "requests": entries if reveal_values else [mask_request_entry(e) for e in entries],
     }
     if not state["active"]:
         payload["note"] = (
@@ -6862,21 +7160,82 @@ async def dry_run(
     }, indent=2))
 
 
+def _har_entry(entry: dict) -> dict:
+    """One captured request in HAR 1.2 shape; sizes and times unknown here say so."""
+    from datetime import datetime, timezone
+    from urllib.parse import parse_qsl, urlsplit
+
+    def pairs(headers: Optional[dict]) -> list[dict]:
+        return [{"name": k, "value": str(v)} for k, v in (headers or {}).items()]
+
+    url = entry.get("url") or ""
+    body = entry.get("request_body")
+    wall = entry.get("wall_time")
+    request: dict[str, Any] = {
+        "method": entry.get("method") or "",
+        "url": url,
+        "httpVersion": "",
+        "headers": pairs(entry.get("request_headers")),
+        "queryString": [{"name": k, "value": v} for k, v in
+                        parse_qsl(urlsplit(url).query, keep_blank_values=True)],
+        "cookies": [],
+        "headersSize": -1,
+        "bodySize": len(body) if body else 0,
+    }
+    if body:
+        kind = next((v for k, v in (entry.get("request_headers") or {}).items()
+                     if k.lower() == "content-type"), "")
+        request["postData"] = {"mimeType": kind, "text": body}
+    return {
+        "startedDateTime": (datetime.fromtimestamp(float(wall), timezone.utc).isoformat()
+                            if wall else ""),
+        "time": -1,
+        "request": request,
+        "response": {
+            "status": entry.get("status") or 0,
+            "statusText": "",
+            "httpVersion": "",
+            "headers": pairs(entry.get("response_headers")),
+            "cookies": [],
+            "content": {"size": -1, "mimeType": entry.get("mime") or ""},
+            "redirectURL": "",
+            "headersSize": -1,
+            "bodySize": entry.get("size") if entry.get("size") is not None else -1,
+        },
+        "cache": {},
+        "timings": {"send": -1, "wait": -1, "receive": -1},
+        "_resourceType": entry.get("type"),
+        "_requestId": entry.get("request_id"),
+    }
+
+
 @mcp.tool()
 async def export_har(filename: Optional[str] = None) -> str:
-    """Export captured network traffic to HAR-like JSON file."""
+    """Export captured requests to a HAR file: URLs, headers, bodies sent, status, type.
+
+    Needs network_start(capture_bodies=True), the default. Timings and response bodies are
+    not captured. The file holds real header values, so it is written mode 600 and only its
+    path is returned.
+    """
     try:
+        entries = list((BrowserState.network_index or {}).values())
+        if not entries:
+            return err(f"no indexed requests to export ({len(BrowserState.network_logs)} raw "
+                       f"events). Call network_start(capture_bodies=True) before the traffic.")
         ensure_dirs()
-        fname = filename or ts_filename("traffic", "har")
-        path = confined_output_path(EXPORT_DIR, fname)
-        path.write_text(json.dumps({
+        path = confined_output_path(EXPORT_DIR, filename or ts_filename("traffic", "har"))
+        document = json.dumps({
             "log": {
                 "version": "1.2",
                 "creator": {"name": "mcp-stealth-chrome", "version": __version__},
-                "entries": BrowserState.network_logs,
+                "entries": [_har_entry(e) for e in entries],
             }
-        }, indent=2, default=str))
-        return ok(str(path))
+        }, indent=2, default=str)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            handle.write(document)
+        return ok(f"{path}\n{len(entries)} request(s), mode 600: holds real header values")
     except Exception as e:
         return err(str(e))
 
@@ -7092,13 +7451,15 @@ async def _apply_storage_state(browser: Browser, path: str) -> dict:
             expires = None
             if raw_expires is not None and float(raw_expires) > 0:
                 expires = cdp_network.TimeSinceEpoch(float(raw_expires))
-            await tab.send(cdp_network.set_cookie(
+            accepted = await tab.send(cdp_network.set_cookie(
                 name=c.get("name"), value=c.get("value"),
                 domain=c.get("domain"), path=c.get("path", "/"),
                 secure=c.get("secure", False),
                 http_only=c.get("http_only", c.get("httpOnly", False)),
                 expires=expires,
             ))
+            if accepted is False:
+                raise RuntimeError(f"Chrome rejected cookie {c.get('name')!r}")
             report["cookies_set"] += 1
         except Exception as exc:
             report["cookies_failed"] += 1
@@ -7824,6 +8185,100 @@ from .tools.network_http import (  # noqa: F401
 # Idle instances auto-close after configurable timeout (prevents memory leaks).
 
 
+# How long a Chrome that is running but missed nodriver's window gets to open its port.
+SLOW_CHROME_WAIT = 10.0
+
+
+async def _start_chrome(config: Config) -> Browser:
+    """nodriver.start, surviving a Chrome that was merely slow to answer.
+
+    nodriver probes for about 2.3 seconds and raises, which a busy machine, several
+    sessions launching at once or a browser update can exceed. The process keeps starting
+    anyway, and with no Browser returned nothing knows it exists: it is left running,
+    holding its profile. So it is given time and adopted when it answers. Ending it and
+    spawning another would only add load and meet the same short window. One that never
+    answers is ended, and the launch tried once more.
+
+    nodriver writes the host and port it picked into the config and reads a set pair as
+    "connect to a running Chrome", so a retry that keeps them spawns nothing and only
+    knocks on the port of the Chrome just ended.
+
+    A failed exception carries `reap_report`: the launch's Chrome is already dealt with.
+    """
+    host, port = config.host, config.port
+    for attempt in (1, 2):
+        try:
+            return await asyncio.wait_for(
+                nodriver.start(config=config), timeout=BROWSER_LAUNCH_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            await _reap_failed_start(config)
+            raise
+        except Exception as exc:
+            slow = "Failed to connect" in str(exc)
+            adopted = await _adopt_slow_chrome(config) if slow else None
+            if adopted is not None:
+                return adopted
+            reap = await _reap_failed_start(config)
+            if attempt == 2 or not slow:
+                _remove_temp_profile(config)
+                exc.reap_report = reap
+                raise
+            config.host, config.port = host, port
+            await asyncio.sleep(1.0)
+    raise AssertionError("unreachable")
+
+
+async def _adopt_slow_chrome(config: Config) -> Optional[Browser]:
+    """Connect to the Chrome a failed nodriver.start left starting, once its port answers."""
+    registered = nodriver.core.util.get_registered_instances()
+    spawned = next((b for b in registered if b.config is config), None)
+    http = getattr(spawned, "_http", None)
+    process = getattr(spawned, "_process", None)
+    if http is None or process is None:
+        return None
+    deadline = time.monotonic() + SLOW_CHROME_WAIT
+    while True:
+        if getattr(process, "returncode", None) is not None:
+            return None  # exited: it handed over to another Chrome, or crashed
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(http.get("version"), timeout=1.0)
+            break
+        if time.monotonic() >= deadline:
+            return None
+        await asyncio.sleep(0.25)
+    try:
+        # With the port in the config this connects rather than spawns. The new Browser
+        # takes over the process, or closing it would only drop the socket.
+        browser = await asyncio.wait_for(nodriver.start(config=config), timeout=BROWSER_LAUNCH_TIMEOUT)
+    except Exception:
+        return None
+    registered.discard(spawned)
+    browser._process, browser._process_pid = process, spawned._process_pid
+    return browser
+
+
+async def _reap_failed_start(config: Config) -> dict:
+    """End the Chrome a failed nodriver.start spawned, by the PID nodriver recorded.
+
+    Never by scanning the profile: when another Chrome already holds it, the one spawned
+    here hands over and exits, so a scan would find and signal that other browser.
+    """
+    report: dict = {"killed": [], "still_alive": []}
+    registered = nodriver.core.util.get_registered_instances()
+    for instance in [b for b in registered if b.config is config]:
+        registered.discard(instance)
+        report = await _ensure_browser_dead(instance, None, grace=0.3)
+    return report
+
+
+def _remove_temp_profile(config: Config) -> None:
+    """Remove the temporary profile nodriver made for an ephemeral launch that failed."""
+    profile = Path(str(getattr(config, "user_data_dir", "") or ""))
+    if profile.name.startswith("uc_") and Path(tempfile.gettempdir()).resolve() in profile.resolve().parents:
+        shutil.rmtree(profile, ignore_errors=True)
+
+
 def _profile_directory_args(user_data_dir: Optional[Path], extra_args: Optional[list[str]]) -> list[str]:
     """--profile-directory for a user-data dir holding several profiles.
 
@@ -7965,9 +8420,7 @@ async def _launch_browser_instance(
 
     browser: Optional[Browser] = None
     try:
-        browser = await asyncio.wait_for(
-            nodriver.start(config=config), timeout=BROWSER_LAUNCH_TIMEOUT
-        )
+        browser = await _start_chrome(config)
     except asyncio.TimeoutError:
         await _safe_stop_browser(browser)
         await _remove_privacy_profile(privacy_profile)
@@ -8255,6 +8708,9 @@ async def list_instances() -> str:
     """⭐ List all browser instances with status + last-active time.
     Also reports external (non-MCP) Chrome processes that may conflict with
     custom --user-data-dir launches."""
+    if BrowserState.browser is not None:
+        with contextlib.suppress(Exception):
+            await _refresh_tabs()
     snapshots = BrowserState.list_snapshots()
     out = []
     now = time.time()
@@ -9287,7 +9743,9 @@ async def smart_fill(fields: dict, submit_label: Optional[str] = None) -> str:
                   }}
                   const proto = this.tagName === 'TEXTAREA'
                     ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-                  Object.getOwnPropertyDescriptor(proto, 'value').set.call(this, wanted);
+                  // A setter ignores maxlength, which typing cannot exceed.
+                  const text = this.maxLength >= 0 ? wanted.slice(0, this.maxLength) : wanted;
+                  Object.getOwnPropertyDescriptor(proto, 'value').set.call(this, text);
                   this.dispatchEvent(new Event('input', {{bubbles: true}}));
                   this.dispatchEvent(new Event('change', {{bubbles: true}}));
                   return this.value;
@@ -9300,9 +9758,15 @@ async def smart_fill(fields: dict, submit_label: Optional[str] = None) -> str:
                     raise RuntimeError(exc.text or "value setter threw")
                 actual = remote.value
                 if str(actual) != str(value):
+                    kind, _ = await _wait(tab.send(cdp_runtime.call_function_on(
+                        "function() { return this.type; }", object_id=parts["el"].object_id,
+                        return_by_value=True,
+                    )), what=f"smart_fill read '{label}'")
+                    secret = kind.value == "password" or is_secret_name(label)
+                    reads = f"{len(str(actual))} chars" if secret else repr(str(actual)[:80])
                     results.append({
                         "label": label, "matched": best["label"], "ok": False,
-                        "error": f"field reads {str(actual)[:80]!r} after setting it",
+                        "error": f"field reads {reads} after setting it",
                     })
                     continue
                 results.append({"label": label, "matched": best["label"], "ok": True})
@@ -9987,11 +10451,15 @@ async def auth_capture(
     count: int = 1,
     timeout: float = 10.0,
     include_response_headers: bool = False,
+    reveal_values: bool = False,
 ) -> str:
     """⭐ Intercept the next N requests matching a URL pattern and return
-    their headers (Authorization, Cookie, X-CSRF-*, etc.) — useful for
+    their headers (Authorization, X-CSRF-*, etc.) — useful for
     SPAs that hold bearer tokens in JS memory and never write them to
-    localStorage.
+    localStorage. Their values are hidden unless reveal_values=True, because
+    tool output lands in the transcript. After network_start,
+    http_request_with_session reuses a token seen on the same origin without
+    showing it.
 
     Pattern: substring match on URL (case-sensitive). For regex use
     network_get instead.
@@ -10001,6 +10469,7 @@ async def auth_capture(
         count: stop capturing after this many matches (default 1)
         timeout: max seconds to wait (default 10)
         include_response_headers: also wait for + return response headers
+        reveal_values: return credential values as they are
 
     Returns JSON array of {url, method, request_headers, request_body,
     [response_headers, status]}.
@@ -10081,6 +10550,8 @@ async def auth_capture(
             return err(
                 f"auth_capture: no requests matched {filter_url_pattern!r} within {timeout}s"
             )
+        if not reveal_values:
+            captured = [mask_request_entry(c) for c in captured]
         return ok(json.dumps(captured, indent=2, default=str)[:30000])
     except Exception as e:
         return err(str(e))
@@ -10244,14 +10715,24 @@ async def _arm_request_watch(
     handlers = [(cdp_network.RequestWillBeSent, on_req)]
     if require_response:
         handlers.append((cdp_network.ResponseReceived, on_res))
-    for event_type, handler in handlers:
-        tab.add_handler(event_type, handler)
+    _add_all_handlers(tab, handlers)
     return {"match": match, "pending": pending, "done": done,
             "disarm": lambda: _drop_handlers(tab, handlers)}
 
 
+def _add_all_handlers(tab: Any, handlers: list) -> None:
+    """All or none: a caller that gets an exception has no disarm to clean up with."""
+    try:
+        for event_type, handler in handlers:
+            tab.add_handler(event_type, handler)
+    except Exception:
+        _drop_handlers(tab, handlers)
+        raise
+
+
 async def _await_request_watch(
     watch: dict, url_pattern: str, method: Optional[str], timeout: float,
+    reveal_values: bool = False,
 ) -> str:
     try:
         await asyncio.wait_for(watch["done"].wait(), timeout=timeout)
@@ -10260,7 +10741,8 @@ async def _await_request_watch(
         what = (f"{len(pending)} request(s) matched {url_pattern!r} but none got a response"
                 if pending else f"no request matched {url_pattern!r}")
         return err(what + (f" method={method}" if method else "") + f" within {timeout}s")
-    return ok(json.dumps(watch["match"], indent=2, default=str))
+    match = watch["match"] if reveal_values else mask_request_entry(watch["match"])
+    return ok(json.dumps(match, indent=2, default=str))
 
 
 @mcp.tool()
@@ -10269,6 +10751,7 @@ async def wait_for_request(
     method: Optional[str] = None,
     timeout: float = 15.0,
     require_response: bool = True,
+    reveal_values: bool = False,
 ) -> str:
     """⭐ Block until a network request matching url_pattern is observed.
     Replaces the setTimeout(2000)+poll anti-pattern.
@@ -10278,6 +10761,7 @@ async def wait_for_request(
         method: optional HTTP verb filter (GET/POST/...)
         timeout: max seconds to wait
         require_response: also wait for the response phase (default True)
+        reveal_values: return credential headers and fields as they are, not "*** (N chars)"
 
     Returns JSON of the matching entry (url/method/status/request_headers/
     response_headers).
@@ -10286,7 +10770,7 @@ async def wait_for_request(
         tab = BrowserState.active_tab()
         watch = await _arm_request_watch(tab, url_pattern, method, require_response)
         try:
-            return await _await_request_watch(watch, url_pattern, method, timeout)
+            return await _await_request_watch(watch, url_pattern, method, timeout, reveal_values)
         finally:
             watch["disarm"]()
     except Exception as e:
@@ -10334,8 +10818,7 @@ async def _arm_inflight_tracker(tab: Any) -> tuple[dict, Any]:
         (cdp_network.LoadingFinished, on_finished),
         (cdp_network.LoadingFailed, on_finished),
     ]
-    for event_type, handler in handlers:
-        tab.add_handler(event_type, handler)
+    _add_all_handlers(tab, handlers)
     return tracker, lambda: _drop_handlers(tab, handlers)
 
 
