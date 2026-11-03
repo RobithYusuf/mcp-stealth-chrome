@@ -48,7 +48,7 @@ from urllib.parse import urlparse
 from .._app import mcp
 from ..helpers import err, get_url, ok, parse_json
 from ..humanize import humanized_move
-from ..state import BrowserState
+from ..state import SESSION_GONE_HOOKS, BrowserState
 
 # ── Bounds ─────────────────────────────────────────────────────────────────
 # Tracked requests outlive the tool call that started them, so every one of
@@ -261,6 +261,17 @@ class _Tracked:
 
 
 _TRACKED: dict[str, _Tracked] = {}
+
+
+def _forget_session_requests(session: str) -> None:
+    for request_id, rec in list(_TRACKED.items()):
+        if rec.session == session:
+            if rec.state == "pending" and rec.task is not None:
+                rec.task.cancel()
+            _TRACKED.pop(request_id, None)
+
+
+SESSION_GONE_HOOKS.append(_forget_session_requests)
 
 
 def _own_tracked() -> list[_Tracked]:

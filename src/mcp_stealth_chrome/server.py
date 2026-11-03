@@ -60,6 +60,7 @@ from .refs import (
     MAX_FRAMES,
     active_element,
     all_frames,
+    close_connection,
     collect_snapshot,
     ensure_in_root_view,
     evaluate_parts,
@@ -82,6 +83,7 @@ from .snapshot import (
 )
 from .state import (
     PRIMARY_SESSION,
+    SESSION_GONE_HOOKS,
     DEFAULT_IDLE_TIMEOUT,
     EXPORT_DIR,
     IDENTITIES_DIR,
@@ -249,6 +251,24 @@ async def _restore_window_bounds(instance_id: str, tab) -> dict:
     return result
 
 
+async def _debug_port_closed(browser: Any, grace: float) -> bool:
+    """True once nothing is listening on an attached browser's debugging port."""
+    config = getattr(browser, "config", None)
+    host, port = getattr(config, "host", None), getattr(config, "port", None)
+    if not host or not port:
+        return False
+    deadline = time.monotonic() + max(grace, 3.0)
+    while True:
+        try:
+            _reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), 1)
+            writer.close()
+        except (OSError, asyncio.TimeoutError):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(0.2)
+
+
 async def _ensure_browser_dead(browser, profile_dir=None, grace: float = 1.5) -> dict:
     """Stop a browser and VERIFY the OS process actually died.
 
@@ -274,16 +294,40 @@ async def _ensure_browser_dead(browser, profile_dir=None, grace: float = 1.5) ->
               "still_alive": [], "detail": ""}
     pid = getattr(browser, "_process_pid", None) if browser else None
     report["pid"] = pid
+    # Attached: this server did not start that Chrome and has no process to signal, and
+    # from nodriver 0.50 stop() only closes the socket. Ask it to quit, then look for
+    # evidence, or an attached browser reads as closed while it keeps running.
+    attached = (browser is not None and getattr(browser, "_process", None) is None
+                and not pid and getattr(getattr(browser, "config", None), "port", None) is not None)
+    if attached:
+        from nodriver.cdp import browser as cdp_browser
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(
+                (getattr(browser, "connection", None) or browser).send(cdp_browser.close()),
+                timeout=3,
+            )
     try:
         if browser:
             browser.stop()
         report["stopped"] = True
     except Exception as e:
         report["detail"] = f"stop() raised: {type(e).__name__}: {e}"
+    if attached:
+        if await _debug_port_closed(browser, grace):
+            report["verified"] = True
+        else:
+            report["stopped"] = False
+            report["detail"] = (
+                "the attached Chrome is still answering on its debugging port after "
+                "being asked to close"
+            )
+        return report
 
     # Collect every PID that could still be ours.
     candidates: list[int] = [pid] if isinstance(pid, int) and pid > 0 else []
-    if profile_dir is not None:
+    # The profile scan is only a fallback for when no PID was captured. With a PID the
+    # target is known, and a scan can only add processes that are not ours to signal.
+    if profile_dir is not None and not candidates:
         try:
             from .state import find_chrome_pids_by_profile
             for extra in find_chrome_pids_by_profile(profile_dir):
@@ -339,6 +383,9 @@ def _kill_note(report: dict) -> str:
         bits.append(
             f"WARNING: PID(s) {report['still_alive']} are STILL RUNNING and are "
             f"now orphaned — kill them manually")
+    # Only where the close is being reported as done; a failed stop already says so itself.
+    if report.get("stopped") and not report.get("verified") and not report.get("still_alive"):
+        bits.append("stop was requested, but no process could be checked to confirm it ended")
     return (" (" + "; ".join(bits) + ")") if bits else ""
 
 
@@ -437,7 +484,9 @@ async def _first_live_tab(browser: Any, attempts: int = 8) -> Any:
     for _ in range(attempts):
         with contextlib.suppress(Exception):
             await browser.update_targets()
-            infos = await browser.connection.send(cdp_target.get_targets())
+            # A Browser has .connection up to 0.48 and is itself a Connection from 0.50.
+            infos = await (getattr(browser, "connection", None) or browser).send(
+                cdp_target.get_targets())
             live = {str(t.target_id) for t in infos if t.type_ == "page"}
             for candidate in browser.tabs:
                 if str(candidate.target.target_id) not in live:
@@ -933,9 +982,26 @@ from . import image_output as _image_output  # registers native image inspection
 # ── Utility: ensure active tab after operations that may shift tabs ────────
 
 async def _refresh_tabs() -> None:
-    """Sync BrowserState.tabs with browser.tabs (after new windows etc.)."""
-    if BrowserState.browser:
-        BrowserState.tabs = list(BrowserState.browser.tabs)
+    """Sync BrowserState.tabs with the browser, keeping the active tab selected.
+
+    nodriver up to 0.48 tracked new and closed targets by itself. From 0.50 it only learns
+    of them on update_targets, so without this a popup stays invisible and a closed tab
+    stays listed, and the active one could silently become a different tab.
+    """
+    browser = BrowserState.browser
+    if not browser:
+        return
+    index = BrowserState.active_tab_index
+    current = BrowserState.tabs[index] if 0 <= index < len(BrowserState.tabs) else None
+    with contextlib.suppress(Exception):
+        await asyncio.wait_for(browser.update_targets(), timeout=5)
+    BrowserState.tabs = list(browser.tabs)
+    if current is not None:
+        wanted = _target_key(current)
+        for position, tab in enumerate(BrowserState.tabs):
+            if _target_key(tab) == wanted:
+                BrowserState.active_tab_index = position
+                break
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1410,7 +1476,10 @@ async def browser_launch(
             )
             if profile_info.get("error"):
                 return err(profile_info["error"])
-            profile_path = resolved_profile or PROFILE_DIR
+            # None for an ephemeral launch. Recording the shared profile here instead made
+            # browser_close scan it and signal whichever Chrome really was using it: the
+            # browser of another session, with its logins.
+            profile_path = resolved_profile
             used_fallback = bool(persistent) and "conflict_with_pid" in profile_info
             if persistent and BrowserState.current_instance_id == "main":
                 from .state import set_profile_affinity
@@ -3243,6 +3312,19 @@ async def _click_text_rescue(tab, text: str, exact: bool) -> dict:
         return {}
 
 
+# nodriver 0.50's Tab.find also searches child frames and returns a plain Element with
+# frame-local coordinates. Mouse input goes through the root tab, so clicking it would
+# land on whatever the page has at those same numbers. Refs carry the frame offset.
+_FRAME_TEXT_HINT = (
+    "{text!r} is inside an iframe, and text lookups only click in the main frame. "
+    "Take a browser_snapshot and click its ref."
+)
+
+
+def _element_is_in_frame(tab: Any, el: Any) -> bool:
+    return getattr(el, "tab", tab) is not tab
+
+
 async def _js_click(el) -> None:
     """element.click() from JS. isTrusted=false — only ever on explicit request."""
     await el.apply("function() { this.click(); }")
@@ -3403,6 +3485,9 @@ async def click_text(text: str, exact: bool = False, verify: bool = True) -> str
     try:
         tab = BrowserState.active_tab()
         el = await tab.find(text, best_match=not exact)
+        in_frame = el is not None and _element_is_in_frame(tab, el)
+        if in_frame:
+            el = None
         if el is not None:
             probe = await _click_probe(el)
             if _blocked_reason(probe) is None:
@@ -3431,6 +3516,8 @@ async def click_text(text: str, exact: bool = False, verify: bool = True) -> str
             return _click_outcome(head, detail, before, await _page_sig(tab))
 
         if el is None and not cand.get("found"):
+            if in_frame:
+                return err(_FRAME_TEXT_HINT.format(text=text))
             return err(f"no element with text {text!r}")
         if el is not None:
             # Report why the original match is unusable, plus what the scan saw.
@@ -3482,6 +3569,8 @@ async def click_role(role: str, name: Optional[str] = None, verify: bool = True)
                 el = None
         if el is None and name:
             el = await tab.find(name, best_match=True)
+            if el is not None and _element_is_in_frame(tab, el):
+                return err(_FRAME_TEXT_HINT.format(text=name))
         if el is None:
             return err(
                 f"no element found for role={role!r}"
@@ -5285,21 +5374,26 @@ _dialog_pre_action: dict[str, Any] = {
 }
 
 
-def _session_dialog_cfg(kind: str) -> dict:
-    """Dialog settings of the calling session. Handlers capture this when armed, so one
-    session changing its settings cannot leave another's dialogs hanging."""
-    return _DIALOG_SESSION_CFG.setdefault((BrowserState.session_key(), kind), {
+def _instance_dialog_cfg(kind: str) -> dict:
+    """Dialog settings of the current instance.
+
+    A handler captures this when armed and is armed once per tab. Keyed by instance, not
+    by session: otherwise an instance handed to another session keeps obeying its previous
+    owner, while the new owner is told its setting was applied. Instance names are unique
+    across sessions, so no session can reach another's settings.
+    """
+    return _DIALOG_INSTANCE_CFG.setdefault((BrowserState.current_instance_id, kind), {
         "action": "accept", "text": "", "enabled": False, "types": None,
     })
 
 
-_DIALOG_SESSION_CFG: dict[tuple[str, str], dict] = {}
+_DIALOG_INSTANCE_CFG: dict[tuple[str, str], dict] = {}
 
 
 @mcp.tool()
 async def dialog_handle(action: str = "accept", text: Optional[str] = None) -> str:
     """Pre-arm handler for next alert/confirm/prompt. Call BEFORE action that triggers it."""
-    pre_cfg = _session_dialog_cfg("pre")
+    pre_cfg = _instance_dialog_cfg("pre")
     pre_cfg["action"] = action
     pre_cfg["text"] = text
     try:
@@ -5320,6 +5414,9 @@ async def dialog_handle(action: str = "accept", text: Optional[str] = None) -> s
             except Exception:
                 pass
 
+        # nodriver up to 0.48 enabled the domain for a registered handler; 0.50 does not,
+        # and without this the dialog event never arrives.
+        await tab.send(cdp_page.enable())
         tab.add_handler(cdp_page.JavascriptDialogOpening, handle)
         _dialog_pre_action["_registered_tab_ids"].add(tid)
         return ok(f"dialog handler armed ({action})")
@@ -5434,7 +5531,7 @@ async def dialog_auto_handle(
     Native dialogs only (Chrome's own card UI). HTML/CSS modal overlays
     are regular DOM — use click_text("Cancel") / click_role for those.
     """
-    auto_cfg = _session_dialog_cfg("auto")
+    auto_cfg = _instance_dialog_cfg("auto")
     auto_cfg["enabled"] = bool(enabled)
     auto_cfg["action"] = action
     auto_cfg["text"] = text or ""
@@ -5470,6 +5567,7 @@ async def dialog_auto_handle(
             except Exception:
                 pass
 
+        await tab.send(cdp_page.enable())
         tab.add_handler(cdp_page.JavascriptDialogOpening, auto_handler)
         _DIALOG_AUTO_CFG["_registered_tab_ids"].add(tab_id)
         return ok(
@@ -5592,6 +5690,8 @@ async def console_start() -> str:
 
         tab.add_handler(cdp_runtime.ConsoleAPICalled, handle)
         tab.add_handler(cdp_runtime.ExceptionThrown, handle_exception)
+        with contextlib.suppress(Exception):
+            await tab.send(cdp_page.enable())
         tab.add_handler(cdp_page.FrameNavigated, on_navigated)
         try:
             await tab.send(cdp_runtime.enable())
@@ -6453,7 +6553,10 @@ async def intercept_start(
         }, indent=2))
     except Exception as e:
         try:
-            await _intercept_disable("failed to start")
+            # Only what this call set up. active_tab() raising before the owner check,
+            # with another session's interception live, used to switch that one off.
+            if _INTERCEPT.get("session") == BrowserState.session_key():
+                await _intercept_disable("failed to start")
         except Exception:
             pass
         return err(str(e))
@@ -6941,6 +7044,9 @@ async def identity_pin(
     """
     try:
         iid = instance_id or BrowserState.current_instance_id
+        foreign = BrowserState.foreign_instance(iid)
+        if foreign:
+            return err(foreign)
         ensure_dirs()
         existing = _load_identity(iid) or {}
         pinned_fingerprint = dict(existing.get("fingerprint") or {})
@@ -6955,12 +7061,9 @@ async def identity_pin(
         }
         path = _identity_path(iid)
         tmp = path.with_suffix(f".json.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        # Private before the first byte: a pin can hold a proxy URL with credentials.
+        _write_private(tmp, json.dumps(payload, indent=2) + "\n")
         os.replace(tmp, path)
-        try:
-            path.chmod(0o600)
-        except OSError:
-            pass
         return ok(json.dumps(payload, indent=2))
     except Exception as e:
         return err(str(e))
@@ -6971,6 +7074,9 @@ async def identity_show(instance_id: Optional[str] = None) -> str:
     """Show the persisted identity pin for an instance."""
     try:
         iid = instance_id or BrowserState.current_instance_id
+        foreign = BrowserState.foreign_instance(iid)
+        if foreign:
+            return err(foreign)
         identity = _load_identity(iid)
         if identity is None:
             return err(f"no pinned identity for instance {iid!r}")
@@ -7729,13 +7835,13 @@ async def _sweep_idle_instances() -> None:
             to_close.append((iid, snap))
     for iid, snap in to_close:
         _tabs = list(snap.tabs)
-        try:
-            if snap.browser:
-                snap.browser.stop()
-        except Exception:
-            # Keep the instance reachable and retry next sweep. Popping
-            # it here would leak a live Chrome with no remaining handle.
-            continue
+        # stop() can return without raising when the socket is gone. Keep the instance
+        # reachable and retry next sweep unless the process is really gone; dropping it
+        # would leak a live Chrome with no remaining handle.
+        if snap.browser:
+            _dead = await _ensure_browser_dead(snap.browser, snap.profile_dir)
+            if not _dead["stopped"] and not _dead["verified"]:
+                continue
         # Mark profile cleanly exited (matches close_instance) so the
         # next launch doesn't hit a "Restore pages?" / stale-lock state.
         if snap.privacy:
@@ -7755,12 +7861,11 @@ async def _sweep_idle_instances() -> None:
         _cur_profile = BrowserState.current_profile_dir
         _cur_privacy = BrowserState.current_privacy
         _cur_tabs = list(BrowserState.tabs)
-        try:
-            if BrowserState.browser:
-                BrowserState.browser.stop()
-        except Exception:
-            # State must remain reachable so the next sweep can retry.
-            return
+        if BrowserState.browser:
+            _dead = await _ensure_browser_dead(BrowserState.browser, _cur_profile)
+            if not _dead["stopped"] and not _dead["verified"]:
+                # State must remain reachable so the next sweep can retry.
+                return
         BrowserState.reset()
         _clear_tab_scoped_state(_cur_tabs)
         BrowserState.current_headless = False
@@ -8121,12 +8226,11 @@ async def close_all_instances() -> str:
     # Close stored
     for iid, snap in list(BrowserState.instances.items()):
         _tabs = list(snap.tabs)
-        try:
-            if snap.browser:
-                snap.browser.stop()
-        except Exception as e:
-            failures.append(f"{iid}: stop failed ({type(e).__name__}: {e})")
-            continue
+        if snap.browser:
+            _kill = await _ensure_browser_dead(snap.browser, snap.profile_dir)
+            if not _kill["stopped"] and not _kill["verified"]:
+                failures.append(f"{iid}: {_kill['detail'] or 'stop failed'}; instance retained")
+                continue
         snap.browser = None
         snap.tabs = []
         _clear_tab_scoped_state(_tabs)
@@ -8143,13 +8247,11 @@ async def close_all_instances() -> str:
         _current_profile = BrowserState.current_profile_dir
         _current_privacy = BrowserState.current_privacy
         _current_tabs = list(BrowserState.tabs)
-        try:
-            if BrowserState.browser:
-                BrowserState.browser.stop()
-        except Exception as e:
+        _kill = await _ensure_browser_dead(BrowserState.browser, _current_profile)
+        if not _kill["stopped"] and not _kill["verified"]:
             failures.append(
-                f"{BrowserState.current_instance_id}: stop failed "
-                f"({type(e).__name__}: {e})"
+                f"{BrowserState.current_instance_id}: "
+                f"{_kill['detail'] or 'stop failed'}; instance retained"
             )
         else:
             _clear_tab_scoped_state(_current_tabs)
@@ -8432,6 +8534,20 @@ async def clone_chrome_profile(
             return err(
                 f"Target instance already exists: {target_root}\n"
                 f"Pass overwrite=true to replace, or use different target_instance_id."
+            )
+        # overwrite means "replace a stale copy", never "delete a browser out from under
+        # whoever is using it", in this session or another.
+        foreign = BrowserState.foreign_instance(target_instance_id)
+        if foreign:
+            return err(f"not overwriting: {foreign}")
+        from .state import find_chrome_pids_by_profile
+        holder = chrome_lock_holder_pid(target_root)
+        running = find_chrome_pids_by_profile(target_root)
+        # No process listing on Windows, so nothing there can show the profile is free.
+        if holder is not None or running or is_chrome_profile_locked(target_root) or sys.platform == "win32":
+            return err(
+                f"not overwriting {target_root}: it is in use "
+                f"(lock holder {holder}, Chrome PIDs {running}). Close that browser first."
             )
         try:
             shutil.rmtree(target_root)
@@ -9079,21 +9195,34 @@ async def assert_element_visible(
 
 # In-memory snapshots keyed by user-supplied name. Lives only for current
 # MCP session (not persisted across launches — use storage_state_save for that).
-_STORAGE_SNAPSHOTS: dict[str, dict] = {}
+_STORAGE_SNAPSHOTS: dict[Any, dict] = {}
 
 
-def _snapshot_key(name: str) -> str:
+def _snapshot_key(name: str) -> Any:
     """Names are per session: diffing against another session's snapshot would blame the
-    action under test for the difference between two browsers."""
+    action under test for the difference between two browsers. A tuple, because a joined
+    string lets the primary session name a snapshot "session-2::x" and reach session-2's.
+    """
     key = BrowserState.session_key()
-    return name if key == PRIMARY_SESSION else f"{key}::{name}"
+    return name if key == PRIMARY_SESSION else (key, name)
+
+
+def _forget_session_snapshots(session: str) -> None:
+    for name in list(_STORAGE_SNAPSHOTS):
+        owned = isinstance(name, str) if session == PRIMARY_SESSION else (
+            isinstance(name, tuple) and name[0] == session)
+        if owned:
+            _STORAGE_SNAPSHOTS.pop(name, None)
+
+
+SESSION_GONE_HOOKS.append(_forget_session_snapshots)
 
 
 def _own_snapshot_names() -> list[str]:
-    prefix = f"{BrowserState.session_key()}::"
-    if BrowserState.session_key() == PRIMARY_SESSION:
-        return [n for n in _STORAGE_SNAPSHOTS if "::" not in n]
-    return [n[len(prefix):] for n in _STORAGE_SNAPSHOTS if n.startswith(prefix)]
+    key = BrowserState.session_key()
+    if key == PRIMARY_SESSION:
+        return [n for n in _STORAGE_SNAPSHOTS if isinstance(n, str)]
+    return [n[1] for n in _STORAGE_SNAPSHOTS if isinstance(n, tuple) and n[0] == key]
 
 
 async def _take_storage_snapshot(tab) -> dict:
@@ -9277,6 +9406,7 @@ def _register_workflow_tools() -> None:
     if _WORKFLOW_TOOLS:
         return
     g = globals()
+    registered = mcp._tool_manager._tools
     for name in (
         "navigate", "reload", "go_back", "go_forward",
         "click", "click_text", "click_role", "fill", "type_text", "press_key",
@@ -9295,8 +9425,11 @@ def _register_workflow_tools() -> None:
         "hover", "paste_text", "fill_form", "wait_for_function", "wait_for_change",
         "wait_for_network_idle",
     ):
-        if name in g and callable(g[name]):
-            # FastMCP wraps tools — unwrap to the underlying coroutine fn
+        # The registered tool first: a tool's Python name can differ from its public one,
+        # and globals() then yields something else. get_url is the helper needing a tab.
+        if name in registered:
+            _WORKFLOW_TOOLS[name] = registered[name].fn
+        elif name in g and callable(g[name]):
             fn = g[name]
             _WORKFLOW_TOOLS[name] = getattr(fn, "fn", fn) if hasattr(fn, "fn") else fn
 
@@ -10339,11 +10472,12 @@ async def detach() -> str:
     # Close just the websocket connection, leave the Chrome process alive.
     detached_tabs = list(BrowserState.tabs)
     try:
-        if BrowserState.browser and getattr(BrowserState.browser, "connection", None):
-            try:
-                await BrowserState.browser.connection.aclose()
-            except Exception:
-                pass
+        if BrowserState.browser:
+            # Each tab may hold its own connection, and closing only the browser's would
+            # leave those open with their listener tasks running.
+            for connection in (*detached_tabs,
+                               getattr(BrowserState.browser, "connection", None) or BrowserState.browser):
+                await close_connection(connection)
         # Don't call .stop() — that terminates Chrome.
     finally:
         _ATTACHED_BROWSERS.discard(iid)

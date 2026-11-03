@@ -20,6 +20,7 @@ Facts this module is built on, each checked against a real Chrome:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import itertools
 import json
 import time
@@ -174,14 +175,18 @@ def forget_refs(tab_keys) -> None:
 
 def _close_soon(conn: Any) -> None:
     try:
-        asyncio.get_running_loop().create_task(_close_conn(conn))
+        asyncio.get_running_loop().create_task(close_connection(conn))
     except RuntimeError:
         pass
 
 
-async def _close_conn(conn: Any) -> None:
+async def close_connection(conn: Any) -> None:
+    """Close a CDP connection without touching the browser process."""
+    # nodriver renamed this: disconnect() up to 0.48, aclose() from 0.50.
+    close = getattr(conn, "aclose", None) or getattr(conn, "disconnect", None)
     try:
-        await conn.disconnect()
+        if close is not None:
+            await close()
     except Exception:
         pass
 
@@ -200,13 +205,24 @@ async def _frame_conn(root: Tab, frame_id: str) -> Optional[Tab]:
     if info is None:
         return None
     browser = root.browser
-    conn = Tab(
-        f"ws://{browser.config.host}:{browser.config.port}/devtools/page/{info.target_id}",
-        target=info,
-        browser=browser,
-    )
+    conn = _connect_to_target(browser, info)
     conns[frame_id] = conn
     return conn
+
+
+def _connect_to_target(browser: Any, info: Any) -> Tab:
+    """A connection to one CDP target, on whichever design this nodriver has.
+
+    Up to 0.48 a Tab is built from its own /devtools/page/<id> URL. From 0.50 it opens the
+    browser endpoint and attaches to the target as a session, with the Browser as parent.
+    """
+    if "websocket_url" in inspect.signature(Tab.__init__).parameters:
+        return Tab(
+            f"ws://{browser.config.host}:{browser.config.port}/devtools/page/{info.target_id}",
+            target=info,
+            browser=browser,
+        )
+    return Tab(target=info, parent=browser, auto_attach=False)
 
 
 def _flatten_frames(node: Any) -> list[Any]:

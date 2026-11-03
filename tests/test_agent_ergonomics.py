@@ -221,6 +221,9 @@ def test_per_target_handlers_do_not_duplicate_and_network_mode_reconfigures(monk
         def add_handler(self, event_type, handler):
             self.handlers.append((event_type, handler))
 
+        async def send(self, _command):
+            return None
+
     first = _Tab()
     replacement = _Tab()
     active = iter((first, replacement))
@@ -277,6 +280,9 @@ def test_dialog_handlers_use_stable_target_identity(monkeypatch):
 
         def add_handler(self, event_type, handler):
             self.handlers.append((event_type, handler))
+
+        async def send(self, _command):
+            return None
 
     first = _Tab()
     replacement = _Tab()
@@ -678,7 +684,9 @@ def test_client_security_state_patch_tolerates_missing_field():
         "initiatorIsSecureContext": True,
         "initiatorIPAddressSpace": "Public",
     })
-    assert state.private_network_request_policy is not None
+    # The field was renamed between nodriver versions; either way it must be filled.
+    assert (getattr(state, "private_network_request_policy", None)
+            or getattr(state, "local_network_access_request_policy", None)) is not None
 
 
 def test_export_curl_builds_a_replayable_pair():
@@ -1298,3 +1306,65 @@ def test_multi_profile_dir_opens_the_last_used_profile(tmp_path):
     state_file.unlink()
     assert args(tmp_path, []) == ["--profile-directory=Default"]
     assert args(tmp_path / "Default", []) == []  # no sub-profile: leave Chrome to it
+
+
+def test_closing_a_browser_with_a_known_pid_never_scans_for_others(monkeypatch):
+    """persistent=False recorded the shared profile, so its close signalled the real one."""
+    import asyncio
+    import signal
+
+    from mcp_stealth_chrome import server, state
+
+    signalled = []
+
+    def fake_kill(pid, sig):
+        if sig != 0:
+            signalled.append(pid)
+        elif pid == 111:  # our own process is gone; anything else would look alive
+            raise ProcessLookupError
+
+    class _Browser:
+        _process_pid = 111
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(server.os, "kill", fake_kill)
+    monkeypatch.setattr(state, "find_chrome_pids_by_profile", lambda _p: [222])
+    report = asyncio.run(server._ensure_browser_dead(_Browser(), state.PROFILE_DIR, grace=0))
+    assert 222 not in signalled and report["pid"] == 111
+    assert signal.SIGKILL not in signalled
+
+
+def test_ephemeral_launch_claims_no_profile():
+    """The resolver answers None, and browser_launch must keep it that way."""
+    import inspect
+
+    from mcp_stealth_chrome import server
+
+    path, info = server._resolve_launch_profile("main", persistent=False, profile_conflict="fallback")
+    assert path is None and info["actual_profile"] is None
+    assert "resolved_profile or PROFILE_DIR" not in inspect.getsource(server.browser_launch)
+
+
+def test_identity_pin_temp_file_is_private_from_the_first_byte(tmp_path, monkeypatch):
+    import asyncio
+    import os as _os
+    import stat
+
+    from mcp_stealth_chrome import server
+
+    monkeypatch.setattr(server, "IDENTITIES_DIR", tmp_path)
+    monkeypatch.setattr(server, "ensure_dirs", lambda: None)
+    seen = []
+    real_replace = _os.replace
+
+    def spy(src, dst):
+        seen.append(stat.S_IMODE(_os.stat(src).st_mode))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(server.os, "replace", spy)
+    out = asyncio.run(server.mcp._tool_manager._tools["identity_pin"].fn(
+        instance_id="pin_mode", fingerprint={"timezone": "UTC"}))
+    assert not out.startswith("Error:"), out
+    assert seen == [0o600]

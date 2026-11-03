@@ -11,6 +11,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional
 
+BRANCHES_VAR = "__branches__"
 MAX_EXECUTED_STEPS = 2000
 MAX_FOREACH_ITEMS = 1000
 MAX_REPORTED_ENTRIES = 200
@@ -209,6 +210,12 @@ def _fail(run: _Run, path: list[int], step: Any, error: str) -> None:
         run.failure = {"path": path, "step": step, "error": error}
 
 
+def _note_failure(run: _Run, message: str) -> None:
+    """${last} describes the step that just ran, or a branch on ${last.ok} after a failed
+    step reads the success before it."""
+    run.variables["last"] = {"ok": False, "value": None, "text": message}
+
+
 async def _run_tool(run: _Run, step: dict, path: list[int]) -> None:
     tool = step["tool"]
     if not run.allowed(tool):
@@ -222,12 +229,15 @@ async def _run_tool(run: _Run, step: dict, path: list[int]) -> None:
         if not isinstance(args, dict):
             raise WorkflowError(f"args must be a dict, got {type(args).__name__}")
     except WorkflowError as exc:
+        _note_failure(run, str(exc))
         _fail(run, path, step, str(exc))
         return
     try:
         text = str(await run.dispatch(tool, args))
     except Exception as exc:
-        _fail(run, path, step, str(exc) or type(exc).__name__)
+        message = str(exc) or type(exc).__name__
+        _note_failure(run, message)
+        _fail(run, path, step, message)
         return
     failed = text.startswith("Error:")
     value = step_value(text)
@@ -273,7 +283,13 @@ async def _run_block(run: _Run, steps: Any, prefix: list[int], resume: list[int]
             elif "foreach" in step:
                 await _run_foreach(run, step, path, rest)
             elif "if" in step:
-                branch = "then" if condition(step["if"], run.variables) else "else"
+                branches = run.variables.setdefault(BRANCHES_VAR, {})
+                taken = branches.get(_dotted(path)) if rest else None
+                # Resuming inside a branch re-enters the one that ran. Its own failure may
+                # have changed what the condition reads, and re-evaluating would then run
+                # the other branch at the same index and report success.
+                branch = taken or ("then" if condition(step["if"], run.variables) else "else")
+                branches[_dotted(path)] = branch
                 _record(run, {"index": _dotted(path), "if": branch, "ok": True,
                               "label": step.get("label", "")})
                 await _run_block(run, step.get(branch) or [], path, rest)

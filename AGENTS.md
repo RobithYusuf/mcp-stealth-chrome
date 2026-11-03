@@ -40,9 +40,16 @@ uvx mcp-stealth-chrome → Python 3.11+ → FastMCP → nodriver → Chrome/Chro
   `reveal_values=True`, because tool output lands in the transcript, and files holding them are mode 600. The PyPI token lives in the macOS Keychain
   (`security find-generic-password -s mcp-stealth-chrome-pypi -w`), never in a file in the tree.
   Cookie and token files used during a release go to `/tmp` mode `600` and are `shred`ed after.
-- `nodriver` must stay pinned `<0.49` until this code is ported: 0.50 rebuilt `Connection` and `Tab` around
-  sessions, breaking the OOPIF connection and the identity override, and `uv.lock` hides it just as it does
-  for `mcp`. Run the E2E suites in a lock-free venv before lifting it.
+- `nodriver` stays capped at the newest version the E2E suites have passed on (`<0.51`): `uv.lock` hides
+  breakage just as it does for `mcp`, and a fresh install gets the newest allowed. 0.50 rebuilt `Connection`
+  and `Tab` around sessions, so code touching them must work on both designs (`_connect_to_target`).
+- From 0.50 nodriver tracks targets only on `update_targets`, so `_refresh_tabs` must call it, and `Tab.find`
+  also returns elements from child frames with frame-local coordinates. Those must never reach root-tab mouse
+  input: `click_text` and `click_role` refuse them and point to snapshot refs.
+- `Browser.stop()` on an attached browser only closes the socket from 0.50. `_ensure_browser_dead` sends
+  `Browser.close` and checks that the debugging port stopped answering.
+- A CDP override belongs to its session. nodriver 0.50's `Tab.get` opened a new session per navigation, which
+  dropped overrides on a cross-site navigation; `patches.py` keeps one session per tab.
 - E2E tests never use the real profile (`persistent=False`, or a temporary HOME with `--use-mock-keychain`).
   Holding `~/.mcp-stealth/profile` pushes other live sessions onto an empty fallback profile.
 - `mcp` must stay pinned `<2`. Version 2.0.0 removed `mcp.server.fastmcp` entirely, and this server

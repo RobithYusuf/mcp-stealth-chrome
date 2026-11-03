@@ -208,3 +208,18 @@ def test_clearing_cache_does_not_make_a_profile_look_recently_used(home):
         os.utime(path, (1_000_000, 1_000_000))
     cleanup("clear_cache", ["profile"], confirm=True)
     assert P._last_used(profile) == 1_000_000
+
+
+def test_symlinked_main_or_named_root_is_not_a_managed_profile(tmp_path, monkeypatch):
+    from mcp_stealth_chrome.tools import profiles as P
+
+    monkeypatch.setattr(state, "HOME", tmp_path)
+    root = tmp_path / ".mcp-stealth"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    make_profile(outside)
+    (root / "profile").symlink_to(outside)
+    outside_named = tmp_path / "named"
+    make_profile(outside_named / "work")
+    (root / "profiles").symlink_to(outside_named)
+    assert P._named_profiles() == []

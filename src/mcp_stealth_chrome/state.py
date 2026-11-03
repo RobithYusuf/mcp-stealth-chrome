@@ -553,9 +553,22 @@ class InstanceSnapshot:
         if self.browser is None or not self.tabs:
             return False
         if getattr(self.browser, "_process", None) is None:
-            connection = getattr(self.browser, "connection", None)
-            return connection is not None and not getattr(connection, "closed", True)
+            return connection_alive(self.browser)
         return not getattr(self.browser, "stopped", True)
+
+
+def connection_alive(browser: Any) -> bool:
+    """Is an attached browser's CDP connection up? Works on both nodriver designs.
+
+    Up to 0.48 a Browser holds a .connection with .closed. From 0.50 it is a Connection
+    itself, with .socket and no .connection, so asking the old way reported a healthy
+    attached browser as dead.
+    """
+    connection = getattr(browser, "connection", None)
+    if connection is not None:
+        return not getattr(connection, "closed", True)
+    socket = getattr(browser, "socket", None)
+    return socket is not None and getattr(socket, "close_code", None) is None
 
 
 def _default_field(name: str) -> Any:
@@ -781,10 +794,7 @@ class BrowserState(metaclass=_SessionRouted):
             return False
         # Attached browser: _process is None, so use CDP websocket liveness.
         if getattr(b, "_process", None) is None:
-            conn = getattr(b, "connection", None)
-            if conn is None:
-                return False
-            return not getattr(conn, "closed", True)
+            return connection_alive(b)
         # Launched browser: use the standard stopped flag.
         return not getattr(b, "stopped", True)
 
@@ -916,6 +926,10 @@ class BrowserState(metaclass=_SessionRouted):
         return cls.instances.pop(instance_id, None) is not None
 
 
+# Called with a session key when that session ends, for records held outside this module.
+SESSION_GONE_HOOKS: list[Callable[[str], None]] = []
+
+
 def set_session_liveness(check: Optional[Callable[[str], bool]]) -> None:
     """Install the HTTP transport's answer to "does this Mcp-Session-Id still exist"."""
     global _session_is_live
@@ -971,6 +985,13 @@ def _session_gone(key: str) -> None:
             _pool_put(state.current_instance_id, BrowserState.snapshot_current())
     finally:
         _current_session.reset(token)
+    # Before the key can be reused: "primary" passes to the next client, which must get
+    # the browser it reclaims but not the previous client's requests and snapshots.
+    for hook in SESSION_GONE_HOOKS:
+        try:
+            hook(key)
+        except Exception:
+            pass
     if key == PRIMARY_SESSION:
         _SESSIONS[PRIMARY_SESSION] = _SessionState()
         _primary_taken = False

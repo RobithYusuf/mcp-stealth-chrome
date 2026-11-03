@@ -157,10 +157,11 @@ def _named_profiles() -> list[tuple[str, Path, str]]:
     root = _root()
     found: list[tuple[str, Path, str]] = []
     main = root / "profile"
-    if main.is_dir():
+    # A symlink here would aim cleanup outside the tree this tool manages.
+    if main.is_dir() and not main.is_symlink():
         found.append(("profile", main, "main"))
     named = root / "profiles"
-    if named.is_dir():
+    if named.is_dir() and not named.is_symlink():
         found.extend(
             (f"profiles/{p.name}", p, "named")
             for p in sorted(named.iterdir()) if p.is_dir() and not p.is_symlink()

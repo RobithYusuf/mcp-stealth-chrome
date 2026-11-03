@@ -243,11 +243,82 @@ def test_storage_snapshots_and_dialog_settings_are_per_session():
     token = BrowserState.in_session(state.POOL_SESSION)
     try:
         other_key = server._snapshot_key("before")
-        other_cfg = server._session_dialog_cfg("auto")
     finally:
         BrowserState.unbind_session(token)
     assert server._snapshot_key("before") == "before" != other_key
-    assert server._session_dialog_cfg("auto") is not other_cfg
+
+
+def test_a_snapshot_name_cannot_reach_another_session():
+    """A joined string let the primary name a snapshot "pool::before" and read that one."""
+    from mcp_stealth_chrome import server
+
+    token = BrowserState.in_session(state.POOL_SESSION)
+    try:
+        other_key = server._snapshot_key("before")
+    finally:
+        BrowserState.unbind_session(token)
+    assert server._snapshot_key(f"{state.POOL_SESSION}::before") != other_key
+    assert server._snapshot_key(str(other_key)) != other_key
+
+
+def test_dialog_policy_follows_the_instance_through_a_handoff():
+    """The new owner was told its setting applied while the old handler kept accepting."""
+    from mcp_stealth_chrome import server
+
+    token = BrowserState.in_session(state.POOL_SESSION)
+    try:
+        BrowserState.current_instance_id = "handed-over"
+        cfg_old_owner = server._instance_dialog_cfg("auto")
+    finally:
+        BrowserState.unbind_session(token)
+    previous = BrowserState.current_instance_id
+    BrowserState.current_instance_id = "handed-over"
+    try:
+        assert server._instance_dialog_cfg("auto") is cfg_old_owner
+    finally:
+        BrowserState.current_instance_id = previous
+    assert server._instance_dialog_cfg("auto") is not cfg_old_owner
+
+
+@pytest.mark.parametrize("owner_state", ["foreign", "locked", "running"])
+def test_clone_overwrite_never_deletes_a_profile_in_use(tmp_path, monkeypatch, owner_state):
+    """overwrite=True used to rmtree the target without asking who was using it."""
+    from mcp_stealth_chrome import server
+
+    source_root = tmp_path / "source"
+    (source_root / "Default").mkdir(parents=True)
+    (source_root / "Default" / "Preferences").write_text("{}")
+    target = tmp_path / "profiles" / "victim"
+    (target / "Default").mkdir(parents=True)
+    (target / "Default" / "Cookies").write_text("live")
+    monkeypatch.setattr(server, "PROFILES_ROOT", tmp_path / "profiles")
+    monkeypatch.setattr(server, "chrome_user_data_root", lambda _browser=None: source_root)
+    monkeypatch.setattr(server, "is_chrome_profile_locked", lambda _p: False)
+    deleted = []
+    monkeypatch.setattr(server.shutil, "rmtree", lambda p, *a, **k: deleted.append(p))
+    if owner_state == "foreign":
+        state._SESSIONS["session-9"] = state._SessionState(current_instance_id="victim")
+    elif owner_state == "locked":
+        monkeypatch.setattr(server, "chrome_lock_holder_pid", lambda p: 4242 if p == target else None)
+    else:
+        monkeypatch.setattr(state, "find_chrome_pids_by_profile", lambda p: [4242] if p == target else [])
+    out = asyncio.run(server.mcp._tool_manager._tools["clone_chrome_profile"].fn(
+        source_profile="Default", target_instance_id="victim", overwrite=True))
+    assert out.startswith("Error:") and "not overwriting" in out, out
+    assert target not in deleted
+    assert (target / "Default" / "Cookies").read_text() == "live"
+
+
+@pytest.mark.parametrize("cls_attrs,expected", [
+    ({"connection": type("C", (), {"closed": False})()}, True),
+    ({"connection": type("C", (), {"closed": True})()}, False),
+    ({"socket": type("S", (), {"close_code": None})()}, True),
+    ({"socket": type("S", (), {"close_code": 1006})()}, False),
+    ({"socket": None}, False),
+    ({}, False),
+])
+def test_attached_browser_liveness_on_both_nodriver_designs(cls_attrs, expected):
+    assert state.connection_alive(type("B", (), cls_attrs)()) is expected
 
 
 def test_tracked_requests_are_invisible_to_other_sessions():
@@ -582,3 +653,49 @@ def test_two_clients_drive_separate_browsers_in_parallel(tmp_path):
     leftover = subprocess.run(["pgrep", "-f", f"user-data-dir={tmp_path}"], capture_output=True, text=True)
     assert not leftover.stdout.strip(), "server left a browser behind after SIGTERM"
     assert proc.returncode == 0
+
+
+def test_failed_intercept_start_leaves_another_sessions_interception(monkeypatch):
+    """B had no browser; its failure disabled A's protective interception."""
+    from mcp_stealth_chrome import server
+
+    disabled = []
+
+    async def fake_disable(reason="stopped"):
+        disabled.append(reason)
+
+    monkeypatch.setattr(server, "_intercept_disable", fake_disable)
+    monkeypatch.setitem(server._INTERCEPT, "active", True)
+    monkeypatch.setitem(server._INTERCEPT, "session", "session-other")
+    monkeypatch.setattr(BrowserState, "active_tab",
+                        classmethod(lambda cls: (_ for _ in ()).throw(RuntimeError("Browser not running"))))
+    out = asyncio.run(server.mcp._tool_manager._tools["intercept_start"].fn())
+    assert out.startswith("Error:") and disabled == []
+
+
+def test_next_client_does_not_inherit_requests_or_snapshots():
+    """The string "primary" passes on; the browser may, the records must not."""
+    from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import network_http as nh
+
+    alive = {"first"}
+    state.set_session_liveness(lambda sid: sid in alive)
+    assert _bind("first") == state.PRIMARY_SESSION
+    server._STORAGE_SNAPSHOTS["secret"] = {"cookies": ["x"]}
+    nh._TRACKED["r9"] = nh._Tracked(request_id="r9", method="GET", url="http://x", created_at=0.0,
+                                    operation_deadline=1.0, session=state.PRIMARY_SESSION)
+    alive.clear()
+    BrowserState.collect_departed_sessions()
+    alive.add("second")
+    assert _bind("second") == state.PRIMARY_SESSION
+    assert "secret" not in server._STORAGE_SNAPSHOTS
+    assert "r9" not in nh._TRACKED
+
+
+def test_identity_tools_refuse_another_sessions_instance():
+    from mcp_stealth_chrome import server
+
+    state._SESSIONS["session-8"] = state._SessionState(current_instance_id="theirs")
+    for name in ("identity_show", "identity_pin"):
+        out = asyncio.run(server.mcp._tool_manager._tools[name].fn(instance_id="theirs"))
+        assert out.startswith("Error:") and "another MCP session" in out

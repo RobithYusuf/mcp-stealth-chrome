@@ -579,3 +579,157 @@ def test_spawn_works_on_a_copied_multi_profile_browser(loop, tmp_path):
     finally:
         run(loop, "close_instance", iid)
         run(loop, "switch_instance", "main")
+
+
+@E2E
+def test_identity_survives_cross_site_navigation(loop, browser, base_url):
+    """nodriver 0.50 opened a new CDP session per navigation, which dropped overrides."""
+    browser(fingerprint={"user_agent": WIN_UA, "timezone": "Asia/Tokyo"})
+    other_site = base_url.replace("localhost", "127.0.0.1")
+    for url in (f"{base_url}/keys.html", f"{other_site}/keys.html", f"{base_url}/keys.html"):
+        run(loop, "navigate", url)
+        state = json.loads(run(loop, "evaluate",
+            "JSON.stringify([navigator.platform, navigator.userAgent, "
+            "Intl.DateTimeFormat().resolvedOptions().timeZone])"))
+        assert state == ["Win32", WIN_UA, "Asia/Tokyo"], url
+
+
+@E2E
+@pytest.mark.parametrize("tool_name,kwargs", [
+    ("dialog_auto_handle", {"action": "accept"}),
+    ("dialog_handle", {"action": "accept"}),
+])
+def test_dialog_handlers_receive_events_on_a_fresh_tab(loop, browser, base_url, tool_name, kwargs):
+    """nodriver 0.50 stopped enabling the Page domain for registered handlers."""
+    browser()
+    run(loop, "navigate", f"{base_url}/keys.html")
+    assert not run(loop, tool_name, **kwargs).startswith("Error:")
+    answer = run(loop, "evaluate", "confirm('ok?')", timeout_ms=8000)
+    assert answer == "True", answer
+
+
+@E2E
+def test_ephemeral_browser_records_no_shared_profile(loop, browser):
+    from mcp_stealth_chrome.server import BrowserState
+
+    browser()
+    assert BrowserState.current_profile_dir is None
+
+
+# ── Found by the independent review round ─────────────────────────────────
+
+
+@E2E
+def test_popup_is_listed_and_a_closed_tab_is_not(loop, browser, base_url):
+    """nodriver 0.50 stopped tracking targets by itself."""
+    browser()
+    run(loop, "navigate", f"{base_url}/keys.html")
+    run(loop, "evaluate", "document.getElementById('next').onclick = () => window.open('about:blank'); 1")
+    run(loop, "click", selector="#next")
+    loop.run_until_complete(asyncio.sleep(0.6))
+    listing = run(loop, "tab_list")
+    assert "[1]" in listing and "about:blank" in listing, listing
+    assert listing.startswith("Active tab: 0"), listing  # the active tab did not move
+    assert "closed tab 1" == run(loop, "tab_close", 1)
+    loop.run_until_complete(asyncio.sleep(0.3))
+    assert "[1]" not in run(loop, "tab_list")
+
+
+@E2E
+def test_tab_url_stays_current_after_navigation(loop, browser, base_url):
+    from mcp_stealth_chrome.server import BrowserState
+
+    browser()
+    run(loop, "navigate", f"{base_url}/keys.html")
+    loop.run_until_complete(asyncio.sleep(0.3))
+    tab = BrowserState.active_tab()
+    assert "keys.html" in str(tab.target.url)
+
+
+@E2E
+def test_text_lookup_never_clicks_at_frame_local_coordinates(loop, browser, base_url):
+    """The root page has a button exactly where the frame-local numbers would land."""
+    browser()
+    run(loop, "navigate", f"{base_url}/frame_text.html")
+    loop.run_until_complete(asyncio.sleep(0.7))
+    out = run(loop, "click_text", "Inner only")
+    assert run(loop, "evaluate", "document.title") == "frame text", out
+    # nodriver 0.50 finds it in the frame and gets a hint; up to 0.48 it finds nothing.
+    assert out.startswith("Error:") and ("browser_snapshot" in out or "no element" in out), out
+
+
+@E2E
+def test_workflow_can_read_the_url(loop, browser, base_url):
+    browser()
+    run(loop, "navigate", f"{base_url}/keys.html")
+    out = json.loads(run(loop, "workflow_run", [{"tool": "get_url", "save_as": "u"}]))
+    assert "keys.html" in out["vars"]["u"]
+
+
+def _start_external_chrome(tmp_path):
+    import socket
+    import subprocess
+    import time
+
+    from mcp_stealth_chrome.state import find_chrome_binary
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    proc = subprocess.Popen([
+        str(find_chrome_binary()), f"--remote-debugging-port={port}", "--headless=new",
+        f"--user-data-dir={tmp_path}", "--use-mock-keychain", "--no-first-run", "about:blank",
+    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+                return proc, port
+        except OSError:
+            time.sleep(0.2)
+    proc.kill()
+    raise AssertionError("Chrome did not open its debugging port")
+
+
+@E2E
+def test_attached_browser_stays_usable_and_close_really_closes_it(loop, tmp_path):
+    """Liveness read .connection, gone in 0.50, and close only dropped the socket."""
+    proc, port = _start_external_chrome(tmp_path)
+    try:
+        out = run(loop, "attach_to_chrome", port=port)
+        assert not out.startswith("Error:"), out
+        assert "2" in run(loop, "evaluate", "1+1")
+        closed = run(loop, "browser_close")
+        assert not closed.startswith("Error:"), closed
+        assert proc.wait(timeout=10) is not None
+    finally:
+        # attach_to_chrome renames the current instance; later tests expect "main".
+        run(loop, "switch_instance", "main")
+        if proc.poll() is None:
+            proc.kill()
+
+
+@E2E
+def test_detach_leaves_the_external_browser_running(loop, tmp_path):
+    proc, port = _start_external_chrome(tmp_path)
+    try:
+        assert not run(loop, "attach_to_chrome", port=port).startswith("Error:")
+        assert "detached" in run(loop, "detach")
+        loop.run_until_complete(asyncio.sleep(0.5))
+        assert proc.poll() is None
+    finally:
+        run(loop, "switch_instance", "main")
+        proc.kill()
+        proc.wait(timeout=10)
+
+
+@E2E
+def test_close_all_really_ends_stored_browsers(loop, tmp_path):
+    import subprocess
+
+    iid = f"closeall_{os.getpid()}"
+    run(loop, "spawn_browser", iid, headless=True, profile_dir=str(tmp_path / "p"))
+    assert "closed" in run(loop, "close_all_instances")
+    loop.run_until_complete(asyncio.sleep(0.5))
+    left = subprocess.run(["pgrep", "-f", f"user-data-dir={tmp_path}/p"], capture_output=True, text=True)
+    assert not left.stdout.strip()

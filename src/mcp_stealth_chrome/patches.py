@@ -9,6 +9,8 @@ crash. `status()` exposes what applied, and server_status surfaces it.
 """
 from __future__ import annotations
 
+import asyncio
+
 # name -> True (applied) | str (why it did not)
 _STATUS: dict[str, object] = {}
 
@@ -94,6 +96,49 @@ def _patch_client_security_state() -> None:
         _STATUS["client_security_state"] = f"{type(e).__name__}: {e}"
 
 
+def _patch_tab_get_keeps_session() -> None:
+    """nodriver 0.50's Tab.get opens a new CDP session after every navigation.
+
+    Overrides belong to a session, so a cross-site navigation drops them: measured as
+    navigator.platform returning to the real value while the UA stayed overridden.
+    Navigating without re-attaching keeps one session per tab, as up to 0.48.
+    Absent up to 0.48, where Connection has no attach and there is nothing to patch.
+    """
+    try:
+        from nodriver.core.connection import Connection
+        from nodriver.core.tab import Tab
+        if not hasattr(Connection, "attach") or getattr(Tab, "_mcp_get_patched", False):
+            return
+        from nodriver import cdp
+
+        original_get = Tab.get
+
+        async def patched_get(self, url="chrome://welcome", new_tab=False, new_window=False):
+            if new_tab or new_window or not self.browser:
+                return await original_get(self, url, new_tab, new_window)
+            await self.send(cdp.page.navigate(url))
+            # attach() was also what refreshed this. Without it Tab.url stays stale. Briefly,
+            # since the target only reports the new URL once the navigation commits.
+            before = str(getattr(self.target, "url", "") or "")
+            for _ in range(10):
+                try:
+                    info = await self.send(cdp.target.get_target_info(self.target.target_id))
+                except Exception:
+                    break
+                self.target = info
+                if info.url and info.url != before:
+                    break
+                await asyncio.sleep(0.05)
+            return self
+
+        Tab.get = patched_get
+        Tab._mcp_get_patched = True
+        _STATUS["tab_get_keeps_session"] = True
+    except Exception as e:  # never block server startup on patch failure
+        _STATUS["tab_get_keeps_session"] = f"{type(e).__name__}: {e}"
+
+
 def apply_all() -> None:
     _patch_cookie_same_party()
     _patch_client_security_state()
+    _patch_tab_get_keeps_session()

@@ -276,3 +276,34 @@ def test_resume_can_read_last():
         start_at=1, variables=failed["vars"],
     )
     assert "failed_at" not in resumed and calls == [("c", {})]
+
+
+def test_resume_inside_a_branch_stays_in_that_branch():
+    """Its own failure changed the condition; re-evaluating ran the other branch."""
+    steps = [
+        {"tool": "prepare"},
+        {"if": {"value": "${last.ok}", "truthy": True},
+         "then": [{"tool": "retry_me"}],
+         "else": [{"tool": "wrong_branch"}]},
+    ]
+    failed, _ = run(steps, {"retry_me": "Error: flaky"})
+    assert failed["failed_path"] == "1.0"
+    resumed, calls = run(steps, {"retry_me": "ok"},
+                         start_at=failed["failed_path"], variables=failed["vars"])
+    assert "failed_at" not in resumed
+    assert calls == [("retry_me", {})]
+
+
+def test_a_fresh_run_still_evaluates_its_conditions():
+    steps = [{"if": {"value": "${x}", "truthy": True}, "then": [{"tool": "a"}], "else": [{"tool": "b"}]}]
+    assert run(steps, variables={"x": True, "__branches__": {"0": "else"}})[1] == [("a", {})]
+    assert run(steps, variables={"x": False})[1] == [("b", {})]
+
+
+def test_last_describes_a_step_that_raised():
+    """A raised failure left ${last.ok} true from the step before, so a guard passed."""
+    steps = [{"tool": "first"}, {"tool": "boom"},
+             {"if": {"value": "${last.ok}", "truthy": True},
+              "then": [{"tool": "success_only"}], "else": [{"tool": "cleanup"}]}]
+    _, calls = run(steps, {"boom": RuntimeError("no")}, stop_on_error=False)
+    assert [c[0] for c in calls] == ["first", "boom", "cleanup"]
