@@ -1,14 +1,26 @@
+<div align="center">
+
 # MCP Stealth Chrome
+
+An MCP server with 172 tools that gives an AI agent a real Chrome browser and an HTTP client with Chrome's TLS fingerprint.
 
 [![PyPI version](https://img.shields.io/pypi/v/mcp-stealth-chrome.svg)](https://pypi.org/project/mcp-stealth-chrome/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org)
 
-An MCP server with 172 tools that gives an AI agent a real Chrome browser and an HTTP client with Chrome's TLS fingerprint.
+</div>
 
 It drives Chrome over CDP with [nodriver](https://github.com/ultrafunkamsterdam/nodriver), so there is no WebDriver and the identity stays that of your real browser and machine. Requests that need no browser go through [curl_cffi](https://github.com/lexiforest/curl_cffi), which is much lighter than rendering a page. Search and page reading work without an API key.
 
 Use the browser when a page needs JavaScript, a login or a person looking at it. Use HTTP when you only need the data.
+
+- ✅ Real Chrome over CDP, with no WebDriver
+- ✅ HTTP with the TLS fingerprint of Chrome, Firefox or Safari
+- ✅ Search and page reading without an API key
+- ✅ Real mouse input, and results that say what actually happened
+- ✅ Passwords and cookies hidden from tool output by default
+- ✅ Several browsers side by side, each with its own profile
+- ✅ Works with Claude Code, Cursor, Codex, Gemini CLI, OpenCode, Droid and other MCP clients
 
 ## Install
 
@@ -20,13 +32,32 @@ You need [uv](https://docs.astral.sh/uv/) and Chrome or Chromium. uv takes care 
 | Ubuntu or Debian | `curl -LsSf https://astral.sh/uv/install.sh \| sh` | `sudo apt install -y google-chrome-stable` |
 | Windows | `powershell -c "irm https://astral.sh/uv/install.ps1 \| iex"` | `winget install Google.Chrome` |
 
-Then add the server. For Claude Code:
+Then add the server to your client. Open the one you use:
+
+<details>
+<summary><b>Claude Code</b></summary>
+
+All projects:
 
 ```bash
 claude mcp add stealth-chrome --scope user -- uvx mcp-stealth-chrome@latest
 ```
 
-Drop `--scope user` to add it to the current project only. Other clients use this block in their config file:
+Current project only:
+
+```bash
+claude mcp add stealth-chrome -- uvx mcp-stealth-chrome@latest
+```
+</details>
+
+<details>
+<summary><b>Claude Desktop</b></summary>
+
+Edit the config file, then restart the app:
+
+- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+- Linux: `~/.config/Claude/claude_desktop_config.json`
 
 ```json
 {
@@ -38,14 +69,160 @@ Drop `--scope user` to add it to the current project only. Other clients use thi
   }
 }
 ```
+</details>
 
-| Client | Config file | Top-level key |
-|--------|-------------|---------------|
-| Claude Desktop | macOS `~/Library/Application Support/Claude/claude_desktop_config.json`, Windows `%APPDATA%\Claude\claude_desktop_config.json`, Linux `~/.config/Claude/claude_desktop_config.json` | `mcpServers` |
-| Cursor | `~/.cursor/mcp.json`, or `.cursor/mcp.json` in a project | `mcpServers` |
-| Windsurf | `~/.windsurf/mcp.json`, or `.windsurf/mcp.json` in a project | `servers` |
-| VS Code (Continue, Cline, Kilo Code) | `~/.continue/config.json`, or `.vscode/mcp.json` in a project | `mcpServers` |
-| Zed | `~/.config/zed/settings.json` | `context_servers`, with `"command": {"path": "uvx", "args": [...]}` |
+<details>
+<summary><b>Cursor</b></summary>
+
+Use `~/.cursor/mcp.json` for all projects, or `.cursor/mcp.json` in one project:
+
+```json
+{
+  "mcpServers": {
+    "stealth-chrome": {
+      "command": "uvx",
+      "args": ["mcp-stealth-chrome@latest"]
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary><b>Windsurf</b></summary>
+
+Use `~/.windsurf/mcp.json` for all projects, or `.windsurf/mcp.json` in one project:
+
+```json
+{
+  "servers": {
+    "stealth-chrome": {
+      "command": "uvx",
+      "args": ["mcp-stealth-chrome@latest"]
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary><b>VS Code (Continue, Cline, Kilo Code)</b></summary>
+
+Use your VS Code settings or `~/.continue/config.json` for all projects, or `.vscode/mcp.json` in one project:
+
+```json
+{
+  "mcpServers": {
+    "stealth-chrome": {
+      "command": "uvx",
+      "args": ["mcp-stealth-chrome@latest"]
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary><b>Zed</b></summary>
+
+Open Settings, then Extensions, then MCP Servers, or edit `~/.config/zed/settings.json`:
+
+```json
+{
+  "context_servers": {
+    "stealth-chrome": {
+      "command": {
+        "path": "uvx",
+        "args": ["mcp-stealth-chrome@latest"]
+      }
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary><b>Codex CLI</b></summary>
+
+Add to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.stealth-chrome]
+command = "uvx"
+args = ["mcp-stealth-chrome@latest"]
+```
+</details>
+
+<details>
+<summary><b>Gemini CLI</b></summary>
+
+Add to `~/.gemini/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "stealth-chrome": {
+      "command": "uvx",
+      "args": ["mcp-stealth-chrome@latest"]
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary><b>OpenCode</b></summary>
+
+Add to `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "mcp": {
+    "stealth-chrome": {
+      "type": "local",
+      "command": ["uvx", "mcp-stealth-chrome@latest"],
+      "enabled": true
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary><b>Factory Droid</b></summary>
+
+Add to `~/.factory/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "stealth-chrome": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["mcp-stealth-chrome@latest"]
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary><b>Oh My Pi (omp)</b></summary>
+
+Add to `~/.omp/agent/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "stealth-chrome": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["mcp-stealth-chrome@latest"]
+    }
+  }
+}
+```
+</details>
 
 See [docs/INSTALL.md](docs/INSTALL.md) for verification and troubleshooting.
 
@@ -106,32 +283,47 @@ dry_run(enable=false)
 
 ## Test results
 
-Sites change, so read these as results from the linked screenshots and not as a guarantee.
+Sites change, so read these as results from the screenshots below and not as a guarantee.
 
 | Site | What it checks | Result |
 |------|----------------|--------|
-| `bot.sannysoft.com` | Fingerprint tests | All passed ([screenshot](https://raw.githubusercontent.com/RobithYusuf/mcp-stealth-chrome/main/docs/images/sannysoft.jpg)) |
-| `browserscan.net/bot-detection` | WebDriver, Selenium, CDP, headless | All "Normal" ([screenshot](https://raw.githubusercontent.com/RobithYusuf/mcp-stealth-chrome/main/docs/images/browserscan.jpg)) |
-| `arh.antoinevastel.com` areyouheadless | Headless Chrome | "You are not Chrome headless" ([screenshot](https://raw.githubusercontent.com/RobithYusuf/mcp-stealth-chrome/main/docs/images/areyouheadless.jpg)) |
-| `2captcha.com/demo/cloudflare-turnstile` | Turnstile widget | Passed with `click_turnstile` ([screenshot](https://raw.githubusercontent.com/RobithYusuf/mcp-stealth-chrome/main/docs/images/turnstile.jpg)) |
-| `google.com/recaptcha/api2/demo` | reCAPTCHA v2 images | 5 of 5 runs with `solve_recaptcha_ai`, 113 s on average ([screenshot](https://raw.githubusercontent.com/RobithYusuf/mcp-stealth-chrome/main/docs/images/recaptcha.jpg)) |
+| `bot.sannysoft.com` | Fingerprint tests | ✅ All passed |
+| `browserscan.net/bot-detection` | WebDriver, Selenium, CDP, headless | ✅ All "Normal" |
+| `arh.antoinevastel.com` areyouheadless | Headless Chrome | ✅ "You are not Chrome headless" |
+| `2captcha.com/demo/cloudflare-turnstile` | Turnstile widget | ✅ Passed with `click_turnstile` |
+| `google.com/recaptcha/api2/demo` | reCAPTCHA v2 images | ✅ 5 of 5 runs with `solve_recaptcha_ai` |
+| `tls.browserleaks.com` | JA3 and JA4 | ✅ Shows the JA3 of the browser it impersonates |
 
-<table>
-<tr>
-<td width="50%"><img src="https://raw.githubusercontent.com/RobithYusuf/mcp-stealth-chrome/main/docs/images/sannysoft.jpg" alt="bot.sannysoft.com fingerprint tests passing"><br>bot.sannysoft.com</td>
-<td width="50%"><img src="https://raw.githubusercontent.com/RobithYusuf/mcp-stealth-chrome/main/docs/images/browserscan.jpg" alt="browserscan.net showing every category as Normal"><br>browserscan.net</td>
-</tr>
-<tr>
-<td><img src="https://raw.githubusercontent.com/RobithYusuf/mcp-stealth-chrome/main/docs/images/areyouheadless.jpg" alt="areyouheadless reporting not Chrome headless"><br>areyouheadless</td>
-<td><img src="https://raw.githubusercontent.com/RobithYusuf/mcp-stealth-chrome/main/docs/images/turnstile.jpg" alt="Cloudflare Turnstile widget showing Success"><br>Cloudflare Turnstile demo</td>
-</tr>
-<tr>
-<td><img src="https://raw.githubusercontent.com/RobithYusuf/mcp-stealth-chrome/main/docs/images/recaptcha.jpg" alt="reCAPTCHA v2 demo solved"><br>reCAPTCHA v2 demo</td>
-<td></td>
-</tr>
-</table>
+### Cloudflare Turnstile with click_turnstile
 
-TLS, measured at `tls.browserleaks.com`. Each impersonation shows the JA3 of the browser it names, and a plain Python client does not. Hashes change with browser versions.
+<img src="https://raw.githubusercontent.com/RobithYusuf/mcp-stealth-chrome/main/docs/images/turnstile.jpg" alt="Cloudflare Turnstile widget showing Success" width="500">
+
+One call moves the checkbox from "Verify you are human" to "Success!".
+
+- ✅ Works on the embedded widget (`.cf-turnstile`, `[data-sitekey]`, or a `challenges.cloudflare.com` iframe), such as `2captcha.com/demo/cloudflare-turnstile`, the `dash.cloudflare.com` login and `nopecha.com/captcha/turnstile`
+- ❌ Does not work on Cloudflare's full-page "Just a moment..." challenge. There, use `solve_captcha` or a saved session
+
+### bot.sannysoft.com
+
+<img src="https://raw.githubusercontent.com/RobithYusuf/mcp-stealth-chrome/main/docs/images/sannysoft.jpg" alt="bot.sannysoft.com fingerprint tests passing" width="500">
+
+`navigator.webdriver` is missing, WebDriver Advanced passes, Chrome and its plugins read as normal, and WebGL reports the real GPU.
+
+### areyouheadless
+
+<img src="https://raw.githubusercontent.com/RobithYusuf/mcp-stealth-chrome/main/docs/images/areyouheadless.jpg" alt="areyouheadless reporting not Chrome headless" width="500">
+
+Antoine Vastel's public test reports "You are not Chrome headless" for a Chrome controlled by this server.
+
+### browserscan.net
+
+<img src="https://raw.githubusercontent.com/RobithYusuf/mcp-stealth-chrome/main/docs/images/browserscan.jpg" alt="browserscan.net showing every category as Normal" width="500">
+
+Every signal it checks reads "Normal", including WebDriver, Selenium, CDP and headless Chrome.
+
+### TLS fingerprint
+
+Measured at `tls.browserleaks.com`. Each impersonation shows the JA3 of the browser it names, and a plain Python client does not. Hashes change with browser versions.
 
 ```
 httpx:                JA3 37f7d09ced1a845dc48872abc1a29d7b   python-httpx/0.28.1
@@ -140,9 +332,23 @@ impersonate=firefox:  JA3 6f7889b9fb1a62a9577e685c1fcfa919   Firefox/147.0
 impersonate=safari:   JA3 ecdf4f49dd59effc439639da29186671   Safari/605.1.15
 ```
 
+### reCAPTCHA v2 images
+
+<img src="https://raw.githubusercontent.com/RobithYusuf/mcp-stealth-chrome/main/docs/images/recaptcha.jpg" alt="reCAPTCHA v2 demo solved" width="350">
+
+Five runs in a row on Google's demo page, with a fresh profile and a vision model through an OpenAI-compatible API:
+
+```
+Run 1: passed, 2169-char token, tiles [3,4,7],        146 s
+Run 2: passed, 2126-char token, tiles [0,2,4,7],       80 s
+Run 3: passed, 2169-char token, tiles [1,2,4,8],      143 s
+Run 4: passed, 2148-char token, tiles [1,4,5,6,8,9],  126 s
+Run 5: passed, 2169-char token, tiles [0,3,4],         69 s
+Average: 113 s
+```
+
 ## Limits
 
-- `click_turnstile` works on the embedded widget (`.cf-turnstile`, `[data-sitekey]`, or a `challenges.cloudflare.com` iframe). It does not work on Cloudflare's full-page "Just a moment..." challenge. There, use `solve_captcha` or a saved session.
 - DataDome, Kasada, PerimeterX/HUMAN and ChatGPT's managed Turnstile are hard to pass with open source tools. A session saved after a manual login is the most reliable option, and commercial services may be needed in production.
 - Datacenter IPs and fresh profiles get blocked more often. For search engines, a warm profile with `engine="brave"` returns the most, and an empty result page usually comes from the environment.
 - Headless is easier to detect, so keep `headless=false` on difficult sites.
@@ -171,18 +377,18 @@ Runtime data lives in `~/.mcp-stealth/`: `profile/`, `profiles/<id>/`, `screensh
 
 Results describe what was observed. A tool that reports success when nothing happened would leave an agent building on a false result, so these rules hold across the server:
 
-- Clicks are real mouse input. `click`, `click_text` and `click_role` test the target first and refuse by name when something covers it. They say `clicked but NO page change detected` when nothing happened, and name any new tab the click opened. A JS click only happens with `js_fallback=True`, and the result says so.
-- `select_option` sets the value from JS because a native dropdown cannot be driven with page input. The result states `isTrusted=false`, and the value is read back.
-- `browser_snapshot` writes nothing to the page. Refs live on the server and reach into iframes, cross-origin ones included, and open shadow roots.
-- `navigate` reports the final URL, redirects, status and ready state. `expect_url` and `expect_status` turn a redirect into a failure.
-- `evaluate`, `frame_evaluate` and `wait_for_function` report a JavaScript exception as an error, and promises are awaited.
-- `press_key` reports what the key did: navigation, page change, focus, or nothing.
-- `fill_form` fails when a field fails and then does not submit. `batch_actions` counts it as failed.
-- Empty results say whether anything was measured. `console_get`, `intercept_log` and `storage_snapshot` report that state.
-- `assert_clickable` tells you what would block a click without clicking.
-- A lost browser connection names the condition and how to recover. `browser_recover` handles a stuck browser and only touches this server's profiles.
+- ✅ Clicks are real mouse input. `click`, `click_text` and `click_role` test the target first and refuse by name when something covers it. They say `clicked but NO page change detected` when nothing happened, and name any new tab the click opened. A JS click only happens with `js_fallback=True`, and the result says so.
+- ✅ `select_option` sets the value from JS because a native dropdown cannot be driven with page input. The result states `isTrusted=false`, and the value is read back.
+- ✅ `browser_snapshot` writes nothing to the page. Refs live on the server and reach into iframes, cross-origin ones included, and open shadow roots.
+- ✅ `navigate` reports the final URL, redirects, status and ready state. `expect_url` and `expect_status` turn a redirect into a failure.
+- ✅ `evaluate`, `frame_evaluate` and `wait_for_function` report a JavaScript exception as an error, and promises are awaited.
+- ✅ `press_key` reports what the key did: navigation, page change, focus, or nothing.
+- ✅ `fill_form` fails when a field fails and then does not submit. `batch_actions` counts it as failed.
+- ✅ Empty results say whether anything was measured. `console_get`, `intercept_log` and `storage_snapshot` report that state.
+- ✅ `assert_clickable` tells you what would block a click without clicking.
+- ✅ A lost browser connection names the condition and how to recover. `browser_recover` handles a stuck browser and only touches this server's profiles.
 
-Credentials stay out of tool output, since output lands in the agent's transcript. `cookie_list`, `network_get`, `intercept_log`, `wait_for_request`, `auth_capture` and `export_curl` hide cookies, credential headers, JSON and form fields, and query parameters unless you pass `reveal_values=True`. Bodies in other formats pass through unchanged. `export_curl` also returns an `http_request` call that replays the session with the browser's own cookies. Files holding credentials are written mode 600.
+✅ Credentials stay out of tool output, since output lands in the agent's transcript. `cookie_list`, `network_get`, `intercept_log`, `wait_for_request`, `auth_capture` and `export_curl` hide cookies, credential headers, JSON and form fields, and query parameters unless you pass `reveal_values=True`. Bodies in other formats pass through unchanged. `export_curl` also returns an `http_request` call that replays the session with the browser's own cookies. Files holding credentials are written mode 600.
 
 ## Tools
 
@@ -269,7 +475,7 @@ These run without a browser and without a search API key, and use the stealth br
 
 ## API keys
 
-166 of the 172 tools need no key. These six do:
+✅ 166 of the 172 tools need no key. These six do:
 
 | Tools | Key | Approximate cost |
 |-------|-----|------------------|
@@ -288,7 +494,10 @@ Add the key to the `env` block of the server config. Use one of these:
 "env": { "CAPSOLVER_KEY": "CAP-..." }
 ```
 
-The model must accept images, for example `gpt-4o`, `claude-opus-4-7`, `llava` or `llama3.2-vision`. A text-only model such as `gpt-3.5-turbo` fails. Any provider with `/v1/chat/completions` and `image_url` support works.
+- ✅ Works: models that accept images, such as `gpt-4o`, `claude-opus-4-7`, `llava` or `llama3.2-vision`
+- ❌ Fails: text-only models such as `gpt-3.5-turbo`
+
+Any provider with `/v1/chat/completions` and `image_url` support works.
 
 Order of use: arguments to the tool, then `OPENAI_*`, then `AI_VISION_*` (deprecated, it logs a warning), then `ANTHROPIC_*`.
 
@@ -302,9 +511,9 @@ mcp-stealth-chrome --http                # http://127.0.0.1:8765/mcp
 
 The server can act as whoever is logged in to its browsers, so access is restricted:
 
-- A bearer token is always required, from `MCP_STEALTH_TOKEN` or `~/.mcp-stealth/http-token` (created mode 600 on first run, never printed). Send it as `Authorization: Bearer <token>`.
-- Only loopback is allowed unless you pass `--allow-remote`. The token then travels unencrypted without a TLS proxy. Behind a proxy or on a wildcard address, name what clients use with `--allowed-host`.
-- Host and Origin checks stay on, which blocks DNS rebinding from a web page.
+- ✅ A bearer token is always required, from `MCP_STEALTH_TOKEN` or `~/.mcp-stealth/http-token` (created mode 600 on first run, never printed). Send it as `Authorization: Bearer <token>`.
+- ✅ Only loopback is allowed unless you pass `--allow-remote`. The token then travels unencrypted without a TLS proxy. Behind a proxy or on a wildcard address, name what clients use with `--allowed-host`.
+- ✅ Host and Origin checks stay on, which blocks DNS rebinding from a web page.
 
 Things to know:
 

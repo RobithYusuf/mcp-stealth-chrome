@@ -312,7 +312,7 @@ Platform truths, not preferences. Each one cost a release.
   `tests/test_registry.py` (`EXPECTED_COUNT` and the name list).
 - The PyPI `description` in `pyproject.toml` carries its own tool count. It has drifted twice.
 - `tests/test_registry.py` fails when a registered tool is missing from the README's Tools table.
-- Write docs in plain language: no star ratings or emoji, no em dashes, no promotional claims. A result names what was measured.
+- Write docs in plain language: no star ratings or emoji in headings, no em dashes, no promotional claims. Check marks in lists and result tables are welcome. A result names what was measured.
 - Record a decision here when it is non-obvious and would otherwise be re-litigated or re-broken.
 
 ## Verification and debugging
