@@ -26,11 +26,14 @@ uvx mcp-stealth-chrome → Python 3.11+ → FastMCP → nodriver → Chrome/Chro
 - `src/mcp_stealth_chrome/http_transport.py` — `--http`: token, bind rules, Mcp-Session-Id.
 - `src/mcp_stealth_chrome/helpers.py` — `ok`/`err`, tab selection, path confinement, JSON parsing.
 - `src/mcp_stealth_chrome/patches.py` — runtime monkey-patches for nodriver/CDP drift.
+- `src/mcp_stealth_chrome/identity.py` — key events, client hints and languages. `humanize.py` — pointer and typing input.
+- `src/mcp_stealth_chrome/_app.py` — `StealthMCP`, the FastMCP boundary. `captcha.py`, `image_output.py`, `result_types.py` — their named helpers.
 - `src/mcp_stealth_chrome/tools/` — `research.py`, `devtools.py`, `vision.py`, `network_http.py`, `profiles.py`;
   each registers itself on import.
 - `tests/test_registry.py` — the tool-surface gate. `tests/test_reliability_e2e.py` and
   `tests/test_agent_ergonomics.py` — behaviour, real browser and fast unit respectively.
-- `README.md` — the authoritative tool list. `docs/` — install, demo, research method, proof images.
+  `tests/test_old_tools_e2e.py` and `tests/test_slow_start_e2e.py` — tools and launch paths on real Chrome.
+- `README.md` — the authoritative tool list. `docs/` — install and troubleshooting, plus the proof images the README links.
 - Runtime data lives outside the repo: `~/.mcp-stealth/{profile,profiles,screenshots,exports,
   storage-states,identities,window-state}`.
 
@@ -54,7 +57,9 @@ uvx mcp-stealth-chrome → Python 3.11+ → FastMCP → nodriver → Chrome/Chro
   `Browser.close` and checks that the debugging port stopped answering.
 - A CDP override belongs to its session. nodriver 0.50's `Tab.get` opened a new session per navigation, which
   dropped overrides on a cross-site navigation; `patches.py` keeps one session per tab.
-- E2E tests never use the real profile (`persistent=False`, or a temporary HOME with `--use-mock-keychain`).
+- E2E tests never use the real profile (`persistent=False`, or a temporary HOME with `--use-mock-keychain`). The
+  suites do not pass that flag themselves, so running them under a temporary HOME shows the developer a macOS
+  "Keychain Not Found" dialog whose "Reset To Defaults" can reset the login keychain. Run them with the real HOME.
   Holding `~/.mcp-stealth/profile` pushes other live sessions onto an empty fallback profile.
 - `mcp` must stay pinned `<2`. Version 2.0.0 removed `mcp.server.fastmcp` entirely, and this server
   is built on FastMCP. `uv.lock` hides the breakage from the test suite, so a green suite proves
@@ -302,11 +307,12 @@ Platform truths, not preferences. Each one cost a release.
 ## Documentation on demand
 
 - `README.md` is the authoritative tool list and must be updated in the same change that adds,
-  removes or modifies a tool: hero count, comparison table, the category tables, new parameters.
+  removes or modifies a tool: the count in the opening line, the Tools table, new parameters.
   Bump the version in BOTH `pyproject.toml` and `src/mcp_stealth_chrome/__init__.py`, and update
   `tests/test_registry.py` (`EXPECTED_COUNT` and the name list).
 - The PyPI `description` in `pyproject.toml` carries its own tool count. It has drifted twice.
-- Audit the tool tables against `mcp._tool_manager._tools` rather than counting by eye.
+- `tests/test_registry.py` fails when a registered tool is missing from the README's Tools table.
+- Write docs in plain language: no star ratings or emoji, no em dashes, no promotional claims. A result names what was measured.
 - Record a decision here when it is non-obvious and would otherwise be re-litigated or re-broken.
 
 ## Verification and debugging

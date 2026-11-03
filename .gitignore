@@ -43,3 +43,6 @@ test-*.log
 # (service: mcp-stealth-chrome-pypi), not on disk.
 .pypi-token
 *.token
+
+# macOS screenshots saved here by accident; they reach the public repo
+docs/images/SCR-*

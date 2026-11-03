@@ -162,3 +162,20 @@ def test_no_tool_is_registered_twice(caplog):
             ):
                 assert node.name not in seen, f"{node.name}: {seen[node.name]} and {path.name}"
                 seen[node.name] = path.name
+
+
+def test_readme_lists_every_tool():
+    """The README is the authoritative tool list, and its count drifted to 143 at 160 tools."""
+    import pathlib
+    import re
+
+    from mcp_stealth_chrome.server import mcp
+
+    readme = (pathlib.Path(__file__).parent.parent / "README.md").read_text()
+    table = readme[readme.index("## Tools"):readme.index("## Main features")]
+    listed = set(re.findall(r"`([a-z_]+)`", table))
+    registered = set(mcp._tool_manager._tools)
+    assert registered - listed == set(), "missing from the README"
+    assert listed - registered == set(), "in the README but not registered"
+    assert f"with {len(registered)} tools" in readme
+
