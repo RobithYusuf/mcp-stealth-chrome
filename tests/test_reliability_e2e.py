@@ -42,7 +42,9 @@ def loop():
     """
     lp = asyncio.new_event_loop()
     asyncio.set_event_loop(lp)
-    lp.run_until_complete(tool("browser_launch")(headless=True))
+    # Never the real profile: holding it pushes any other Claude Code session running
+    # this server onto an empty fallback profile, where its logins seem to be gone.
+    lp.run_until_complete(tool("browser_launch")(headless=True, persistent=False))
     lp.run_until_complete(tool("navigate")(PROBE.as_uri()))
     lp.run_until_complete(asyncio.sleep(0.6))
     try:
@@ -344,7 +346,7 @@ def test_identity_pin_is_reapplied_on_relaunch(loop):
         _identity_path(iid).unlink(missing_ok=True)
 
 
-def test_privacy_launch_rotates_and_removes_profiles(loop):
+def test_privacy_launch_uses_a_new_profile_and_removes_it(loop):
     iid = f"privacy_e2e_{os.getpid()}"
     fingerprints = []
     profiles = []
@@ -365,7 +367,8 @@ def test_privacy_launch_rotates_and_removes_profiles(loop):
             closed = loop.run_until_complete(tool("close_instance")(iid))
             assert "Error:" not in closed
             assert not profile.exists()
-        assert fingerprints[0] != fingerprints[1]
+        # The identity is the real browser's each time; what rotates is the profile.
+        assert fingerprints[0] == fingerprints[1]
         assert profiles[0] != profiles[1]
     finally:
         loop.run_until_complete(tool("close_instance")(iid))

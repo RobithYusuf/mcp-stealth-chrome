@@ -1,0 +1,20 @@
+<!doctype html>
+<html>
+<body style="margin:10px">
+  <button id="inner" onclick="this.textContent='hit:' + event.isTrusted">Inner Button</button>
+  <input id="field" aria-label="Frame field">
+  <div id="child-host"></div>
+  <script>
+    const name = new URLSearchParams(location.search).get('name');
+    document.getElementById('inner').textContent = 'Inner ' + name;
+    document.getElementById('child-host').attachShadow({mode: 'open'}).innerHTML =
+      '<button id="frame-shadow" onclick="this.textContent=\'fs:\' + event.isTrusted">Frame Shadow ' + name + '</button>';
+    window.__mutations = [];
+    new MutationObserver((list) => {
+      for (const m of list) {
+        if (m.type === 'attributes') window.__mutations.push(m.attributeName);
+      }
+    }).observe(document, {subtree: true, attributes: true});
+  </script>
+</body>
+</html>

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import fnmatch
 import json
 import os
@@ -26,6 +27,7 @@ import httpx
 
 import nodriver
 from nodriver import Browser, Config, Tab
+from nodriver.cdp import dom as cdp_dom, runtime as cdp_runtime
 
 from . import __version__
 from . import patches as _patches
@@ -38,19 +40,39 @@ from .helpers import (
     get_url,
     ok,
     parse_json,
-    resolve_ref,
     select_tab,
     target_key,
     transport_lost,
     ts_filename,
 )
+from .identity import (
+    chrome_version,
+    default_accept_language,
+    key_event_params,
+    navigator_languages,
+    navigator_platform,
+    os_family,
+    strip_headless,
+    ua_metadata_fields,
+)
+from .refs import (
+    MAX_FRAMES,
+    active_element,
+    all_frames,
+    collect_snapshot,
+    ensure_in_root_view,
+    evaluate_parts,
+    forget_refs,
+    frame_world,
+    new_object_group,
+    outer_blocker,
+    release_group,
+    resolve_ref,
+)
 from .result_types import structured_json
-from .humanize import humanized_click, humanized_move, humanized_scroll, humanized_type
+from .workflow import WorkflowError, run_workflow
+from .humanize import humanized_click, humanized_move, humanized_scroll, humanized_type, move_pointer
 from .snapshot import (
-    SNAPSHOT_JS,
-    SNAPSHOT_JS_FAST,
-    SNAPSHOT_JS_VIEWPORT,
-    build_snapshot_js,
     element_fingerprint,
     format_snapshot,
     snapshot_hash,
@@ -58,6 +80,7 @@ from .snapshot import (
     snapshot_scope_signature,
 )
 from .state import (
+    PRIMARY_SESSION,
     DEFAULT_IDLE_TIMEOUT,
     EXPORT_DIR,
     IDENTITIES_DIR,
@@ -365,7 +388,32 @@ async def _wait(coro, timeout: Optional[float] = None, what: str = "operation"):
 
 # Serialize concurrent launches inside ONE MCP process. Cross-process collision
 # is handled separately by `resolve_default_profile()` (per-PID fallback).
-_LAUNCH_LOCK = asyncio.Lock()
+class _PerSessionLock:
+    """One launch at a time per MCP session.
+
+    It guards a session against racing itself into two Chromes on one profile.
+    Sessions launch different profiles, and one must not fail because another
+    happens to be starting a browser.
+    """
+
+    def __init__(self) -> None:
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    def _lock(self) -> asyncio.Lock:
+        return self._locks.setdefault(BrowserState.session_key(), asyncio.Lock())
+
+    def locked(self) -> bool:
+        return self._lock().locked()
+
+    async def __aenter__(self) -> None:
+        await self._lock().acquire()
+
+    async def __aexit__(self, *_exc: Any) -> None:
+        self._lock().release()
+
+
+_LAUNCH_LOCK = _PerSessionLock()
+_SPAWNING: dict[str, str] = {}
 
 
 _FINGERPRINT_FIELDS = ("user_agent", "accept_language", "platform", "timezone")
@@ -398,31 +446,9 @@ def _direct_child(root: Path, name: str, label: str) -> Path:
     return root / name
 
 
-def _random_fingerprint() -> dict[str, str]:
-    """Return a coherent, fresh desktop fingerprint for a new identity."""
-    family = random.choice((
-        ("Windows NT 10.0; Win64; x64", "Win32", "America/New_York"),
-        ("Macintosh; Intel Mac OS X 10_15_7", "MacIntel", "America/Los_Angeles"),
-        ("X11; Linux x86_64", "Linux x86_64", "Europe/Berlin"),
-    ))
-    major = random.randint(134, 147)
-    build = random.randint(1000, 6999)
-    patch = random.randint(10, 199)
-    language = random.choice(("en-US,en;q=0.9", "en-GB,en;q=0.9", "id-ID,id;q=0.9,en;q=0.8"))
-    return {
-        "user_agent": (
-            f"Mozilla/5.0 ({family[0]}) AppleWebKit/537.36 "
-            f"(KHTML, like Gecko) Chrome/{major}.0.{build}.{patch} Safari/537.36"
-        ),
-        "accept_language": language,
-        "platform": family[1],
-        "timezone": family[2],
-    }
-
-
 def _normalize_fingerprint(value: Optional[dict]) -> dict[str, str]:
     if value is None:
-        return _random_fingerprint()
+        return {}
     if not isinstance(value, dict):
         raise ValueError("fingerprint must be an object")
     unknown = set(value) - set(_FINGERPRINT_FIELDS)
@@ -476,17 +502,22 @@ def _launch_identity(
     fingerprint: Optional[dict],
     privacy: bool,
 ) -> tuple[Optional[str], dict[str, str], str]:
-    """Resolve explicit, pinned, or privacy identity values for one launch."""
+    """Resolve one launch's identity: caller's fields over a pin over the real browser.
+
+    With nothing specified the browser presents itself as it is, in privacy mode
+    too. Privacy means a disposable profile, not a made-up machine: a random OS,
+    Chrome version and timezone on top of a real engine contradict each other, and
+    that contradiction is what stands out.
+    """
     _validate_instance_id(instance_id)
     pinned = None if privacy else _load_identity(instance_id)
     if privacy:
-        effective_fp = _random_fingerprint()
-        source = "privacy"
+        effective_fp = {}
         effective_proxy = _privacy_proxy(proxy)
     else:
         effective_fp = dict((pinned or {}).get("fingerprint") or {})
-        source = "pinned" if pinned else "caller"
         effective_proxy = proxy if proxy is not None else (pinned or {}).get("proxy")
+    source = "pinned" if effective_fp else "native"
     if fingerprint is not None:
         effective_fp.update(_normalize_fingerprint(fingerprint))
         source = "caller"
@@ -497,19 +528,58 @@ def _launch_identity(
 
 
 async def _apply_fingerprint_to_tab(tab: Tab, fingerprint: dict[str, str]) -> None:
-    """Apply a resolved fingerprint to a specific tab via CDP."""
+    """Apply a resolved identity to a tab, keeping its fields consistent.
+
+    Fields left out follow the real browser. Network.setUserAgentOverride requires a
+    UA even to change only the language, and without metadata it empties
+    navigator.userAgentData.brands, so the UA is always sent and the client hints
+    are always derived from it. A UA with no navigator.platform gets the matching
+    one. In headless mode the override also runs with nothing specified, because the
+    real UA and brands say HeadlessChrome.
+    """
     from nodriver.cdp import emulation as cdp_emulation
     from nodriver.cdp import network as cdp_network
 
-    ua_kwargs = {}
-    if fingerprint.get("user_agent"):
-        ua_kwargs["user_agent"] = fingerprint["user_agent"]
-    if fingerprint.get("accept_language"):
-        ua_kwargs["accept_language"] = fingerprint["accept_language"]
-    if fingerprint.get("platform"):
-        ua_kwargs["platform"] = fingerprint["platform"]
-    if ua_kwargs:
-        await tab.send(cdp_network.set_user_agent_override(**ua_kwargs))
+    requested_ua = fingerprint.get("user_agent") or ""
+    language = fingerprint.get("accept_language") or ""
+    platform = fingerprint.get("platform") or ""
+    from nodriver.cdp import browser as cdp_browser
+
+    version = await tab.send(cdp_browser.get_version())
+    real_version = version[1].rsplit("/", 1)[-1]
+    real = version[3]
+    native = strip_headless(real)
+    needs_cleanup = not requested_ua and native != real
+    if requested_ua or language or platform or needs_cleanup:
+        user_agent = requested_ua or native or ""
+        if not platform and requested_ua:
+            platform = navigator_platform(os_family(user_agent)) or ""
+        kwargs: dict[str, Any] = {"user_agent": user_agent}
+        if language:
+            # Chrome takes the bare list and generates the weighted header from it.
+            tags = navigator_languages(language)
+            kwargs["accept_language"] = ",".join(tags)
+        if platform:
+            kwargs["platform"] = platform
+        hints = ua_metadata_fields(user_agent, platform, real_version)
+        if hints:
+            make = cdp_emulation.UserAgentBrandVersion
+            kwargs["user_agent_metadata"] = cdp_emulation.UserAgentMetadata(
+                **{
+                    **hints,
+                    "brands": [make(**b) for b in hints["brands"]],
+                    "full_version_list": [make(**b) for b in hints["full_version_list"]],
+                }
+            )
+        await tab.send(cdp_network.set_user_agent_override(**kwargs))
+        if language:
+            # Weights Chrome would not produce itself can only be sent as an explicit
+            # header. navigator.languages keeps the bare list either way.
+            wanted = ",".join(p.strip() for p in language.split(",") if p.strip())
+            if wanted != default_accept_language(tags):
+                await tab.send(cdp_network.enable())
+                await tab.send(cdp_network.set_extra_http_headers(
+                    cdp_network.Headers({"Accept-Language": wanted})))
     if fingerprint.get("timezone"):
         await tab.send(cdp_emulation.set_timezone_override(
             timezone_id=fingerprint["timezone"]
@@ -1022,6 +1092,24 @@ def _resolve_launch_profile(
     return fallback, info
 
 
+# Only flags that reduce work without changing what a script can measure about the
+# browser, apart from images. Rendering and GPU flags stay out: they change canvas
+# and WebGL output, which is exactly what fingerprinters read. --disable-features is
+# also out, because Chrome honours the last one and nodriver passes its own.
+LIGHT_MODE_FLAGS = (
+    "--blink-settings=imagesEnabled=false",
+    "--disable-background-networking",
+    "--disable-component-update",
+    "--disable-sync",
+    "--disable-default-apps",
+    "--disable-domain-reliability",
+    "--disable-client-side-phishing-detection",
+    "--disable-notifications",
+    "--autoplay-policy=user-gesture-required",
+    "--mute-audio",
+)
+
+
 @mcp.tool()
 async def browser_launch(
     url: str = "about:blank",
@@ -1043,6 +1131,7 @@ async def browser_launch(
     profile_conflict: str = "fallback",
     expect_url: Optional[str] = None,
     expect_status: Optional[int] = None,
+    profile_mode: Literal["default", "light"] = "default",
 ) -> str:
     """Launch stealth Chrome via nodriver. Creates persistent profile by default.
 
@@ -1065,6 +1154,11 @@ async def browser_launch(
         lang: browser language
         extra_args: additional Chromium flags
         storage_state_path: load cookies/localStorage from JSON before first nav
+        profile_mode: "light" saves memory and network by not loading images and
+            turning off background Chrome services. For reading ordinary pages.
+            Pages can notice images failing to load (img.naturalWidth stays 0), and
+            layout or vision tools see no pictures, so keep "default" on bot-protected
+            sites or when looking at the page matters.
         testing_mode: 2-5× faster startup+nav for perf/regression testing —
             disables image loading, background throttling dampers, translate,
             notifications, media autoplay. WARNING: reduces stealth — not for
@@ -1084,8 +1178,14 @@ async def browser_launch(
             cloning the profile. Use list_chrome_profiles to enumerate.
         fingerprint: explicit CDP overrides (user_agent, accept_language,
             platform, timezone). Overrides a pinned identity for this launch.
-        privacy: use a fresh fingerprint and a disposable profile that is
-            deleted by browser_close. Incompatible with user_data_dir.
+        privacy: start from an empty profile that is deleted when the browser closes,
+            so nothing from this browser's history, logins or cookies is present or
+            kept. The identity is still the real browser and machine unless fingerprint
+            overrides it. A proxy written as a pool (a|b) picks one member. Incompatible
+            with user_data_dir.
+            To use a logged-in account, leave this off: the default keeps logins between
+            launches, and persistent=False with privacy=False tries something without
+            saving a login.
         profile_conflict: what to do when the profile is already held by another
             Chrome. "fallback" (default, legacy behaviour) uses a separate
             per-process profile and says so; "fail" refuses with the holding
@@ -1134,6 +1234,9 @@ async def browser_launch(
                 await _wait(_tab.evaluate("1", return_by_value=True),
                             timeout=5, what="reuse probe")
                 reuse_head = f"reusing the running browser ({len(BrowserState.tabs)} tab(s))"
+                if profile_mode != "default":
+                    reuse_head += (f"; profile_mode={profile_mode!r} NOT applied, it only "
+                                   f"takes effect on a new launch")
                 _doc_state, _disarm = await _arm_document_watch(_tab)
                 try:
                     if url and url != "about:blank":
@@ -1256,15 +1359,21 @@ async def browser_launch(
                         f"OR use attach_to_chrome(port=...) if Chrome was started with debug port."
                     )
 
-            # Per-process profile fallback: if another live MCP server already
-            # holds the shared default profile lock, use ~/.mcp-stealth/profile-pid<N>/
-            # so parallel Claude sessions never collide on Chrome's SingletonLock.
-            profile_path = resolve_default_profile(persistent)
-            used_fallback = persistent and profile_path != PROFILE_DIR
-            # Pin this process to whatever profile we just settled on, so a later
-            # browser_recover + relaunch cannot silently migrate to a different
-            # cookie jar and make the session look wiped.
-            if persistent:
+            # Each instance has one deterministic profile, and a conflict over it is
+            # settled by the caller's profile_conflict. Only "main" takes part in
+            # process affinity: a second HTTP session must not repoint it, or the
+            # primary's next launch lands on a different cookie jar and its logins
+            # look wiped.
+            resolved_profile, profile_info = _resolve_launch_profile(
+                BrowserState.current_instance_id,
+                persistent=bool(persistent),
+                profile_conflict=profile_conflict,
+            )
+            if profile_info.get("error"):
+                return err(profile_info["error"])
+            profile_path = resolved_profile or PROFILE_DIR
+            used_fallback = bool(persistent) and "conflict_with_pid" in profile_info
+            if persistent and BrowserState.current_instance_id == "main":
                 from .state import set_profile_affinity
                 set_profile_affinity(profile_path)
 
@@ -1329,6 +1438,9 @@ async def browser_launch(
         if not any((a or "").startswith("--window-position=")
                     for a in merged_extra_args):
             config.add_argument("--window-position=100,100")
+        if profile_mode == "light":
+            for _flag in LIGHT_MODE_FLAGS:
+                config.add_argument(_flag)
         if testing_mode:
             for _flag in (
                 "--blink-settings=imagesEnabled=false",
@@ -1453,9 +1565,12 @@ async def browser_launch(
         BrowserState.current_privacy = privacy
         BrowserState.current_fingerprint = dict(effective_fingerprint)
         BrowserState.current_proxy = effective_proxy
+        # A stdio browser_launch has never been idle-reaped, and that stays. Over HTTP a
+        # client can vanish, so the reaper is what eventually ends its browser.
+        if BrowserState.http_mode():
+            _ensure_idle_reaper_running()
         suffix = (
-            f" [profile fallback: {profile_path.name} — default profile is in use "
-            f"by another Chrome]"
+            f" [{profile_info.get('session_state_source')}]"
             if used_fallback else ""
         )
 
@@ -2395,15 +2510,19 @@ async def browser_snapshot(
     role: Optional[str] = None,
     name_contains: Optional[str] = None,
     include_hidden: bool = False,
+    include_frames: bool = True,
 ) -> str:
     """Ref-indexed list of the interactive elements on the active tab.
 
-    Refs (e0, e1, ...) are attached via data-mcp-ref. EVERY snapshot clears the
-    previous snapshot's refs before assigning new ones: a scoped or capped
-    snapshot would otherwise leave e0 on an old element and put e0 on a new one,
-    and resolve_ref would silently act on whichever came first in the document.
-    So a ref is valid until the next snapshot (or the next navigation), and a ref
-    that has been superseded fails loudly instead of hitting the wrong element.
+    Reaches into iframes (cross-origin included) and open shadow roots; those
+    elements are marked `frame=fN` / `shadow` and their refs work with click,
+    fill and the rest like any other. Closed shadow roots cannot be measured.
+
+    Refs (e0, e1, ...) live on the server, mapped to CDP node ids; the snapshot
+    runs in an isolated world and writes nothing to the page. EVERY snapshot
+    replaces all refs. A ref is valid until the next snapshot, and one that was
+    superseded, or whose element is gone, fails with an error saying so instead
+    of hitting the wrong element.
 
     Modes:
       interactive_compact — default. Full fidelity, minus non-interactive
@@ -2431,6 +2550,9 @@ async def browser_snapshot(
                         (aria-label / alt / title / text / value / placeholder).
       include_hidden    also return elements that are not rendered, each marked
                         `hidden`. They are counted either way.
+      include_frames    False measures the main frame only. max_elements covers
+                        the whole page, main frame first. viewport_only judges
+                        frame content against its own frame's viewport.
 
     The report always states matched / measured / eligible / returned / omitted
     for the same DOM walk that produced the list, so a filtered result can never
@@ -2441,7 +2563,7 @@ async def browser_snapshot(
     element list is not re-serialized. It is scoped per option set because a
     compact and a full snapshot measure different sets — sharing one cache entry
     would answer "unchanged" to a call that would have returned a different list.
-    The cache also keys on a per-document token, so a reload or a return to the
+    The cache also keys on each frame's loader id, so a reload or a return to the
     same URL never reports "unchanged": the refs the caller holds died with the
     old document even when the hash is identical.
 
@@ -2459,40 +2581,19 @@ async def browser_snapshot(
             name_contains=name_contains,
             include_hidden=include_hidden,
             max_elements=max_elements,
+            include_frames=include_frames,
         )
-        raw = await _wait(
-            tab.evaluate(build_snapshot_js(options), return_by_value=True),
-            what="browser_snapshot",
-        )
-        raw = raw.value if hasattr(raw, "value") and not isinstance(raw, str) else raw
-        try:
-            payload = raw if isinstance(raw, (dict, list)) else json.loads(raw)
-        except (TypeError, json.JSONDecodeError) as e:
-            return err(f"snapshot script returned invalid JSON: {e}")
-        if isinstance(payload, list):
-            # Legacy array shape (the fixed SNAPSHOT_JS constants) — no counts.
-            payload = {"elements": payload}
-        if not isinstance(payload, dict):
-            return err("snapshot script returned an invalid element list")
-        if payload.get("ok") is False:
-            return err(payload.get("error") or "snapshot script refused the scope")
-        elements = payload.get("elements")
-        if not isinstance(elements, list) or any(
-            not isinstance(element, dict) for element in elements
-        ):
-            return err("snapshot script returned an invalid element list")
-        counts = {
-            key: payload.get(key)
-            for key in (
-                "matched", "measured", "eligible", "returned", "omitted",
-                "truncated", "hidden_skipped", "offscreen_skipped",
-                "excluded", "container",
-            )
+        walk = await _wait(collect_snapshot(tab, options), what="browser_snapshot")
+        elements = walk.elements
+        counts = dict(walk.counts)
+        counts["frames"] = {
+            "walked": walk.frames, "failed": walk.failed,
+            "skipped": walk.skipped, "limit": MAX_FRAMES,
         }
         url = await get_url(tab)
         title = await get_title(tab)
         h = snapshot_hash(elements)
-        doc_token = str(payload.get("doc") or "")
+        doc_token = walk.doc_token()
         cache_key = _target_key(tab)
         scope_sig = snapshot_scope_signature(options)
         scopes = _SNAPSHOT_CACHE.setdefault(cache_key, {})
@@ -2874,8 +2975,26 @@ async def click(
     ref: Optional[str] = None,
     selector: Optional[str] = None,
     humanize: bool = False,
+    verify: bool = True,
+    js_fallback: bool = False,
 ) -> str:
-    """Click an element by ref (from snapshot) or CSS selector. JS fallback on failure."""
+    """Click an element by ref (from snapshot) or CSS selector with real mouse input.
+
+    Dispatches a trusted mouse event at the element's centre, scrolling it into
+    view first if needed. Refuses and names the blocker when the point belongs to
+    something else, so an overlay never produces a false "clicked". The result names
+    what was used: method=cdp_mouse, or method=js_click after js_fallback.
+
+    Args:
+        ref: element ref from browser_snapshot
+        selector: CSS selector
+        humanize: approach along a curved path and click a random spot inside
+        verify: compare the page before and after, and say so when nothing changed
+        js_fallback: when the real click cannot land, call element.click() from JS
+            instead of refusing. The event has isTrusted=false, which sites can
+            detect, and bypasses whatever was covering the element. The result
+            states when this happened. Off by default.
+    """
     try:
         tab = BrowserState.active_tab()
         el = None
@@ -2885,19 +3004,10 @@ async def click(
             el = await tab.query_selector(selector)
         if el is None:
             return err("element not found")
-        try:
-            if humanize:
-                await humanized_click(tab, el)
-            else:
-                await el.click()
-        except Exception:
-            # JS fallback for overlay-blocked elements
-            await tab.evaluate(
-                f'document.querySelector(\'[data-mcp-ref="{ref}"]\').click()'
-                if ref else f'document.querySelector({json.dumps(selector)}).click()',
-                return_by_value=True,
-            )
-        return ok("clicked")
+        label = f"click {ref or selector!r}"
+        return await _click_and_report(
+            tab, el, label, verify, js_fallback=js_fallback, humanize=humanize,
+        )
     except Exception as e:
         return err(str(e))
 
@@ -2922,7 +3032,10 @@ function() {
   const inVp = cx >= 0 && cy >= 0 && cx <= innerWidth && cy <= innerHeight;
   let top = null, hit = false;
   if (inVp) {
-    top = document.elementFromPoint(cx, cy);
+    // A shadow root answers for itself. document.elementFromPoint stops at the
+    // host, which does not "contain" anything inside its shadow tree.
+    const scope = this.getRootNode();
+    top = (scope.elementFromPoint ? scope : document).elementFromPoint(cx, cy);
     hit = !!top && (top === this || this.contains(top) || top.contains(this));
   }
   const cs = getComputedStyle(this);
@@ -2955,6 +3068,30 @@ _PAGE_SIG_JS = """
 """
 
 
+# Same question asked from the clicked element's own tree. The page fingerprint
+# reads the main document only, so a click that changed an iframe, a shadow tree,
+# or just a checkbox's state used to be reported as "NO page change".
+_ELEMENT_SIG_JS = """
+function() {
+  const root = this.getRootNode();
+  const scope = root.documentElement || root;
+  return JSON.stringify({
+    len: (scope.innerHTML || '').length,
+    nodes: scope.querySelectorAll('*').length,
+    connected: this.isConnected,
+    focused: root.activeElement === this,
+    editable: this.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(this.tagName),
+    checked: !!this.checked,
+    value: typeof this.value === 'string' ? this.value.length : null,
+    open: !!this.open,
+    aria: ['expanded', 'pressed', 'selected', 'checked']
+      .map(a => this.getAttribute('aria-' + a)).join(','),
+    cls: typeof this.className === 'string' ? this.className : ''
+  });
+}
+"""
+
+
 async def _click_probe(el) -> dict:
     """Hit-test the element before clicking. Returns {} if the probe can't run."""
     try:
@@ -2965,14 +3102,26 @@ async def _click_probe(el) -> dict:
         return {}
 
 
-async def _page_sig(tab) -> dict:
-    """Snapshot a cheap page fingerprint; {} when unavailable."""
+async def _page_sig(tab, el=None) -> dict:
+    """Snapshot a cheap page fingerprint; {} when unavailable.
+
+    With el, also fingerprints the element's own tree. That half reads as {} once
+    the element is gone, which correctly compares as a change.
+    """
     try:
         v = await tab.evaluate(_PAGE_SIG_JS, return_by_value=True)
         v = v.value if hasattr(v, "value") and not isinstance(v, str) else v
-        return json.loads(v) if v else {}
+        sig = json.loads(v) if v else {}
     except Exception:
         return {}
+    if el is not None and sig:
+        try:
+            own = await el.apply(_ELEMENT_SIG_JS)
+            own = own.value if hasattr(own, "value") and not isinstance(own, str) else own
+            sig["element"] = json.loads(own) if own else {}
+        except Exception:
+            sig["element"] = {}
+    return sig
 
 
 def _blocked_reason(p: dict) -> Optional[str]:
@@ -3064,43 +3213,143 @@ async def _click_text_rescue(tab, text: str, exact: bool) -> dict:
         return {}
 
 
-async def _click_and_report(tab, el, label: str, verify: bool) -> str:
+async def _js_click(el) -> None:
+    """element.click() from JS. isTrusted=false — only ever on explicit request."""
+    await el.apply("function() { this.click(); }")
+
+
+def _click_outcome(head: str, detail: str, before: dict, after: dict) -> str:
+    """Compare fingerprints and say what the click did, never a bare 'clicked'.
+
+    A real mouse click moves focus onto its target by itself, so that alone is not
+    the page reacting; a dead button must still read as "NO page change". Focus
+    moving somewhere ELSE is a reaction, and focus arriving on a field is exactly
+    what clicking a field is for, so it gets its own wording.
+    """
+    if not (before and after):
+        return ok(f"{head} — {detail}")
+    if before.get("url") != after.get("url"):
+        return ok(f"{head} — {detail}; navigated to {after.get('url')}")
+    own_before = {k: v for k, v in (before.get("element") or {}).items() if k != "focused"}
+    own_after = {k: v for k, v in (after.get("element") or {}).items() if k != "focused"}
+    # With no element fingerprint the caller clicked a raw point, and whether focus
+    # moved says nothing about which element it moved to.
+    focus_is_ours = bool((after.get("element") or {}).get("focused")) or "element" not in after
+    changed = (
+        before.get("len") != after.get("len")
+        or before.get("nodes") != after.get("nodes")
+        or own_before != own_after
+        or (before.get("active") != after.get("active") and not focus_is_ours)
+    )
+    if changed:
+        return ok(f"{head} — {detail}; page changed "
+                  f"(nodes {before.get('nodes')}→{after.get('nodes')})")
+    if own_after.get("editable") and (after.get("element") or {}).get("focused"):
+        return ok(f"{head} — {detail}; the field took focus")
+    return ok(
+        f"{head} but NO page change detected — {detail}. The event was dispatched; "
+        f"the page did not react (handler not bound, click swallowed, or the change "
+        f"is purely visual)."
+    )
+
+
+async def _settled_position(el):
+    """The element's position once it stops moving (smooth scroll, entry animation).
+
+    Bounded: something animating forever is clicked where it is now.
+    """
+    pos = await el.get_position()
+    still = 0
+    for _ in range(30):
+        await asyncio.sleep(0.04)
+        again = await el.get_position()
+        if pos is None or again is None:
+            return again
+        moved = abs(again.left - pos.left) >= 1 or abs(again.top - pos.top) >= 1
+        pos = again
+        still = 0 if moved else still + 1
+        if still >= 2:  # one quiet interval can be a smooth scroll's first frame
+            break
+    return pos
+
+
+async def _click_and_report(
+    tab, el, label: str, verify: bool,
+    js_fallback: bool = False, humanize: bool = False,
+) -> str:
     """Click `el`, then report what actually happened — never a bare 'clicked'.
 
-    Reports the resolved element and its rect so the caller can judge for itself,
-    refuses up-front when the hit-test says the click cannot land, and (with
-    verify) says plainly when the page did not change.
+    nodriver's Element.click() is itself a JS el.click() preceded by flash(), which
+    inserts a marker into the page: an untrusted event plus a visible DOM mutation.
+    This dispatches real mouse input at the element's position instead. It refuses
+    up-front when the hit-test says the click cannot land, and (with verify) says
+    plainly when the page did not change.
     """
+    # First wait out anything still moving it, such as a smooth scroll in progress:
+    # a hit test only holds for as long as the element stays put.
+    with contextlib.suppress(Exception):
+        await _settled_position(el)
     probe = await _click_probe(el)
+    scrolled = False
+    if probe.get("sized") and not probe.get("in_viewport"):
+        with contextlib.suppress(Exception):
+            await el.tab.send(cdp_dom.scroll_into_view_if_needed(
+                backend_node_id=el.backend_node_id))
+            # A smooth scroll is still moving at this point; probing now would
+            # refuse an element that is about to be in view.
+            await _settled_position(el)
+            probe = await _click_probe(el)
+            scrolled = True
+    with contextlib.suppress(Exception):
+        if await ensure_in_root_view(el):
+            await _settled_position(el)
+            probe = await _click_probe(el)
+            scrolled = True
     reason = _blocked_reason(probe)
-    if reason:
-        return err(
-            f"{label}: NOT clicked — {reason}. "
-            f"target=<{probe.get('target')}> rect={probe.get('rect')}. "
-            f"Try: scroll_to / mouse_click_xy at a different point / dismiss the overlay."
-        )
-    before = await _page_sig(tab) if verify else {}
-    await el.click()
-    detail = f"target=<{probe.get('target')}> at {probe.get('point')}" if probe else "target=<unknown>"
-    if not verify:
-        return ok(f"{label}: clicked — {detail}")
-    await asyncio.sleep(0.35)  # let handlers/render settle before re-reading
-    after = await _page_sig(tab)
-    if before and after:
-        if before.get("url") != after.get("url"):
-            return ok(f"{label}: clicked — {detail}; navigated to {after.get('url')}")
-        changed = (before.get("len") != after.get("len")
-                   or before.get("nodes") != after.get("nodes")
-                   or before.get("active") != after.get("active"))
-        if not changed:
-            return ok(
-                f"{label}: clicked but NO page change detected — {detail}. "
-                f"The event was dispatched; the page did not react (handler not bound, "
-                f"click swallowed, or the change is purely visual)."
+    pos = None
+    if reason is None:
+        pos = await _settled_position(el)
+        if pos is None:
+            reason = "element has no on-screen position"
+    if reason is None:
+        x, y = pos.left + pos.width / 2, pos.top + pos.height / 2
+        # Re-probe: the hit test above ran before the page finished moving.
+        probe = await _click_probe(el) or probe
+        reason = _blocked_reason(probe) or await outer_blocker(el, x, y)
+
+    target = f"target=<{probe.get('target') or 'unknown'}>"
+    if reason is not None:
+        if not js_fallback:
+            return err(
+                f"{label}: NOT clicked — {reason}. "
+                f"{target} rect={probe.get('rect')}. "
+                f"Try: scroll_to / mouse_click_xy at a different point / dismiss the "
+                f"overlay / js_fallback=True for an untrusted JS click."
             )
-        return ok(f"{label}: clicked — {detail}; page changed "
-                  f"(nodes {before.get('nodes')}→{after.get('nodes')})")
-    return ok(f"{label}: clicked — {detail}")
+        before = await _page_sig(tab, el) if verify else {}
+        await _js_click(el)
+        head = (f"{label}: clicked via JS FALLBACK (isTrusted=false, real click refused: "
+                f"{reason})")
+        detail = f"method=js_click {target}"
+        if not verify:
+            return ok(f"{head} — {detail}")
+        await asyncio.sleep(0.35)
+        return _click_outcome(head, detail, before, await _page_sig(tab, el))
+
+    before = await _page_sig(tab, el) if verify else {}
+    if humanize:
+        await humanized_click(tab, el, last_pos_ref=BrowserState.last_mouse_xy)
+        where = "humanized point inside the element"
+    else:
+        await move_pointer(tab, x, y)
+        await tab.mouse_click(x, y)
+        where = f"({int(x)},{int(y)})"
+    head = f"{label}: clicked"
+    detail = f"method=cdp_mouse {target} at {where}" + (" (scrolled into view)" if scrolled else "")
+    if not verify:
+        return ok(f"{head} — {detail}")
+    await asyncio.sleep(0.35)  # let handlers/render settle before re-reading
+    return _click_outcome(head, detail, before, await _page_sig(tab, el))
 
 
 @mcp.tool()
@@ -3135,11 +3384,11 @@ async def click_text(text: str, exact: bool = False, verify: bool = True) -> str
         if cand.get("x") is not None:
             before = await _page_sig(tab) if verify else {}
             try:
-                await tab.mouse_move(cand["x"], cand["y"])
+                await move_pointer(tab, cand["x"], cand["y"])
             except Exception:
                 pass
             await tab.mouse_click(cand["x"], cand["y"])
-            note = (f"{label}: clicked — target=<{cand.get('target')}> "
+            note = (f"{label}: clicked — method=cdp_mouse target=<{cand.get('target')}> "
                     f"at {{'x': {cand['x']}, 'y': {cand['y']}}}"
                     + (" (scrolled into view)" if cand.get("scrolled") else "")
                     + (f"; first text match was unreachable, used a visible one "
@@ -3148,18 +3397,8 @@ async def click_text(text: str, exact: bool = False, verify: bool = True) -> str
             if not verify:
                 return ok(note)
             await asyncio.sleep(0.35)
-            after = await _page_sig(tab)
-            if before and after:
-                if before.get("url") != after.get("url"):
-                    return ok(f"{note}; navigated to {after.get('url')}")
-                if (before.get("len") == after.get("len")
-                        and before.get("nodes") == after.get("nodes")
-                        and before.get("active") == after.get("active")):
-                    return ok(f"{note}; but NO page change detected — the event was "
-                              f"dispatched and the page did not react.")
-                return ok(f"{note}; page changed "
-                          f"(nodes {before.get('nodes')}→{after.get('nodes')})")
-            return ok(note)
+            head, _, detail = note.partition(" — ")
+            return _click_outcome(head, detail, before, await _page_sig(tab))
 
         if el is None and not cand.get("found"):
             return err(f"no element with text {text!r}")
@@ -3286,6 +3525,12 @@ async def assert_clickable(selector: Optional[str] = None, ref: Optional[str] = 
         if not probe:
             return err("probe failed — could not evaluate the element")
         reason = _blocked_reason(probe)
+        if reason is None:
+            # Frame content is covered by the page around it too, as click sees it.
+            pos = await el.get_position()
+            if pos is not None:
+                reason = await outer_blocker(
+                    el, pos.left + pos.width / 2, pos.top + pos.height / 2)
         return ok(json.dumps({"clickable": reason is None, "reason": reason, **probe},
                              indent=2))
     except Exception as e:
@@ -3303,7 +3548,7 @@ async def hover(ref: Optional[str] = None, selector: Optional[str] = None) -> st
         pos = await el.get_position()
         if pos is None:
             return err("position unavailable")
-        await tab.mouse_move(int(pos.left + pos.width / 2), int(pos.top + pos.height / 2))
+        await move_pointer(tab, int(pos.left + pos.width / 2), int(pos.top + pos.height / 2))
         return ok("hovered")
     except Exception as e:
         return err(str(e))
@@ -3326,6 +3571,15 @@ async def fill(ref: Optional[str] = None, selector: Optional[str] = None,
             await el.send_keys(value)
         except Exception:
             await el.set_value(value)
+        actual = await el.apply(
+            "function() { return this.isContentEditable ? this.innerText : this.value; }"
+        )
+        if isinstance(actual, str) and actual.strip() != str(value).strip():
+            return err(
+                f"typed, but the field reads {actual[:80]!r} rather than the "
+                f"{len(str(value))}-char value sent. The page rewrote or rejected it "
+                f"(input mask, maxlength, framework state)."
+            )
         return ok("filled")
     except Exception as e:
         return err(str(e))
@@ -3343,43 +3597,97 @@ async def type_text(text: str, humanize: bool = False,
         )
         if not active:
             return err("no focused element — click/focus an input first")
-        # Get active element handle via a marker
-        await tab.evaluate(
-            "document.activeElement.setAttribute('data-mcp-focused','1')",
-            return_by_value=True,
-        )
-        el = await tab.query_selector("[data-mcp-focused='1']")
+        el = await active_element(tab)
         if el is None:
             return err("focused element lookup failed")
-        try:
-            if humanize:
-                await humanized_type(el, text, mean_delay=mean_delay)
-            else:
-                await el.send_keys(text)
-        finally:
-            # Always strip the marker, even if typing raised — a stale
-            # data-mcp-focused would poison the next type_text lookup.
-            try:
-                await tab.evaluate(
-                    "document.querySelectorAll('[data-mcp-focused]').forEach(e=>e.removeAttribute('data-mcp-focused'))",
-                    return_by_value=True,
-                )
-            except Exception:
-                pass
+        if humanize:
+            await humanized_type(el, text, mean_delay=mean_delay)
+        else:
+            await el.send_keys(text)
         return ok("typed")
     except Exception as e:
         return err(str(e))
 
 
+async def _dispatch_key(tab: Any, params: dict) -> None:
+    """A full key press: down (with text, so it acts on the page), then up."""
+    from nodriver.cdp import input_ as cdp_input
+
+    fields = {k: v for k, v in params.items() if k != "text"}
+    text = params.get("text")
+    await tab.send(cdp_input.dispatch_key_event(
+        type_="keyDown" if text else "rawKeyDown",
+        text=text, unmodified_text=text, **fields,
+    ))
+    await tab.send(cdp_input.dispatch_key_event(type_="keyUp", **fields))
+
+
+def _key_effect(before: dict, after: dict) -> Optional[str]:
+    """What changed between two fingerprints, in words. None when nothing did."""
+    if not before or not after:
+        return None
+    if before.get("url") != after.get("url"):
+        return f"navigated to {after.get('url')}"
+    if before.get("len") != after.get("len") or before.get("nodes") != after.get("nodes"):
+        return f"page changed (nodes {before.get('nodes')}→{after.get('nodes')})"
+    if before.get("active") != after.get("active"):
+        return f"focus moved to <{(after.get('active') or '?').lower()}>"
+    if before.get("element") != after.get("element"):
+        return "the focused element changed"
+    return None
+
+
 @mcp.tool()
-async def press_key(key: str) -> str:
-    """Press a single key (Enter, Escape, Tab, ArrowDown, a, etc)."""
+async def press_key(key: str, verify: bool = True, settle_ms: int = 1000) -> str:
+    """Press a key and report what was observed, not only that it was sent.
+
+    Args:
+        key: a character, a name (Enter, Tab, Escape, Backspace, ArrowDown, Home, F5)
+            or a combination (Control+a, Shift+Tab).
+        verify: compare the page before and after. False sends the key and says the
+            effect was not checked.
+        settle_ms: how long to watch for an effect. A form submitted by Enter takes a
+            moment to navigate, so this stops as soon as something changes.
+
+    "NO page change detected" means nothing this tool can see moved within settle_ms.
+    The key was still delivered, and a handler may have acted without touching the DOM.
+    """
     try:
         tab = BrowserState.active_tab()
-        from nodriver.cdp import input_ as cdp_input
-        await tab.send(cdp_input.dispatch_key_event(type_="keyDown", key=key))
-        await tab.send(cdp_input.dispatch_key_event(type_="keyUp", key=key))
-        return ok(f"pressed {key}")
+        try:
+            params = key_event_params(key)
+        except ValueError as e:
+            return err(str(e))
+        focused = None
+        with contextlib.suppress(Exception):
+            focused = await active_element(tab)
+        target = "<unknown>"
+        if focused is not None:
+            ident = (focused.attrs.get("id") if focused.attrs else None) or ""
+            target = f"<{focused.node_name.lower()}{'#' + ident if ident else ''}>"
+        before = await _page_sig(tab, focused) if verify else {}
+        await _dispatch_key(tab, params)
+        if not verify:
+            return ok(f"pressed {key} — sent to {target}; effect not checked (verify=False)")
+        deadline = time.monotonic() + max(0, settle_ms) / 1000
+        after: dict = {}
+        while True:
+            await asyncio.sleep(0.05)
+            after = await _page_sig(tab, focused)
+            effect = _key_effect(before, after)
+            if effect:
+                return ok(f"pressed {key} — sent to {target}; {effect}")
+            if time.monotonic() >= deadline:
+                break
+        if before and not after:
+            return ok(f"pressed {key} — sent to {target}; the page stopped answering "
+                      f"within {settle_ms}ms, so the effect is unknown (it may be navigating)")
+        if not before:
+            return ok(f"pressed {key} — sent to {target}; the page could not be read "
+                      f"beforehand, so the effect is unknown")
+        return ok(f"pressed {key} but NO page change detected within {settle_ms}ms — "
+                  f"sent to {target}. The page shows no reaction (no DOM, URL or focus "
+                  f"change).")
     except Exception as e:
         return err(str(e))
 
@@ -3402,35 +3710,88 @@ async def select_option(
         return err(str(e))
 
 
-@mcp.tool()
-async def check(ref: Optional[str] = None, selector: Optional[str] = None) -> str:
-    """Tick a checkbox/radio (idempotent)."""
-    return await _set_checked(ref, selector, True)
+# Reads a native input, a <label> by its control, or role=checkbox by aria-checked.
+# `.checked` alone is undefined on the last two, which reads as "unchecked" forever.
+_READ_CHECKED_JS = """
+function() {
+  if (typeof this.checked === 'boolean') return this.checked;
+  if (this.control && typeof this.control.checked === 'boolean') return this.control.checked;
+  const aria = this.getAttribute('aria-checked');
+  return aria === null ? 'unknown' : aria === 'true';
+}
+"""
 
 
-@mcp.tool()
-async def uncheck(ref: Optional[str] = None, selector: Optional[str] = None) -> str:
-    """Untick a checkbox."""
-    return await _set_checked(ref, selector, False)
+async def _label_of(el) -> Any:
+    """The element's <label> as an element in its own right, or None."""
+    remote = await el.tab.send(cdp_dom.resolve_node(backend_node_id=el.backend_node_id))
+    found, exc = await el.tab.send(cdp_runtime.call_function_on(
+        "function() { return (this.labels && this.labels[0]) || null; }",
+        object_id=remote.object_id, return_by_value=False,
+    ))
+    if exc is not None or found.object_id is None:
+        return None
+    node = await el.tab.send(cdp_dom.describe_node(object_id=found.object_id, depth=-1))
+    label = type(el)(node, el.tab, tree=node)
+    entry = getattr(el, "ref_entry", None)
+    if entry is not None:
+        label._ref_entry = entry
+    return label
 
 
-async def _set_checked(ref, selector, state: bool) -> str:
+async def _set_checked(ref, selector, state: bool, js_fallback: bool = False) -> str:
+    verb = "check" if state else "uncheck"
     try:
         tab = BrowserState.active_tab()
         el = await resolve_ref(ref) if ref else (await tab.query_selector(selector) if selector else None)
         if el is None:
             return err("element not found")
-        # Get current state, click if different
-        current = await tab.evaluate(
-            f'!!document.querySelector(\'[data-mcp-ref="{ref}"]\').checked'
-            if ref else f'!!document.querySelector({json.dumps(selector)}).checked',
-            return_by_value=True,
-        )
-        if bool(current) != state:
-            await el.click()
-        return ok(f"{'checked' if state else 'unchecked'}")
+        current = await el.apply(_READ_CHECKED_JS)
+        if current == "unknown":
+            return err(f"{verb}: this element has no checked state "
+                       f"(not a checkbox, a label for one, or role=checkbox with aria-checked)")
+        if bool(current) == state:
+            return ok(f"already {'checked' if state else 'unchecked'}")
+        label = f"{verb} {ref or selector!r}"
+        result = await _click_and_report(tab, el, label, False)
+        how = "method=cdp_mouse"
+        if result.startswith("Error:"):
+            # Styled checkboxes hide the real input and show a label instead, so the
+            # label is what a person actually clicks.
+            target = await _label_of(el)
+            if target is not None:
+                result = await _click_and_report(tab, target, f"{label} via its label", False)
+                how = "method=cdp_mouse on its label"
+            if result.startswith("Error:"):
+                if not js_fallback:
+                    return err(f"{result[len('Error: '):]} Neither the input nor a label could "
+                               f"be clicked; js_fallback=True toggles it from JS.")
+                await _js_click(el)
+                how = "method=js_click (isTrusted=false, the input is hidden or covered)"
+        if bool(await el.apply(_READ_CHECKED_JS)) != state:
+            return err(f"{verb}: clicked with {how} but the state did not change. {result}")
+        return ok(f"{'checked' if state else 'unchecked'} — {how}")
     except Exception as e:
         return err(str(e))
+
+
+@mcp.tool()
+async def check(ref: Optional[str] = None, selector: Optional[str] = None,
+                js_fallback: bool = False) -> str:
+    """Tick a checkbox/radio (idempotent), confirming the state changed.
+
+    Handles native inputs, labels and role=checkbox. A hidden styled input is clicked
+    through its label. js_fallback=True toggles it from JS if nothing can be clicked;
+    the result names the method used.
+    """
+    return await _set_checked(ref, selector, True, js_fallback)
+
+
+@mcp.tool()
+async def uncheck(ref: Optional[str] = None, selector: Optional[str] = None,
+                  js_fallback: bool = False) -> str:
+    """Untick a checkbox, confirming the state changed. See check."""
+    return await _set_checked(ref, selector, False, js_fallback)
 
 
 @mcp.tool()
@@ -3474,7 +3835,7 @@ async def mouse_click_xy(x: int, y: int, button: str = "left",
         if move_first:
             # Hover first so hover-rendered targets exist before mousedown.
             try:
-                await tab.mouse_move(x, y)
+                await move_pointer(tab, x, y)
             except Exception:
                 pass  # best-effort; the click below is what matters
         await tab.mouse_click(x, y, button=button)
@@ -3492,7 +3853,7 @@ async def mouse_move(x: int, y: int, humanize: bool = False) -> str:
             # Start from a random offset; nodriver has no current-pos getter
             await humanized_move(tab, x + 100, y + 100, x, y)
         else:
-            await tab.mouse_move(x, y)
+            await move_pointer(tab, x, y)
         return ok(f"moved to ({x},{y})")
     except Exception as e:
         return err(str(e))
@@ -3504,7 +3865,7 @@ async def drag_and_drop(start_x: int, start_y: int, end_x: int, end_y: int) -> s
     try:
         tab = BrowserState.active_tab()
         from nodriver.cdp import input_ as cdp_input
-        await tab.mouse_move(start_x, start_y)
+        await move_pointer(tab, start_x, start_y)
         await tab.send(cdp_input.dispatch_mouse_event(
             type_="mousePressed", x=start_x, y=start_y, button="left", click_count=1,
         ))
@@ -3807,20 +4168,47 @@ async def tab_close(index: Optional[int] = None) -> str:
 
 
 @mcp.tool()
-async def cookie_list(url: Optional[str] = None) -> str:
-    """List all cookies (optionally filtered by URL)."""
+async def cookie_list(url: Optional[str] = None, reveal_values: bool = False) -> str:
+    """List cookies (optionally filtered by URL), with their values hidden by default.
+
+    A session cookie is a credential, and whatever this returns lands in the agent's
+    transcript. So each value is replaced by "***" plus `value_length`, which is enough
+    to see that a cookie exists and is non-empty.
+
+    Args:
+        url: only cookies that apply to this host or URL
+        reveal_values: True returns the real values. Only when the value itself is
+            needed; to reuse a session, cookie_export or http_request does not need it.
+    """
     try:
         if not BrowserState.browser:
             return err("browser not running")
         cookies = await BrowserState.browser.cookies.get_all()
         if url:
             cookies = [c for c in cookies if _cookie_domain_match(c.domain, url)]
-        data = [{"name": c.name, "value": c.value, "domain": c.domain,
-                 "path": c.path, "expires": c.expires,
+        data = [{**_cookie_value_fields(c.value, reveal_values), "name": c.name,
+                 "domain": c.domain, "path": c.path, "expires": c.expires,
                  "http_only": c.http_only, "secure": c.secure} for c in cookies]
         return ok(json.dumps(data, indent=2, default=str))
     except Exception as e:
         return err(str(e))
+
+
+def _cookie_value_fields(value: Any, reveal: bool) -> dict[str, Any]:
+    """The value itself, or only the fact of it."""
+    if reveal:
+        return {"value": value}
+    return {"value": "***", "value_masked": True, "value_length": len(str(value or ""))}
+
+
+def _write_private(path: Path, text: str) -> None:
+    """Write a file holding credentials, readable by this user only from the first byte."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    # An existing file keeps its old mode through O_CREAT.
+    with contextlib.suppress(OSError):
+        path.chmod(0o600)
 
 
 def _cookie_domain_match(cookie_domain: Optional[str], url_or_host: str) -> bool:
@@ -4130,11 +4518,18 @@ async def cookie_import(
 
 @mcp.tool()
 async def cookie_export(filename: Optional[str] = None,
-                         url: Optional[str] = None) -> str:
+                         url: Optional[str] = None,
+                         reveal_values: bool = True) -> str:
     """Export cookies to a JSON file. Cookies-only (use storage_state_save for full session).
 
     Output is a plain JSON array compatible with cookie_import / EditThisCookie /
-    Playwright cookies format. Saved to ~/.mcp-stealth/storage-states/.
+    Playwright cookies format. Saved to ~/.mcp-stealth/storage-states/ with mode 600.
+    This tool's response names the file and never contains a value.
+
+    Args:
+        reveal_values: True (default) writes real values, because a file without them
+            cannot be imported. False writes "***" and value_length, for sharing what
+            cookies exist; such a file cannot restore a session.
     """
     try:
         if not BrowserState.browser:
@@ -4143,16 +4538,17 @@ async def cookie_export(filename: Optional[str] = None,
         if url:
             cookies = [c for c in cookies if _cookie_domain_match(c.domain, url)]
         data = [{
-            "name": c.name, "value": c.value, "domain": c.domain,
-            "path": c.path, "expires": c.expires,
+            **_cookie_value_fields(c.value, reveal_values), "name": c.name,
+            "domain": c.domain, "path": c.path, "expires": c.expires,
             "httpOnly": c.http_only, "secure": c.secure,
             "sameSite": getattr(c, "same_site", None),
         } for c in cookies]
         ensure_dirs()
         fname = filename or ts_filename("cookies", "json")
         path = confined_output_path(STORAGE_STATE_DIR, fname)
-        path.write_text(json.dumps(data, indent=2, default=str))
-        return ok(f"{path}\nexported {len(data)} cookies")
+        _write_private(path, json.dumps(data, indent=2, default=str))
+        note = "" if reveal_values else " with values masked; this file cannot be imported"
+        return ok(f"{path}\nexported {len(data)} cookies{note}")
     except Exception as e:
         return err(str(e))
 
@@ -4471,7 +4867,14 @@ async def get_attribute(
     """Get attribute value of element."""
     try:
         tab = BrowserState.active_tab()
-        sel_for_js = f'[data-mcp-ref="{ref}"]' if ref else selector
+        if ref:
+            el = await resolve_ref(ref)
+            value = await el.apply(
+                f"function() {{ var v = this.getAttribute({json.dumps(name)}); "
+                f"return v === null ? '__MCP_NULL__' : v; }}"
+            )
+            return ok("(attribute not set)" if value == "__MCP_NULL__" else str(value))
+        sel_for_js = selector
         if not sel_for_js:
             return err("ref or selector required")
         # IIFE: null-check the element (raw querySelector(...).getAttribute
@@ -4539,36 +4942,38 @@ async def get_links(same_origin: bool = False, limit: int = 200) -> str:
 
 @mcp.tool()
 async def list_frames() -> str:
-    """List all iframes and their URLs."""
+    """List every frame on the active tab, cross-origin (out-of-process) ones included."""
     try:
         tab = BrowserState.active_tab()
-        tree = await tab.get_frame_tree()
-        frames = []
-
-        def walk(node, depth=0):
-            frame = node.frame if hasattr(node, "frame") else node
-            frames.append({
-                "id": getattr(frame, "id_", None),
-                "url": getattr(frame, "url", None),
-                "depth": depth,
-            })
-            for child in getattr(node, "child_frames", None) or []:
-                walk(child, depth + 1)
-        walk(tree)
-        return ok(json.dumps(frames, indent=2, default=str))
+        frames = await _wait(all_frames(tab), what="list_frames")
+        rows = []
+        for f in frames:
+            if f["frame"] is None:
+                rows.append({"id": f["frame_id"], "url": None, "depth": f["depth"],
+                             "error": f"not reachable: {f['scan_error']}"})
+                continue
+            row = {"id": str(f["frame"].id_), "url": f["frame"].url, "depth": f["depth"],
+                   "out_of_process": f["conn"] is not tab}
+            if f["scan_error"]:
+                row["error"] = f"child frames not checked: {f['scan_error']}"
+            rows.append(row)
+        return ok(json.dumps(rows, indent=2, default=str))
     except Exception as e:
         return err(str(e))
 
 
 @mcp.tool()
 async def frame_evaluate(frame_url_pattern: str, expression: str) -> str:
-    """Run JS inside an iframe matching URL pattern.
+    """Run JS inside the first child frame whose URL matches a regex.
 
-    Same-origin frames only: cross-origin iframes (reCAPTCHA bframe, payment
-    widgets, third-party embeds) block contentWindow.eval and return an error.
+    A same-origin frame runs it in the page's own context. A cross-origin frame
+    (reCAPTCHA bframe, payment widgets, third-party embeds) refuses that, so it
+    runs in an isolated world instead: the DOM is the same, but the frame's own
+    JS globals are not visible. The result says which one happened.
     """
     try:
         tab = BrowserState.active_tab()
+        pattern = re.compile(frame_url_pattern)
         # Build the matcher from a string via new RegExp(...) so slashes and
         # other regex/JS-special chars in the pattern can't break the JS literal.
         result = await tab.evaluate(
@@ -4576,15 +4981,33 @@ async def frame_evaluate(frame_url_pattern: str, expression: str) -> str:
             f"var iframes = document.querySelectorAll('iframe'); "
             f"for (var f of iframes) {{ if (re.test(f.src)) {{ "
             f"try {{ return JSON.stringify(f.contentWindow.eval({json.dumps(expression)})); }} "
-            f"catch(e){{ return 'ERR:'+e.message; }} }} }} return 'no frame matched'; }})()",
+            f"catch(e){{ return 'ERR:'+e.name+':'+e.message; }} }} }} return 'no frame matched'; }})()",
             return_by_value=True,
         )
         result = result.value if hasattr(result, "value") and not isinstance(result, str) else result
         text = str(result)
-        # Cross-origin access throws a SecurityError inside contentWindow.eval.
-        if text.startswith("ERR:") and ("cross-origin" in text.lower() or "SecurityError" in text):
-            return err(f"cross-origin frame not accessible: {text[4:]}")
-        return ok(text)
+        cross_origin = text.startswith("ERR:") and (
+            "cross-origin" in text.lower() or "SecurityError" in text)
+        if not cross_origin and text != "no frame matched":
+            if text.startswith("ERR:"):
+                return err(f"frame script threw: {text[4:]}")
+            return ok(text)
+        for found in await _wait(all_frames(tab), what="frame_evaluate"):
+            if found["frame"] is None:
+                continue
+            if found["depth"] == 0 or not pattern.search(str(found["frame"].url or "")):
+                continue
+            ctx = await frame_world(found["conn"], found["frame"])
+            remote, exc = await _wait(found["conn"].send(cdp_runtime.evaluate(
+                expression, context_id=ctx, return_by_value=True, await_promise=True,
+            )), what="frame_evaluate")
+            if exc is not None:
+                detail = getattr(exc.exception, "description", None) if exc.exception else None
+                return err(f"frame script threw: {detail or exc.text}")
+            return ok(f"{json.dumps(remote.value, default=str)}\n"
+                      f"(ran in an isolated world of {found['frame'].url}: DOM shared, "
+                      f"the frame's own JS globals not visible)")
+        return ok("no frame matched")
     except Exception as e:
         return err(str(e))
 
@@ -4596,36 +5019,29 @@ async def frame_evaluate(frame_url_pattern: str, expression: str) -> str:
 
 @mcp.tool()
 async def batch_actions(actions: list[dict]) -> str:
-    """Execute a list of actions sequentially.
+    """Execute a flat list of actions in order and report each one.
 
-    Each action: {type: click|fill|type|wait|press|navigate, ...params}
+    Each action: {type: click|fill|type|wait|press|navigate, ...params}, or the name
+    of any workflow_run tool with its arguments alongside, such as
+    {"type": "select_option", "selector": "#c", "value": "x"}.
+    Add "stop_on_error": true to an action to stop there if it fails.
     Example: [{"type":"click","ref":"e3"},{"type":"fill","ref":"e4","value":"x"}]
+
+    For branching, loops or using one step's result in another, use workflow_run.
     """
     if not isinstance(actions, list):
         actions = parse_json(actions, [])
+    _register_workflow_tools()
     results = []
     for i, act in enumerate(actions):
         atype = act.get("type")
         try:
-            if atype == "click":
-                r = await click(ref=act.get("ref"), selector=act.get("selector"),
-                                 humanize=act.get("humanize", False))
-            elif atype == "fill":
-                r = await fill(ref=act.get("ref"), selector=act.get("selector"),
-                                value=act.get("value", ""))
-            elif atype == "type":
-                r = await type_text(text=act.get("text", ""),
-                                     humanize=act.get("humanize", False))
-            elif atype == "press":
-                r = await press_key(key=act.get("key", "Enter"))
-            elif atype == "wait":
-                r = await wait_for(selector=act.get("selector"), text=act.get("text"),
-                                    timeout=act.get("timeout", 5.0))
-            elif atype == "navigate":
-                r = await navigate(url=act.get("url"))
-            else:
+            tool, args = _batch_action_call(act)
+            if tool is None:
                 r = err(f"unknown action type: {atype}")
-            results.append(f"[{i}] {atype}: {str(r)[:80]}")
+            else:
+                r = await _WORKFLOW_TOOLS[tool](**args)
+            results.append(f"[{i}] {atype}: {str(r)[:160]}")
             # A tool can return an "Error: ..." string WITHOUT raising — honor
             # stop_on_error for those too, not just for exceptions.
             if isinstance(r, str) and r.startswith("Error:") and act.get("stop_on_error"):
@@ -4637,6 +5053,30 @@ async def batch_actions(actions: list[dict]) -> str:
     n_failed = sum(1 for ln in results if ": Error:" in ln or ": ERR " in ln)
     header = f"{len(results)} actions, {n_failed} failed" if n_failed else f"{len(results)} actions OK"
     return ok(header + "\n" + "\n".join(results))
+
+
+def _batch_action_call(act: dict) -> tuple[Optional[str], dict]:
+    """Map a batch action to (tool, args). The six legacy names keep their defaults."""
+    atype = act.get("type")
+    if atype == "click":
+        return "click", {"ref": act.get("ref"), "selector": act.get("selector"),
+                         "humanize": act.get("humanize", False)}
+    if atype == "fill":
+        return "fill", {"ref": act.get("ref"), "selector": act.get("selector"),
+                        "value": act.get("value", "")}
+    if atype == "type":
+        return "type_text", {"text": act.get("text", ""),
+                             "humanize": act.get("humanize", False)}
+    if atype == "press":
+        return "press_key", {"key": act.get("key", "Enter")}
+    if atype == "wait":
+        return "wait_for", {"selector": act.get("selector"), "text": act.get("text"),
+                            "timeout": act.get("timeout", 5.0)}
+    if atype == "navigate":
+        return "navigate", {"url": act.get("url")}
+    if atype in _WORKFLOW_TOOLS:
+        return atype, {k: v for k, v in act.items() if k not in ("type", "stop_on_error")}
+    return None, {}
 
 
 @mcp.tool()
@@ -4774,11 +5214,18 @@ async def scroll_to(
         return err("ref or selector required")
     try:
         tab = BrowserState.active_tab()
-        if ref:
-            target_sel = f'[data-mcp-ref="{ref}"]'
-        else:
-            target_sel = selector
         behavior = "smooth" if smooth else "auto"
+        if ref:
+            el = await resolve_ref(ref)
+            await el.apply(
+                f"function() {{ this.scrollIntoView("
+                f"{{block:{json.dumps(block)}, behavior:{json.dumps(behavior)}}}); }}"
+            )
+            # A smooth scroll is still moving when this returns; the next tool
+            # would otherwise measure a position that is already out of date.
+            await _settled_position(el)
+            return ok(f"scrolled to ref {ref} (block={block})")
+        target_sel = selector
         js = (
             f"(() => {{ var el = document.querySelector({json.dumps(target_sel)}); "
             f"if (!el) return 'not_found'; "
@@ -4807,11 +5254,23 @@ _dialog_pre_action: dict[str, Any] = {
 }
 
 
+def _session_dialog_cfg(kind: str) -> dict:
+    """Dialog settings of the calling session. Handlers capture this when armed, so one
+    session changing its settings cannot leave another's dialogs hanging."""
+    return _DIALOG_SESSION_CFG.setdefault((BrowserState.session_key(), kind), {
+        "action": "accept", "text": "", "enabled": False, "types": None,
+    })
+
+
+_DIALOG_SESSION_CFG: dict[tuple[str, str], dict] = {}
+
+
 @mcp.tool()
 async def dialog_handle(action: str = "accept", text: Optional[str] = None) -> str:
     """Pre-arm handler for next alert/confirm/prompt. Call BEFORE action that triggers it."""
-    _dialog_pre_action["action"] = action
-    _dialog_pre_action["text"] = text
+    pre_cfg = _session_dialog_cfg("pre")
+    pre_cfg["action"] = action
+    pre_cfg["text"] = text
     try:
         tab = BrowserState.active_tab()
         from nodriver.cdp import page as cdp_page
@@ -4824,8 +5283,8 @@ async def dialog_handle(action: str = "accept", text: Optional[str] = None) -> s
         async def handle(_event):
             try:
                 await tab.send(cdp_page.handle_java_script_dialog(
-                    accept=(_dialog_pre_action["action"] == "accept"),
-                    prompt_text=_dialog_pre_action["text"] or "",
+                    accept=(pre_cfg["action"] == "accept"),
+                    prompt_text=pre_cfg["text"] or "",
                 ))
             except Exception:
                 pass
@@ -4869,6 +5328,7 @@ def _clear_tab_scoped_state(tabs: list[Any]) -> None:
     keys = {_target_key(tab) for tab in tabs}
     if not keys:
         return
+    forget_refs(keys)
     for key in keys:
         _SNAPSHOT_CACHE.pop(key, None)
         _HUMAN_HELP.pop(key, None)
@@ -4943,10 +5403,11 @@ async def dialog_auto_handle(
     Native dialogs only (Chrome's own card UI). HTML/CSS modal overlays
     are regular DOM — use click_text("Cancel") / click_role for those.
     """
-    _DIALOG_AUTO_CFG["enabled"] = bool(enabled)
-    _DIALOG_AUTO_CFG["action"] = action
-    _DIALOG_AUTO_CFG["text"] = text or ""
-    _DIALOG_AUTO_CFG["types"] = set(types) if types else None
+    auto_cfg = _session_dialog_cfg("auto")
+    auto_cfg["enabled"] = bool(enabled)
+    auto_cfg["action"] = action
+    auto_cfg["text"] = text or ""
+    auto_cfg["types"] = set(types) if types else None
 
     if not enabled:
         return ok("dialog auto-handle disabled (config preserved — re-enable to resume)")
@@ -4963,7 +5424,7 @@ async def dialog_auto_handle(
         from nodriver.cdp import page as cdp_page
 
         async def auto_handler(event):
-            cfg = _DIALOG_AUTO_CFG
+            cfg = auto_cfg
             if not cfg["enabled"]:
                 return
             ev_type = getattr(event, "type_", None) or getattr(event, "type", None)
@@ -5038,7 +5499,7 @@ async def console_start() -> str:
         BrowserState.capture_console = True
         _CONSOLE_STARTED_AT = _now_iso()
         tid = _target_key(tab)
-        from nodriver.cdp import runtime as cdp_runtime, page as cdp_page
+        from nodriver.cdp import page as cdp_page
 
         if tid in _CONSOLE_ARMED_TAB_IDS:
             # Handler is still bound, but the domain can lapse — re-enabling is
@@ -5333,6 +5794,7 @@ async def server_status() -> str:
     """
     status = {
         "version": __version__,
+        "session": BrowserState.session_key(),
         "browser_running": BrowserState.is_up(),
         "instance": BrowserState.current_instance_id,
         "tabs": len(BrowserState.tabs),
@@ -5398,6 +5860,11 @@ _FINGERPRINT_AUDIT_JS = r"""
   out.pixel_ratio = window.devicePixelRatio;
   out.touch_points = nav.maxTouchPoints;
   out.pdf_viewer = nav.pdfViewerEnabled === undefined ? null : nav.pdfViewerEnabled;
+  out.secure_context = window.isSecureContext;
+  out.ua_data = nav.userAgentData
+    ? {brands: nav.userAgentData.brands.map(b => b.brand + "/" + b.version),
+       platform: nav.userAgentData.platform, mobile: nav.userAgentData.mobile}
+    : null;
 
   try {
     const c = document.createElement("canvas");
@@ -5522,6 +5989,33 @@ async def fingerprint_audit(url: Optional[str] = None) -> str:
               f"UA says {ua_os}, platform says {plat_os} ({platform!r}) — "
               f"detectors weight this mismatch heavily")
 
+        check("HeadlessChrome" not in ua, "headless marker in UA",
+              "the User-Agent announces HeadlessChrome")
+        not_checked_hints: list[str] = []
+        ua_data = fp.get("ua_data")
+        ua_version = chrome_version(ua)
+        if ua_version and ua_data is None:
+            # userAgentData only exists on secure contexts, so this is unmeasured
+            # here rather than clean.
+            not_checked_hints.append(
+                "Client hints (navigator.userAgentData) — unavailable on this page "
+                "because it is not a secure context; audit an https:// page")
+        elif ua_version:
+            brands = ua_data.get("brands") or []
+            check(bool(brands), "userAgentData.brands",
+                  "empty on a Chrome UA — real Chrome always lists its brands")
+            major = ua_version.split(".")[0]
+            chrome_brand = next((b for b in brands if b.startswith("Google Chrome/")), None)
+            if brands:
+                check(chrome_brand == f"Google Chrome/{major}",
+                      "UA version vs client hints",
+                      f"UA says Chrome {major}, brands say {brands}")
+            hint_os = {"Windows": "windows", "macOS": "mac", "Linux": "linux"}.get(
+                ua_data.get("platform") or "")
+            if hint_os:
+                check(hint_os == ua_os or ua_os == "unknown", "UA vs client hints platform",
+                      f"UA says {ua_os}, userAgentData.platform says {ua_data.get('platform')!r}")
+
         renderer = (fp.get("webgl_renderer") or "")
         if renderer:
             gpu_os = ("mac" if "Apple" in renderer else
@@ -5553,6 +6047,7 @@ async def fingerprint_audit(url: Optional[str] = None) -> str:
             "passed": passed,
             "fingerprint": fp,
             "not_checked": [
+                *not_checked_hints,
                 "TLS/JA3 fingerprint — needs a network peer; use "
                 "http_request(impersonate=...) against a TLS-echo endpoint",
                 "IP vs timezone/locale coherence — needs the exit IP's geo",
@@ -5795,6 +6290,12 @@ async def intercept_start(
     try:
         tab = BrowserState.active_tab()
         if _INTERCEPT["active"]:
+            holder = _INTERCEPT.get("session")
+            if holder not in (None, BrowserState.session_key()):
+                return err(
+                    f"request interception is in use by another MCP session ({holder}). "
+                    "This server runs one interception at a time; wait for it to end."
+                )
             await _intercept_disable("restarted")
 
         from nodriver.cdp import fetch as cdp_fetch, network as cdp_network
@@ -5808,6 +6309,7 @@ async def intercept_start(
         state = _INTERCEPT
         state.update({
             "active": True,
+            "session": BrowserState.session_key(),
             "action": action,
             "url_pattern": url_pattern or "*",
             "methods": wanted,
@@ -5935,6 +6437,10 @@ async def intercept_log(limit: int = 50, clear: bool = False) -> str:
     "never started" or "the deadline already fired".
     """
     state = _INTERCEPT
+    holder = state.get("session")
+    if holder not in (None, BrowserState.session_key()):
+        # The log holds another session's request headers and bodies.
+        return err(f"request interception belongs to another MCP session ({holder}).")
     entries = state["log"][-max(1, int(limit)):]
     payload = {
         "active": state["active"],
@@ -5961,6 +6467,9 @@ async def intercept_log(limit: int = 50, clear: bool = False) -> str:
 @mcp.tool()
 async def intercept_stop() -> str:
     """Stop intercepting and let the page make requests normally again."""
+    holder = _INTERCEPT.get("session")
+    if _INTERCEPT["active"] and holder not in (None, BrowserState.session_key()):
+        return err(f"request interception belongs to another MCP session ({holder}).")
     was_active = _INTERCEPT["active"]
     counts = dict(_INTERCEPT["counts"])
     await _intercept_disable("stopped by caller")
@@ -6291,7 +6800,8 @@ async def storage_state_save(filename: Optional[str] = None) -> str:
             "origins": {origin: local_storage} if origin else {},
             "saved_at": time.time(),
         }
-        path.write_text(json.dumps(state, indent=2, default=str))
+        # Real cookies and localStorage: the same credentials cookie_export protects.
+        _write_private(path, json.dumps(state, indent=2, default=str))
         return ok(f"saved {len(state['cookies'])} cookies to {path}")
     except Exception as e:
         return err(str(e))
@@ -6389,8 +6899,8 @@ async def identity_pin(
     """Persist a stable fingerprint + proxy for one browser instance.
 
     Future browser_launch/spawn_browser calls for that instance apply the pin
-    automatically. Omitted fields preserve an existing pin; the first call
-    without a fingerprint creates a coherent random desktop fingerprint.
+    automatically. Omitted fields preserve an existing pin. Fields never set follow
+    the real browser, so pinning only a proxy leaves the identity as it is.
     """
     try:
         iid = instance_id or BrowserState.current_instance_id
@@ -6399,8 +6909,6 @@ async def identity_pin(
         pinned_fingerprint = dict(existing.get("fingerprint") or {})
         if fingerprint is not None:
             pinned_fingerprint.update(_normalize_fingerprint(fingerprint))
-        elif not pinned_fingerprint:
-            pinned_fingerprint = _random_fingerprint()
         pinned_proxy = proxy if proxy is not None else existing.get("proxy")
         payload = {
             "instance_id": iid,
@@ -6443,7 +6951,9 @@ async def fingerprint_rotate(
 ) -> str:
     """Override fingerprint vectors for active tab: user_agent, accept_language,
     platform (Win32/MacIntel/Linux x86_64), timezone (Asia/Jakarta, etc).
-    Applied via CDP. Persists until next tab creation.
+    Applied via CDP. Persists until next tab creation. Client hints
+    (navigator.userAgentData) are derived from the UA so they agree with it, and a UA
+    without a platform gets the matching navigator.platform.
     """
     try:
         tab = BrowserState.active_tab()
@@ -6889,7 +7399,7 @@ async def mouse_replay(path_json: str, speed: float = 1.0) -> str:
             t = ev.get("t", prev_t)
             dt = max(0, (t - prev_t) / 1000.0 / speed)
             await asyncio.sleep(dt)
-            await tab.mouse_move(int(ev.get("x", 0)), int(ev.get("y", 0)))
+            await move_pointer(tab, int(ev.get("x", 0)), int(ev.get("y", 0)))
             prev_t = t
         return ok(f"replayed {len(events)} mouse events")
     except Exception as e:
@@ -6930,6 +7440,16 @@ from .tools.network_http import (  # noqa: F401
 # Run multiple isolated browsers in parallel — one per account, per site, or
 # per worker. Each instance has its own profile, tabs, cookies, and logs.
 # Idle instances auto-close after configurable timeout (prevents memory leaks).
+
+
+def _exc_text(e: BaseException) -> str:
+    """An exception's message, or its type when str() is blank.
+
+    nodriver raises message-less exceptions on some launch failures, which used to
+    surface as an error with nothing after the colon.
+    """
+    text = str(e).strip()
+    return f"{type(e).__name__}: {text}" if text else f"{type(e).__name__} (no message)"
 
 
 def _instance_profile_path(
@@ -7059,7 +7579,7 @@ async def _launch_browser_instance(
     except Exception as e:
         await _safe_stop_browser(browser)
         await _remove_privacy_profile(privacy_profile)
-        return False, f"launch failed: {e}"
+        return False, f"launch failed: {_exc_text(e)}"
 
     if storage_state_path:
         try:
@@ -7101,7 +7621,7 @@ async def _launch_browser_instance(
     except Exception as e:
         await _safe_stop_browser(browser)
         await _remove_privacy_profile(privacy_profile)
-        return False, f"initial nav failed: {e}"
+        return False, f"initial nav failed: {_exc_text(e)}"
 
     # Write into the target instance slot
     if instance_id == BrowserState.current_instance_id:
@@ -7145,65 +7665,78 @@ async def _launch_browser_instance(
     )
 
 
+async def _sweep_idle_instances() -> None:
+    """Close the calling session's instances that are past their idle timeout."""
+    # Check stored instances
+    to_close = []
+    for iid, snap in list(BrowserState.instances.items()):
+        if snap.is_running() and snap.is_idle_expired():
+            to_close.append((iid, snap))
+    for iid, snap in to_close:
+        _tabs = list(snap.tabs)
+        try:
+            if snap.browser:
+                snap.browser.stop()
+        except Exception:
+            # Keep the instance reachable and retry next sweep. Popping
+            # it here would leak a live Chrome with no remaining handle.
+            continue
+        # Mark profile cleanly exited (matches close_instance) so the
+        # next launch doesn't hit a "Restore pages?" / stale-lock state.
+        if snap.privacy:
+            if not await _remove_privacy_profile(snap.profile_dir):
+                snap.browser = None
+                snap.tabs = []
+                _clear_tab_scoped_state(_tabs)
+                continue
+        elif snap.profile_dir:
+            clean_profile_state(snap.profile_dir)
+        _clear_tab_scoped_state(_tabs)
+        BrowserState.instances.pop(iid, None)
+    # Check current instance
+    if (BrowserState.is_up()
+        and BrowserState.current_idle_timeout > 0
+        and (time.time() - BrowserState.current_last_active) > BrowserState.current_idle_timeout):
+        _cur_profile = BrowserState.current_profile_dir
+        _cur_privacy = BrowserState.current_privacy
+        _cur_tabs = list(BrowserState.tabs)
+        try:
+            if BrowserState.browser:
+                BrowserState.browser.stop()
+        except Exception:
+            # State must remain reachable so the next sweep can retry.
+            return
+        BrowserState.reset()
+        _clear_tab_scoped_state(_cur_tabs)
+        BrowserState.current_headless = False
+        BrowserState.current_privacy = False
+        if _cur_privacy:
+            if not await _remove_privacy_profile(_cur_profile):
+                BrowserState.current_profile_dir = _cur_profile
+                BrowserState.current_privacy = True
+        elif _cur_profile:
+            clean_profile_state(_cur_profile)
+
+
 async def _idle_reaper_loop() -> None:
-    """Close instances that have been idle past their timeout."""
+    """Close instances idle past their timeout, in every session and the pool."""
     while True:
         try:
             await asyncio.sleep(IDLE_REAPER_INTERVAL)
-            # Check stored instances
-            to_close = []
-            for iid, snap in list(BrowserState.instances.items()):
-                if snap.is_running() and snap.is_idle_expired():
-                    to_close.append((iid, snap))
-            for iid, snap in to_close:
-                _tabs = list(snap.tabs)
-                try:
-                    if snap.browser:
-                        snap.browser.stop()
-                except Exception:
-                    # Keep the instance reachable and retry next sweep. Popping
-                    # it here would leak a live Chrome with no remaining handle.
-                    continue
-                # Mark profile cleanly exited (matches close_instance) so the
-                # next launch doesn't hit a "Restore pages?" / stale-lock state.
-                if snap.privacy:
-                    if not await _remove_privacy_profile(snap.profile_dir):
-                        snap.browser = None
-                        snap.tabs = []
-                        _clear_tab_scoped_state(_tabs)
-                        continue
-                elif snap.profile_dir:
-                    clean_profile_state(snap.profile_dir)
-                _clear_tab_scoped_state(_tabs)
-                BrowserState.instances.pop(iid, None)
-            # Check current instance
-            if (BrowserState.is_up()
-                and BrowserState.current_idle_timeout > 0
-                and (time.time() - BrowserState.current_last_active) > BrowserState.current_idle_timeout):
-                _cur_profile = BrowserState.current_profile_dir
-                _cur_privacy = BrowserState.current_privacy
-                _cur_tabs = list(BrowserState.tabs)
-                try:
-                    if BrowserState.browser:
-                        BrowserState.browser.stop()
-                except Exception:
-                    # State must remain reachable so the next sweep can retry.
-                    continue
-                BrowserState.reset()
-                _clear_tab_scoped_state(_cur_tabs)
-                BrowserState.current_headless = False
-                BrowserState.current_privacy = False
-                if _cur_privacy:
-                    if not await _remove_privacy_profile(_cur_profile):
-                        BrowserState.current_profile_dir = _cur_profile
-                        BrowserState.current_privacy = True
-                elif _cur_profile:
-                    clean_profile_state(_cur_profile)
         except asyncio.CancelledError:
             return
-        except Exception:
-            # Don't let reaper crash
-            continue
+        with contextlib.suppress(Exception):
+            BrowserState.collect_departed_sessions()
+        for key in BrowserState.session_keys():
+            token = BrowserState.in_session(key)
+            try:
+                await _sweep_idle_instances()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                continue  # one session's failure must not stop the others
+            finally:
+                BrowserState.unbind_session(token)
 
 
 def _ensure_idle_reaper_running() -> None:
@@ -7246,7 +7779,9 @@ async def spawn_browser(
         profile_dir: override profile path (default: ~/.mcp-stealth/profiles/<id>/)
         desc: natural-language purpose used to find the instance by meaning later
         fingerprint: explicit user_agent/accept_language/platform/timezone overrides
-        privacy: fresh fingerprint + disposable profile removed when closed
+        privacy: empty profile deleted when closed. The identity stays the real browser
+            and machine unless fingerprint overrides it. To use a logged-in account,
+            leave this off
         other args: same as browser_launch
 
     Use switch_instance(id) to route subsequent tool calls to this instance.
@@ -7255,47 +7790,62 @@ async def spawn_browser(
         _validate_instance_id(instance_id)
     except ValueError as e:
         return err(str(e))
+    foreign = BrowserState.foreign_instance(instance_id)
+    if foreign:
+        return err(foreign)
+    if instance_id in BrowserState.released_ids():
+        return err(f"instance {instance_id!r} was released by another session. "
+                   f"Take it with switch_instance({instance_id!r}).")
     if _LAUNCH_LOCK.locked():
         return err("another launch is already in progress — wait for it to finish")
-    async with _LAUNCH_LOCK:
-        if instance_id == BrowserState.current_instance_id:
-            if BrowserState.is_up():
-                return err(
-                    f"instance {instance_id!r} already running (current). "
-                    "Use switch_instance instead."
+    # The name is only visible to other sessions once the launch finishes, so two
+    # sessions spawning one name would both pass the check above and share a profile.
+    holder = _SPAWNING.get(instance_id)
+    if holder is not None:
+        return err(f"instance {instance_id!r} is being launched by another session ({holder}).")
+    _SPAWNING[instance_id] = BrowserState.session_key()
+    try:
+        async with _LAUNCH_LOCK:
+            if instance_id == BrowserState.current_instance_id:
+                if BrowserState.is_up():
+                    return err(
+                        f"instance {instance_id!r} already running (current). "
+                        "Use switch_instance instead."
+                    )
+                if BrowserState.current_privacy and BrowserState.current_profile_dir:
+                    return err(
+                        f"instance {instance_id!r} has pending privacy cleanup. "
+                        "Retry close_instance() before relaunching."
+                    )
+            if instance_id in BrowserState.instances:
+                state = (
+                    "running" if BrowserState.instances[instance_id].is_running()
+                    else "stopped or awaiting cleanup"
                 )
-            if BrowserState.current_privacy and BrowserState.current_profile_dir:
                 return err(
-                    f"instance {instance_id!r} has pending privacy cleanup. "
-                    "Retry close_instance() before relaunching."
+                    f"instance {instance_id!r} already exists ({state}). "
+                    "Call close_instance() before reusing its name."
                 )
-        if instance_id in BrowserState.instances:
-            state = (
-                "running" if BrowserState.instances[instance_id].is_running()
-                else "stopped or awaiting cleanup"
+            ok_flag, msg = await _launch_browser_instance(
+                instance_id=instance_id,
+                url=url,
+                headless=headless,
+                proxy=proxy,
+                user_agent=user_agent,
+                window_width=window_width,
+                window_height=window_height,
+                persistent=persistent,
+                lang=lang,
+                extra_args=extra_args,
+                storage_state_path=storage_state_path,
+                idle_timeout=idle_timeout_seconds,
+                profile_dir_override=profile_dir,
+                fingerprint=fingerprint,
+                privacy=privacy,
+                desc=desc,
             )
-            return err(
-                f"instance {instance_id!r} already exists ({state}). "
-                "Call close_instance() before reusing its name."
-            )
-        ok_flag, msg = await _launch_browser_instance(
-            instance_id=instance_id,
-            url=url,
-            headless=headless,
-            proxy=proxy,
-            user_agent=user_agent,
-            window_width=window_width,
-            window_height=window_height,
-            persistent=persistent,
-            lang=lang,
-            extra_args=extra_args,
-            storage_state_path=storage_state_path,
-            idle_timeout=idle_timeout_seconds,
-            profile_dir_override=profile_dir,
-            fingerprint=fingerprint,
-            privacy=privacy,
-            desc=desc,
-        )
+    finally:
+        _SPAWNING.pop(instance_id, None)
     if not ok_flag:
         return err(msg)
     return ok(msg)
@@ -7329,6 +7879,9 @@ async def list_instances() -> str:
     external = find_external_chrome_pids()
     payload = {
         "instances": out,
+        "session": BrowserState.session_key(),
+        "released_claimable": BrowserState.released_ids(),
+        "other_sessions": BrowserState.other_session_instances(),
         "external_chrome_pids": external,
         "warning": (
             f"{len(external)} external Chrome process(es) detected — "
@@ -7343,6 +7896,9 @@ async def instance_describe(instance_id: str, desc: str, append: bool = False) -
     """Set or append the natural-language purpose of a browser instance."""
     try:
         _validate_instance_id(instance_id)
+        foreign = BrowserState.foreign_instance(instance_id)
+        if foreign:
+            return err(foreign)
         if instance_id == BrowserState.current_instance_id:
             old = BrowserState.current_desc
             BrowserState.current_desc = (
@@ -7374,11 +7930,43 @@ async def switch_instance(instance_id: str) -> str:
         return err(str(e))
     if instance_id == BrowserState.current_instance_id:
         return ok(f"already on {instance_id!r}")
+    foreign = BrowserState.foreign_instance(instance_id)
+    if foreign:
+        return err(foreign)
+    BrowserState.claim_released(instance_id)
     existed = instance_id in BrowserState.instances
     BrowserState.switch_to(instance_id)
     if not existed and not BrowserState.is_up():
         return ok(f"switched to {instance_id!r} (not yet running — call spawn_browser or browser_launch)")
     return ok(f"switched to {instance_id!r}")
+
+
+@mcp.tool()
+async def instance_release(instance_id: str) -> str:
+    """Hand a running instance over so another MCP session can take it.
+
+    Only meaningful in HTTP mode, where several sessions share one server. The
+    instance keeps running, tabs and logins intact, until another session calls
+    switch_instance on it or the idle timeout closes it. Switch away first if it is
+    the current one.
+    """
+    try:
+        _validate_instance_id(instance_id)
+    except ValueError as e:
+        return err(str(e))
+    foreign = BrowserState.foreign_instance(instance_id)
+    if foreign:
+        return err(foreign)
+    if instance_id == BrowserState.current_instance_id:
+        return err(
+            f"{instance_id!r} is this session's current instance. "
+            "switch_instance to another name first, then release it."
+        )
+    if instance_id not in BrowserState.instances:
+        return err(f"instance {instance_id!r} not found in this session")
+    BrowserState.release_instance(instance_id)
+    return ok(f"released {instance_id!r}; another session can take it with "
+              f"switch_instance({instance_id!r})")
 
 
 @mcp.tool()
@@ -7388,6 +7976,10 @@ async def close_instance(instance_id: str) -> str:
         _validate_instance_id(instance_id)
     except ValueError as e:
         return err(str(e))
+    foreign = BrowserState.foreign_instance(instance_id)
+    if foreign:
+        return err(foreign)
+    BrowserState.claim_released(instance_id)
     # Close current
     if instance_id == BrowserState.current_instance_id:
         if BrowserState.is_up():
@@ -7917,6 +8509,7 @@ from .tools import devtools as _devtools  # noqa: F401  -- registers tools with 
 # HTTP-first (curl_cffi, browserless) with stealth-browser fallback — aims to
 # replace firecrawl/tavily and most of exa for everyday research.
 from .tools import research as _research  # noqa: F401  -- registers tools with mcp
+from .tools import profiles as _profiles  # noqa: F401  -- registers tools with mcp
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -8194,19 +8787,24 @@ _SMART_FILL_FIND_JS = """
       if (overlap > 0) score = 100 + overlap * 50;
     }
     if (score > 0) {
-      // Tag input with marker so we can re-query it server-side without
-      // sending the element across CDP boundary.
-      const marker = '__mcp_smart_' + Math.random().toString(36).slice(2, 10);
-      el.setAttribute('data-mcp-smart', marker);
-      const rect = el.getBoundingClientRect();
-      scored.push({score, label: lbl, marker, type: el.tagName.toLowerCase(),
-        input_type: (el.type || '').toLowerCase(),
-        x: Math.round(rect.left + rect.width / 2),
-        y: Math.round(rect.top + rect.height / 2)});
+      scored.push({score, label: lbl, el, type: el.tagName.toLowerCase(),
+        input_type: (el.type || '').toLowerCase()});
     }
   }
   scored.sort((a, b) => b.score - a.score);
-  return JSON.stringify({best: scored[0] || null, candidates: [...new Set(candidates)].filter(Boolean).slice(0, 30)});
+  const top = scored[0] || null;
+  let best = null;
+  if (top) {
+    // Measure only the winner, after bringing it on screen: a point outside the
+    // viewport would send the mouse click nowhere.
+    top.el.scrollIntoView({block: 'center', inline: 'nearest', behavior: 'instant'});
+    const rect = top.el.getBoundingClientRect();
+    best = {score: top.score, label: top.label, type: top.type, input_type: top.input_type,
+      x: Math.round(rect.left + rect.width / 2),
+      y: Math.round(rect.top + rect.height / 2)};
+  }
+  return {json: JSON.stringify({best, candidates: [...new Set(candidates)].filter(Boolean).slice(0, 30)}),
+          el: top ? top.el : null};
 }
 """
 
@@ -8237,15 +8835,12 @@ async def smart_fill(fields: dict, submit_label: Optional[str] = None) -> str:
         for label, value in fields.items():
             if not isinstance(label, str):
                 continue
-            raw = await _wait(
-                tab.evaluate(
-                    f"({_SMART_FILL_FIND_JS})({json.dumps(label)})",
-                    return_by_value=True,
-                ),
+            group = new_object_group()
+            parts = await _wait(
+                evaluate_parts(tab, f"({_SMART_FILL_FIND_JS})({json.dumps(label)})", group),
                 what=f"smart_fill find '{label}'",
             )
-            text = raw.value if hasattr(raw, "value") and not isinstance(raw, str) else raw
-            data = parse_json(str(text), {})
+            data = parse_json(parts["json"].value if "json" in parts else "", {})
             best = data.get("best") if isinstance(data, dict) else None
             candidates = data.get("candidates", []) if isinstance(data, dict) else []
             if not best:
@@ -8254,6 +8849,7 @@ async def smart_fill(fields: dict, submit_label: Optional[str] = None) -> str:
                     "error": "no field matched",
                     "did_you_mean": candidates[:10],
                 })
+                await release_group(tab, group)
                 continue
             # Click into the field then type. Using mouse_click + JS fill is
             # more reliable than .focus() across React/Vue components that
@@ -8262,26 +8858,33 @@ async def smart_fill(fields: dict, submit_label: Optional[str] = None) -> str:
                 await tab.mouse_click(int(best["x"]), int(best["y"]))
                 await asyncio.sleep(0.1)
                 # Native value setter so React/Vue see the change
-                await _wait(tab.evaluate(
-                    f"""
-                    (() => {{
-                      const el = document.querySelector('[data-mcp-smart="{best['marker']}"]');
-                      if (!el) return false;
-                      const setter = Object.getOwnPropertyDescriptor(
-                        el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype,
-                        'value'
-                      ).set;
-                      setter.call(el, {json.dumps(str(value))});
-                      el.dispatchEvent(new Event('input', {{bubbles: true}}));
-                      el.dispatchEvent(new Event('change', {{bubbles: true}}));
-                      return true;
-                    }})()
-                    """,
-                    return_by_value=True,
-                ), what=f"smart_fill set '{label}'")
+                setter_js = f"""
+                function() {{
+                  const proto = this.tagName === 'TEXTAREA'
+                    ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                  Object.getOwnPropertyDescriptor(proto, 'value').set.call(this, {json.dumps(str(value))});
+                  this.dispatchEvent(new Event('input', {{bubbles: true}}));
+                  this.dispatchEvent(new Event('change', {{bubbles: true}}));
+                  return this.value;
+                }}
+                """
+                remote, exc = await _wait(tab.send(cdp_runtime.call_function_on(
+                    setter_js, object_id=parts["el"].object_id, return_by_value=True,
+                )), what=f"smart_fill set '{label}'")
+                if exc is not None:
+                    raise RuntimeError(exc.text or "value setter threw")
+                actual = remote.value
+                if str(actual) != str(value):
+                    results.append({
+                        "label": label, "matched": best["label"], "ok": False,
+                        "error": f"field reads {str(actual)[:80]!r} after setting it",
+                    })
+                    continue
                 results.append({"label": label, "matched": best["label"], "ok": True})
             except Exception as e:
                 results.append({"label": label, "ok": False, "error": str(e)})
+            finally:
+                await release_group(tab, group)
         # Optional submit
         submit_result = None
         if submit_label:
@@ -8424,6 +9027,20 @@ async def assert_element_visible(
 _STORAGE_SNAPSHOTS: dict[str, dict] = {}
 
 
+def _snapshot_key(name: str) -> str:
+    """Names are per session: diffing against another session's snapshot would blame the
+    action under test for the difference between two browsers."""
+    key = BrowserState.session_key()
+    return name if key == PRIMARY_SESSION else f"{key}::{name}"
+
+
+def _own_snapshot_names() -> list[str]:
+    prefix = f"{BrowserState.session_key()}::"
+    if BrowserState.session_key() == PRIMARY_SESSION:
+        return [n for n in _STORAGE_SNAPSHOTS if "::" not in n]
+    return [n[len(prefix):] for n in _STORAGE_SNAPSHOTS if n.startswith(prefix)]
+
+
 async def _take_storage_snapshot(tab) -> dict:
     """Capture cookies + localStorage + sessionStorage + url + title.
 
@@ -8489,7 +9106,7 @@ async def storage_snapshot(name: str = "default") -> str:
     try:
         tab = BrowserState.active_tab()
         snap = await _take_storage_snapshot(tab)
-        _STORAGE_SNAPSHOTS[name] = snap
+        _STORAGE_SNAPSHOTS[_snapshot_key(name)] = snap
         if len(_STORAGE_SNAPSHOTS) > _STORAGE_SNAPSHOT_LIMIT:
             for stale in list(_STORAGE_SNAPSHOTS)[:-_STORAGE_SNAPSHOT_LIMIT]:
                 _STORAGE_SNAPSHOTS.pop(stale, None)
@@ -8523,13 +9140,13 @@ async def storage_diff(name: str = "default") -> str:
       storage_diff("before")  → returns what the action actually changed
     """
     try:
-        if name not in _STORAGE_SNAPSHOTS:
+        if _snapshot_key(name) not in _STORAGE_SNAPSHOTS:
             return err(
                 f"no snapshot named {name!r}. Available: "
-                f"{list(_STORAGE_SNAPSHOTS.keys()) or '(none)'}"
+                f"{_own_snapshot_names() or '(none)'}"
             )
         tab = BrowserState.active_tab()
-        before = _STORAGE_SNAPSHOTS[name]
+        before = _STORAGE_SNAPSHOTS[_snapshot_key(name)]
         after = await _take_storage_snapshot(tab)
 
         def _kvdiff(b: dict, a: dict) -> dict:
@@ -8593,9 +9210,8 @@ async def storage_diff(name: str = "default") -> str:
 # ── workflow_run (resumable) ───────────────────────────────────────────────
 
 # Map of tool-name → function ref for workflow_run dispatch. Only a curated
-# subset is exposed (the ones useful for sequencing — read-only inspectors
-# like get_text are intentionally excluded since the workflow output already
-# captures step results).
+# subset is exposed. batch_actions and workflow_run share it, so a step type means
+# the same thing in both.
 _WORKFLOW_TOOLS: dict[str, Any] = {}
 
 
@@ -8617,6 +9233,12 @@ def _register_workflow_tools() -> None:
         "storage_snapshot", "storage_diff",
         "cookie_import", "storage_state_load",
         "evaluate", "mouse_click_xy",
+        # Readers: a later step can branch on or iterate over what these return.
+        "get_text", "get_attribute", "get_url", "get_links", "get_html",
+        "query_selector_all", "extract_table", "extract_structured",
+        "browser_snapshot", "describe_page", "search_page",
+        "hover", "paste_text", "fill_form", "wait_for_function", "wait_for_change",
+        "wait_for_network_idle",
     ):
         if name in g and callable(g[name]):
             # FastMCP wraps tools — unwrap to the underlying coroutine fn
@@ -8627,98 +9249,80 @@ def _register_workflow_tools() -> None:
 @mcp.tool()
 async def workflow_run(
     steps: list[dict],
-    start_at: int = 0,
+    start_at: int | str = 0,
     stop_on_error: bool = True,
+    vars: Optional[dict] = None,
 ) -> str:
-    """⭐ Execute a list of tool steps sequentially. Resumable — pass
-    start_at=N to skip the first N steps.
+    """⭐ Run many tool steps in one call, with branching, loops and earlier results.
 
-    Each step: {"tool": "<name>", "args": {...}, "label": "optional"}
+    A tool step: {"tool": "fill", "args": {...}, "save_as": "x", "label": "...",
+    "continue_on_error": false}
+
+    Using earlier results: save_as stores a step's result, parsed as JSON when it
+    is JSON. Any string in args may then reference it as ${x}, ${x.field} or
+    ${x[0].name}; a string that is exactly one reference keeps its type. ${last.ok},
+    ${last.value} and ${last.text} describe the previous step. A reference to
+    something undefined fails the step and lists what is defined.
+
+    Loop: {"foreach": "${rows}", "as": "row", "steps": [...]} sets ${row} and
+    ${row_index} for each item.
+
+    Branch: {"if": <condition>, "then": [...], "else": [...]}. Conditions are
+    {"value": "${x}", "<op>": y} with op one of equals, not_equals, contains,
+    not_contains, matches (regex), gt, gte, lt, lte, truthy, falsy; or
+    {"exists": "${x.y}"}, {"all": [...]}, {"any": [...]}, {"not": {...}}. There is no
+    expression language and nothing is evaluated as code on the server.
+
+    Example, submitting a form once per row of data taken from the page:
+      [{"tool": "evaluate", "args": {"expression": "JSON.stringify(window.rows)"},
+        "save_as": "rows"},
+       {"foreach": "${rows}", "as": "row", "steps": [
+         {"tool": "fill", "args": {"selector": "#name", "value": "${row.name}"}},
+         {"if": {"value": "${row.active}", "truthy": true}, "then": [
+           {"tool": "check", "args": {"selector": "#active"}}]},
+         {"tool": "click", "args": {"selector": "#save"}}]}]
 
     Args:
-        steps: list of step dicts
-        start_at: index to begin from (for resume after a fix)
-        stop_on_error: abort on first failure (default True). If False,
-            continue and collect all results.
+        steps: the steps above
+        start_at: where to begin. A top-level index, or a dotted path from a failure
+            report: "3.2.1" is step 3, item 2 of its loop, inner step 1.
+        stop_on_error: stop at the first failure (default). If False, keep going and
+            report every result.
+        vars: starting variables. Pass the `vars` of a failure report when resuming,
+            since nothing is kept between calls.
 
-    Returns JSON:
-      {
-        "completed": [
-          {"index": 0, "tool": "navigate", "ok": true, "result": "..."},
-          ...
-        ],
-        "failed_at": 3,                # index of failure (omitted on success)
-        "failure_context": {...},      # last step's input + error (for LLM debug)
-        "resume_with": "workflow_run(steps=..., start_at=4)"  # hint
-      }
+    Returns JSON with completed (capped at 200 entries, the rest counted), total and
+    vars. On failure also failed_at, failed_path, failure_context and resume_with.
+    With stop_on_error=False, failed_count and failed_paths list every failure even
+    past that cap. Steps the failed step depended on are not re-run on resume, so check
+    that any state they left on the page still holds. A start_at that does not exist
+    is refused.
 
-    Allowed tools (curated for sequencing): navigate, reload, go_back/forward,
-    click, click_text, click_role, fill, type_text, press_key, select_option,
-    check, uncheck, wait_for*, screenshot, scroll, scroll_to, smart_fill,
-    vision_locate, assert_*, storage_*, cookie_import, storage_state_load,
-    evaluate, mouse_click_xy.
+    Tools: navigate, reload, go_back/forward, click, click_text, click_role, fill,
+    fill_form, type_text, paste_text, press_key, select_option, check, uncheck,
+    hover, scroll, scroll_to, mouse_click_xy, smart_fill, wait_for*, screenshot,
+    evaluate, get_text, get_attribute, get_url, get_links, get_html, search_page,
+    query_selector_all, extract_table, extract_structured, browser_snapshot,
+    describe_page, vision_locate, assert_*, storage_*, cookie_import,
+    storage_state_load.
     """
     _register_workflow_tools()
+    steps = parse_json(steps, None) if isinstance(steps, str) else steps
     if not isinstance(steps, list):
         return err("steps must be a list of dicts")
-    completed: list[dict] = []
-    for i in range(start_at, len(steps)):
-        step = steps[i]
-        if not isinstance(step, dict) or "tool" not in step:
-            entry = {"index": i, "ok": False, "error": "step must have 'tool' key"}
-            completed.append(entry)
-            if stop_on_error:
-                return err(json.dumps({
-                    "completed": completed, "failed_at": i,
-                    "failure_context": {"step": step, "error": "malformed"},
-                    "resume_with": f"workflow_run(steps=..., start_at={i + 1})",
-                }, indent=2, ensure_ascii=False))
-            continue
-        tool_name = step["tool"]
-        args = step.get("args", {}) or {}
-        label = step.get("label", "")
-        if tool_name not in _WORKFLOW_TOOLS:
-            entry = {"index": i, "tool": tool_name, "ok": False,
-                     "error": f"unknown or non-allowlisted tool: {tool_name}",
-                     "available": sorted(_WORKFLOW_TOOLS.keys())[:20]}
-            completed.append(entry)
-            if stop_on_error:
-                return err(json.dumps({
-                    "completed": completed, "failed_at": i,
-                    "failure_context": entry,
-                    "resume_with": f"workflow_run(steps=..., start_at={i + 1})",
-                }, indent=2, ensure_ascii=False))
-            continue
-        try:
-            fn = _WORKFLOW_TOOLS[tool_name]
-            if not isinstance(args, dict):
-                raise ValueError(f"args must be a dict, got {type(args).__name__}")
-            res = await fn(**args)
-            res_str = str(res)
-            is_err = res_str.startswith("Error:")
-            entry = {"index": i, "tool": tool_name, "label": label,
-                     "ok": not is_err, "result": res_str[:500]}
-            completed.append(entry)
-            if is_err and stop_on_error:
-                return err(json.dumps({
-                    "completed": completed, "failed_at": i,
-                    "failure_context": {"step": step, "result": res_str},
-                    "resume_with": f"workflow_run(steps=..., start_at={i})",
-                    "hint": "fix the underlying issue then re-run with start_at unchanged "
-                            "(retry same step) or start_at+1 (skip).",
-                }, indent=2, ensure_ascii=False))
-        except Exception as e:
-            entry = {"index": i, "tool": tool_name, "label": label,
-                     "ok": False, "error": str(e)}
-            completed.append(entry)
-            if stop_on_error:
-                return err(json.dumps({
-                    "completed": completed, "failed_at": i,
-                    "failure_context": {"step": step, "error": str(e)},
-                    "resume_with": f"workflow_run(steps=..., start_at={i})",
-                }, indent=2, ensure_ascii=False))
-    return ok(json.dumps({"completed": completed, "total": len(steps)},
-                          indent=2, ensure_ascii=False))
+
+    async def dispatch(tool: str, args: dict) -> Any:
+        return await _WORKFLOW_TOOLS[tool](**args)
+
+    try:
+        result = await run_workflow(
+            steps, dispatch, lambda name: name in _WORKFLOW_TOOLS,
+            start_at=start_at, stop_on_error=stop_on_error, variables=vars,
+        )
+    except WorkflowError as e:
+        return err(str(e))
+    text = json.dumps(result, indent=2, ensure_ascii=False, default=str)
+    return err(text) if "failed_at" in result else ok(text)
 
 
 # ── detect_and_bypass ──────────────────────────────────────────────────────
@@ -8834,29 +9438,26 @@ async def paste_text(
 
     Args:
         text: value to paste
-        ref: data-mcp-ref from browser_snapshot
+        ref: element ref from browser_snapshot
         selector: CSS selector
         submit: if True, simulate Enter keypress after paste
     """
     try:
         tab = BrowserState.active_tab()
-        target_selector: Optional[str] = None
         if ref:
-            # Existence probe only — the actual paste re-queries via the selector.
-            if await resolve_ref(ref) is None:
-                return err(f"ref {ref} not found")
-            target_selector = f'[data-mcp-ref="{ref}"]'
+            el = await resolve_ref(ref)
         elif selector:
-            target_selector = selector
+            el = await tab.query_selector(selector)
+            if el is None:
+                return err("paste failed: element not found")
         else:
             return err("paste_text: pass ref= or selector=")
 
         # Single-shot JS that does the full event dance — keeps timing tight.
-        result_raw = await _wait(tab.evaluate(
+        result_raw = await _wait(el.apply(
             f"""
-            (() => {{
-              const el = document.querySelector({json.dumps(target_selector)});
-              if (!el) return JSON.stringify({{ok: false, error: 'element not found'}});
+            function() {{
+              const el = this;
               const text = {json.dumps(text)};
               try {{ el.focus(); }} catch (e) {{}}
               // 1. Paste event with DataTransfer
@@ -8895,9 +9496,8 @@ async def paste_text(
               // 5. change event for blur-validators
               el.dispatchEvent(new Event('change', {{bubbles: true}}));
               return JSON.stringify({{ok: true, value: el.value}});
-            }})()
+            }}
             """,
-            return_by_value=True,
         ), what="paste_text")
         result_text = result_raw.value if hasattr(result_raw, "value") and not isinstance(result_raw, str) else result_raw
         data = parse_json(str(result_text), {})
@@ -8905,14 +9505,10 @@ async def paste_text(
             return err(f"paste failed: {data.get('error') if isinstance(data, dict) else result_text}")
         if submit:
             try:
-                await tab.send_keys("\r")  # Enter
+                await _dispatch_key(tab, key_event_params("Enter"))
             except Exception:
-                try:
-                    await tab.evaluate(
-                        f"""document.querySelector({json.dumps(target_selector)}).form?.requestSubmit?.()"""
-                    )
-                except Exception:
-                    pass
+                with contextlib.suppress(Exception):
+                    await el.apply("function() { this.form?.requestSubmit?.(); }")
         return ok(f"pasted {len(text)} chars; field value={str(data.get('value', ''))[:80]}")
     except Exception as e:
         return err(str(e))
@@ -9607,6 +10203,9 @@ async def attach_to_chrome(
         _validate_instance_id(instance_id)
     except ValueError as e:
         return err(str(e))
+    foreign = BrowserState.foreign_instance(instance_id)
+    if foreign:
+        return err(foreign)
     if BrowserState.is_up():
         return err(
             f"Browser already attached/running on instance {BrowserState.current_instance_id!r}. "
@@ -9702,8 +10301,45 @@ async def detach() -> str:
 # ══════════════════════════════════════════════════════════════════════════
 
 
+def _stop_all_browsers() -> None:
+    """Stop every browser this process started, in every session and the pool.
+
+    Stopping only the current one left stored instances running after the server
+    exited, with nothing remaining that knew about them.
+    """
+    for key in BrowserState.session_keys():
+        token = BrowserState.in_session(key)
+        try:
+            handles = [BrowserState.browser]
+            handles.extend(s.browser for s in BrowserState.instances.values())
+            for browser in handles:
+                with contextlib.suppress(Exception):
+                    if browser and not getattr(browser, "stopped", False):
+                        browser.stop()
+        finally:
+            BrowserState.unbind_session(token)
+
+
+def _parse_cli(argv: list[str]) -> Any:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="mcp-stealth-chrome",
+        description="Stealth Chrome MCP server. Speaks stdio unless --http is given.",
+    )
+    parser.add_argument("--http", action="store_true",
+                        help="serve MCP over HTTP: one server, one session per client")
+    parser.add_argument("--host", default="127.0.0.1", help="HTTP bind address (default 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=8765, help="HTTP port (default 8765)")
+    parser.add_argument("--allow-remote", action="store_true",
+                        help="permit a non-loopback --host; anyone with the token controls the browser")
+    parser.add_argument("--allowed-host", action="append", default=[],
+                        help="hostname clients use, for a proxy or a wildcard --host (repeatable)")
+    return parser.parse_args(argv)
+
+
 def main() -> None:
-    """Stdio MCP entry point.
+    """MCP entry point: stdio by default, HTTP with --http.
 
     Survival rules — MCP stdio servers must NOT die when the parent (Claude
     Code) cancels a tool call or hits Esc:
@@ -9720,6 +10356,24 @@ def main() -> None:
        shutdown signal from the parent and exits immediately.
     """
     import signal
+
+    cli = _parse_cli(sys.argv[1:])
+    if cli.http:
+        # None of the stdio survival rules below apply: there is no parent to
+        # outlive, and SIGTERM must be able to stop a long-running service.
+        from . import http_transport
+
+        code = 1
+        try:
+            code = http_transport.serve(mcp, cli.host, cli.port, cli.allow_remote,
+                                        cli.allowed_host)
+        except (SystemExit, KeyboardInterrupt):
+            code = 0
+        finally:
+            _stop_all_browsers()
+        if code:
+            sys.exit(code)
+        return
 
     # 1. Detach from the parent's process group so terminal SIGINT/SIGTERM
     #    aimed at the group never lands on us.
@@ -9759,11 +10413,7 @@ def main() -> None:
         finally:
             pass
 
-    try:
-        if BrowserState.browser and not getattr(BrowserState.browser, "stopped", False):
-            BrowserState.browser.stop()
-    except Exception:
-        pass
+    _stop_all_browsers()
 
 
 if __name__ == "__main__":

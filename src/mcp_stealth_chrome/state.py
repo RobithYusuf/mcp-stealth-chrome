@@ -11,10 +11,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
+import weakref
+from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import ClassVar, Optional
+from typing import Any, Callable, Optional
 
 from nodriver import Browser, Tab
 
@@ -404,11 +407,14 @@ def find_chrome_pids_by_profile(profile_path: Path) -> list[int]:
             ["ps", "-ax", "-o", "pid=,command="],
             capture_output=True, text=True, timeout=3,
         )
-        needle = f"--user-data-dir={target}"
+        # The argument must END at the path. A substring match makes
+        # ~/.mcp-stealth/profile also claim profiles/* and profile-pid*, so closing
+        # one browser would signal every other browser and server on the machine.
+        needle = re.compile(re.escape(f"--user-data-dir={target}") + r"""(?=\s|$|["'])""")
         pids: list[int] = []
         for line in (r.stdout or "").splitlines():
             line = line.strip()
-            if not line or needle not in line:
+            if not line or not needle.search(line):
                 continue
             head = line.split(None, 1)[0]
             if head.isdigit():
@@ -552,48 +558,212 @@ class InstanceSnapshot:
         return not getattr(self.browser, "stopped", True)
 
 
-class BrowserState:
+def _default_field(name: str) -> Any:
+    return getattr(_SessionState(), name)
+
+
+@dataclass
+class _SessionState:
+    """The current instance and stored instances of one MCP session."""
+
+    browser: Optional[Browser] = None
+    tabs: list[Tab] = field(default_factory=list)
+    active_tab_index: int = 0
+    console_logs: list[dict] = field(default_factory=list)
+    network_logs: list[dict] = field(default_factory=list)
+    # Per-request map: request_id → full entry with headers/body. Populated by
+    # network_start when capture_bodies=True. Flat network_logs above remains the
+    # legacy event-stream view.
+    network_index: dict[str, dict] = field(default_factory=dict)
+    page_errors: list[str] = field(default_factory=list)
+    capture_console: bool = False
+    capture_network: bool = False
+
+    # Multi-instance: other instances stored here, plus metadata for current
+    current_instance_id: str = "main"
+    current_profile_dir: Optional[Path] = None
+    current_desc: str = ""
+    current_headless: bool = False
+    current_privacy: bool = False
+    current_fingerprint: dict[str, str] = field(default_factory=dict)
+    current_proxy: Optional[str] = None
+    current_idle_timeout: int = DEFAULT_IDLE_TIMEOUT
+    current_last_active: float = field(default_factory=time.time)
+    current_created_at: float = field(default_factory=time.time)
+
+    # Last mouse position — enables realistic cursor continuation (no teleports).
+    # Updated by tools that move the mouse.
+    last_mouse_xy: dict[str, Optional[int]] = field(
+        default_factory=lambda: {"x": None, "y": None}
+    )
+
+    instances: dict[str, InstanceSnapshot] = field(default_factory=dict)  # does NOT include current
+
+
+_SESSION_FIELDS = frozenset(_SessionState.__dataclass_fields__)
+PRIMARY_SESSION = "primary"
+# Instances released or orphaned by a session wait here until another session
+# claims them or the idle reaper closes them. Never bound to a client.
+POOL_SESSION = "pool"
+_SESSIONS: dict[str, _SessionState] = {
+    PRIMARY_SESSION: _SessionState(),
+    POOL_SESSION: _SessionState(current_instance_id="(pool)"),
+}
+_current_session: ContextVar[str] = ContextVar("mcp_stealth_session", default=PRIMARY_SESSION)
+# Connections without an Mcp-Session-Id (stdio, in-memory) are told apart by object.
+_SESSION_KEYS: "weakref.WeakKeyDictionary[Any, str]" = weakref.WeakKeyDictionary()
+# Mcp-Session-Id -> session key. A GC finalizer cannot tell when these end: every
+# task started during a tool call (nodriver's CDP listener among them) copies the
+# request context, and that keeps the session object alive as long as the browser.
+_HTTP_SESSIONS: dict[str, str] = {}
+_primary_taken = False
+_session_counter = 1
+# Set in HTTP mode: answers whether an Mcp-Session-Id still exists on the server.
+_session_is_live: Optional[Callable[[str], bool]] = None
+
+
+class _SessionRouted(type):
+    """Routes BrowserState.tabs and friends to the calling session's state.
+
+    A stdio server has exactly one session, the primary, so every existing caller
+    of BrowserState.tabs behaves as it always has. Over HTTP each Mcp-Session-Id
+    binds its own state, and the ~100 call sites stay untouched and isolated.
+    """
+
+    def __getattr__(cls, name: str) -> Any:
+        if name in _SESSION_FIELDS:
+            return getattr(_SESSIONS[_current_session.get()], name)
+        raise AttributeError(name)
+
+    def __setattr__(cls, name: str, value: Any) -> None:
+        if name in _SESSION_FIELDS:
+            setattr(_SESSIONS[_current_session.get()], name, value)
+        else:
+            super().__setattr__(name, value)
+
+    def __delattr__(cls, name: str) -> None:
+        if name in _SESSION_FIELDS:
+            setattr(_SESSIONS[_current_session.get()], name, _default_field(name))
+        else:
+            super().__delattr__(name)
+
+
+class BrowserState(metaclass=_SessionRouted):
     """Class-level singleton holding CURRENT instance + dict of others.
 
     `browser`, `tabs`, etc. always reflect the active instance. Other instances
     are stored in `instances` dict as snapshots — switching swaps snapshots in.
     """
 
-    # Current instance state (class-level — existing code writes here directly).
-    # These are deliberately class-level shared mutable state: BrowserState is a
-    # singleton facade that is never instantiated, so ClassVar both documents
-    # the intent and silences the mutable-default lint.
-    browser: ClassVar[Optional[Browser]] = None
-    tabs: ClassVar[list[Tab]] = []
-    active_tab_index: ClassVar[int] = 0
-    console_logs: ClassVar[list[dict]] = []
-    network_logs: ClassVar[list[dict]] = []
-    # Per-request map: request_id → full entry with headers/body. Populated
-    # by network_start when capture_bodies=True. Flat network_logs above
-    # remains the legacy event-stream view.
-    network_index: ClassVar[dict[str, dict]] = {}
-    page_errors: ClassVar[list[str]] = []
-    capture_console: ClassVar[bool] = False
-    capture_network: ClassVar[bool] = False
-
-    # Multi-instance: other instances stored here, plus metadata for current
-    current_instance_id: ClassVar[str] = "main"
-    current_profile_dir: ClassVar[Optional[Path]] = None
-    current_desc: ClassVar[str] = ""
-    current_headless: ClassVar[bool] = False
-    current_privacy: ClassVar[bool] = False
-    current_fingerprint: ClassVar[dict[str, str]] = {}
-    current_proxy: ClassVar[Optional[str]] = None
-    current_idle_timeout: ClassVar[int] = DEFAULT_IDLE_TIMEOUT
-    current_last_active: ClassVar[float] = time.time()
-    current_created_at: ClassVar[float] = time.time()
-
-    # Last mouse position — enables realistic cursor continuation (no teleports).
-    # Updated by tools that move the mouse.
-    last_mouse_xy: ClassVar[dict[str, Optional[int]]] = {"x": None, "y": None}
-
-    instances: ClassVar[dict[str, InstanceSnapshot]] = {}  # does NOT include current
     _reaper_task = None  # asyncio.Task
+
+    # ── Sessions ───────────────────────────────────────────────────────────
+
+    @classmethod
+    def session_key(cls) -> str:
+        return _current_session.get()
+
+    @classmethod
+    def bind_session(cls, session: Any, http_session_id: Optional[str] = None) -> Token:
+        """Route this call to the state of an MCP session, creating it on first use.
+
+        The first live session takes the primary state, which is what makes a lone
+        client identical to the pre-session behaviour, "main" instance included.
+        """
+        key = _HTTP_SESSIONS.get(http_session_id) if http_session_id else _SESSION_KEYS.get(session)
+        if key is None:
+            key = _new_session_key()
+            if http_session_id:
+                _HTTP_SESSIONS[http_session_id] = key
+            else:
+                _SESSION_KEYS[session] = key
+        return _current_session.set(key)
+
+    @classmethod
+    def http_mode(cls) -> bool:
+        return _session_is_live is not None
+
+    @classmethod
+    def collect_departed_sessions(cls) -> list[str]:
+        """Move the browsers of ended HTTP sessions to the pool. Returns those keys."""
+        if _session_is_live is None:
+            return []
+        departed = []
+        for http_id, key in list(_HTTP_SESSIONS.items()):
+            if not _session_is_live(http_id):
+                _HTTP_SESSIONS.pop(http_id, None)
+                _session_gone(key)
+                departed.append(key)
+        return departed
+
+    @classmethod
+    def unbind_session(cls, token: Token) -> None:
+        _current_session.reset(token)
+
+    @classmethod
+    def in_session(cls, key: str) -> Token:
+        """Act as a session from a background task (the idle reaper, shutdown)."""
+        return _current_session.set(key)
+
+    @classmethod
+    def session_keys(cls) -> list[str]:
+        return list(_SESSIONS)
+
+    @classmethod
+    def owner_of(cls, instance_id: str) -> Optional[str]:
+        """Which session holds an instance id. None when nobody does."""
+        for key, state in list(_SESSIONS.items()):
+            if instance_id in state.instances:
+                return key
+            if key != POOL_SESSION and state.current_instance_id == instance_id:
+                return key
+        return None
+
+    @classmethod
+    def foreign_instance(cls, instance_id: str) -> Optional[str]:
+        """Refusal text when instance_id belongs to another session, else None."""
+        owner = cls.owner_of(instance_id)
+        if owner in (None, cls.session_key(), POOL_SESSION):
+            return None
+        return (
+            f"instance {instance_id!r} belongs to another MCP session ({owner}) and "
+            f"cannot be used from this one. That session can hand it over with "
+            f"instance_release({instance_id!r})."
+        )
+
+    @classmethod
+    def release_instance(cls, instance_id: str) -> None:
+        """Hand a stored instance to the pool, where another session can claim it."""
+        snap = cls.instances.pop(instance_id)
+        _SESSIONS[POOL_SESSION].instances[instance_id] = snap
+
+    @classmethod
+    def claim_released(cls, instance_id: str) -> bool:
+        """Take an instance from the pool into this session."""
+        pool = _SESSIONS[POOL_SESSION].instances
+        if instance_id not in pool:
+            return False
+        cls.instances[instance_id] = pool.pop(instance_id)
+        return True
+
+    @classmethod
+    def released_ids(cls) -> list[str]:
+        return sorted(_SESSIONS[POOL_SESSION].instances)
+
+    @classmethod
+    def other_session_instances(cls) -> dict[str, list[str]]:
+        """Names held elsewhere, so a caller can see why a name is refused."""
+        mine = cls.session_key()
+        out: dict[str, list[str]] = {}
+        for key, state in list(_SESSIONS.items()):
+            if key in (mine, POOL_SESSION):
+                continue
+            names = list(state.instances)
+            if state.browser is not None:
+                names.append(state.current_instance_id)
+            if names:
+                out[key] = sorted(names)
+        return out
 
     # ── Legacy API (backward compat) ───────────────────────────────────────
 
@@ -744,3 +914,65 @@ class BrowserState:
         if instance_id == cls.current_instance_id:
             return False
         return cls.instances.pop(instance_id, None) is not None
+
+
+def set_session_liveness(check: Optional[Callable[[str], bool]]) -> None:
+    """Install the HTTP transport's answer to "does this Mcp-Session-Id still exist"."""
+    global _session_is_live
+    _session_is_live = check
+
+
+def _new_session_key() -> str:
+    """Key for a new client. A new primary gets back the browser the last one left."""
+    global _primary_taken, _session_counter
+    if not _primary_taken:
+        _primary_taken = True
+        snap = _SESSIONS[POOL_SESSION].instances.pop(_SESSIONS[PRIMARY_SESSION].current_instance_id, None)
+        if snap is not None:
+            token = _current_session.set(PRIMARY_SESSION)
+            try:
+                BrowserState.restore_from(snap)
+            finally:
+                _current_session.reset(token)
+        return PRIMARY_SESSION
+    _session_counter += 1
+    key = f"session-{_session_counter}"
+    _SESSIONS[key] = _SessionState(current_instance_id=key)
+    return key
+
+
+def _pool_put(instance_id: str, snap: InstanceSnapshot) -> None:
+    """Add to the pool without ever overwriting: that would lose a live Chrome's handle."""
+    pool = _SESSIONS[POOL_SESSION].instances
+    name, n = instance_id, 1
+    while name in pool:
+        n += 1
+        name = f"{instance_id}-orphan{n}"
+    snap.instance_id = name
+    pool[name] = snap
+
+
+def _session_gone(key: str) -> None:
+    """A client went away: its browsers go to the pool rather than becoming orphans.
+
+    In the pool they stay reachable for the idle reaper, shutdown, and any session
+    that wants to claim them.
+    """
+    global _primary_taken
+    state = _SESSIONS.get(key)
+    if state is None:
+        return
+    for name, snap in list(state.instances.items()):
+        _pool_put(name, snap)
+    state.instances = {}
+    token = _current_session.set(key)
+    try:
+        if state.browser is not None:
+            _pool_put(state.current_instance_id, BrowserState.snapshot_current())
+    finally:
+        _current_session.reset(token)
+    if key == PRIMARY_SESSION:
+        _SESSIONS[PRIMARY_SESSION] = _SessionState()
+        _primary_taken = False
+    else:
+        _SESSIONS.pop(key, None)

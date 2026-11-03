@@ -27,6 +27,23 @@ class StealthMCP(FastMCP):
         if tool is None:
             return await super().call_tool(name, arguments)
 
+        try:
+            session = context.session
+        except ValueError:  # called outside a request, as direct callers do
+            session = None
+        token = None
+        if session is not None:
+            request = getattr(context.request_context, "request", None)
+            headers = getattr(request, "headers", None)
+            http_id = headers.get("mcp-session-id") if headers is not None else None
+            token = BrowserState.bind_session(session, http_id)
+        try:
+            return await self._call_bound(name, arguments, context, tool)
+        finally:
+            if token is not None:
+                BrowserState.unbind_session(token)
+
+    async def _call_bound(self, name: str, arguments: dict[str, Any], context: Any, tool: Any):
         lock = None
         if name in _TAB_SERIALIZED_TOOLS and BrowserState.is_up():
             index = arguments.get("tab")

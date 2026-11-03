@@ -238,6 +238,7 @@ class _Tracked:
     created_at: float
     operation_deadline: float          # seconds the request may keep running
     spec: dict = field(default_factory=dict)   # everything needed to replay it
+    session: str = ""                  # MCP session that made it; others cannot see it
     state: str = "pending"             # pending | succeeded | failed | cancelled
     outcome: str = "pending"           # pending | completed | not_executed | unknown
     result: Optional[str] = None       # the settled ok()/err() payload
@@ -260,6 +261,16 @@ class _Tracked:
 
 
 _TRACKED: dict[str, _Tracked] = {}
+
+
+def _own_tracked() -> list[_Tracked]:
+    """Records of the calling session. A request can carry its cookies and tokens."""
+    return [r for r in _TRACKED.values() if r.session == BrowserState.session_key()]
+
+
+def _tracked_for_caller(request_id: str) -> Optional[_Tracked]:
+    rec = _TRACKED.get(request_id)
+    return rec if rec is not None and rec.session == BrowserState.session_key() else None
 
 
 def _prune_tracked() -> None:
@@ -560,6 +571,7 @@ async def http_request(
             "use_browser_cookies": use_browser_cookies,
         },
     )
+    rec.session = BrowserState.session_key()
     _TRACKED[request_id] = rec
     rec.task = asyncio.ensure_future(_run_tracked(rec))
 
@@ -613,14 +625,14 @@ async def http_request_status(
     _prune_tracked()
     if request_id is None:
         return ok(json.dumps({
-            "tracked": len(_TRACKED),
+            "tracked": len(_own_tracked()),
             "in_flight": _inflight(),
             "retention": {"max_records": HTTP_TRACK_MAX, "ttl_s": HTTP_TRACK_TTL,
                           "max_in_flight": HTTP_MAX_INFLIGHT},
-            "requests": [r.public() for r in _TRACKED.values()],
+            "requests": [r.public() for r in _own_tracked()],
         }, indent=2, default=str))
 
-    rec = _TRACKED.get(request_id)
+    rec = _tracked_for_caller(request_id)
     if rec is None:
         return err(
             f"unknown request_id {request_id!r} — it settled more than "
@@ -652,7 +664,7 @@ async def http_request_cancel(request_id: str) -> str:
     out, the server may have processed it in full; no rollback is performed,
     requested, or implied. The reply says which of the two it was.
     """
-    rec = _TRACKED.get(request_id)
+    rec = _tracked_for_caller(request_id)
     if rec is None:
         return err(f"unknown request_id {request_id!r} — nothing to cancel")
     if rec.state != "pending":
@@ -705,7 +717,7 @@ async def http_request_retry(
 
     Returns a NEW request_id — the original record is left untouched.
     """
-    rec = _TRACKED.get(request_id)
+    rec = _tracked_for_caller(request_id)
     if rec is None:
         return err(f"unknown request_id {request_id!r} — nothing to retry")
     if rec.state == "pending":

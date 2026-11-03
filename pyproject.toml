@@ -1,7 +1,7 @@
 [project]
 name = "mcp-stealth-chrome"
 version = "0.11.0"
-description = "Stealth Chrome MCP server — nodriver + Chromium + 169 tools with configurable waits, native image artifacts, tracked HTTP, Cloudflare/Turnstile bypass, CapSolver, storage-state reuse, and a self-sufficient web-research kit"
+description = "Stealth Chrome MCP server — nodriver + Chromium + 172 tools with configurable waits, native image artifacts, tracked HTTP, Cloudflare/Turnstile bypass, CapSolver, storage-state reuse, and a self-sufficient web-research kit"
 readme = "README.md"
 license = { text = "MIT" }
 authors = [
@@ -40,7 +40,11 @@ dependencies = [
     # resolves to 2.x and the server dies at import with ModuleNotFoundError.
     # Lift it only together with a port to whatever 2.x replaces FastMCP.
     "mcp>=1.2.0,<2",
-    "nodriver>=0.40",
+    # Upper bound is load-bearing too: 0.50 rebuilt Connection and Tab around sessions on
+    # one websocket, and this server depends on those internals (see refs.py). uv.lock hides
+    # it, so only a lock-free install shows the breakage. Lift it together with a port,
+    # after running the E2E suites in a lock-free venv.
+    "nodriver>=0.40,<0.49",
     "pydantic>=2.5",
     "httpx>=0.27",
     "opencv-python>=4.8",

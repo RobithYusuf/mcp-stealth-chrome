@@ -439,17 +439,12 @@ def image_response(
 
 # ── capture geometry ───────────────────────────────────────────────────────
 
-_BOX_JS = """
-(() => {
-  const el = %(expr)s;
+_BOX_BODY_JS = """
   if (!el) return JSON.stringify({found: false});
   if (%(scroll)s) {
-    const root = document.documentElement;
-    const prev = root.style.scrollBehavior;
-    root.style.scrollBehavior = 'auto';
-    try { el.scrollIntoView({block: 'center', inline: 'center'}); }
-    catch (e) { el.scrollIntoView(); }
-    root.style.scrollBehavior = prev;
+    // behavior:'instant' beats a smooth scroll-behavior without touching the
+    // page's style attribute, which a MutationObserver would see.
+    el.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});
   }
   const r = el.getBoundingClientRect();
   const vv = window.visualViewport;
@@ -470,8 +465,34 @@ _BOX_JS = """
   });
   function root_w() { return document.documentElement.scrollWidth; }
   function root_h() { return document.documentElement.scrollHeight; }
-})()
 """
+_BOX_JS = "(() => { const el = %(expr)s;" + _BOX_BODY_JS + "})()"
+_BOX_FN_JS = "function() { const el = this;" + _BOX_BODY_JS + "}"
+
+
+async def _to_root_viewport(tab: Any, el: Any, box: dict[str, Any], frame_offset: Any) -> dict[str, Any]:
+    """Express a box measured inside a frame in the root page's coordinates.
+
+    A capture clip is relative to the top page, so a frame's local rect, scroll and
+    viewport would clip the wrong region. Main-frame boxes pass through unchanged.
+    """
+    entry = getattr(el, "ref_entry", None)
+    if not box.get("found") or entry is None or not entry.frame_label:
+        return box
+    pos = await el.get_position()
+    if pos is None:
+        return {**box, "w": 0, "h": 0, "hidden": True}
+    context = await viewport_context(tab)
+    return {
+        **box,
+        "x": pos.left, "y": pos.top, "w": pos.width, "h": pos.height,
+        "pageLeft": context.get("pageLeft", 0), "pageTop": context.get("pageTop", 0),
+        "dpr": context.get("dpr", box.get("dpr")),
+        "innerW": context.get("innerW", box.get("innerW")),
+        "innerH": context.get("innerH", box.get("innerH")),
+        "docW": context.get("docW", box.get("docW")),
+        "docH": context.get("docH", box.get("docH")),
+    }
 
 
 def _unwrap(value: Any) -> Any:
@@ -491,7 +512,17 @@ async def measure_box(
     from .server import _wait
 
     if ref and not selector:
-        expr = f'document.querySelector({json.dumps(f"[data-mcp-ref={ref!r}]".replace(chr(39), chr(34)))})'
+        from .refs import frame_offset, resolve_ref
+
+        el = await resolve_ref(ref, tab)
+        js = _BOX_FN_JS % {"scroll": "true" if scroll_into_view else "false"}
+        raw = _unwrap(await _wait(el.apply(js), timeout=timeout,
+                                  what="element box measurement"))
+        try:
+            box = json.loads(str(raw))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"could not measure element box: {exc}; got {str(raw)[:160]!r}")
+        return await _to_root_viewport(tab, el, box, frame_offset)
     elif selector:
         expr = f"document.querySelector({json.dumps(selector)})"
     else:
@@ -602,6 +633,13 @@ def verify_capture(
     expected_w = round(clip["width"] * dpr * scale)
     expected_h = round(clip["height"] * dpr * scale)
     if abs(width - expected_w) <= 2 and abs(height - expected_h) <= 2:
+        return width, height, None
+    # Browser zoom moves window.devicePixelRatio (a profile that once zoomed a host
+    # to 90% reports 0.9 there) without changing how a clip is rasterised, so the
+    # measured DPR overstates the difference. A capture at the clip's own CSS size
+    # is the box that was asked for; only reject it when it is not.
+    if (abs(width - round(clip["width"] * scale)) <= 2
+            and abs(height - round(clip["height"] * scale)) <= 2):
         return width, height, None
     vw = round(float(context.get("innerW") or 0) * dpr)
     vh = round(float(context.get("innerH") or 0) * dpr)

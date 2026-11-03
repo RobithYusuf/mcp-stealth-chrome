@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from nodriver import Element, Tab
+from nodriver import Tab
 
 from .state import BrowserState
 
@@ -35,17 +35,6 @@ def transport_lost(text: str) -> bool:
         "websocket connection is closed", "session with given id not found",
         "cdp session lost", "cdp websocket lost", "-32001",
     ))
-
-
-async def resolve_ref(ref: str, tab: Tab | None = None) -> Element | None:
-    """Find element by data-mcp-ref attribute set via SNAPSHOT_JS."""
-    tab = tab if tab is not None else BrowserState.active_tab()
-    try:
-        return await tab.query_selector(f'[data-mcp-ref="{ref}"]')
-    except Exception as exc:
-        if transport_lost(str(exc)):
-            raise
-        return None
 
 
 async def get_url(tab: Tab) -> str:

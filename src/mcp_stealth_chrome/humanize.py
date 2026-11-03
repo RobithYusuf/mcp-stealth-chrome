@@ -16,7 +16,7 @@ import math
 import random
 from typing import Optional, Tuple
 
-from nodriver import Element, Tab
+from nodriver import Element, Tab, cdp
 
 from .helpers import parse_json
 
@@ -68,7 +68,7 @@ async def humanized_move(
         # Smoothstep for position (ease-in-out curve)
         t_smooth = t * t * (3 - 2 * t)
         x, y = _bezier_point(t_smooth, p0, c1, c2, p3)
-        await tab.mouse_move(int(x), int(y))
+        await move_pointer(tab, int(x), int(y))
 
         # Parabolic speed: speed_factor peaks at t=0.5 (middle)
         # delay is INVERSE of speed — slower at edges, faster at middle
@@ -84,6 +84,16 @@ async def humanized_move(
     return int(end_x), int(end_y)
 
 
+async def move_pointer(tab: Tab, x: float, y: float) -> None:
+    """One mouseMoved to (x, y).
+
+    Tab.mouse_move interpolates from (0,0) rather than the cursor, sweeping a diagonal
+    across the page and firing hover handlers along it, and then sends a mouseReleased
+    the page sees as a stray mouseup.
+    """
+    await tab.send(cdp.input_.dispatch_mouse_event("mouseMoved", x=x, y=y))
+
+
 async def humanized_click(
     tab: Tab, element: Element,
     last_pos_ref: Optional[dict] = None,
@@ -91,8 +101,7 @@ async def humanized_click(
     """Click element with Bezier approach from last-known cursor position."""
     pos = await element.get_position()
     if pos is None:
-        await element.click()
-        return
+        raise RuntimeError("element has no on-screen position to move the mouse to")
     # Random spot inside element (not dead center — that's a bot tell)
     target_x = pos.left + pos.width * random.uniform(0.3, 0.7)
     target_y = pos.top + pos.height * random.uniform(0.3, 0.7)

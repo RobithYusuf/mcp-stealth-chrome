@@ -84,6 +84,7 @@ def _patch_client_security_state() -> None:
             json.setdefault("initiatorIsSecureContext", False)
             json.setdefault("initiatorIPAddressSpace", "Unknown")
             json.setdefault("privateNetworkRequestPolicy", "Allow")
+            json.setdefault("localNetworkAccessRequestPolicy", "Allow")
             return original_from_json(json)
 
         target.from_json = patched_from_json

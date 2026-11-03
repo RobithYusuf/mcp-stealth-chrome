@@ -11,10 +11,11 @@ both surfaced by the registry gate).
 """
 import sys
 
-EXPECTED_COUNT = 169
+EXPECTED_COUNT = 172
 EXPECTED_TOOLS = {
     # Lifecycle
     "browser_launch", "browser_close", "browser_recover",
+    "instance_release", "profile_report", "profile_cleanup",
     "request_human_help", "wait_for_human",
     # Attach / inspect external Chrome (v0.4.8)
     "attach_to_chrome", "detach", "list_external_chrome",
@@ -143,3 +144,21 @@ if __name__ == "__main__":
     print("test_critical_tools_callable:")
     test_critical_tools_callable()
     print("\nALL PASS")
+
+
+def test_no_tool_is_registered_twice(caplog):
+    """FastMCP keeps the FIRST definition and only logs a warning, so a stale duplicate
+    silently wins over the new code: check() once lost its js_fallback parameter this way."""
+    import ast
+    import pathlib
+
+    root = pathlib.Path(__file__).parent.parent / "src" / "mcp_stealth_chrome"
+    seen: dict[str, str] = {}
+    for path in root.rglob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.AsyncFunctionDef) and any(
+                isinstance(d, ast.Call) and ast.unparse(d.func) == "mcp.tool"
+                for d in node.decorator_list
+            ):
+                assert node.name not in seen, f"{node.name}: {seen[node.name]} and {path.name}"
+                seen[node.name] = path.name

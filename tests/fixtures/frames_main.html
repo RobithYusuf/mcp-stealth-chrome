@@ -1,0 +1,63 @@
+<!doctype html>
+<html>
+<head><title>frames fixture</title></head>
+<body style="margin:20px">
+  <h1>Frames fixture</h1>
+  <button id="free" onclick="report('free', event)">Free</button>
+  <button id="dead">Dead</button>
+  <input id="box" type="checkbox">
+  <label><input id="styled" type="checkbox" style="opacity:0;position:absolute"><span>Styled</span></label>
+  <input id="plain" name="plain" aria-label="Plain field" data-x="attr-value">
+  <input id="capped" maxlength="2" aria-label="Capped field">
+  <div style="position:relative;width:200px;height:40px;margin-top:8px">
+    <button id="covered" onclick="report('covered', event)">Covered</button>
+    <div id="cover" style="position:absolute;inset:0"></div>
+  </div>
+  <div id="light-host"></div>
+  <button id="removable">Removable</button>
+  <div id="out">idle</div>
+
+  <iframe id="same" src="/frames_child.html?name=same"
+          style="position:absolute;left:400px;top:20px;width:320px;height:150px;border:5px solid #888"></iframe>
+  <iframe id="cross" src="__CROSS__/frames_child.html?name=cross"
+          style="position:absolute;left:400px;top:200px;width:320px;height:150px;border:7px solid #888"></iframe>
+  <iframe id="cross-covered" src="__CROSS__/frames_child.html?name=crosscovered"
+          style="position:absolute;left:400px;top:380px;width:320px;height:150px;border:0"></iframe>
+  <div style="position:absolute;left:400px;top:380px;width:320px;height:150px" id="frame-cover"></div>
+
+  <iframe id="below" src="__CROSS__/frames_child.html?name=below"
+          style="position:absolute;left:30px;top:1500px;width:320px;height:150px;border:0"></iframe>
+  <div id="fake-box" role="checkbox" aria-checked="false" tabindex="0" style="width:90px;height:20px"
+       onclick="this.setAttribute('aria-checked', this.getAttribute('aria-checked') !== 'true')">Fake box</div>
+  <div style="height:2000px"></div>
+  <button id="far" onclick="report('far', event)">Far Below</button>
+
+  <script>
+    window.mouseEvents = [];
+    for (const type of ['mousedown', 'mouseup', 'click']) {
+      document.addEventListener(type, () => window.mouseEvents.push(type), true);
+    }
+    function report(name, e) {
+      document.getElementById('out').textContent = name + ':trusted=' + e.isTrusted;
+    }
+    const outer = document.getElementById('light-host').attachShadow({mode: 'open'});
+    outer.innerHTML = '<div id="inner-host"></div><button id="shadow-one">Shadow One</button>';
+    const inner = outer.getElementById('inner-host').attachShadow({mode: 'open'});
+    inner.innerHTML = '<button id="shadow-deep">Shadow Deep</button><input id="shadow-input" aria-label="Shadow field">';
+    inner.getElementById('shadow-deep').onclick = (e) => report('shadow-deep', e);
+    const closed = document.createElement('div');
+    document.body.appendChild(closed);
+    closed.attachShadow({mode: 'closed'}).innerHTML = '<button>Closed Secret</button>';
+
+    window.__mutations = [];
+    // Armed on load: while parsing, the HTML parser's own inserts would be recorded.
+    window.addEventListener('load', () => {
+      new MutationObserver((list) => {
+        for (const m of list) {
+          window.__mutations.push(m.type + ':' + (m.attributeName || m.target.nodeName));
+        }
+      }).observe(document, {subtree: true, attributes: true, childList: true});
+    });
+  </script>
+</body>
+</html>

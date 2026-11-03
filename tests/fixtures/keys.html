@@ -1,0 +1,20 @@
+<!doctype html>
+<html>
+<head><title>keys fixture</title></head>
+<body>
+  <form id="search" action="/keys_result.html" method="get">
+    <input id="q" name="q" aria-label="Search">
+  </form>
+  <button id="next">Next</button>
+  <div id="log"></div>
+  <script>
+    window.events = [];
+    for (const type of ['keydown', 'keypress', 'keyup']) {
+      document.addEventListener(type, (e) => window.events.push({
+        type, key: e.key, code: e.code, keyCode: e.keyCode, trusted: e.isTrusted,
+        ctrl: e.ctrlKey, shift: e.shiftKey,
+      }), true);
+    }
+  </script>
+</body>
+</html>

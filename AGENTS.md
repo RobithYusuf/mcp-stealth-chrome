@@ -7,7 +7,7 @@ working defaults; hard constraints may only be overridden when the developer exp
 
 ## Product and repository map
 
-An MCP server (stdio JSON-RPC) that gives an agent a stealth browser: 160 tools over
+An MCP server (stdio JSON-RPC) that gives an agent a stealth browser: 172 tools over
 [nodriver](https://github.com/ultrafunkamsterdam/nodriver) (direct CDP, no WebDriver), plus a
 browserless HTTP path with a real Chrome TLS fingerprint. Published on PyPI as `mcp-stealth-chrome`.
 
@@ -20,10 +20,13 @@ uvx mcp-stealth-chrome → Python 3.11+ → FastMCP → nodriver → Chrome/Chro
 - `src/mcp_stealth_chrome/server.py` — entry plus most tools, sectioned by `══════` banners.
 - `src/mcp_stealth_chrome/state.py` — `BrowserState` (multi-instance), profile discovery, Chrome
   lookup, lock/PID helpers.
-- `src/mcp_stealth_chrome/snapshot.py` — the `SNAPSHOT_JS` IIFE and `format_snapshot`.
-- `src/mcp_stealth_chrome/helpers.py` — `ok`/`err`, ref resolution, path confinement, JSON parsing.
+- `src/mcp_stealth_chrome/snapshot.py` — the snapshot script template and `format_snapshot`.
+- `src/mcp_stealth_chrome/refs.py` — server-side refs, the frame walk, `resolve_ref`.
+- `src/mcp_stealth_chrome/workflow.py` — the `workflow_run` engine, free of browser imports.
+- `src/mcp_stealth_chrome/http_transport.py` — `--http`: token, bind rules, Mcp-Session-Id.
+- `src/mcp_stealth_chrome/helpers.py` — `ok`/`err`, tab selection, path confinement, JSON parsing.
 - `src/mcp_stealth_chrome/patches.py` — runtime monkey-patches for nodriver/CDP drift.
-- `src/mcp_stealth_chrome/tools/` — `research.py`, `devtools.py`, `vision.py`, `network_http.py`;
+- `src/mcp_stealth_chrome/tools/` — `research.py`, `devtools.py`, `vision.py`, `network_http.py`, `profiles.py`;
   each registers itself on import.
 - `tests/test_registry.py` — the tool-surface gate. `tests/test_reliability_e2e.py` and
   `tests/test_agent_ergonomics.py` — behaviour, real browser and fast unit respectively.
@@ -33,9 +36,15 @@ uvx mcp-stealth-chrome → Python 3.11+ → FastMCP → nodriver → Chrome/Chro
 
 ## Hard constraints
 
-- Never commit or print a credential. The PyPI token lives in the macOS Keychain
+- Never commit or print a credential. A session cookie is one: `cookie_list` masks values unless
+  `reveal_values=True`, because tool output lands in the transcript, and files holding them are mode 600. The PyPI token lives in the macOS Keychain
   (`security find-generic-password -s mcp-stealth-chrome-pypi -w`), never in a file in the tree.
   Cookie and token files used during a release go to `/tmp` mode `600` and are `shred`ed after.
+- `nodriver` must stay pinned `<0.49` until this code is ported: 0.50 rebuilt `Connection` and `Tab` around
+  sessions, breaking the OOPIF connection and the identity override, and `uv.lock` hides it just as it does
+  for `mcp`. Run the E2E suites in a lock-free venv before lifting it.
+- E2E tests never use the real profile (`persistent=False`, or a temporary HOME with `--use-mock-keychain`).
+  Holding `~/.mcp-stealth/profile` pushes other live sessions onto an empty fallback profile.
 - `mcp` must stay pinned `<2`. Version 2.0.0 removed `mcp.server.fastmcp` entirely, and this server
   is built on FastMCP. `uv.lock` hides the breakage from the test suite, so a green suite proves
   nothing here — the failure only appears in a lock-free install (`uv tool install`, `uvx`, and
@@ -46,8 +55,8 @@ uvx mcp-stealth-chrome → Python 3.11+ → FastMCP → nodriver → Chrome/Chro
   so — see the honest-reporting invariants below.
 - Do not weaken a security property to make a test pass: managed paths never escape their root,
   identity files are written `0600`, and a profile clone only ever opens the source read-only.
-- Anything that deletes a profile (`clone_chrome_profile(overwrite=True)`, privacy cleanup,
-  `browser_recover`) needs an explicit request. The shared profile holds the developer's real logins.
+- Anything that deletes a profile (`clone_chrome_profile(overwrite=True)`, `profile_cleanup(confirm=True)`,
+  privacy cleanup, `browser_recover`) needs an explicit request. The shared profile holds the developer's real logins.
 
 ## Working defaults
 
@@ -69,10 +78,18 @@ This is the spine of the project. A tool that reports a rosier state than realit
 failure mode for an agent: the caller cannot tell, so a wrong "success" spreads into wrong
 conclusions. Each rule below replaced a real lie.
 
-- A click result must reflect what happened. `click_text` / `click_role` hit-test the target with
-  `document.elementFromPoint` before clicking and refuse when the point belongs to something else,
-  naming the blocker. With `verify=True` (default) they compare a page fingerprint before and after
-  and say `clicked but NO page change detected` when nothing moved.
+- A click result must reflect what happened. `click` / `click_text` / `click_role` hit-test the target
+  with `elementFromPoint` on its own root node (a shadow root answers for itself; `document` stops at the
+  host) before clicking and refuse when the point belongs to something else, naming the blocker. With
+  `verify=True` (default) they compare a fingerprint before and after and say
+  `clicked but NO page change detected` when nothing moved. The fingerprint includes the element's own
+  tree and state, or an iframe, shadow tree or checkbox change reads as no change. A real click focuses its
+  target by itself, so focus landing on the clicked element is not a change.
+- `Element.click()` in nodriver is a JS `el.click()` (`isTrusted=false`) preceded by `flash()`, which
+  inserts a node into the page. Never call it. Use `_click_and_report`, which dispatches real input at
+  the settled position; a JS click only happens with `js_fallback=True` and the result says so.
+- Wait for the element to stop moving before a hit test. `scroll_to` defaults to smooth, and a target
+  measured mid-scroll passes the test and is then clicked where it no longer is.
 - Refusing is not enough on its own. When the first text match is unusable, `click_text` looks for
   another element carrying the same text that is genuinely reachable (scrolling it into view if that
   is the only problem) before giving up. On github.com the fuzzy match is a hidden marketing `<span>`;
@@ -90,8 +107,18 @@ conclusions. Each rule below replaced a real lie.
 
 ### State, instances and capture
 
-- `BrowserState` keeps class-level attributes for the CURRENT instance; others live in `instances` as
-  snapshots, swapped by `switch_to()`. Existing code reading `BrowserState.tabs` keeps working.
+- `BrowserState.tabs` and friends reflect the CURRENT instance of the CALLING MCP session; others live
+  in `instances` as snapshots, swapped by `switch_to()`. A metaclass routes those names to a per-session
+  state selected by a ContextVar, which `StealthMCP.call_tool` binds. A stdio server has one session, the
+  primary, so every call site behaves as if the state were global. A background task must bind a session
+  explicitly (`in_session`), as the idle reaper does, or it only ever sees the primary.
+- Each stdio client has its own server process, so sessions matter only over `--http`. Subagents
+  sharing a connection are one session to the server: session isolation does not separate them.
+- A session that disconnects moves its browsers to the pool rather than dropping them: losing the handle
+  orphans a live Chrome. Tools that take an `instance_id` refuse another session's through
+  `foreign_instance`.
+- The HTTP transport always requires the token and refuses non-loopback binds without `--allow-remote`.
+  The token is never printed. Use pure ASGI middleware: `BaseHTTPMiddleware` buffers the MCP event stream.
 - Capture buffers are handed between snapshot and restore **by reference, never copied**. A CDP
   handler binds its sink when capture is armed; copying on switch orphans that handler, so the
   instance's later events land in a list nobody reads while the list the user reads stops growing.
@@ -128,7 +155,18 @@ conclusions. Each rule below replaced a real lie.
 
 ### Refs, snapshots and paths
 
-- `browser_snapshot` injects `data-mcp-ref`; `resolve_ref` is the only place that selector is written.
+- Nothing is written to the page. The snapshot runs in an isolated world and returns element handles,
+  which `refs.py` maps to `backendNodeId` on the server. A `data-mcp-ref` attribute or a `flash()` dot is
+  visible to any `MutationObserver`, so do not reintroduce a marker to find an element again: hold a handle
+  (`evaluate_parts`, `active_element`).
+- A cross-origin iframe is its own CDP target even with nodriver's site-isolation flag, and is absent
+  from the parent's `Page.getFrameTree`. Its quads are local to its own viewport; `RefElement.get_position`
+  adds the owner `<iframe>`'s content box. The frame's own hit test cannot see an overlay drawn by the
+  parent, which is what `outer_blocker` is for.
+- `DOM.describeNode` keeps answering for a node from a previous document. Staleness is proved by
+  `DOM.resolveNode` plus `isConnected`, as `resolve_ref` does.
+- Set attributes on a nodriver `Element` only with a leading underscore. `Element.__setattr__` silently
+  forwards any other name to the HTML attributes, so `el.foo = x` reads back as `None`.
 - `delta=True` marks elements added or changed since the tab's previous snapshot with `*`. The
   fingerprint deliberately EXCLUDES the ref: refs are regenerated every snapshot, so including them
   would mark everything as changed, every time.
@@ -162,6 +200,25 @@ conclusions. Each rule below replaced a real lie.
 ## Chrome, CDP and nodriver facts
 
 Platform truths, not preferences. Each one cost a release.
+
+- `Network.setUserAgentOverride` needs `user_agent_metadata`, or `navigator.userAgentData.brands` comes back
+  EMPTY, which no real Chrome reports. It also requires a UA even to change only the language. Identity
+  defaults to the real browser and machine in every mode, and `_apply_fingerprint_to_tab` derives the hints
+  from whatever UA is in force. Never invent a default identity: a random OS or Chrome version over a real
+  engine contradicts itself. Overrides are per launch, through `fingerprint`.
+- `Network.setUserAgentOverride(acceptLanguage)` is split on commas for `navigator.languages` and also
+  generates the weighted header. Pass the bare tags: passing `id-ID,id;q=0.9` reports a language named
+  `id;q=0.9`. Weights Chrome would not generate go through `setExtraHTTPHeaders`.
+- A key event with only `key` set fires keydown but no keypress, so Enter never submits a form. Use
+  `key_event_params`, which fills `code`, the virtual key code and `text`.
+- Do not call `Tab.mouse_move`. It interpolates from (0,0), not from the cursor, sweeping a diagonal across
+  the page that fires hover handlers, then sends a `mouseReleased` the page sees as a stray mouseup. Use
+  `move_pointer`, or `humanized_move` for a path.
+- `DOM.getNodeForLocation` takes document coordinates; every other position in CDP here is viewport-relative.
+  Add the scroll offset, or the hit test checks the wrong spot on a scrolled page.
+- `window.devicePixelRatio` includes browser zoom, and a persistent profile remembers zoom per host, so a
+  host once zoomed to 90% reports 0.9. A clip still rasterises at CSS size there. E2E tests use
+  `persistent=False` for this reason, and so as not to write into the real profile.
 
 - `tab.evaluate(expr, return_by_value=True)` can STILL return a `RemoteObject`. Unwrap via
   `v.value if hasattr(v, "value") ...` before casting.
@@ -209,6 +266,7 @@ uv run pytest tests/ -q                 # fast: unit + registry, browser tests s
 MCP_E2E=1 uv run pytest tests/ -q       # adds the real-Chrome suites
 uv build                                # produce dist/*.whl + *.tar.gz
 uv tool install --force .               # install this tree as the PROD MCP
+uv run mcp-stealth-chrome --http        # one server for many clients (token required)
 ```
 
 - A green unit suite proves nothing about the paths it skips. The E2E suites only run under
@@ -237,9 +295,10 @@ uv tool install --force .               # install this tree as the PROD MCP
   explicitly to `clone_chrome_profile`, or an almost-empty Chrome will be chosen for you.
 - Cloning a running browser is supported (`allow_running=True`): each SQLite file is copied with its
   `-wal`/`-shm` companions and the copy is integrity-checked.
-- Known issue: `spawn_browser(instance_id=<cloned profile>)` fails with an EMPTY error message,
-  while `browser_launch(user_data_dir=..., profile_directory="Default")` on the same profile works.
-  Use the second form. The empty message is itself a bug — fix the message before the launch path.
+- Known issue: `spawn_browser(instance_id=<cloned profile>)` fails, while
+  `browser_launch(user_data_dir=..., profile_directory="Default")` on the same profile works. Use the second
+  form. The failure now reports the exception type instead of an empty message (`_exc_text`), so the next
+  occurrence names the cause; the launch path itself is still unfixed.
 - The PyPI token lives in the macOS Keychain, project-scoped to this package:
   `uv publish --token "$(security find-generic-password -s mcp-stealth-chrome-pypi -w)"`.
   If it is revoked, recreate it through the browser: import the PyPI session cookies, open

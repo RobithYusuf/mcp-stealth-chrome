@@ -2,7 +2,7 @@
 
 # MCP Stealth Chrome
 
-**169 tools** for AI agents that bypass Cloudflare, Turnstile, reCAPTCHA, and modern anti-bot systems — with configurable long waits, scoped snapshots, tracked HTTP requests, native image artifacts, an LLM-optimized action kit (`describe_page`, `smart_fill`, `workflow_run`, vision-LLM review and element locator) and a self-sufficient web-research kit (`web_search`, `scrape_markdown`, `deep_research`, `social_research`) layered on top of standard automation.
+**172 tools** for AI agents that bypass Cloudflare, Turnstile, reCAPTCHA, and modern anti-bot systems — with configurable long waits, scoped snapshots, tracked HTTP requests, native image artifacts, an LLM-optimized action kit (`describe_page`, `smart_fill`, `workflow_run`, vision-LLM review and element locator) and a self-sufficient web-research kit (`web_search`, `scrape_markdown`, `deep_research`, `social_research`) layered on top of standard automation.
 
 [![PyPI version](https://img.shields.io/pypi/v/mcp-stealth-chrome.svg)](https://pypi.org/project/mcp-stealth-chrome/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -263,7 +263,7 @@ Settings → Extensions → MCP Servers, or edit `~/.config/zed/settings.json`:
 
 ## 🔑 BYOK (Bring Your Own Key) — Optional
 
-`mcp-stealth-chrome` is **fully functional without any API key** — 164 of 169 tools work out of the box, including `click_turnstile` (Cloudflare Turnstile bypass), TLS-perfect HTTP, tracked request polling/cancellation, scoped snapshots, native image artifacts, multi-instance, DevTools-level perf/coverage/emulation, the full LLM-optimized kit (`describe_page` / `smart_fill` / `workflow_run`), the web-research kit (`web_search` / `scrape_markdown` / `deep_research` / `social_research` — no search-API key needed), and all scraping tools.
+`mcp-stealth-chrome` is **fully functional without any API key** — 167 of 172 tools work out of the box, including `click_turnstile` (Cloudflare Turnstile bypass), TLS-perfect HTTP, tracked request polling/cancellation, scoped snapshots, native image artifacts, multi-instance, DevTools-level perf/coverage/emulation, the full LLM-optimized kit (`describe_page` / `smart_fill` / `workflow_run`), the web-research kit (`web_search` / `scrape_markdown` / `deep_research` / `social_research` — no search-API key needed), and all scraping tools.
 
 **API keys are optional — only needed for 5 vision/solver tools:**
 
@@ -426,6 +426,10 @@ with an honest timeout). `screenshot(region_selector="css")` measures the crop b
 for you, removing the CSS-px-vs-device-px guesswork.
 ## Reliability and review primitives
 
+Clicks are real input. `click`, `click_text` and `click_role` dispatch trusted mouse events (`isTrusted=true`) after a hit test, scroll the target into view when needed, and refuse by name when something covers it. A JS click happens only with `click(js_fallback=True)`, and the result says so.
+
+`browser_snapshot()` writes nothing to the page: it runs in an isolated world and refs live on the server, mapped to CDP node ids. It reaches into iframes, cross-origin ones included, and open shadow roots, marking those elements `frame=fN` or `shadow`, and their refs work like any other. `include_frames=False` limits it to the main frame. Closed shadow roots cannot be measured. A frame that could not be read is listed as not measured.
+
 Long-running pages no longer require manual sleep loops. `evaluate(timeout_ms=600000, survive_navigation=True, tab=1)` raises the per-call ceiling explicitly, while `wait_for_function(expression, timeout_ms, poll_ms, tab)` polls a side-effect-free predicate without changing focus. Navigation reports requested/final URLs, redirect chain, HTTP status, and ready state; `expect_url` and `expect_status` turn redirects into explicit failures.
 
 `browser_snapshot()` defaults to `interactive_compact` with `max_elements`, `container_selector`, `viewport_only`, `role`, `name_contains`, and measured omission counts. `screenshot(output_mode="artifact|inline_image|path|base64", tab=...)` keeps base64 opt-in. `screenshot_element(exact_bounds=True)` captures an element, and `inspect_image` reports native dimensions, MIME, byte size, checksum, and a managed artifact.
@@ -486,7 +490,8 @@ Designed for LLM-driven workflows — token-efficient page summaries, label-fuzz
 | `assert_text_present` / `assert_url_matches` / `assert_element_visible` | Verification primitives with internal poll-loop |
 | `click_and_wait` | Click + observe one of navigation / url / text / selector / request / network_idle. Distinguishes real submit from silent invalid-form click |
 | `form_introspect` | Per-field detail (label, framework binding react/vue/solid/lit, validation state, pattern/length constraints, aria-invalid) |
-| `workflow_run` | Sequential tool runner with resumable `start_at` index and `stop_on_error`. Failure response includes `failure_context` and `resume_with` hint |
+| `workflow_run` | Many tool steps in one call, with `foreach`, `if`, `save_as` and `${var}` references to earlier results. No code runs on the server: conditions are named operators. Resumes from a nested path with `start_at="3.2.1"` plus the reported `vars` |
+| `batch_actions` | Flat list of actions, each reported. Accepts the original six types and any `workflow_run` tool name |
 | `storage_snapshot` / `storage_diff` | Snapshot cookies + localStorage + sessionStorage + url to a named slot, then diff after an action — debug "what did this click actually change?" |
 | `detect_and_bypass` | One-shot: detect anti-bot wall (CF / DataDome / PX / Akamai / Imperva / Kasada) and apply best bypass we have |
 
@@ -519,7 +524,7 @@ Network capture with response bodies, plus a bridge from browser session into TL
 | `fingerprint_rotate` | UA/lang/platform/timezone via CDP |
 | `fingerprint_audit` | **Audit this browser's OWN fingerprint** for the leaks detectors read — in-page, nothing leaves the machine. Weights cross-field consistency (a Windows UA on a MacIntel platform) and states what it cannot see from inside a page (TLS/JA3, IP-vs-timezone) |
 | `identity_pin` / `identity_show` | Persist and inspect a stable fingerprint + proxy per browser instance |
-| `browser_launch(privacy=True)` | Fresh randomized fingerprint + disposable profile removed on close |
+| `browser_launch(privacy=True)` | Empty profile deleted on close. See [Choosing a profile mode](#choosing-a-profile-mode) |
 | `humanize_click` / `humanize_type` | Bezier+Gaussian for single actions |
 
 ### Local Human Handoff
@@ -535,6 +540,49 @@ Network capture with response bodies, plus a bridge from browser session into TL
 | `list_instances` / `switch_instance` | Manage multiple browsers |
 | `instance_describe` | Set/append semantic purpose memory that survives instance switching |
 | `close_instance` / `close_all_instances` | Clean shutdown |
+| `instance_release` | Hand a running instance to another MCP session (HTTP mode) |
+
+### Choosing a profile mode
+
+| You want to | Use | Profile | Kept after closing |
+|-------------|-----|---------|--------------------|
+| Work with a logged-in account | `browser_launch()` | `~/.mcp-stealth/profile` | Logins, cookies, history |
+| Try something, including with imported cookies, without saving a login | `browser_launch(persistent=False)` | Temporary | Nothing |
+| Start with no trace of this browser's past use | `browser_launch(privacy=True)` | Empty, under `privacy-profiles/` | Nothing, and it is checked that the directory was removed |
+
+What `privacy=True` changes: the browser starts from an empty profile, that profile is deleted on close, and a proxy written as a pool (`a|b`) picks one member. What it does not change: the identity. User agent, Chrome version, operating system, language and timezone remain the real browser's and machine's in every mode, because a made-up identity on a real engine contradicts itself. To use a logged-in account, leave privacy off.
+
+Any identity field can be overridden per launch, in any mode: `fingerprint={"user_agent": ..., "accept_language": ..., "platform": ..., "timezone": ...}`. Fields you leave out stay real. Client hints (`navigator.userAgentData`) and a missing `navigator.platform` are derived from the user agent so they agree with it, and `navigator.languages` comes from `accept_language` with the `;q=` weights removed.
+
+### One server, many agents (HTTP mode)
+
+```bash
+mcp-stealth-chrome --http                # http://127.0.0.1:8765/mcp
+```
+
+stdio stays the default and behaves as before: each client starts its own server. With `--http`, one server serves every client, and each connection (`Mcp-Session-Id`) gets its own instances, tabs and logs. An instance belonging to another session is refused by name until that session calls `instance_release`.
+
+This server can act as whoever is logged in to its browsers, so access is locked down by default:
+
+- **A bearer token is always required.** It comes from `MCP_STEALTH_TOKEN`, or from `~/.mcp-stealth/http-token`, created on first run with mode `600`. It is never printed. Send it as `Authorization: Bearer <token>`.
+- **Loopback only by default.** Any other `--host` is refused without `--allow-remote`, and the token then travels unencrypted unless a TLS proxy fronts it. Behind a proxy or on a wildcard address, name what clients use with `--allowed-host`.
+- **Host and Origin checks stay on**, so a web page cannot reach the server through DNS rebinding.
+
+Limits to know about:
+
+- A Chrome profile can only be open once, so a second session's default browser uses its own profile (`~/.mcp-stealth/profiles/session-N`) without the first session's logins. Use `instance_release`, or clone the profile with `clone_chrome_profile`.
+- Subagents sharing one MCP connection are one session to the server, and still share state.
+- Each session runs its own Chrome, so this mode saves server processes, not browser memory.
+- A client that ends its session leaves its browsers to be claimed or closed by the idle timeout.
+- A few capture features remain one per server: request interception (a second session gets a clear refusal) and performance tracing.
+
+### Disk and memory
+
+| Tool / option | Purpose |
+|---------------|---------|
+| `browser_launch(profile_mode="light")` | No images and no background Chrome services. For reading ordinary pages; keep the default on bot-protected sites, since pages can notice images not loading |
+| `profile_report` | Size, cache size, last use and in-use status of every profile. Read-only |
+| `profile_cleanup` | Clear regenerable caches (logins stay), or remove a `profile-pid<N>` fallback. A preview unless `confirm=True`. Refuses main and named profiles, anything in use, and fallbacks whose owner is still running |
 
 ### ⭐⭐ DevTools Suite — perf, coverage, emulation (new in v0.2.0)
 | Tool | Purpose |
@@ -569,15 +617,15 @@ Network capture with response bodies, plus a bridge from browser session into TL
 | Navigation: 4 | navigate, go_back, go_forward, reload |
 | DOM/Content: 6 | browser_snapshot, screenshot, get_text, get_html, get_url, save_pdf |
 | Interaction: 10 | click, click_text, click_role, **assert_clickable**, hover, fill, select_option, check, uncheck, upload_file |
-| Keyboard: 2 | type_text, press_key |
+| Keyboard: 2 | type_text, press_key (complete key events, combinations such as `Control+a`, and it reports the observed effect: navigation, page change, focus, or no change) |
 | Mouse: 3 | mouse_click_xy, mouse_move, drag_and_drop |
 | Wait: 6 | wait_for, **wait_for_change**, wait_for_navigation, wait_for_url, wait_for_response, wait_for_request |
 | Tabs: 4 | tab_list, tab_new, tab_select, tab_close |
-| Cookies: 5 | cookie_list/set/delete, cookie_import (+ raw_text auto-detect), cookie_export |
+| Cookies: 5 | cookie_list (values masked unless `reveal_values=True`), cookie_set/delete, cookie_import (+ raw_text auto-detect), cookie_export (mode 600; response never shows values) |
 | Storage: 9 | localstorage_get/set/clear, sessionstorage_get/set/clear, cache_clear, indexeddb_list/delete |
 | JavaScript: 2 | evaluate, inject_init_script |
 | Inspection: 4 | inspect_element, get_attribute, query_selector_all, get_links |
-| Frames: 2 | list_frames, frame_evaluate |
+| Frames: 2 | list_frames (out-of-process frames included), frame_evaluate (cross-origin frames run in an isolated world) |
 | Batch: 3 | batch_actions, fill_form, navigate_and_snapshot |
 | Viewport/Scroll: 4 | get/set_viewport_size, scroll, scroll_to |
 | Dialog: 2 | dialog_handle, dialog_auto_handle |
@@ -762,6 +810,7 @@ git clone https://github.com/RobithYusuf/mcp-stealth-chrome
 cd mcp-stealth-chrome
 uv sync
 uv run mcp-stealth-chrome       # run stdio server locally
+uv run mcp-stealth-chrome --http   # or one HTTP server for many clients
 ```
 
 Testing:

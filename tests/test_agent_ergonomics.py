@@ -161,15 +161,17 @@ def test_browser_snapshot_rejects_unmeasured_invalid_json(monkeypatch):
 
     from mcp_stealth_chrome import server
 
-    class _Tab:
-        async def evaluate(self, *_args, **_kwargs):
-            return "not-json"
+    from mcp_stealth_chrome.refs import parse_frame_payload
+
+    async def _collect(_tab, _options):
+        return parse_frame_payload("not-json")
 
     monkeypatch.setattr(
         server.BrowserState,
         "active_tab",
-        classmethod(lambda cls: _Tab()),
+        classmethod(lambda cls: object()),
     )
+    monkeypatch.setattr(server, "collect_snapshot", _collect)
     snapshot = server.mcp._tool_manager._tools["browser_snapshot"].fn
     result = asyncio.run(snapshot())
     assert result.startswith("Error: snapshot script returned invalid JSON")
@@ -1116,3 +1118,14 @@ def test_window_placement_refuses_states_that_would_hide_the_window(tmp_path, mo
     (tmp_path / "w.json").unlink()
     out = asyncio.run(srv._restore_window_bounds("w", None))
     assert out["restored"] is False and out["reason"] == "no saved placement"
+
+
+def test_verify_capture_tolerates_browser_zoom(monkeypatch):
+    """A host zoomed to 90% reports dpr 0.9; the clip still rasterises at CSS size."""
+    from mcp_stealth_chrome import image_output
+
+    monkeypatch.setattr(image_output, "image_dimensions", lambda _d: (42, 20, "image/png"))
+    clip = {"width": 42, "height": 20}
+    assert image_output.verify_capture(b"x", clip, 0.9, 1.0, {})[2] is None
+    # A genuinely wrong capture is still refused.
+    assert image_output.verify_capture(b"x", {"width": 400, "height": 300}, 0.9, 1.0, {})[2]

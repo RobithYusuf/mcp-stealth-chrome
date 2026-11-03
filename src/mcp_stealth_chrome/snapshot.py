@@ -1,133 +1,18 @@
-"""DOM snapshot JS — IIFE strings compatible across Chromium via nodriver.evaluate().
+"""DOM snapshot JS and its report formatting.
 
-The fixed-shape scripts, kept for compatibility:
-  SNAPSHOT_JS       — full — matches mcp-camoufox, computed-style visibility check
-  SNAPSHOT_JS_FAST  — skip getComputedStyle & attribute enumeration — 2-3× faster
-  SNAPSHOT_JS_VIEWPORT — full fidelity but filter to elements inside current viewport — 5-10× for long pages
+browser_snapshot runs build_snapshot_js(snapshot_options(...)) once per frame, in
+an isolated world. The script adds container scoping, role/name filtering and an
+element cap, and — the part that matters most — returns the accounting (matched /
+measured / eligible / returned / omitted) alongside the elements, so a short list
+is never mistaken for a short page.
 
-What browser_snapshot actually runs is build_snapshot_js(snapshot_options(...)),
-which adds container scoping, role/name filtering and an element cap, and — the
-part that matters most — returns the accounting (matched / measured / eligible /
-returned / omitted) alongside the elements, so a short list is never mistaken
-for a short page.
+It writes nothing to the DOM. Elements are returned as object handles and mapped
+to refs on the server: see refs.py.
 """
 from __future__ import annotations
 
 import hashlib
 import json
-
-# IIFE — page.evaluate executes the expression, return value is serialized.
-# Design identical to mcp-camoufox for cross-package consistency.
-SNAPSHOT_JS = r"""(() => {
-  var sels = 'button, a, input:not([type="hidden"]), textarea, select, '
-    + '[role="button"], [role="link"], [role="textbox"], [role="checkbox"], '
-    + '[role="radio"], [role="tab"], [role="menuitem"], [contenteditable="true"], '
-    + 'img[alt], h1, h2, h3, h4, h5, h6, label, [role="dialog"], [role="alert"], [role="status"]';
-  var els = document.querySelectorAll(sels);
-  var results = [];
-  var refId = 0;
-  for (var i = 0; i < els.length; i++) {
-    var el = els[i];
-    var r = el.getBoundingClientRect();
-    if (r.width < 1 || r.height < 1) continue;
-    var cs = getComputedStyle(el);
-    if (cs.display === 'none' || cs.visibility === 'hidden') continue;
-    var ref = 'e' + refId++;
-    el.setAttribute('data-mcp-ref', ref);
-    var entry = {
-      ref: ref,
-      tag: el.tagName.toLowerCase(),
-      role: el.getAttribute('role') || '',
-      text: (el.innerText || el.value || '').trim().slice(0, 100),
-      type: el.getAttribute('type') || '',
-      name: el.getAttribute('name') || '',
-      placeholder: el.getAttribute('placeholder') || '',
-      aria: el.getAttribute('aria-label') || '',
-      href: el.tagName === 'A' ? (el.href || '').slice(0, 500) : '',
-      checked: el.checked || false,
-      disabled: el.disabled || false
-    };
-    var clean = {};
-    var keys = Object.keys(entry);
-    for (var j = 0; j < keys.length; j++) {
-      var k = keys[j], v = entry[k];
-      if (v !== '' && v !== false && v !== undefined) clean[k] = v;
-    }
-    results.push(clean);
-  }
-  return JSON.stringify(results);
-})()"""
-
-
-# Fast mode — no getComputedStyle, no attribute enumeration, minimal payload.
-# Trades completeness for speed: good for "is this element still here" checks.
-SNAPSHOT_JS_FAST = r"""(() => {
-  var sels = 'button, a, input:not([type="hidden"]), textarea, select, '
-    + '[role="button"], [role="link"], [contenteditable="true"], h1, h2, h3';
-  var els = document.querySelectorAll(sels);
-  var results = [];
-  var refId = 0;
-  for (var i = 0; i < els.length; i++) {
-    var el = els[i];
-    var r = el.getBoundingClientRect();
-    if (r.width < 1 || r.height < 1) continue;
-    var ref = 'e' + refId++;
-    el.setAttribute('data-mcp-ref', ref);
-    results.push({
-      ref: ref,
-      tag: el.tagName.toLowerCase(),
-      text: (el.innerText || el.value || '').trim().slice(0, 80)
-    });
-  }
-  return JSON.stringify(results);
-})()"""
-
-
-# Viewport-only — same fidelity as full, but skip elements outside the current
-# scroll viewport. 5-10× speedup on long pages (feeds, search results).
-SNAPSHOT_JS_VIEWPORT = r"""(() => {
-  var vh = window.innerHeight, vw = window.innerWidth;
-  var sels = 'button, a, input:not([type="hidden"]), textarea, select, '
-    + '[role="button"], [role="link"], [role="textbox"], [role="checkbox"], '
-    + '[role="radio"], [role="tab"], [role="menuitem"], [contenteditable="true"], '
-    + 'img[alt], h1, h2, h3, h4, h5, h6, label, [role="dialog"], [role="alert"], [role="status"]';
-  var els = document.querySelectorAll(sels);
-  var results = [];
-  var refId = 0;
-  for (var i = 0; i < els.length; i++) {
-    var el = els[i];
-    var r = el.getBoundingClientRect();
-    if (r.width < 1 || r.height < 1) continue;
-    // Skip if fully outside viewport (keep partial overlaps)
-    if (r.bottom < 0 || r.top > vh || r.right < 0 || r.left > vw) continue;
-    var cs = getComputedStyle(el);
-    if (cs.display === 'none' || cs.visibility === 'hidden') continue;
-    var ref = 'e' + refId++;
-    el.setAttribute('data-mcp-ref', ref);
-    var entry = {
-      ref: ref,
-      tag: el.tagName.toLowerCase(),
-      role: el.getAttribute('role') || '',
-      text: (el.innerText || el.value || '').trim().slice(0, 100),
-      type: el.getAttribute('type') || '',
-      name: el.getAttribute('name') || '',
-      placeholder: el.getAttribute('placeholder') || '',
-      aria: el.getAttribute('aria-label') || '',
-      href: el.tagName === 'A' ? (el.href || '').slice(0, 500) : '',
-      checked: el.checked || false,
-      disabled: el.disabled || false
-    };
-    var clean = {};
-    var keys = Object.keys(entry);
-    for (var j = 0; j < keys.length; j++) {
-      var k = keys[j], v = entry[k];
-      if (v !== '' && v !== false && v !== undefined) clean[k] = v;
-    }
-    results.push(clean);
-  }
-  return JSON.stringify(results);
-})()"""
-
 
 def snapshot_hash(elements: list[dict]) -> str:
     """Stable fingerprint of snapshot content — used for diff detection.
@@ -135,7 +20,7 @@ def snapshot_hash(elements: list[dict]) -> str:
     Only hashes keys that matter for UI state (tag/text/disabled/checked/href),
     skips volatile fields like ref (reassigned each call).
     """
-    keys = ("tag", "role", "text", "alt", "href", "checked", "disabled")
+    keys = ("tag", "role", "text", "alt", "href", "checked", "disabled", "frame", "shadow")
     rows = []
     for el in elements:
         rows.append("|".join(str(el.get(k, "")) for k in keys))
@@ -146,7 +31,7 @@ def element_fingerprint(element: dict) -> str:
     """Stable identity for delta snapshots, excluding the regenerated ref."""
     keys = (
         "tag", "role", "text", "type", "name", "placeholder", "aria", "alt",
-        "href", "checked", "disabled", "hidden",
+        "href", "checked", "disabled", "hidden", "frame", "shadow",
     )
     row = "|".join(str(element.get(k, "")) for k in keys)
     return hashlib.sha1(row.encode("utf-8")).hexdigest()[:16]
@@ -213,6 +98,10 @@ def format_snapshot(
     lines = list(header)
     for el in elements:
         parts = [f"[{el.get('tag', '?')}]"]
+        if el.get("frame"):
+            parts.append(f"frame={el['frame']}")
+        if el.get("shadow"):
+            parts.append("shadow")
         if el.get("role"):
             parts.append(f"role={el['role']}")
         if el.get("type"):
@@ -272,7 +161,6 @@ _SNAPSHOT_JS_TEMPLATE = r"""(() => {
   var CFG = __CFG__;
   var out = {
     ok: true,
-    doc: '',
     container: {requested: !!CFG.container, selector: CFG.container || '',
                 matched: 0, found: true},
     matched: 0,
@@ -287,25 +175,6 @@ _SNAPSHOT_JS_TEMPLATE = r"""(() => {
     elements: []
   };
 
-  // Per-document token. It disappears with the document, so a reload or a
-  // navigation back to the same URL cannot be mistaken for "nothing changed":
-  // the refs the caller is holding died with the old document even though the
-  // DOM hash is identical.
-  var de = document.documentElement;
-  var tok = de.getAttribute('data-mcp-doc');
-  if (!tok) {
-    tok = 'd' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-    de.setAttribute('data-mcp-doc', tok);
-  }
-  out.doc = tok;
-
-  // Drop the previous snapshot's refs before handing out new ones. Left in
-  // place, a scoped or capped snapshot leaves e0 on an old element AND puts e0
-  // on a new one; resolve_ref's querySelector returns whichever comes first in
-  // document order, so the caller silently acts on the wrong element.
-  var stale = document.querySelectorAll('[data-mcp-ref]');
-  for (var s = 0; s < stale.length; s++) stale[s].removeAttribute('data-mcp-ref');
-
   var roots = [document];
   if (CFG.container) {
     var found;
@@ -314,13 +183,31 @@ _SNAPSHOT_JS_TEMPLATE = r"""(() => {
       out.ok = false;
       out.error = 'container_selector is not valid CSS: ' +
                   (e && e.message ? e.message : String(e));
-      return JSON.stringify(out);
+      return {json: JSON.stringify(out), els: [], owners: []};
     }
     out.container.matched = found.length;
     out.container.found = found.length > 0;
     roots = [];
     for (var c = 0; c < found.length; c++) roots.push(found[c]);
-    if (!roots.length) return JSON.stringify(out);
+    if (!roots.length) return {json: JSON.stringify(out), els: [], owners: []};
+  }
+
+  // Every open shadow root under `start`, at any depth. Closed roots are invisible
+  // to JS by design, so what lives in them is not measured.
+  function deepRoots(start) {
+    var acc = [start];
+    if (start.shadowRoot) acc = acc.concat(deepRoots(start.shadowRoot));
+    var w = document.createTreeWalker(start, NodeFilter.SHOW_ELEMENT);
+    var n;
+    while ((n = w.nextNode())) {
+      if (n.shadowRoot) acc = acc.concat(deepRoots(n.shadowRoot));
+    }
+    return acc;
+  }
+
+  var searchRoots = [];
+  for (var dr = 0; dr < roots.length; dr++) {
+    searchRoots = searchRoots.concat(deepRoots(roots[dr]));
   }
 
   function implicitRole(el) {
@@ -381,8 +268,8 @@ _SNAPSHOT_JS_TEMPLATE = r"""(() => {
   var arrSeen = useSet ? null : [];
   var kept = [];
 
-  for (var ri = 0; ri < roots.length; ri++) {
-    var els = roots[ri].querySelectorAll(CFG.selectors);
+  for (var ri = 0; ri < searchRoots.length; ri++) {
+    var els = searchRoots[ri].querySelectorAll(CFG.selectors);
     for (var i = 0; i < els.length; i++) {
       var el = els[i];
       // Overlapping containers can hand back the same element twice; counting
@@ -427,7 +314,7 @@ _SNAPSHOT_JS_TEMPLATE = r"""(() => {
       }
 
       out.eligible++;
-      if (CFG.max_elements > 0 && kept.length >= CFG.max_elements) {
+      if (CFG.budget !== null && kept.length >= CFG.budget) {
         out.omitted++;
         out.truncated = true;
         continue;
@@ -436,13 +323,11 @@ _SNAPSHOT_JS_TEMPLATE = r"""(() => {
       var entry;
       if (CFG.minimal) {
         entry = {
-          ref: '',
           tag: el.tagName.toLowerCase(),
           text: (el.innerText || el.value || '').trim().slice(0, CFG.text_cap)
         };
       } else {
         entry = {
-          ref: '',
           tag: el.tagName.toLowerCase(),
           role: role,
           text: (el.innerText || el.value || '').trim().slice(0, CFG.text_cap),
@@ -457,15 +342,13 @@ _SNAPSHOT_JS_TEMPLATE = r"""(() => {
         };
       }
       if (hidden) entry.hidden = true;
+      if (el.getRootNode() !== document) entry.shadow = true;
       kept.push([el, entry]);
     }
   }
 
   for (var k = 0; k < kept.length; k++) {
-    var ref = 'e' + k;
-    kept[k][0].setAttribute('data-mcp-ref', ref);
     var e = kept[k][1];
-    e.ref = ref;
     var clean = {};
     var keys = Object.keys(e);
     for (var j = 0; j < keys.length; j++) {
@@ -475,7 +358,20 @@ _SNAPSHOT_JS_TEMPLATE = r"""(() => {
     out.elements.push(clean);
   }
   out.returned = out.elements.length;
-  return JSON.stringify(out);
+
+  var owners = [];
+  if (CFG.include_frames) {
+    var ownerRoots = deepRoots(document);
+    for (var o = 0; o < ownerRoots.length; o++) {
+      var fr = ownerRoots[o].querySelectorAll('iframe, frame');
+      for (var f = 0; f < fr.length; f++) owners.push(fr[f]);
+    }
+  }
+  return {
+    json: JSON.stringify(out),
+    els: kept.map(function (pair) { return pair[0]; }),
+    owners: owners
+  };
 })()"""
 
 
@@ -536,6 +432,7 @@ def snapshot_options(
     name_contains: str | None = None,
     include_hidden: bool = False,
     max_elements: int = 100,
+    include_frames: bool = True,
 ) -> dict:
     """Resolve tool arguments into the config the snapshot script runs on."""
     mode = mode if mode in SNAPSHOT_MODES else "interactive_compact"
@@ -553,12 +450,20 @@ def snapshot_options(
         "name_contains": (name_contains or "").strip().lower(),
         "include_hidden": bool(include_hidden),
         "max_elements": max(0, int(max_elements or 0)),
+        "include_frames": bool(include_frames),
     }
 
 
-def build_snapshot_js(options: dict) -> str:
-    """Render the snapshot IIFE for one resolved option set."""
-    return _SNAPSHOT_JS_TEMPLATE.replace("__CFG__", json.dumps(options))
+def build_snapshot_js(options: dict, budget: int | None = None) -> str:
+    """Render the snapshot IIFE for one frame.
+
+    ``budget`` is how many elements this frame may still return: max_elements
+    applies to the whole page, so each frame gets what the earlier ones left.
+    None means uncapped. Elements past it are still counted as omitted.
+    """
+    return _SNAPSHOT_JS_TEMPLATE.replace(
+        "__CFG__", json.dumps({**options, "budget": budget})
+    )
 
 
 def snapshot_scope_signature(options: dict) -> str:
@@ -571,7 +476,7 @@ def snapshot_scope_signature(options: dict) -> str:
     """
     keys = (
         "mode", "container", "viewport_only", "roles", "name_contains",
-        "include_hidden", "max_elements",
+        "include_hidden", "max_elements", "include_frames",
     )
     payload = json.dumps({k: options.get(k) for k in keys}, sort_keys=True)
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
@@ -590,6 +495,8 @@ def describe_scope(options: dict) -> str:
         bits.append(f'name contains "{options["name_contains"]}"')
     if options.get("include_hidden"):
         bits.append("hidden included")
+    if not options.get("include_frames", True):
+        bits.append("main frame only")
     cap = options.get("max_elements") or 0
     bits.append(f"max_elements={cap}" if cap else "max_elements=0 (no cap)")
     return " · ".join(bits)
@@ -641,6 +548,29 @@ def format_counts(counts: dict, options: dict) -> list[str]:
             f"TRUNCATED: {counts.get('omitted', 0)} eligible element(s) were not "
             f"returned because max_elements={options.get('max_elements')} — raise "
             f"it or narrow with container_selector/role/name_contains to see them."
+        )
+    if counts.get("unresolved"):
+        lines.append(
+            f"Unresolved: {counts['unresolved']} element(s) disappeared while being "
+            f"measured and got no ref."
+        )
+    frames = counts.get("frames") or {}
+    walked = frames.get("walked") or []
+    if len(walked) > 1:
+        listed = " · ".join(
+            f"{f['label']}={f['url'][:60]}" for f in walked if f["label"] != "main"
+        )
+        lines.append(f"Frames: {len(walked)} measured ({listed})")
+    if frames.get("failed"):
+        detail = " · ".join(f"{f['url'][:60]}: {f['error']}" for f in frames["failed"])
+        lines.append(
+            f"Frames NOT measured: {len(frames['failed'])} — their content is missing "
+            f"from this list, not absent from the page ({detail})"
+        )
+    if frames.get("skipped"):
+        lines.append(
+            f"Frames NOT measured: {frames['skipped']} past the limit of "
+            f"{frames.get('limit')} — narrow with include_frames=False or list_frames."
         )
     container = counts.get("container") or {}
     if container.get("requested"):
