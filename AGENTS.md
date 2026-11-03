@@ -295,10 +295,11 @@ uv run mcp-stealth-chrome --http        # one server for many clients (token req
   explicitly to `clone_chrome_profile`, or an almost-empty Chrome will be chosen for you.
 - Cloning a running browser is supported (`allow_running=True`): each SQLite file is copied with its
   `-wal`/`-shm` companions and the copy is integrity-checked.
-- Known issue: `spawn_browser(instance_id=<cloned profile>)` fails, while
-  `browser_launch(user_data_dir=..., profile_directory="Default")` on the same profile works. Use the second
-  form. The failure now reports the exception type instead of an empty message (`_exc_text`), so the next
-  occurrence names the cause; the launch path itself is still unfixed.
+- `Browser.main_tab` can name a target Chrome has already replaced during startup, and connecting then fails
+  with `server rejected WebSocket connection: HTTP 404`. Launch paths use `_first_live_tab`.
+- `get_url` / `get_title` return "" on a failed read only for callers polling through a navigation.
+  Anything reporting the value passes `strict=True`, or a failure reads as a page with no URL. A lost CDP
+  connection raises in both modes.
 - The PyPI token lives in the macOS Keychain, project-scoped to this package:
   `uv publish --token "$(security find-generic-password -s mcp-stealth-chrome-pypi -w)"`.
   If it is revoked, recreate it through the browser: import the PyPI session cookies, open

@@ -39,6 +39,7 @@ from .helpers import (
     get_title,
     get_url,
     ok,
+    PageReadError,
     parse_json,
     select_tab,
     target_key,
@@ -413,6 +414,42 @@ class _PerSessionLock:
 
 
 _LAUNCH_LOCK = _PerSessionLock()
+
+
+async def _page_facts_for_report(tab: Any) -> tuple[str, str]:
+    """(url, title) for a report line, saying so when they could not be read."""
+    try:
+        return await get_url(tab, strict=True), await get_title(tab, strict=True)
+    except PageReadError as exc:
+        return f"(unreadable: {exc})", "(unreadable)"
+
+
+async def _first_live_tab(browser: Any, attempts: int = 8) -> Any:
+    """A page target that actually answers.
+
+    Browser.main_tab returns the first page target nodriver has on record, and Chrome can
+    replace that one during startup (restoring a session, a profile from another
+    browser). Connecting to it then fails with "server rejected WebSocket connection:
+    HTTP 404", which aborted the launch of a perfectly healthy browser.
+    """
+    from nodriver.cdp import runtime as cdp_rt, target as cdp_target
+
+    for _ in range(attempts):
+        with contextlib.suppress(Exception):
+            await browser.update_targets()
+            infos = await browser.connection.send(cdp_target.get_targets())
+            live = {str(t.target_id) for t in infos if t.type_ == "page"}
+            for candidate in browser.tabs:
+                if str(candidate.target.target_id) not in live:
+                    continue
+                try:
+                    await asyncio.wait_for(candidate.send(cdp_rt.evaluate("1")), timeout=3)
+                    return candidate
+                except Exception:
+                    continue
+        await asyncio.sleep(0.25)
+    return await asyncio.wait_for(browser.get("about:blank", new_tab=True),
+                                  timeout=BROWSER_NAV_TIMEOUT)
 _SPAWNING: dict[str, str] = {}
 
 
@@ -1335,6 +1372,8 @@ async def browser_launch(
                         f"Available: {avail}"
                     )
                 merged_extra_args.append(f"--profile-directory={profile_directory}")
+            else:
+                merged_extra_args.extend(_profile_directory_args(explicit_udd, merged_extra_args))
             persistent = False  # we're managing user_data_dir ourselves; skip default profile flow
             profile_path = explicit_udd
             used_fallback = False
@@ -1526,14 +1565,7 @@ async def browser_launch(
 
         try:
             await asyncio.sleep(0.5)
-            main = BrowserState.browser.main_tab
-            if main is None:
-                await BrowserState.browser.update_targets()
-                main = BrowserState.browser.tabs[0] if BrowserState.browser.tabs else None
-            if main is None:
-                main = await asyncio.wait_for(
-                    BrowserState.browser.get("about:blank"), timeout=BROWSER_NAV_TIMEOUT
-                )
+            main = await _first_live_tab(BrowserState.browser)
             await _apply_fingerprint_to_tab(main, effective_fingerprint)
             await asyncio.wait_for(main.get(url), timeout=BROWSER_NAV_TIMEOUT)
             try:
@@ -2242,8 +2274,7 @@ async def tab_focus() -> str:
                 "could not confirm that the browser was focused; "
                 f"actions: {', '.join(focused_actions)}"
             )
-        url = await get_url(tab)
-        title = await get_title(tab)
+        url, title = await _page_facts_for_report(tab)
         profile = (
             BrowserState.current_profile_dir.name
             if BrowserState.current_profile_dir else "(default)"
@@ -2590,8 +2621,7 @@ async def browser_snapshot(
             "walked": walk.frames, "failed": walk.failed,
             "skipped": walk.skipped, "limit": MAX_FRAMES,
         }
-        url = await get_url(tab)
-        title = await get_title(tab)
+        url, title = await _page_facts_for_report(tab)
         h = snapshot_hash(elements)
         doc_token = walk.doc_token()
         cache_key = _target_key(tab)
@@ -2942,7 +2972,7 @@ async def get_current_url() -> str:
     """Return current URL of active tab."""
     try:
         tab = BrowserState.active_tab()
-        return ok(await get_url(tab))
+        return ok(await get_url(tab, strict=True))
     except Exception as e:
         return err(str(e))
 
@@ -3994,7 +4024,8 @@ async def wait_for_navigation(timeout: float = 15.0) -> str:
     try:
         tab = BrowserState.active_tab()
         await tab.wait(t=timeout)
-        return ok(f"navigated to {await get_url(tab)}")
+        url, _title = await _page_facts_for_report(tab)
+        return ok(f"navigated to {url}")
     except Exception as e:
         return err(str(e))
 
@@ -4679,7 +4710,7 @@ async def indexeddb_list() -> str:
     """
     try:
         tab = BrowserState.active_tab()
-        url = await get_url(tab)
+        url = await get_url(tab, strict=True)
         from urllib.parse import urlparse
         p = urlparse(url)
         origin = f"{p.scheme}://{p.netloc}" if p.scheme and p.netloc else None
@@ -4703,7 +4734,7 @@ async def indexeddb_delete(database_name: str) -> str:
     """Delete an IndexedDB database by name (scoped to current origin)."""
     try:
         tab = BrowserState.active_tab()
-        url = await get_url(tab)
+        url = await get_url(tab, strict=True)
         from urllib.parse import urlparse
         p = urlparse(url)
         origin = f"{p.scheme}://{p.netloc}" if p.scheme and p.netloc else None
@@ -6788,9 +6819,15 @@ async def storage_state_save(filename: Optional[str] = None) -> str:
         # Derive a real scheme://host[:port] origin (one get_url round-trip,
         # not two) — rsplit('/',1) mangled URLs with paths into a bad key.
         from urllib.parse import urlparse
-        _url = await get_url(tab)
-        _p = urlparse(_url) if _url else None
-        origin = f"{_p.scheme}://{_p.netloc}" if _p and _p.scheme and _p.netloc else ""
+        origin = ""
+        storage_note = ""
+        try:
+            _p = urlparse(await get_url(tab, strict=True))
+            origin = f"{_p.scheme}://{_p.netloc}" if _p.scheme and _p.netloc else ""
+            if not origin:
+                storage_note = "; localStorage NOT saved: this page has no web origin"
+        except PageReadError as exc:
+            storage_note = f"; localStorage NOT saved: {exc}"
         state = {
             "cookies": [{
                 "name": c.name, "value": c.value, "domain": c.domain,
@@ -6802,7 +6839,7 @@ async def storage_state_save(filename: Optional[str] = None) -> str:
         }
         # Real cookies and localStorage: the same credentials cookie_export protects.
         _write_private(path, json.dumps(state, indent=2, default=str))
-        return ok(f"saved {len(state['cookies'])} cookies to {path}")
+        return ok(f"saved {len(state['cookies'])} cookies to {path}{storage_note}")
     except Exception as e:
         return err(str(e))
 
@@ -7442,6 +7479,27 @@ from .tools.network_http import (  # noqa: F401
 # Idle instances auto-close after configurable timeout (prevents memory leaks).
 
 
+def _profile_directory_args(user_data_dir: Optional[Path], extra_args: Optional[list[str]]) -> list[str]:
+    """--profile-directory for a user-data dir holding several profiles.
+
+    Without it Chrome opens its profile picker there, a window with no tab. A cloned
+    multi-profile browser then fails with "no browser is open", though nothing is wrong
+    with it. Uses the profile that browser last used, as a person opening it would.
+    """
+    if user_data_dir is None or any(
+        (arg or "").startswith("--profile-directory=") for arg in (extra_args or [])
+    ):
+        return []
+    chosen = "Default"
+    with contextlib.suppress(OSError, ValueError, KeyError, TypeError, AttributeError):
+        local_state = json.loads((user_data_dir / "Local State").read_text(encoding="utf-8"))
+        chosen = local_state["profile"]["last_used"] or chosen
+    if isinstance(chosen, str) and chosen and "/" not in chosen and "\\" not in chosen \
+            and chosen not in (".", "..") and (user_data_dir / chosen).is_dir():
+        return [f"--profile-directory={chosen}"]
+    return ["--profile-directory=Default"] if (user_data_dir / "Default").is_dir() else []
+
+
 def _exc_text(e: BaseException) -> str:
     """An exception's message, or its type when str() is blank.
 
@@ -7548,7 +7606,7 @@ async def _launch_browser_instance(
         user_data_dir=str(profile_path) if profile_path is not None else None,
         headless=headless,
         lang=(effective_fingerprint.get("accept_language", "").split(",")[0] or lang),
-        browser_args=list(extra_args or []),
+        browser_args=[*(extra_args or []), *_profile_directory_args(profile_path, extra_args)],
     )
     config.add_argument("--hide-crash-restore-bubble")
     config.add_argument("--disable-session-crashed-bubble")
@@ -7595,12 +7653,7 @@ async def _launch_browser_instance(
 
     try:
         await asyncio.sleep(0.5)
-        main_tab = browser.main_tab
-        if main_tab is None:
-            await browser.update_targets()
-            main_tab = browser.tabs[0] if browser.tabs else None
-        if main_tab is None:
-            main_tab = await asyncio.wait_for(browser.get("about:blank"), timeout=BROWSER_NAV_TIMEOUT)
+        main_tab = await _first_live_tab(browser)
         await _apply_fingerprint_to_tab(main_tab, effective_fingerprint)
         await asyncio.wait_for(main_tab.get(url), timeout=BROWSER_NAV_TIMEOUT)
         try:
@@ -7619,7 +7672,9 @@ async def _launch_browser_instance(
         await _remove_privacy_profile(privacy_profile)
         raise
     except Exception as e:
-        await _safe_stop_browser(browser)
+        # Verified, not assumed: a Chrome still dying keeps the profile lock, and the next
+        # launch would then be refused as "in use" by a browser nobody asked for.
+        await _ensure_browser_dead(browser, profile_path)
         await _remove_privacy_profile(privacy_profile)
         return False, f"initial nav failed: {_exc_text(e)}"
 
@@ -9057,8 +9112,8 @@ async def _take_storage_snapshot(tab) -> dict:
                        "localStorage": False, "sessionStorage": False,
                    }}
     try:
-        snap["url"] = await get_url(tab)
-        snap["title"] = await get_title(tab)
+        snap["url"] = await get_url(tab, strict=True)
+        snap["title"] = await get_title(tab, strict=True)
         snap["measured"]["url"] = True
     except Exception as e:
         snap["errors"]["url"] = f"{type(e).__name__}: {e}"
@@ -9849,7 +9904,7 @@ async def click_and_wait(
         return err("click_and_wait: pass ref=, selector=, or text=")
     try:
         tab = BrowserState.active_tab()
-        url_before = await get_url(tab)
+        url_before = await get_url(tab, strict=True)
         t0 = _time.monotonic()
         # Dispatch the click — reuse existing tools
         if text:
@@ -9869,7 +9924,8 @@ async def click_and_wait(
                     deadline = _time.monotonic() + timeout
                     while _time.monotonic() < deadline:
                         url_now = await get_url(tab)
-                        if url_now != url_before:
+                        # Blank means the read failed mid-navigation, not a new URL.
+                        if url_now and url_now != url_before:
                             observed = {"what": "navigation",
                                           "evidence": {"from": url_before, "to": url_now}}
                             break

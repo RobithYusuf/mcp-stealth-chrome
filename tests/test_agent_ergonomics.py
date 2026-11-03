@@ -1129,3 +1129,172 @@ def test_verify_capture_tolerates_browser_zoom(monkeypatch):
     assert image_output.verify_capture(b"x", clip, 0.9, 1.0, {})[2] is None
     # A genuinely wrong capture is still refused.
     assert image_output.verify_capture(b"x", {"width": 400, "height": 300}, 0.9, 1.0, {})[2]
+
+
+class _BrokenTab:
+    def __init__(self, message):
+        self.message = message
+
+    async def evaluate(self, *_a, **_k):
+        raise RuntimeError(self.message)
+
+
+def test_a_failed_url_read_is_not_a_page_without_a_url():
+    import asyncio
+
+    from mcp_stealth_chrome.helpers import PageReadError, get_title, get_url
+
+    tab = _BrokenTab("Execution context was destroyed")
+    assert asyncio.run(get_url(tab)) == ""  # polling through a navigation
+    assert asyncio.run(get_title(tab)) == ""
+    with pytest.raises(PageReadError):
+        asyncio.run(get_url(tab, strict=True))
+    with pytest.raises(PageReadError):
+        asyncio.run(get_title(tab, strict=True))
+
+
+def test_a_lost_connection_raises_even_for_pollers():
+    """It used to make a poll wait out its whole timeout against a dead browser."""
+    import asyncio
+
+    from mcp_stealth_chrome.helpers import PageReadError, get_url
+
+    tab = _BrokenTab("websocket connection is closed")
+    for strict in (False, True):
+        with pytest.raises(RuntimeError) as caught:
+            asyncio.run(get_url(tab, strict=strict))
+        assert not isinstance(caught.value, PageReadError)
+
+
+def test_get_url_tool_reports_failure_instead_of_blank(monkeypatch):
+    import asyncio
+
+    from mcp_stealth_chrome import server
+
+    monkeypatch.setattr(server.BrowserState, "active_tab",
+                        classmethod(lambda cls: _BrokenTab("Execution context was destroyed")))
+    out = asyncio.run(server.mcp._tool_manager._tools["get_url"].fn())
+    assert out.startswith("Error:") and "could not read the page URL" in out
+
+
+def test_report_lines_say_when_facts_are_unreadable():
+    import asyncio
+
+    from mcp_stealth_chrome import server
+
+    url, title = asyncio.run(server._page_facts_for_report(_BrokenTab("context destroyed")))
+    assert url.startswith("(unreadable") and title == "(unreadable)"
+
+
+def test_storage_snapshot_marks_an_unread_url_as_unmeasured():
+    import asyncio
+
+    from mcp_stealth_chrome import server
+
+    class _Tab(_BrokenTab):
+        async def send(self, *_a, **_k):
+            raise RuntimeError("no")
+
+    snap = asyncio.run(server._take_storage_snapshot(_Tab("context destroyed")))
+    assert snap["measured"]["url"] is False and "url" in snap["errors"]
+
+
+def _fake_browser(tabs, live_ids):
+    class _Info:
+        type_ = "page"
+
+        def __init__(self, target_id):
+            self.target_id = target_id
+
+    class _Conn:
+        async def send(self, _command):
+            return [_Info(i) for i in live_ids]
+
+    class _Browser:
+        connection = _Conn()
+        created = 0
+
+        def __init__(self):
+            self.tabs = tabs
+
+        async def update_targets(self):
+            pass
+
+        async def get(self, url, new_tab=False):
+            self.created += 1
+            return "created-tab"
+
+    return _Browser()
+
+
+def _fake_tab(target_id, alive=True):
+    class _Target:
+        pass
+
+    class _Tab:
+        target = _Target()
+
+        async def send(self, _command):
+            if not alive:
+                raise RuntimeError("server rejected WebSocket connection: HTTP 404")
+
+    _Tab.target.target_id = target_id
+    return _Tab()
+
+
+def test_startup_tab_that_chrome_replaced_is_skipped():
+    """The cause of spawn_browser failing on a profile copied from another browser."""
+    import asyncio
+
+    from mcp_stealth_chrome import server
+
+    gone, alive = _fake_tab("gone"), _fake_tab("alive")
+    browser = _fake_browser([gone, alive], ["alive"])
+    assert asyncio.run(server._first_live_tab(browser)) is alive
+
+
+def test_tab_listed_as_live_but_refusing_is_skipped():
+    import asyncio
+
+    from mcp_stealth_chrome import server
+
+    refusing, alive = _fake_tab("a", alive=False), _fake_tab("b")
+    browser = _fake_browser([refusing, alive], ["a", "b"])
+    assert asyncio.run(server._first_live_tab(browser)) is alive
+
+
+def test_a_new_tab_is_opened_when_none_answer():
+    import asyncio
+
+    from mcp_stealth_chrome import server
+
+    browser = _fake_browser([_fake_tab("a", alive=False)], ["a"])
+    assert asyncio.run(server._first_live_tab(browser, attempts=1)) == "created-tab"
+    assert browser.created == 1
+
+
+def test_multi_profile_dir_opens_the_last_used_profile(tmp_path):
+    """Without this Chrome shows its profile picker, a window with no tab to drive."""
+    import json as _json
+
+    from mcp_stealth_chrome import server
+
+    (tmp_path / "Default").mkdir()
+    (tmp_path / "Profile 2").mkdir()
+    state_file = tmp_path / "Local State"
+    state_file.write_text(_json.dumps({"profile": {"last_used": "Profile 2"}}))
+    args = server._profile_directory_args
+    assert args(tmp_path, []) == ["--profile-directory=Profile 2"]
+    assert args(tmp_path, ["--profile-directory=Other"]) == []  # the caller's choice wins
+    assert args(None, []) == []
+
+    state_file.write_text(_json.dumps({"profile": {"last_used": "../../etc"}}))
+    assert args(tmp_path, []) == ["--profile-directory=Default"]
+    state_file.write_text("not json")
+    assert args(tmp_path, []) == ["--profile-directory=Default"]
+    for shape in ({}, {"profile": {}}, {"profile": None}, [], {"profile": {"last_used": None}}, {"profile": {"last_used": 5}}):
+        state_file.write_text(_json.dumps(shape))
+        assert args(tmp_path, []) == ["--profile-directory=Default"], shape
+    state_file.unlink()
+    assert args(tmp_path, []) == ["--profile-directory=Default"]
+    assert args(tmp_path / "Default", []) == []  # no sub-profile: leave Chrome to it

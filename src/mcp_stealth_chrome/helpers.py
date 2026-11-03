@@ -37,25 +37,39 @@ def transport_lost(text: str) -> bool:
     ))
 
 
-async def get_url(tab: Tab) -> str:
-    """Get current URL via evaluate — nodriver doesn't expose direct property."""
+class PageReadError(RuntimeError):
+    """The page's URL or title could not be read. Blank would claim that it has none."""
+
+
+async def _read_page_string(tab: Tab, expression: str, what: str, strict: bool) -> str:
     try:
-        result = await tab.evaluate("window.location.href", return_by_value=True)
+        result = await tab.evaluate(expression, return_by_value=True)
         # nodriver hands back a raw RemoteObject when the value is falsy —
         # unwrap so a blank result never becomes the wrapper's repr string.
         result = result.value if hasattr(result, "value") else result
-        return str(result) if result else ""
-    except Exception:
+    except Exception as exc:
+        # A lost connection is never "no URL yet", even for a caller who is polling:
+        # it would otherwise wait out its whole timeout against a dead browser.
+        if transport_lost(str(exc)):
+            raise
+        if strict:
+            raise PageReadError(f"could not read the page {what}: {exc}") from exc
         return ""
+    return str(result) if result else ""
 
 
-async def get_title(tab: Tab) -> str:
-    try:
-        result = await tab.evaluate("document.title", return_by_value=True)
-        result = result.value if hasattr(result, "value") else result
-        return str(result) if result else ""
-    except Exception:
-        return ""
+async def get_url(tab: Tab, strict: bool = False) -> str:
+    """The page URL via evaluate — nodriver doesn't expose a direct property.
+
+    strict=False returns "" when the read fails, for loops polling through a navigation
+    where that is expected. Anything that REPORTS the URL passes strict=True.
+    """
+    return await _read_page_string(tab, "window.location.href", "URL", strict)
+
+
+async def get_title(tab: Tab, strict: bool = False) -> str:
+    """The page title. Blank is a real answer here: many pages have no title."""
+    return await _read_page_string(tab, "document.title", "title", strict)
 
 
 def ts_filename(prefix: str, ext: str) -> str:

@@ -557,3 +557,25 @@ def test_privacy_changes_the_profile_and_not_the_identity(loop, browser, base_ur
     private = identity(loop)
     for field in ("ua", "platform", "tz", "brands", "hintPlatform"):
         assert normal[field] == private[field], field
+
+
+@E2E
+def test_spawn_works_on_a_copied_multi_profile_browser(loop, tmp_path):
+    """The known failure: spawn_browser on a clone stopped at Chrome's profile picker."""
+    data = tmp_path / "clone"
+    profiles = ["Default", "Profile 1", "Profile 2"]
+    for name in profiles:
+        (data / name).mkdir(parents=True)
+    (data / "Local State").write_text(json.dumps({"profile": {
+        "last_used": "Default", "last_active_profiles": ["Default"], "picker_shown": True,
+        "info_cache": {name: {"name": name, "active_time": 1.0} for name in profiles},
+    }}))
+    iid = f"clone_e2e_{os.getpid()}"
+    try:
+        out = run(loop, "spawn_browser", iid, headless=True, profile_dir=str(data))
+        assert not out.startswith("Error:"), out
+        run(loop, "switch_instance", iid)
+        assert "about:blank" in run(loop, "get_url")
+    finally:
+        run(loop, "close_instance", iid)
+        run(loop, "switch_instance", "main")
