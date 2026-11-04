@@ -197,10 +197,11 @@ def test_a_dialog_opened_by_the_pointer_moving_is_reported(mcp, base, tool, kw):
     """The move comes before the press, so the dialog can open before the click is even sent."""
     mcp.call("navigate", url=f"{base}/movealert.html")
     reply = mcp.call(tool, _timeout=25, **kw)
+    # Answered before any assertion: a dialog left open fails every test after this one.
+    answered = mcp.call("dialog_handle", action="accept", _timeout=10)
     assert reply.seconds < 15, reply.seconds
     assert "dialog_handle" in reply.text, reply.text
     assert f"{tool} stopped" not in reply.text, "the tool should see this itself, not be cut off"
-    answered = mcp.call("dialog_handle", action="accept", _timeout=10)
     assert "answered" in answered.text, answered.text
     assert mcp.evaluate("1+1", timeout_ms=5000) == "2"
 

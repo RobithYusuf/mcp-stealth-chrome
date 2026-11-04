@@ -81,7 +81,7 @@ from .refs import (
 )
 from .result_types import structured_json
 from .workflow import WorkflowError, run_workflow
-from .humanize import humanized_click, humanized_move, humanized_scroll, move_pointer
+from .humanize import humanized_click, humanized_move, humanized_mouse_press, humanized_scroll, move_pointer
 from .snapshot import (
     element_fingerprint,
     format_snapshot,
@@ -1122,22 +1122,26 @@ async def _attempt_turnstile_click(tab: Tab, offset_x: int = 30) -> Optional[tup
     inner_height = max(20, data["height"] - 2 * pad_top)
     target_x = inner_left + offset_x
     target_y = inner_top + inner_height // 2
-    start_x = target_x + 180
-    start_y = target_y - 80
+    # Randomize the approach vector: a fixed (+180, -80) start traces the same
+    # line every call, and interactive Turnstile scores that as scripted.
+    start_x = target_x + random.randint(120, 240) * random.choice((-1, 1))
+    start_y = target_y + random.randint(60, 140) * random.choice((-1, 1))
     try:
         await humanized_move(tab, start_x, start_y, target_x, target_y)
-        await asyncio.sleep(0.15)
-        await tab.mouse_click(target_x, target_y)
+        # humanized_mouse_press settles on the point and holds the button for a
+        # human duration — tab.mouse_click releases with a 0 ms hold, which the
+        # widget scores as synthetic and the server then re-issues (cf_chl_rc_ni).
+        await humanized_mouse_press(tab, target_x, target_y)
         return (target_x, target_y)
     except Exception:
         return None
 
 
-async def _auto_verify_cf(tab: Tab, max_attempts: int = 2) -> str:
+async def _auto_verify_cf(tab: Tab, max_attempts: int = 2, budget: float = 24.0) -> str:
     """Run on the tab right after load. Detects CF challenge + attempts click.
-    Caps at max_attempts; never loops or blocks beyond ~12s total. Returns
-    a short suffix to append to the caller's status line, or '' if no
-    challenge was seen.
+    Caps at max_attempts and self-bounds to `budget` seconds so it always
+    finishes inside the caller's wait_for. Returns a short suffix to append to
+    the caller's status line, or '' if no challenge was seen.
 
     Strategy:
       1. Brief wait so the Turnstile iframe has time to render.
@@ -1158,23 +1162,43 @@ async def _auto_verify_cf(tab: Tab, max_attempts: int = 2) -> str:
     # so OpenCV template match has something to find.
     await asyncio.sleep(2.0)
 
+    # After a click the widget POSTs behavioral telemetry and waits for the
+    # server's verdict; that round trip runs several seconds, so a fixed short
+    # check declares "still present" before the verdict lands and fires a second
+    # click that re-submits and lowers the score. Poll instead, up to ~8s, but
+    # never past the overall budget so the caller's wait_for cannot cancel us
+    # mid-press (a cancelled mousePressed leaves no mouseReleased).
+    overall_deadline = time.monotonic() + budget
+
+    async def _cleared_within(seconds: float) -> bool:
+        deadline = min(time.monotonic() + seconds, overall_deadline)
+        while time.monotonic() < deadline:
+            await asyncio.sleep(1.0)
+            if not await _has_cf_challenge(tab, active=True):
+                return True
+        return False
+
     actions: list[str] = []
     for _ in range(max(1, max_attempts)):
+        # Reserve ~2s for a click+settle before starting another attempt; a
+        # verdict poll that never began cannot have cleared the challenge.
+        if time.monotonic() > overall_deadline - 2.0:
+            break
         # 2. DOM tier
         clicked = await _attempt_turnstile_click(tab)
         if clicked is not None:
             actions.append(f"DOM@{clicked}")
-            await asyncio.sleep(2.5)
-            if not await _has_cf_challenge(tab, active=True):
+            if await _cleared_within(8.0):
                 break
 
         # 3. OpenCV template tier — handles shadow-DOM / cross-origin iframes
+        if time.monotonic() > overall_deadline - 2.0:
+            break
         try:
             clicked_tpl, _what = await asyncio.wait_for(_cf_template_click(tab), timeout=4.0)
             if clicked_tpl:
                 actions.append("template")
-                await asyncio.sleep(2.5)
-                if not await _has_cf_challenge(tab, active=True):
+                if await _cleared_within(8.0):
                     break
         except Exception:
             pass
@@ -1184,7 +1208,16 @@ async def _auto_verify_cf(tab: Tab, max_attempts: int = 2) -> str:
     # The caller is about to read this page, so whether the challenge is still on it matters
     # more than which clicks were tried.
     still = await _has_cf_challenge(tab, active=True)
-    return f" [auto-verify: {' → '.join(actions)}; challenge {'still present' if still else 'gone'}]"
+    if not still:
+        return f" [auto-verify: {' → '.join(actions)}; challenge gone]"
+    # A full-page interactive interstitial ("Just a moment…", Turnstile cType
+    # 'interactive') grades the pointer input itself: CDP-injected clicks, however
+    # well-timed, score below a real HID click and the server re-issues the
+    # challenge (cf_chl_rc_ni). Say so and point at the paths that do work rather
+    # than implying another click would help.
+    return (f" [auto-verify: {' → '.join(actions)}; challenge still present — interactive "
+            f"Turnstile is not solvable by click simulation; load a warm session with "
+            f"storage_state_load (reuses a valid cf_clearance) or use solve_captcha]")
 
 from ._app import mcp  # single FastMCP instance shared with tools/* submodules
 from . import image_output as _image_output  # registers native image inspection tools
@@ -1428,6 +1461,63 @@ LIGHT_MODE_FLAGS = (
 )
 
 
+# A headed Chrome started the normal way opens its first window in front and takes the
+# keyboard: measured frontmost within 300 ms, so whatever the person was typing went into
+# Chrome. Giving focus back afterwards cannot undo that. With no startup window the app
+# never activates, and the first window is created in the background over CDP. A window
+# behind others would then count as occluded and report visibilityState hidden.
+_BACKGROUND_WINDOW_FLAGS = ("--no-startup-window", "--disable-backgrounding-occluded-windows")
+
+
+async def _open_background_window(browser: Any, width: Optional[int] = None,
+                                  height: Optional[int] = None) -> Any:
+    """A new page in its own window behind the person's app, without activating Chrome."""
+    from nodriver.cdp import target as cdp_target
+    # A Browser has .connection up to 0.48 and is itself a Connection from 0.50.
+    target_id = await (getattr(browser, "connection", None) or browser).send(cdp_target.create_target(
+        "about:blank", new_window=True, background=True, width=width, height=height,
+    ))
+    await browser.update_targets()
+    for tab in browser.tabs:
+        if str(tab.target.target_id) == str(target_id):
+            return tab
+    raise RuntimeError("Chrome did not list the window it was asked to open")
+
+
+def _frontmost_pid() -> Optional[int]:
+    if sys.platform != "darwin":
+        return None
+    try:
+        front = subprocess.run(["lsappinfo", "front"], capture_output=True, text=True,
+                               timeout=2, check=False).stdout.strip()
+        info = subprocess.run(["lsappinfo", "info", "-only", "pid", front], capture_output=True,
+                              text=True, timeout=2, check=False).stdout
+    except Exception:
+        return None
+    found = re.search(r'"pid"=(\d+)', info)
+    return int(found.group(1)) if found else None
+
+
+async def _win_focus_back_from_popup(browser_pid: int, app: str, seconds: float = 1.5) -> None:
+    """window.open activates Chrome, and no flag or CDP call prevents that. So after input on
+    a headed browser, watch briefly and give focus straight back if this Chrome took it.
+
+    Only this browser's own process counts, so a person switching to any other app, their own
+    Chrome included, is left alone. Keys typed in the moment before it returns still reach
+    Chrome: this narrows that window and does not close it.
+    """
+    deadline = time.monotonic() + seconds
+    try:
+        while time.monotonic() < deadline:
+            if await asyncio.to_thread(_frontmost_pid) == browser_pid:
+                await asyncio.to_thread(subprocess.run, ["open", "-a", app],
+                                        capture_output=True, timeout=3, check=False)
+                return
+            await asyncio.sleep(0.02)
+    except Exception:
+        pass
+
+
 def _frontmost_app() -> Optional[str]:
     """The foreground app's bundle path on macOS. None anywhere else, or if it can't be read."""
     if sys.platform != "darwin":
@@ -1489,7 +1579,9 @@ async def browser_launch(
 
     Args:
         url: initial URL to load
-        headless: run without UI (many sites detect headless — prefer False)
+        headless: run without UI (many sites detect headless — prefer False). A visible
+            window opens behind the app in use and does not take the keyboard. A click that
+            calls window.open still brings Chrome forward for about 130 ms before focus returns
         proxy: "http://user:pass@host:port" or "socks5://host:port"
         user_agent: override UA string
         window_width, window_height: viewport size
@@ -1843,8 +1935,13 @@ async def browser_launch(
         browser: Optional[Browser] = None
         # Read before Chrome starts, while the person's app is still the frontmost one.
         previous_app = None if headless else await asyncio.to_thread(_frontmost_app)
+        if not headless:
+            for _flag in _BACKGROUND_WINDOW_FLAGS:
+                config.add_argument(_flag)
         try:
             browser = await _start_chrome(config)
+            if not headless:
+                await _open_background_window(browser, window_width, window_height)
         except asyncio.TimeoutError:
             await _safe_stop_browser(browser)
             await _remove_privacy_profile(privacy_profile)
@@ -1981,15 +2078,11 @@ async def browser_launch(
                 ), timeout=2.0, what="health probe")
                 hv = json.loads(probe) if isinstance(probe, str) else (probe or {})
                 if hv.get("w", 1) == 0 or hv.get("h", 1) == 0 or hv.get("v") == "hidden":
-                    # One nudge — bring window to front and re-probe
-                    try:
-                        await main.bring_to_front()
-                    except Exception:
-                        pass
-                    try:
-                        await main.activate()
-                    except Exception:
-                        pass
+                    # One nudge — restore the window without raising it, and re-probe. Taking
+                    # the foreground to check on a window is what this launch must not do.
+                    with contextlib.suppress(Exception):
+                        _window_id, _bounds = await main.get_window()
+                        await main.set_window_state(state="normal")
                     try:
                         probe2 = await _wait(main.evaluate(
                             "JSON.stringify({w:window.outerWidth,h:window.outerHeight,"
@@ -2010,7 +2103,7 @@ async def browser_launch(
         verify_suffix = ""
         if auto_verify:
             try:
-                verify_suffix = await asyncio.wait_for(_auto_verify_cf(main), timeout=25.0)
+                verify_suffix = await asyncio.wait_for(_auto_verify_cf(main), timeout=30.0)
             except Exception:
                 verify_suffix = ""
 
@@ -2619,7 +2712,7 @@ async def navigate(
         verify_suffix = ""
         if auto_verify:
             try:
-                verify_suffix = await asyncio.wait_for(_auto_verify_cf(tab), timeout=25.0)
+                verify_suffix = await asyncio.wait_for(_auto_verify_cf(tab), timeout=30.0)
             except Exception:
                 verify_suffix = ""
         observed = await _observe_navigation(tab, url, disarm())
@@ -3828,6 +3921,22 @@ async def _answer_open_dialog(tab, action: str, text: Optional[str]) -> Optional
     return ok(f"answered the open {found['type']} dialog ({action})")
 
 
+def _browser_process_pid(browser: Any) -> Optional[int]:
+    """The PID nodriver started, or None for an attached browser, which is not ours to manage."""
+    process = getattr(browser, "_process", None)
+    pid = getattr(process, "pid", None) or getattr(browser, "_process_pid", None)
+    return pid if isinstance(pid, int) and pid > 0 else None
+
+
+_BACKGROUND_TASKS: set[asyncio.Future] = set()
+
+
+def _spawn_background(coro) -> None:
+    task = asyncio.ensure_future(coro)
+    _BACKGROUND_TASKS.add(task)  # the loop holds only a weak reference
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+
 def _ignore_task_result(task: asyncio.Future) -> None:
     if not task.cancelled():
         task.exception()
@@ -3838,6 +3947,11 @@ async def _dispatch_input(tab, press) -> None:
     with contextlib.suppress(Exception):
         await _watch_dialogs(tab)
     key = _target_key(tab)
+    if not BrowserState.current_headless:
+        pid = _browser_process_pid(BrowserState.browser)
+        app = await asyncio.to_thread(_frontmost_app) if pid else None
+        if app and await asyncio.to_thread(_frontmost_pid) != pid:
+            _spawn_background(_win_focus_back_from_popup(pid, app))
     task = asyncio.ensure_future(press)
     deadline = time.monotonic() + TOOL_ACTION_TIMEOUT
     while not task.done():
@@ -4989,7 +5103,11 @@ async def tab_new(
         if not BrowserState.browser:
             return err("browser not running")
         # Apply the instance identity before the destination sees any script.
-        new_tab = await BrowserState.browser.get("about:blank", new_tab=True)
+        # Headed, a foreground tab activates Chrome, and a background tab in the same window
+        # is hidden from the page. Its own window behind the person's app is neither.
+        new_tab = (await BrowserState.browser.get("about:blank", new_tab=True)
+                   if BrowserState.current_headless
+                   else await _open_background_window(BrowserState.browser))
         await _apply_fingerprint_to_tab(new_tab, BrowserState.current_fingerprint)
         doc_state, disarm = await _arm_document_watch(new_tab)
         try:
@@ -5013,14 +5131,21 @@ async def tab_new(
 
 
 @mcp.tool()
-async def tab_select(index: int) -> str:
-    """Switch to tab at given index (from tab_list)."""
+async def tab_select(index: int, focus: bool = False) -> str:
+    """Make the tab at index (from tab_list) the one every later tool acts on.
+
+    Does not raise the window, since that takes the keyboard from whatever the person is
+    doing, so a headed browser may keep showing another tab. focus=True, or tab_focus,
+    brings this one to the front.
+    """
     try:
         await _refresh_tabs()
         if index < 0 or index >= len(BrowserState.tabs):
             return err(f"tab {index} out of range")
         BrowserState.active_tab_index = index
-        await BrowserState.tabs[index].activate()
+        if focus or BrowserState.current_headless:
+            # Headless has no foreground to take, and an unselected tab there stops painting.
+            await BrowserState.tabs[index].activate()
         return ok(f"switched to tab {index}")
     except Exception as e:
         return err(str(e))
@@ -8614,7 +8739,7 @@ async def mouse_drift(
             next_y = random.randint(int(h * 0.1), int(h * 0.9))
             await _dispatch_input(tab, humanized_move(tab, cur_x, cur_y, next_x, next_y, steps=int(per_segment * 40)))
             if _dialog_note(tab):
-                return err(f"mouse_drift stopped{_dialog_note(tab)}")
+                return err(f"mouse_drift interrupted{_dialog_note(tab)}")
             cur_x, cur_y = next_x, next_y
             await asyncio.sleep(random.uniform(0.1, 0.4))
         return ok(f"drifted through {segments} segments over {duration_seconds}s")
@@ -8706,7 +8831,7 @@ async def mouse_replay(path_json: str, speed: float = 1.0) -> str:
             await asyncio.sleep(dt)
             await _dispatch_input(tab, move_pointer(tab, int(ev.get("x", 0)), int(ev.get("y", 0))))
             if _dialog_note(tab):
-                return err(f"mouse_replay stopped{_dialog_note(tab)}")
+                return err(f"mouse_replay interrupted{_dialog_note(tab)}")
             prev_t = t
         return ok(f"replayed {len(events)} mouse events")
     except Exception as e:
@@ -8986,8 +9111,13 @@ async def _launch_browser_instance(
 
     browser: Optional[Browser] = None
     previous_app = None if headless else await asyncio.to_thread(_frontmost_app)
+    if not headless:
+        for _flag in _BACKGROUND_WINDOW_FLAGS:
+            config.add_argument(_flag)
     try:
         browser = await _start_chrome(config)
+        if not headless:
+            await _open_background_window(browser, window_width, window_height)
     except asyncio.TimeoutError:
         await _safe_stop_browser(browser)
         await _remove_privacy_profile(privacy_profile)

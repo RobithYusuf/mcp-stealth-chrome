@@ -129,6 +129,37 @@ async def humanized_click(
     await tab.mouse_click(int(target_x), int(target_y))
 
 
+async def humanized_mouse_press(
+    tab: Tab, x: int, y: int,
+    *, settle_moves: int = 3,
+) -> None:
+    """Press and release at (x, y) with human timing and an in-area settle.
+
+    nodriver's Tab.mouse_click dispatches mousePressed and mouseReleased back to
+    back with NO gap. An interactive Cloudflare Turnstile scores the
+    press->release hold and the motion that precedes it: a 0 ms hold arriving
+    after a teleport reads as synthetic, so its token comes back low-scored and
+    the server re-issues the challenge (cf_chl_rc_ni). This nudges a few
+    sub-pixel moves onto the point so the widget's own (cross-origin, closed
+    shadow) iframe sees the cursor arrive and rest, dwells, holds the button for
+    a human 60-150 ms, then releases.
+    """
+    for _ in range(max(0, settle_moves)):
+        await move_pointer(tab, x + random.randint(-2, 2), y + random.randint(-2, 2))
+        await asyncio.sleep(random.uniform(0.02, 0.06))
+    await move_pointer(tab, x, y)
+    await asyncio.sleep(random.uniform(0.04, 0.12))  # dwell before pressing
+    await tab.send(cdp.input_.dispatch_mouse_event(
+        "mousePressed", x=x, y=y,
+        button=cdp.input_.MouseButton.LEFT, buttons=1, click_count=1,
+    ))
+    await asyncio.sleep(random.uniform(0.06, 0.15))  # human hold duration
+    await tab.send(cdp.input_.dispatch_mouse_event(
+        "mouseReleased", x=x, y=y,
+        button=cdp.input_.MouseButton.LEFT, buttons=0, click_count=1,
+    ))
+
+
 async def humanized_type(
     element: Element, text: str,
     mean_delay: float = 0.12, jitter: float = 0.08,

@@ -205,9 +205,16 @@ conclusions. Each rule below replaced a real lie.
 - nodriver stops probing for Chrome after about 2.3 seconds. `_start_chrome` waits for that same process and adopts it
   (`config.host`/`port` set means connect, not spawn), moving `_process` across or a close would only drop the socket.
   Only one that never answers is ended and respawned, with host and port restored first.
-- A headed launch remembers the frontmost app on macOS (`_frontmost_app`) and gives focus back after the window opens,
-  best effort, never failing the launch. `navigate` defaults to `focus=False`; `tab_focus`, `focus=True` and
-  `request_human_help` still raise the window.
+- A headed Chrome must not take the keyboard. Started normally it is the frontmost app within 300 ms, and giving focus back
+  afterwards cannot undo keys that already went into it. So it starts with `--no-startup-window` and its first window comes
+  from `Target.createTarget(newWindow, background)` (`_open_background_window`). `--disable-backgrounding-occluded-windows`
+  is what keeps that window `visibilityState: visible`; without it a covered window reads hidden. `tab_new` opens its own
+  background window for the same reason, because a background tab in the same window is hidden. `tab_select` does not
+  activate unless `focus=True`; `navigate` defaults to `focus=False`. `tab_focus` and `request_human_help` still raise it.
+- `window.open` activates Chrome and no flag or CDP call stops that. `_win_focus_back_from_popup` sends focus back as soon as
+  this browser's PID is frontmost, about 130 ms measured, so keys typed in that moment still reach Chrome. It compares the
+  PID, because a person's own Chrome has the same bundle path. `tests/test_headed_focus.py` measures all this, with
+  `MCP_HEADED=1`, and counts this browser's PID so the person's other apps cannot skew it.
 - A stdio `browser_launch` sets `current_idle_timeout = 0`. Leaving the reaper off is not enough: any `spawn_browser`
   starts it, and it then closed the browser the person was looking at, 15 minutes after its last tool call.
 - `is_up()` false does not mean Chrome stopped: closing the last tab empties `tabs` while the process runs and
