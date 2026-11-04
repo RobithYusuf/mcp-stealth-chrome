@@ -20,7 +20,8 @@ class StructuredResult(str):
     def to_call_tool_result(self) -> CallToolResult:
         return CallToolResult(
             content=[TextContent(type="text", text=str(self))],
-            structuredContent=self.data,
+            # "result" is what the advertised output schema requires of every tool.
+            structuredContent={**self.data, "result": str(self)},
         )
 
 

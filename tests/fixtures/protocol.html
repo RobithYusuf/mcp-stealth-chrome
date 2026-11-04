@@ -1,0 +1,83 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Protocol fixture</title>
+<meta name="description" content="sweep fixture description">
+<style>
+body{font:14px sans-serif;margin:8px}
+#tall{height:2500px;background:#f4f4f4}
+#blockedwrap{position:relative;width:200px;height:40px}
+#blocked{position:absolute;left:0;top:0;width:200px;height:40px}
+#overlay{position:absolute;left:0;top:0;width:200px;height:40px;background:rgba(255,0,0,.4);z-index:5}
+#hoverbox{width:120px;height:30px;background:#def}
+#cornerbox{position:relative;width:200px;height:100px;background:#ffd}
+.card{border:1px solid #ccc;margin:2px;padding:2px}
+#img{width:64px;height:64px;display:block}
+</style></head>
+<body>
+<h1 id="title">Sweep Heading</h1>
+<h2>Sub heading</h2>
+<p id="para">Paragraph visible text with uniqueword123 and alpha beta gamma.</p>
+<p id="hiddenp" style="display:none">hiddenonlytext</p>
+<script>/* SCRIPTMARKER */</script>
+<a id="l1" href="/page2.html">Go page two</a>
+
+<a id="l3" href="/page3.html?x=1">Third page</a>
+<nav><a href="/page2.html">NavOne</a></nav>
+<div id="count">0</div>
+<button id="dead">Dead</button>
+<button id="inc" onclick="document.getElementById('count').textContent=+document.getElementById('count').textContent+1">Increment</button>
+<button id="nav" onclick="location.href='/page2.html'">Navigate</button>
+<button id="popup" onclick="window.open('/page2.html?pop=1')">Popup</button>
+<button id="delay" onclick="setTimeout(()=>{const d=document.createElement('div');d.id='late';d.textContent='Late text here';document.body.prepend(d)},600)">Delayed</button>
+<button id="rm" onclick="document.getElementById('para').remove()">Remove para</button>
+<button id="fetchbtn" onclick="fetch('/api/echo?x=1&access_token=QUERYSECRET',{method:'POST',headers:{'Authorization':'Bearer AUTHSECRET','Content-Type':'application/json','X-Plain':'visible'},body:JSON.stringify({user:'budi',password:'BODYSECRET'})}).then(r=>r.text()).then(t=>{document.getElementById('fout').textContent='fetched '+t.length})">Fetch</button>
+<button id="getbtn" onclick="fetch('/api/echo?y=2').then(r=>r.text()).then(t=>{document.getElementById('fout').textContent='got'})">FetchGet</button>
+<div id="fout"></div>
+<button id="logbtn" onclick="console.log('LOGMSG',1);console.warn('WARNMSG');console.error('ERRMSG')">Log</button>
+<button id="throwbtn" onclick="setTimeout(()=>{throw new Error('THROWN')},0)">Throw</button>
+<button id="rejectbtn" onclick="Promise.reject(new Error('REJECTED'))">Reject</button>
+<button id="alertbtn" onclick="alert('hi');document.getElementById('dlg').textContent='alert-done'">Alert</button>
+<button id="confirmbtn" onclick="document.getElementById('dlg').textContent='confirm:'+confirm('sure?')">Confirm</button>
+<button id="promptbtn" onclick="document.getElementById('dlg').textContent='prompt:'+prompt('name?','def')">Prompt</button>
+<div id="dlg"></div>
+<button id="focuser" onclick="document.getElementById('email').focus()">Focuser</button>
+<div id="plain">Plain text box</div>
+<button id="swap" onclick="document.getElementById('title').textContent='Sweep Heaxing'">Swap</button>
+<div id="blockedwrap"><button id="blocked" onclick="window.blockedClicked=true">Blocked</button><div id="overlay"></div></div>
+<button id="hiddenbtn" style="display:none">HiddenBtn</button>
+<button id="disabledbtn" disabled>DisabledBtn</button>
+<div id="hoverbox" onmouseenter="document.getElementById('hoverout').textContent='hovered'" onmouseleave="document.getElementById('hoverout').textContent='left'">Hover me</div>
+<div id="hoverout"></div>
+<div id="cornerbox" onclick="document.getElementById('cornerout').textContent=JSON.stringify({x:event.offsetX,y:event.offsetY,t:event.isTrusted})">Corner</div>
+<div id="cornerout"></div>
+<form id="f" onsubmit="event.preventDefault();window.submitted=(window.submitted||0)+1;document.getElementById('formout').textContent=JSON.stringify(Object.fromEntries(new FormData(this)))">
+<label for="name">Full Name</label><input id="name" name="fullname" placeholder="Your name">
+<label for="email">Email</label><input id="email" name="email" type="email" required>
+<label for="pw">Password</label><input id="pw" name="pw" type="password">
+<label for="age">Age</label><input id="age" name="age" type="number">
+<label><input id="cb1" name="cb1" type="checkbox"> Agree</label>
+<label><input id="rb1" name="rb" value="1" type="radio"> R1</label><label><input id="rb2" name="rb" value="2" type="radio"> R2</label>
+<label for="sel">Choice</label><select id="sel" name="sel"><option value="a">Alpha</option><option value="b">Beta</option><option value="null">NullOpt</option><option value="123">OneTwoThree</option></select>
+<label for="ta">Notes</label><textarea id="ta" name="ta"></textarea>
+<div id="ce" contenteditable="true" style="min-height:20px;border:1px solid #ccc"></div>
+<label for="file">File</label><input id="file" name="file" type="file" multiple onchange="document.getElementById('fileinfo').textContent=[...this.files].map(f=>f.name+':'+f.size).join(',')">
+<button id="submit" type="submit">Submit Form</button>
+</form>
+<div id="formout"></div><div id="fileinfo"></div>
+<table id="t"><thead><tr><th>Name</th><th>Qty</th></tr></thead><tbody><tr><td>Apple</td><td>3</td></tr><tr><td>Pear</td><td>5</td></tr></tbody></table>
+<table id="t2"><tr><td>x1</td><td>y1</td></tr><tr><td>x2</td><td>y2</td></tr></table>
+<div id="cards">
+<div class="card"><h3 class="ct">Card A</h3><span class="price">$1</span><a class="lnk" href="/a">open</a></div>
+<div class="card"><h3 class="ct">Card B</h3><span class="price">$2</span><a class="lnk" href="/b">open</a></div>
+<div class="card"><h3 class="ct">Card C</h3><span class="price">$3</span><a class="lnk" href="/c">open</a></div>
+<div class="card"><h3 class="ct">Card D</h3><span class="price">$4</span><a class="lnk" href="/d">open</a></div>
+</div>
+<img id="img" src="/img.png" alt="pattern image">
+<iframe id="fr1" src="/frame.html" width="220" height="60"></iframe>
+
+<div id="wheelout"></div>
+<div id="tall">tall <button id="farbtn" style="margin-top:2000px" onclick="window.farClicked=true">Far button</button></div>
+<script>
+window.__ev=[];
+['click','dblclick','mousedown','mouseup','mousemove','contextmenu','keydown','keypress','keyup','input','change','beforeinput','paste','wheel','focusin','pointerdown','auxclick'].forEach(t=>document.addEventListener(t,e=>{window.__ev.push({t,id:e.target&&(e.target.id||e.target.tagName),tr:e.isTrusted,x:e.clientX,y:e.clientY,key:e.key,code:e.code,btn:e.button,data:e.data,it:e.inputType})},true));
+window.__mouse=[];document.addEventListener('mousemove',e=>window.__mouse.push([e.clientX,e.clientY]));
+</script>
+</body></html>

@@ -758,7 +758,7 @@ async def screenshot_element(
     tab: Optional[int] = None,
     output: OutputMode = "artifact",
 ) -> str:
-    """⭐ Capture exactly one element's box — scroll- and DPR-correct.
+    """Capture exactly one element's box — scroll- and DPR-correct.
 
     `screenshot(region_selector=...)` measures the element for you but the clip
     is built here, in page coordinates: CDP's clip is page-space (scroll
@@ -845,7 +845,7 @@ async def inspect_image(
     max_bytes: int = ASSET_MAX_BYTES,
     timeout_s: float = 60.0,
 ) -> str:
-    """⭐ Fetch an image's NATIVE bytes — not a screenshot of the page showing it.
+    """Fetch an image's NATIVE bytes — not a screenshot of the page showing it.
 
     Opening a PNG in Chrome and calling screenshot() gives you a viewport-sized
     picture of a browser window with the asset scaled inside it: the wrapper is

@@ -46,7 +46,9 @@ from typing import Literal, Optional
 from urllib.parse import urlparse
 
 from .._app import mcp
-from ..helpers import err, get_url, mask_headers, ok, parse_json
+from urllib.parse import urlsplit
+
+from ..helpers import err, get_url, mask_body, mask_headers, mask_json_value, mask_url, ok, parse_json
 from ..humanize import humanized_move
 from ..state import SESSION_GONE_HOOKS, BrowserState
 
@@ -275,11 +277,15 @@ class _Tracked:
     sent: bool = False                 # request handed to curl at least once
     finished_at: Optional[float] = None
 
+    def shown_url(self) -> str:
+        """The URL for tool output, which lands in the transcript."""
+        return self.url if self.spec.get("reveal_values") else mask_url(self.url)
+
     def public(self) -> dict:
         return {
             "request_id": self.request_id,
             "method": self.method,
-            "url": self.url,
+            "url": self.shown_url(),
             "state": self.state,
             "outcome": self.outcome,
             "age_s": round(time.time() - self.created_at, 2),
@@ -361,7 +367,16 @@ async def _perform(rec: _Tracked) -> str:
         if spec.get("headers"):
             kwargs["headers"] = spec["headers"]
         if spec.get("cookies"):
-            kwargs["cookies"] = spec["cookies"]
+            # libcurl's cookie engine drops a cookie for a host with no dot, so on localhost
+            # it reported sending cookies that never left. The header is scoped the same way:
+            # libcurl does not carry a custom Cookie header to another host on a redirect.
+            if "." in (urlsplit(spec["url"]).hostname or "."):
+                kwargs["cookies"] = spec["cookies"]
+            else:
+                kwargs["headers"] = {
+                    **(kwargs.get("headers") or {}),
+                    "Cookie": "; ".join(f"{k}={v}" for k, v in spec["cookies"].items()),
+                }
         # json_body takes precedence — curl_cffi overwrites the data-derived
         # body with the JSON body anyway, so make that explicit and never
         # pass both (which would also clobber the Content-Type).
@@ -398,12 +413,16 @@ async def _perform(rec: _Tracked) -> str:
         if elapsed_ms is None:
             elapsed_ms = int((time.monotonic() - started) * 1000)
 
+        # Tokens come back in JSON bodies and redirect URLs as well as Set-Cookie, and all
+        # of this lands in the transcript.
+        reveal = bool(spec.get("reveal_values"))
+        if not reveal:
+            body_text = mask_body(body_text)
         meta = {
             "status": resp.status_code,
-            "url": str(resp.url),
+            "url": str(resp.url) if reveal else mask_url(str(resp.url)),
             "elapsed_ms": elapsed_ms,
-            # Set-Cookie carries the server's session, and this lands in the transcript.
-            "headers": mask_headers(dict(resp.headers)),
+            "headers": dict(resp.headers) if reveal else mask_headers(dict(resp.headers)),
             "cookies_sent": len(spec.get("cookies") or {}),
             "cookie_snapshot": spec.get("cookie_meta"),
             "impersonate": spec["impersonate"],
@@ -412,9 +431,10 @@ async def _perform(rec: _Tracked) -> str:
             "transport": spec["transport"],
         }
 
+        shown = (lambda parsed: parsed) if reveal else mask_json_value
         if return_mode == "json":
             try:
-                return ok(_bounded_result(meta, "body", resp.json()))
+                return ok(_bounded_result(meta, "body", shown(resp.json())))
             except Exception:
                 return ok(_bounded_result(meta, "body_text", body_text))
         if return_mode == "text":
@@ -423,7 +443,7 @@ async def _perform(rec: _Tracked) -> str:
             return ok(json.dumps(meta, indent=2, default=str))
         # auto mode
         try:
-            parsed = resp.json()
+            parsed = shown(resp.json())
             return ok(_bounded_result(meta, "body", parsed))
         except Exception:
             return ok(f"{json.dumps(meta, indent=2, default=str)}"
@@ -516,7 +536,7 @@ async def _run_tracked(rec: _Tracked) -> str:
         )
         rec.detail = detail
         rec.result = err(
-            f"http_request: {detail['error_class']} ({rec.method} {rec.url}) — "
+            f"http_request: {detail['error_class']} ({rec.method} {rec.shown_url()}) — "
             f"outcome {detail['outcome']}.\n"
             + json.dumps(detail, indent=2, default=str)
         )
@@ -547,6 +567,7 @@ async def http_request(
     wait_timeout: Optional[float] = None,
     connect_timeout: Optional[float] = None,
     direct: Optional[bool] = None,
+    reveal_values: bool = False,
 ) -> str:
     """HTTP request with TLS-perfect browser fingerprint via curl_cffi.
     Use for API scraping after browser login — same stealth as real Chrome's JA3/JA4.
@@ -578,12 +599,19 @@ async def http_request(
             instead of a bare timeout.
         direct: force (True) or forbid (False) the proxy-bypassing direct
             transport. Default None auto-detects loopback / private targets.
+        reveal_values: True returns credential headers, JSON fields and query parameters
+            as they are. By default their values read "*** (N chars)", because tool output
+            lands in the transcript. Bodies other than JSON or forms pass through.
     """
     try:
         from curl_cffi.requests import AsyncSession  # noqa: F401
     except ImportError:
         return err("curl-cffi not installed — pip install curl-cffi")
 
+    # libcurl also speaks file:// and others, which would hand any local file to the caller.
+    scheme = urlsplit(url).scheme.lower()
+    if scheme and scheme not in ("http", "https"):
+        return err(f"http_request: only http and https are allowed, not {scheme}://; nothing was sent")
     method = method.upper()
     timeout = max(0.1, min(float(timeout), HTTP_MAX_TIMEOUT))
     conn = HTTP_DEFAULT_CONNECT_TIMEOUT if connect_timeout is None else float(connect_timeout)
@@ -636,6 +664,7 @@ async def http_request(
             "direct": use_direct,
             "transport": transport,
             "use_browser_cookies": use_browser_cookies,
+            "reveal_values": reveal_values,
         },
     )
     rec.session = BrowserState.session_key()
@@ -658,7 +687,7 @@ async def http_request(
             "state": "pending",
             "outcome": "unknown",
             "method": method,
-            "url": url,
+            "url": rec.shown_url(),
             "waited_s": round(wait, 2),
             "operation_deadline_s": round(rec.operation_deadline, 1),
             "note": ("the request is still in flight and keeps running until the "
@@ -678,7 +707,7 @@ async def http_request_status(
     wait_timeout: float = 0.0,
     forget: bool = False,
 ) -> str:
-    """⭐ Poll a tracked http_request — or list every one this session remembers.
+    """Poll a tracked http_request — or list every one this session remembers.
 
     An http_request that outran its wait_timeout is still running. This is how
     you collect its eventual response instead of firing a duplicate.
@@ -725,7 +754,7 @@ async def http_request_status(
 
 @mcp.tool()
 async def http_request_cancel(request_id: str) -> str:
-    """⭐ Stop waiting on a tracked http_request.
+    """Stop waiting on a tracked http_request.
 
     This is a CLIENT-SIDE cancel and nothing more. If the request already went
     out, the server may have processed it in full; no rollback is performed,
@@ -772,7 +801,7 @@ async def http_request_retry(
     confirm_side_effects: bool = False,
     wait_timeout: Optional[float] = None,
 ) -> str:
-    """⭐ Explicitly replay a tracked http_request. Nothing here ever auto-retries.
+    """Explicitly replay a tracked http_request. Nothing here ever auto-retries.
 
     Refused when the first attempt's outcome is UNKNOWN and the method can have
     side effects — a POST that timed out on read may already have been applied,
@@ -796,7 +825,7 @@ async def http_request_retry(
     risky = rec.outcome != "not_executed" and rec.method not in _SAFE_METHODS
     if risky and not confirm_side_effects:
         return err(
-            f"refusing to replay {rec.method} {rec.url}: the first attempt's outcome "
+            f"refusing to replay {rec.method} {rec.shown_url()}: the first attempt's outcome "
             f"is {rec.outcome!r}, so the server may already have applied it. "
             "Re-send only if a duplicate is acceptable: "
             f'http_request_retry(request_id="{request_id}", confirm_side_effects=True)'
@@ -808,6 +837,7 @@ async def http_request_retry(
         method=rec.method,
         impersonate=spec["impersonate"],
         use_browser_cookies=spec["use_browser_cookies"],
+        reveal_values=spec.get("reveal_values", False),
         headers=spec["headers"] or None,
         params=spec["params"],
         data=spec["data"],
@@ -823,7 +853,7 @@ async def http_request_retry(
 
 @mcp.tool()
 async def http_session_cookies(url: str) -> str:
-    """⭐ Inspect which browser cookies would be sent with a request to URL.
+    """Inspect which browser cookies would be sent with a request to URL.
 
     Helpful to verify session sharing works before making requests. `measured`
     separates "no cookies apply to this URL" from "the browser never answered",
@@ -868,6 +898,8 @@ async def session_warmup(
     try:
         if not BrowserState.is_up():
             return err("browser_launch first")
+        if not (target_url or "").startswith(("http://", "https://")):
+            return err(f"session_warmup: target_url must be http or https, not {target_url!r}")
         from urllib.parse import urlparse
         parsed = urlparse(target_url)
         origin = f"{parsed.scheme}://{parsed.netloc}"
@@ -966,6 +998,10 @@ async def session_warmup(
             await tab.get(target_url)
             actions.append(f"final nav to {target_url}")
 
+        final = await get_url(tab, strict=True)
+        if final.startswith("chrome-error:"):
+            return err(f"session warmup ended on an error page: {target_url} did not load. "
+                       f"Steps tried:\n  " + "\n  ".join(actions))
         return ok("session warmup complete:\n  " + "\n  ".join(actions))
     except Exception as e:
         return err(str(e))
@@ -973,7 +1009,7 @@ async def session_warmup(
 
 @mcp.tool()
 async def detect_anti_bot() -> str:
-    """⭐ Analyze current page + HTTP headers to identify anti-bot system.
+    """Analyze current page + HTTP headers to identify anti-bot system.
 
     Detects: Cloudflare, DataDome, PerimeterX/HUMAN, Akamai Bot Manager,
     Kasada, Imperva/Incapsula, F5 Shape, none. Returns system + recommended

@@ -380,18 +380,22 @@ Runtime data lives in `~/.mcp-stealth/`: `profile/`, `profiles/<id>/`, `screensh
 
 Results describe what was observed. A tool that reports success when nothing happened would leave an agent building on a false result, so these rules hold across the server:
 
-- ✅ Clicks are real mouse input. `click`, `click_text` and `click_role` test the target first and refuse by name when something covers it. They say `clicked but NO page change detected` when nothing happened, and name any new tab the click opened. A JS click only happens with `js_fallback=True`, and the result says so.
+- ✅ Clicks are real mouse input. `click`, `click_text`, `click_role`, `click_element_offset`, `click_at_corner` and `hover` test the target first and refuse by name when something covers it. Clicks say `clicked but NO page change detected` when nothing happened, and name any new tab the click opened. A JS click only happens with `js_fallback=True`, and the result says so.
+- ✅ A native dialog cannot hang the server. A click, key or pointer move that opens one returns and names it, any other tool that needs the page says so instead of waiting, and `dialog_handle` answers the one already open.
 - ✅ `select_option` sets the value from JS because a native dropdown cannot be driven with page input. The result states `isTrusted=false`, and the value is read back.
 - ✅ `browser_snapshot` writes nothing to the page. Refs live on the server and reach into iframes, cross-origin ones included, and open shadow roots.
-- ✅ `navigate` reports the final URL, redirects, status and ready state. `expect_url` and `expect_status` turn a redirect into a failure.
-- ✅ `evaluate`, `frame_evaluate` and `wait_for_function` report a JavaScript exception as an error, and promises are awaited.
+- ✅ `navigate` reports the final URL, redirects, status and ready state, and waits for the load event up to 15 seconds. `expect_url` and `expect_status` turn a redirect into a failure. A page that did not load is an error, and `batch_actions` and `workflow_run` count it as failed. It no longer raises the window unless you pass `focus=True`.
+- ✅ `evaluate`, `frame_evaluate` and `wait_for_function` report a JavaScript exception as an error, and promises are awaited. Objects and arrays come back as JSON.
+- ✅ `type_text`, `humanize_type` and `fill` send a keydown and keyup per character. `type_text` refuses when no field has focus, and refuses a newline in a single-line field.
+- ✅ `upload_file` refuses a path that is not a file. `paste_text` refuses a field that cannot take text and reports what landed, contenteditable included.
+- ✅ `click_turnstile`, `verify_cf` and `auto_verify` report what the page shows after the click: whether the token filled, the title, and whether the challenge is still there. A click alone is not a pass, and no click happens when no checkbox matched.
 - ✅ `press_key` reports what the key did: navigation, page change, focus, or nothing.
 - ✅ `fill_form` fails when a field fails and then does not submit. `batch_actions` counts it as failed.
-- ✅ Empty results say whether anything was measured. `console_get`, `intercept_log` and `storage_snapshot` report that state.
+- ✅ Empty results say whether anything was measured. `console_get`, `intercept_log` and `storage_snapshot` report that state, and `network_get` is an error before `network_start`.
 - ✅ `assert_clickable` tells you what would block a click without clicking.
 - ✅ A lost browser connection names the condition and how to recover. `browser_recover` handles a stuck browser and only touches this server's profiles.
 
-✅ Credentials stay out of tool output, since output lands in the agent's transcript. `cookie_list`, `network_get`, `intercept_log`, `wait_for_request`, `auth_capture` and `export_curl` hide cookies, credential headers, JSON and form fields, and query parameters unless you pass `reveal_values=True`. Bodies in other formats pass through unchanged. `export_curl` also returns an `http_request` call that replays the session with the browser's own cookies. Files holding credentials are written mode 600.
+✅ Credentials stay out of tool output, since output lands in the agent's transcript. `cookie_list`, `network_get`, `intercept_log`, `wait_for_request`, `auth_capture`, `export_curl`, `http_request` and `http_request_with_session` hide cookies, credential headers, JSON and form fields, and query parameters unless you pass `reveal_values=True`. Bodies in other formats pass through unchanged. `export_curl` also returns an `http_request` call that replays the session with the browser's own cookies. Files holding credentials are written mode 600.
 
 ## Tools
 
@@ -547,7 +551,7 @@ These run without a browser and without a search API key, and use the stealth br
 <details>
 <summary><b>HTTP with a browser fingerprint</b></summary>
 
-`http_request` presents the TLS handshake of Chrome, Firefox or Safari. Slow calls return a request ID, which you follow with `http_request_status` or stop with `http_request_cancel`. `http_request_retry` replays a request only when you ask, and connection, read and unknown failures stay distinct. `http_request_with_session` reuses browser cookies and a bearer token seen earlier on the same origin. `session_warmup` browses naturally before reaching a target.
+`http_request` presents the TLS handshake of Chrome, Firefox or Safari. Slow calls return a request ID, which you follow with `http_request_status` or stop with `http_request_cancel`. `http_request_retry` replays a request only when you ask, and connection, read and unknown failures stay distinct. `http_request_with_session` reuses browser cookies and a bearer token seen earlier on the same origin. Both accept only http and https, send text arguments exactly as given, and take `reveal_values=True` to show credentials in the response. `session_warmup` browses naturally before reaching a target.
 </details>
 
 <details>

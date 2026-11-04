@@ -614,7 +614,7 @@ def test_dialog_handlers_receive_events_on_a_fresh_tab(loop, browser, base_url, 
     run(loop, "navigate", f"{base_url}/keys.html")
     assert not run(loop, tool_name, **kwargs).startswith("Error:")
     answer = run(loop, "evaluate", "confirm('ok?')", timeout_ms=8000)
-    assert answer == "True", answer
+    assert answer == "true", answer
 
 
 @E2E
@@ -907,7 +907,7 @@ def test_device_emulation_and_its_reset_on_a_real_page(loop, browser, base_url):
     assert back["hintPlatform"] == native["hintPlatform"] and back["platform"] == native["platform"]
     assert back["brands"], "reset left brands empty"
     assert back["ua"] == strip_headless(native["ua"])
-    assert run(loop, "evaluate", "matchMedia('(pointer: coarse)').matches || innerWidth < 500") == "False"
+    assert run(loop, "evaluate", "matchMedia('(pointer: coarse)').matches || innerWidth < 500") == "false"
 
 
 @E2E

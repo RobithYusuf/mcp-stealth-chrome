@@ -145,7 +145,11 @@ async def _browser_render(tab, url: str, max_wait: float = 16.0,
         # ~190KB of leading CSS, so a head-only slice would miss it and return
         # the block page as if it were real content.
         low = (html or "").lower()
-        challenging = (len(html or "") < 1500) or any(m in low for m in _CHALLENGE_MARKERS)
+        marked = any(m in low for m in _CHALLENGE_MARKERS)
+        # A tiny page may be a challenge still loading, or just a tiny page. Without a marker
+        # the grace period below decides, instead of waiting out max_wait every time.
+        short_for_now = len(html or "") < 1500 and (time.monotonic() - start) < 6.0
+        challenging = marked or short_for_now
         if html and not challenging:
             # SPA hydration guard: a challenge-free shell can still have ~no
             # visible text until JS renders the content (Reddit/Threads search
@@ -162,8 +166,8 @@ async def _browser_render(tab, url: str, max_wait: float = 16.0,
         # usually passes. Two attempts make even the FIRST call one-shot instead
         # of needing a manual warm retry.
         elapsed = time.monotonic() - start
-        if (reloads == 0 and elapsed > max_wait * 0.22) or \
-           (reloads == 1 and elapsed > max_wait * 0.5):
+        if marked and ((reloads == 0 and elapsed > max_wait * 0.22) or
+                       (reloads == 1 and elapsed > max_wait * 0.5)):
             reloads += 1
             try:
                 await tab.reload()
@@ -738,7 +742,7 @@ async def web_search(
     use_browser: Literal["auto", "off", "on"] = "auto",
     proxy: Optional[str] = None,
 ) -> str:
-    """⭐ Web search WITHOUT a browser or paid API — replaces tavily/exa discovery.
+    """Web search WITHOUT a browser or paid API — replaces tavily/exa discovery.
 
     Escalation ladder ("use every scenario"):
       1. curl_cffi SERP (browserless, headless/API-mode, light) — Bing default
@@ -804,10 +808,11 @@ async def scrape_markdown(
     max_chars: int = 20000,
     proxy: Optional[str] = None,
 ) -> str:
-    """⭐ Fetch one URL → clean LLM-ready markdown (firecrawl-scrape equivalent).
+    """Fetch one URL → clean LLM-ready markdown (firecrawl-scrape equivalent).
 
     Default path is curl_cffi (no browser — fast, light, headless). Set
-    use_browser=True to render via the stealth browser (needs browser_launch)
+    use_browser=True to render in the active tab, which leaves that tab on this page
+    (needs browser_launch)
     for JS-heavy or anti-bot pages.
 
     Returns {url, path, status, chars, markdown}.
@@ -829,6 +834,7 @@ async def scrape_markdown(
         return ok(json.dumps({
             # This path never sees the document response, so a 403 page must not read as 200.
             "url": u, "path": "browser", "status": None, "status_measured": False,
+            "active_tab_navigated": True,
             "chars": len(md), "elapsed_ms": int((time.monotonic() - t0) * 1000),
             "markdown": md,
         }, ensure_ascii=False))
@@ -856,7 +862,7 @@ async def smart_fetch(
     max_chars: int = 20000,
     proxy: Optional[str] = None,
 ) -> str:
-    """⭐ Dual-mode fetch: curl_cffi first, auto-escalate to the stealth browser
+    """Dual-mode fetch: curl_cffi first, auto-escalate to the stealth browser
     ONLY when the HTTP request is anti-bot blocked. The efficiency core — high
     volume stays browserless; Chrome fires only when truly needed.
 
@@ -875,7 +881,8 @@ async def smart_fetch(
             # A 200 with almost no extractable text is usually a JS/SPA shell
             # (e.g. www.reddit.com) — fall through to render it in the browser.
             # If no browser is up, return the HTTP result rather than nothing.
-            if len(md) >= 200 or not BrowserState.is_up():
+            # An error status is the server's answer, not an empty shell.
+            if len(md) >= 200 or status >= 400 or not BrowserState.is_up():
                 return ok(json.dumps({
                     "url": u, "path": "http", "status": status, "chars": len(md),
                     "elapsed_ms": int((time.monotonic() - t0) * 1000),
@@ -927,7 +934,7 @@ async def deep_research(
     per_source_chars: int = 3000,
     proxy: Optional[str] = None,
 ) -> str:
-    """⭐ One-call research: search → fetch top-N sources → clean markdown + citations.
+    """One-call research: search → fetch top-N sources → clean markdown + citations.
 
     Replaces tavily/firecrawl "research". Fully browserless fast path (curl_cffi);
     sources that are anti-bot blocked are flagged so the caller can re-fetch them
@@ -1088,7 +1095,7 @@ async def social_digest(
     scrolls: int = 3,
     max_posts: int = 15,
 ) -> str:
-    """⭐ Enter a Reddit community and return a clean, STRUCTURED digest of its top
+    """Enter a Reddit community and return a clean, STRUCTURED digest of its top
     posts — a reproducible, account-independent research surface (uses search/sort,
     NOT the personalized 'For you' feed, so the same call yields the same posts for
     any account). Needs a running browser (scrolls + clears JS challenges).
@@ -1179,7 +1186,7 @@ async def github_read(
     limit: int = 15,
     proxy: Optional[str] = None,
 ) -> str:
-    """⭐ Read a GitHub repo via the official API — no browser, no anti-bot needed.
+    """Read a GitHub repo via the official API — no browser, no anti-bot needed.
 
     resource:
       repo     -> metadata {stars, forks, open_issues, language, topics, desc, pushed}
@@ -1337,7 +1344,7 @@ async def youtube_read(
     max_chars: int = 15000,
     proxy: Optional[str] = None,
 ) -> str:
-    """⭐ Read a YouTube video's TRANSCRIPT + metadata natively (no yt-dlp, no
+    """Read a YouTube video's TRANSCRIPT + metadata natively (no yt-dlp, no
     browser) — parses the watch page's player response + timedtext captions.
 
     Returns {video_id, title, author, views, length_s, lang, transcript} (or just
@@ -1543,14 +1550,14 @@ async def social_research(
     read_posts: int = 0,
     proxy: Optional[str] = None,
 ) -> str:
-    """⭐ Social-media market/competitor research — WHO sells/makes X + HOW loud.
+    """Social-media market/competitor research — WHO sells/makes X + HOW loud.
 
     Give a topic/niche → sweeps social platforms + the web to surface who is
     selling/making/discussing it and how busy the buzz is, using OSINT:
     Google/Bing `site:<platform>` dorks (no login, clean, NON-personalized) +
     optional NATIVE in-platform search when a browser session exists.
 
-    ⭐ STRONGLY RECOMMENDED — import your session cookies first for login-walled
+    STRONGLY RECOMMENDED — import your session cookies first for login-walled
     platforms (Threads / Facebook / X / Instagram):
         browser_launch()
         cookie_import(file_path="cookies.json")   # export via Cookie-Editor while logged in
@@ -1558,7 +1565,7 @@ async def social_research(
     posts + engagement (likes/views) the logged-out `site:` dork can't reach.
     Reddit works without login.
 
-    ⭐ CRASH-RESILIENT: pass cookie_files="threads.json,x.json,fb.txt" to
+    CRASH-RESILIENT: pass cookie_files="threads.json,x.json,fb.txt" to
     auto-(re)import those session files at the start of EVERY call. A browser
     crash/restart drops the in-memory session — this re-applies it automatically
     so you never manually re-import after a recover.

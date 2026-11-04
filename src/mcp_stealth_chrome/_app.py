@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
 from .result_types import StructuredResult
 from .state import BrowserState
-from .helpers import target_key
+from .helpers import OPEN_DIALOGS, dialog_note, target_key
 
 
 _TAB_SERIALIZED_TOOLS = frozenset({
@@ -16,6 +17,54 @@ _TAB_SERIALIZED_TOOLS = frozenset({
     "screenshot_element", "inspect_image", "vision_describe", "vision_ocr", "vision_check",
 })
 _TAB_LOCKS: dict[str, asyncio.Lock] = {}
+
+# These do not need the page's renderer, so an open native dialog cannot block them.
+_RUNS_DESPITE_DIALOG = frozenset({
+    "dialog_handle", "dialog_auto_handle", "browser_close", "browser_recover", "browser_launch",
+    "spawn_browser", "attach_to_chrome", "detach", "close_instance", "close_all_instances",
+    "switch_instance", "list_instances", "instance_describe", "instance_release", "server_status",
+    "tab_list", "tab_new", "tab_select", "tab_close", "http_request", "http_request_status",
+    "http_request_cancel", "http_request_retry", "http_request_with_session",
+    "http_session_cookies", "list_chrome_profiles", "clone_chrome_profile", "list_external_chrome",
+    "profile_report", "profile_cleanup", "identity_pin", "identity_show", "console_get",
+    "get_page_errors", "network_get", "intercept_log", "intercept_stop", "export_har", "export_curl",
+    "request_human_help", "wait_for_human", "web_search", "deep_research", "github_read", "youtube_read",
+})
+# Long enough for a dialog_handle armed in advance to answer, and for an input tool to return
+# its own better message. A dialog still open after this is blocking the tool.
+_DIALOG_GRACE_SECONDS = 1.5
+
+
+def _active_dialog_key() -> str | None:
+    if not BrowserState.is_up():
+        return None
+    try:
+        return target_key(BrowserState.active_tab())
+    except Exception:
+        return None
+
+
+async def _run_unless_a_dialog_blocks(name: str, run) -> Any:
+    """Stop a tool waiting on a page that a native dialog has frozen.
+
+    Anything that needs the renderer waits for ever while a dialog is open, including calls
+    with no timeout of their own, and the dialog can open before the call or during it.
+    """
+    if name in _RUNS_DESPITE_DIALOG:
+        return await run()
+    key = _active_dialog_key()
+    if key in OPEN_DIALOGS:
+        return f"Error: {name} did not run" + dialog_note(BrowserState.active_tab())
+    task = asyncio.ensure_future(run())
+    while not task.done():
+        await asyncio.wait({task}, timeout=0.2)
+        found = OPEN_DIALOGS.get(key) if key else None
+        if (not task.done() and found
+                and time.monotonic() - found.get("since", 0) >= _DIALOG_GRACE_SECONDS):
+            task.cancel()
+            await asyncio.wait({task}, timeout=1.0)
+            return f"Error: {name} stopped" + dialog_note(BrowserState.active_tab())
+    return task.result()
 
 
 class StealthMCP(FastMCP):
@@ -61,13 +110,18 @@ class StealthMCP(FastMCP):
             await lock.acquire()
 
         try:
-            result = await tool.run(arguments, context=context, convert_result=False)
+            result = await _run_unless_a_dialog_blocks(
+                name, lambda: tool.run(arguments, context=context, convert_result=False))
             if isinstance(result, StructuredResult):
                 return result.to_call_tool_result()
             from .image_output import ImageResult
             if isinstance(result, ImageResult):
                 from mcp.types import CallToolResult
-                return CallToolResult(content=result.to_mcp_content())
+                # Every tool is annotated -> str, so FastMCP advertises an output schema
+                # requiring {"result": str}. Official clients reject a reply without it.
+                return CallToolResult(
+                    content=result.to_mcp_content(), structuredContent={"result": str(result)},
+                )
             return tool.fn_metadata.convert_result(result)
         finally:
             if lock is not None and lock.locked():

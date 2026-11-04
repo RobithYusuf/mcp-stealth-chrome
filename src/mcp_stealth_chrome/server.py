@@ -34,6 +34,8 @@ from . import patches as _patches
 _patches.apply_all()
 from .captcha import CapSolverError, solve as capsolver_solve
 from .helpers import (
+    OPEN_DIALOGS,
+    dialog_note,
     confined_output_path,
     err,
     get_title,
@@ -79,7 +81,7 @@ from .refs import (
 )
 from .result_types import structured_json
 from .workflow import WorkflowError, run_workflow
-from .humanize import humanized_click, humanized_move, humanized_scroll, humanized_type, move_pointer
+from .humanize import humanized_click, humanized_move, humanized_scroll, move_pointer
 from .snapshot import (
     element_fingerprint,
     format_snapshot,
@@ -985,9 +987,9 @@ _CF_CHALLENGE_PROBE_ACTIVE_JS = """
     for (const inp of inps) {
       if (!inp.value || inp.value.length <= 5) { anyEmpty = true; break; }
     }
-    if (!anyEmpty) return false;  // every input has a token → solved
+    return anyEmpty;  // a token on every input → solved; an empty one → still waiting
   }
-  const txt = (document.body && document.body.innerText || '').toLowerCase();
+  const txt = ((document.title || '') + ' ' + (document.body && document.body.innerText || '')).toLowerCase();
   const phrases = ['performing security verification', 'just a moment',
     'checking your browser', 'verify you are human', 'verifying you are human'];
   if (phrases.some(p => txt.includes(p))) return true;
@@ -1020,6 +1022,79 @@ async def _has_cf_challenge(tab: Tab, *, active: bool = False) -> bool:
         only when visible challenge UI is still on the page (not just the
         post-solve dormant markers)."""
     return bool(await _cf_challenge_state(tab, active=active))
+
+
+# Below this the best template match is just whatever on the page looks least unlike it.
+_CF_TEMPLATE_THRESHOLD = 0.7
+
+
+async def _cf_template_click(tab: Tab, template_image: Optional[str] = None) -> tuple[bool, str]:
+    """Click the Turnstile checkbox found by template match: (clicked, what happened).
+
+    Not Tab.verify_cf: it clicks the best match however poor, so on a page without a
+    widget it reported success after clicking whatever scored highest.
+    """
+    import cv2
+    import numpy as np
+    from nodriver.core import util as nodriver_util
+    if template_image:
+        template = cv2.imread(str(Path(template_image).expanduser()))
+        if template is None:
+            return False, f"could not read template image {template_image}"
+    else:
+        template = cv2.imdecode(np.frombuffer(nodriver_util.get_cf_template(), np.uint8), cv2.IMREAD_COLOR)
+    shot = base64.b64decode(await tab.send(cdp_page_capture_png()))
+    page = cv2.imdecode(np.frombuffer(shot, np.uint8), cv2.IMREAD_COLOR)
+    if page.shape[0] < template.shape[0] or page.shape[1] < template.shape[1]:
+        return False, "the page is smaller than the template"
+    _, score, _, loc = cv2.minMaxLoc(cv2.matchTemplate(page, template, cv2.TM_CCOEFF_NORMED))
+    if score < _CF_TEMPLATE_THRESHOLD:
+        return False, f"no Turnstile checkbox on the page (best template match {score:.2f})"
+    raw = await tab.evaluate("window.devicePixelRatio", return_by_value=True)
+    ratio = float(raw.value if hasattr(raw, "value") else raw) or 1.0
+    x = (loc[0] + template.shape[1] / 2) / ratio
+    y = (loc[1] + template.shape[0] / 2) / ratio
+    await tab.mouse_click(x, y)
+    return True, f"clicked at ({int(x)},{int(y)}) by template match {score:.2f}"
+
+
+def cdp_page_capture_png():
+    from nodriver.cdp import page as cdp_page
+    return cdp_page.capture_screenshot(format_="png")
+
+
+_CF_OBSERVE_JS = """
+JSON.stringify({
+  title: document.title,
+  token: (document.querySelector('input[name="cf-turnstile-response"]') || {}).value || ''
+})
+"""
+
+
+async def _cf_after_click(tab: Tab, wait: float = 3.0) -> str:
+    """What the page shows after a challenge click. A click landing is not a challenge passed."""
+    deadline = time.monotonic() + wait
+    title, token_len, still = "", 0, None
+    while True:
+        await asyncio.sleep(0.5)
+        with contextlib.suppress(Exception):
+            raw = await asyncio.wait_for(tab.evaluate(_CF_OBSERVE_JS, return_by_value=True), timeout=3.0)
+            seen = parse_json(raw, {}) or {}
+            title, token_len = str(seen.get("title", "")), len(str(seen.get("token", "")))
+        still = await _cf_challenge_state(tab, active=True)
+        if token_len and not still:
+            break
+        if time.monotonic() >= deadline:
+            break
+    interstitial = "just a moment" in title.lower()
+    token = f"token filled ({token_len} chars)" if token_len else "token empty"
+    if token_len and not interstitial and not still:
+        verdict = "challenge passed as far as the page shows"
+    elif still or interstitial:
+        verdict = "challenge still present: NOT passed"
+    else:
+        verdict = "no sign either way: check the page before relying on it"
+    return f"observed after {wait:g}s: {token}, title {title[:60]!r}, {verdict}"
 
 
 async def _attempt_turnstile_click(tab: Tab, offset_x: int = 30) -> Optional[tuple[int, int]]:
@@ -1095,17 +1170,21 @@ async def _auto_verify_cf(tab: Tab, max_attempts: int = 2) -> str:
 
         # 3. OpenCV template tier — handles shadow-DOM / cross-origin iframes
         try:
-            await asyncio.wait_for(tab.verify_cf(flash=False), timeout=4.0)
-            actions.append("template")
-            await asyncio.sleep(2.5)
-            if not await _has_cf_challenge(tab, active=True):
-                break
+            clicked_tpl, _what = await asyncio.wait_for(_cf_template_click(tab), timeout=4.0)
+            if clicked_tpl:
+                actions.append("template")
+                await asyncio.sleep(2.5)
+                if not await _has_cf_challenge(tab, active=True):
+                    break
         except Exception:
             pass
 
     if not actions:
         return " [auto-verify: CF detected but no clickable widget found]"
-    return f" [auto-verify: {' → '.join(actions)}]"
+    # The caller is about to read this page, so whether the challenge is still on it matters
+    # more than which clicks were tried.
+    still = await _has_cf_challenge(tab, active=True)
+    return f" [auto-verify: {' → '.join(actions)}; challenge {'still present' if still else 'gone'}]"
 
 from ._app import mcp  # single FastMCP instance shared with tools/* submodules
 from . import image_output as _image_output  # registers native image inspection tools
@@ -1347,6 +1426,35 @@ LIGHT_MODE_FLAGS = (
     "--autoplay-policy=user-gesture-required",
     "--mute-audio",
 )
+
+
+def _frontmost_app() -> Optional[str]:
+    """The foreground app's bundle path on macOS. None anywhere else, or if it can't be read."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        front = subprocess.run(["lsappinfo", "front"], capture_output=True, text=True,
+                               timeout=2, check=False).stdout.strip()
+        info = subprocess.run(["lsappinfo", "info", "-only", "bundlepath", front], capture_output=True,
+                              text=True, timeout=2, check=False).stdout
+    except Exception:
+        return None
+    found = re.search(r'"LSBundlePath"="([^"]+)"', info)
+    return found.group(1) if found else None
+
+
+async def _give_focus_back(app: Optional[str]) -> None:
+    """A headed Chrome takes the foreground when its window opens, away from whatever the
+    person was using. Best effort: a launch must never fail over this."""
+    if not app:
+        return
+    try:
+        await asyncio.sleep(0.3)  # the window activates a moment after CDP answers
+        if await asyncio.to_thread(_frontmost_app) not in (None, app):
+            await asyncio.to_thread(subprocess.run, ["open", "-a", app],
+                                    capture_output=True, timeout=3, check=False)
+    except Exception:
+        pass
 
 
 @mcp.tool()
@@ -1686,6 +1794,10 @@ async def browser_launch(
         else:
             final_udd = None
 
+        # nodriver 0.50 never passes Config.lang on, and macOS Chrome ignores --lang. The
+        # override applied to the tab below is what actually changes it.
+        if lang and lang != "en-US" and not effective_fingerprint.get("accept_language"):
+            effective_fingerprint = {**effective_fingerprint, "accept_language": lang}
         config = Config(
             user_data_dir=final_udd,
             headless=headless,
@@ -1729,6 +1841,8 @@ async def browser_launch(
                 config.add_argument(_flag)
 
         browser: Optional[Browser] = None
+        # Read before Chrome starts, while the person's app is still the frontmost one.
+        previous_app = None if headless else await asyncio.to_thread(_frontmost_app)
         try:
             browser = await _start_chrome(config)
         except asyncio.TimeoutError:
@@ -1800,13 +1914,14 @@ async def browser_launch(
             await asyncio.sleep(0.5)
             main = await _first_live_tab(BrowserState.browser)
             await _apply_fingerprint_to_tab(main, effective_fingerprint)
+            if profile_mode == "light" or testing_mode:
+                # The first document after startup still loads images despite the flag;
+                # every later one obeys it.
+                await asyncio.wait_for(main.get("about:blank"), timeout=BROWSER_NAV_TIMEOUT)
             _doc_state, _disarm = await _arm_document_watch(main)
             try:
                 await asyncio.wait_for(main.get(url), timeout=BROWSER_NAV_TIMEOUT)
-                try:
-                    await asyncio.wait_for(main.wait(t=3), timeout=BROWSER_NAV_TIMEOUT)
-                except asyncio.TimeoutError:
-                    pass  # initial load wait is best-effort
+                await _wait_load_complete(main, 3)  # best effort; ready_state is reported
                 # Saying "Loaded /admin" after a redirect to /login leaves the caller
                 # reading a page it never asked for, and expect_* went unchecked.
                 _launch_observed = await _observe_navigation(main, url, _disarm())
@@ -1917,6 +2032,7 @@ async def browser_launch(
             except Exception:
                 pass  # placement is a convenience; never fail a launch over it
 
+        await _give_focus_back(previous_app)
         return _nav_result(
             f"Browser launched (headless={headless}, persistent={persistent}, "
             f"privacy={privacy}, identity={identity_source}). Loaded",
@@ -2416,10 +2532,36 @@ def _nav_result(
             f"{action} postcondition failed: " + "; ".join(failures)
             + f"\n{body}"
         )
+    # batch_actions and workflow_run count failures by this prefix, so a page that did not
+    # load must carry it even though the tool itself ran.
+    if observed.get("load_failure"):
+        return err(f"{action}: the page did not load ({observed['load_failure']})\n{body}")
     return ok(
         f"{action}: {final_url} [{status_part}{redirect_part}, ready_state {ready}]"
         f"{suffix}\n{body}"
     )
+
+
+# How long navigate waits for the load event. It reports ready_state either way, because a
+# page with one stuck subresource is still a page the caller can use.
+NAV_LOAD_WAIT = 15.0
+
+
+async def _wait_load_complete(tab, timeout: float) -> bool:
+    """Poll readyState until complete. nodriver's Tab.wait(t) is only a sleep of t seconds."""
+    deadline = time.monotonic() + timeout
+    while True:
+        with contextlib.suppress(Exception):
+            state = await asyncio.wait_for(
+                tab.evaluate("document.readyState", return_by_value=True),
+                timeout=max(0.2, min(2.0, deadline - time.monotonic())),
+            )
+            state = state.value if hasattr(state, "value") and not isinstance(state, str) else state
+            if state == "complete":
+                return True
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(0.1)
 
 
 @mcp.tool()
@@ -2427,7 +2569,7 @@ async def navigate(
     url: str,
     wait_until: str = "load",
     auto_verify: bool = True,
-    focus: bool = True,
+    focus: bool = False,
     expect_url: Optional[str] = None,
     expect_status: Optional[int] = None,
 ) -> str:
@@ -2441,12 +2583,9 @@ async def navigate(
     Turnstile challenges after load and click the checkbox naturally
     (CDP-level click, max 2 attempts). Set False to opt out.
 
-    focus: if True (default), bring the tab's window to the OS foreground
-    after navigating. Without this, programmatic navigation in Chrome
-    does NOT raise the window — so on systems with the user's own
-    Chrome already open, MCP-driven navigation can be invisible to the
-    eye even though it succeeded internally. Set False to navigate
-    silently (background scraping flows).
+    focus: if True, bring the tab's window to the OS foreground after navigating. Off by
+    default, because raising the window takes focus from whatever the person is doing.
+    tab_focus does the same on request.
 
     expect_url: fail when final_url does not match. Glob when the pattern
         contains * ? or [ ; otherwise a prefix match, so "https://x/admin"
@@ -2458,12 +2597,16 @@ async def navigate(
     """
     if not BrowserState.is_up():
         return err("Browser not running. Call browser_launch first.")
+    if wait_until not in ("load", "none"):
+        return err(f"navigate: wait_until must be 'load' or 'none', not {wait_until!r}")
     tab = BrowserState.active_tab()
+    with contextlib.suppress(Exception):
+        await _watch_dialogs(tab)
     doc_state, disarm = await _arm_document_watch(tab)
     try:
         await tab.get(url)
         if wait_until != "none":
-            await tab.wait()
+            await _wait_load_complete(tab, NAV_LOAD_WAIT)
         if focus:
             try:
                 await tab.activate()
@@ -2492,7 +2635,7 @@ async def navigate(
 
 @mcp.tool()
 async def tab_focus() -> str:
-    """⭐ Bring the active tab's browser window to the OS foreground.
+    """Bring the active tab's browser window to the OS foreground.
 
     Programmatic CDP navigation does not raise Chrome to the front, so
     on a desktop where the user has their own Chrome already open you
@@ -2686,6 +2829,7 @@ async def wait_for_human(
                     current.get("url") != baseline.get("url")
                     or current.get("nodes") != baseline.get("nodes")
                     or current.get("len") != baseline.get("len")
+                    or current.get("hash") != baseline.get("hash")
                 ):
                     _HUMAN_HELP.pop(key, None)
                     return ok(f"human handoff completed after {elapsed}s: page changed")
@@ -2723,7 +2867,7 @@ async def _history_navigation(
     try:
         await move(tab)
         try:
-            await _wait(tab.wait(), timeout=10, what=f"{action} settle")
+            await _wait_load_complete(tab, 10)
         except Exception:
             pass  # settle is best-effort; the postcondition probe is the truth
         observed = await _observe_navigation(tab, requested_url, disarm())
@@ -3205,14 +3349,16 @@ async def get_text(
 
 @mcp.tool()
 async def get_html(selector: Optional[str] = None, outer: bool = False) -> str:
-    """Return innerHTML (or outerHTML) of element or whole document."""
+    """Return innerHTML of an element, its outerHTML with outer=True, or the whole document."""
     try:
         tab = BrowserState.active_tab()
         if selector:
             el = await tab.query_selector(selector)
             if el is None:
                 return err(f"selector not found: {selector}")
-            html = await el.get_html()
+            html = await el.apply(
+                "function() { return this.%s; }" % ("outerHTML" if outer else "innerHTML")
+            )
             return ok(html or "")
         html = await tab.get_content()
         return ok(html or "")
@@ -3341,13 +3487,20 @@ function() {
 
 # Cheap page fingerprint — used to tell "the click did something" from
 # "the call returned ok but nothing moved".
+# hash, because a counter going from 1 to 2 changes neither the length nor the node count.
 _PAGE_SIG_JS = """
-(() => JSON.stringify({
-  url: location.href,
-  len: document.body ? document.body.innerHTML.length : 0,
-  nodes: document.getElementsByTagName('*').length,
-  active: document.activeElement ? document.activeElement.tagName : null
-}))()
+(() => {
+  const html = document.body ? document.body.innerHTML : '';
+  let hash = 0;
+  for (let i = 0; i < html.length; i++) hash = (hash * 31 + html.charCodeAt(i)) | 0;
+  return JSON.stringify({
+    url: location.href,
+    len: html.length,
+    hash: hash,
+    nodes: document.getElementsByTagName('*').length,
+    active: document.activeElement ? document.activeElement.tagName : null
+  });
+})()
 """
 
 
@@ -3393,7 +3546,8 @@ async def _page_sig(tab, el=None, pages: bool = False) -> dict:
     browser's open tabs, since a click that opens one changes nothing on this page.
     """
     try:
-        v = await tab.evaluate(_PAGE_SIG_JS, return_by_value=True)
+        # Bounded: a native dialog opened by the action under test blocks the renderer.
+        v = await _wait(tab.evaluate(_PAGE_SIG_JS, return_by_value=True), timeout=5.0, what="page read")
         v = v.value if hasattr(v, "value") and not isinstance(v, str) else v
         sig = json.loads(v) if v else {}
     except Exception:
@@ -3555,11 +3709,19 @@ def _click_outcome(head: str, detail: str, before: dict, after: dict) -> str:
     # With no element fingerprint the caller clicked a raw point, and whether focus
     # moved says nothing about which element it moved to.
     focus_is_ours = bool((after.get("element") or {}).get("focused")) or "element" not in after
+    # Focus falling back to <body> is what clicking anything unfocusable does: the button
+    # that held focus loses it. Only focus arriving on another element is the page reacting.
+    focus_moved = (
+        before.get("active") != after.get("active")
+        and after.get("active") not in (None, "BODY", "HTML")
+        and not focus_is_ours
+    )
     changed = (
         before.get("len") != after.get("len")
+        or before.get("hash") != after.get("hash")
         or before.get("nodes") != after.get("nodes")
         or own_before != own_after
-        or (before.get("active") != after.get("active") and not focus_is_ours)
+        or focus_moved
     )
     if changed:
         return ok(f"{head} — {detail}; page changed "
@@ -3621,18 +3783,82 @@ async def _settled_position(el):
     return pos
 
 
-async def _click_and_report(
-    tab, el, label: str, verify: bool,
-    js_fallback: bool = False, humanize: bool = False,
-) -> str:
-    """Click `el`, then report what actually happened — never a bare 'clicked'.
+# Without knowing about a dialog, a click on a button that calls alert() hangs forever.
+# Page.enable also needs the renderer, so it has to happen before the dialog, which is why
+# input tools arm this first. _app.StealthMCP uses the same record to stop any other tool.
+_OPEN_DIALOGS = OPEN_DIALOGS
+_dialog_note = dialog_note
+_DIALOG_WATCHED: set[str] = set()
 
-    nodriver's Element.click() is itself a JS el.click() preceded by flash(), which
-    inserts a marker into the page: an untrusted event plus a visible DOM mutation.
-    This dispatches real mouse input at the element's position instead. It refuses
-    up-front when the hit-test says the click cannot land, and (with verify) says
-    plainly when the page did not change.
-    """
+
+async def _watch_dialogs(tab) -> None:
+    key = _target_key(tab)
+    if key in _DIALOG_WATCHED:
+        return
+    from nodriver.cdp import page as cdp_page
+    await asyncio.wait_for(tab.send(cdp_page.enable()), timeout=3.0)
+
+    def opened(event):
+        kind = getattr(event, "type_", None)
+        _OPEN_DIALOGS[key] = {"type": str(getattr(kind, "value", kind)),
+                              "message": str(getattr(event, "message", ""))[:200],
+                              "since": time.monotonic()}
+
+    def closed(_event):
+        _OPEN_DIALOGS.pop(key, None)
+
+    tab.add_handler(cdp_page.JavascriptDialogOpening, opened)
+    tab.add_handler(cdp_page.JavascriptDialogClosed, closed)
+    _DIALOG_WATCHED.add(key)
+
+
+async def _answer_open_dialog(tab, action: str, text: Optional[str]) -> Optional[str]:
+    """Answer a dialog that is already open. None when there is none."""
+    found = _OPEN_DIALOGS.get(_target_key(tab))
+    if not found:
+        return None
+    from nodriver.cdp import page as cdp_page
+    try:
+        await _wait(tab.send(cdp_page.handle_java_script_dialog(
+            accept=action == "accept", prompt_text=text or "",
+        )), timeout=5.0, what="dialog_handle")
+    except Exception as exc:
+        return err(f"could not answer the open {found['type']} dialog: {_exc_text(exc)}")
+    _OPEN_DIALOGS.pop(_target_key(tab), None)
+    return ok(f"answered the open {found['type']} dialog ({action})")
+
+
+def _ignore_task_result(task: asyncio.Future) -> None:
+    if not task.cancelled():
+        task.exception()
+
+
+async def _dispatch_input(tab, press) -> None:
+    """Run input that a native dialog could block, and stop waiting once one does."""
+    with contextlib.suppress(Exception):
+        await _watch_dialogs(tab)
+    key = _target_key(tab)
+    task = asyncio.ensure_future(press)
+    deadline = time.monotonic() + TOOL_ACTION_TIMEOUT
+    while not task.done():
+        await asyncio.wait({task}, timeout=0.05)
+        if task.done():
+            break
+        if key in _OPEN_DIALOGS:
+            await asyncio.sleep(0.4)  # an armed dialog_handle answers within this
+            if key in _OPEN_DIALOGS and not task.done():
+                # Left running, not cancelled: it finishes once the dialog is answered, and
+                # cancelling a press blocked on mousedown would never send its mouseReleased.
+                task.add_done_callback(_ignore_task_result)
+                return
+        elif time.monotonic() > deadline:
+            task.add_done_callback(_ignore_task_result)
+            raise TimeoutError(f"input was not acknowledged within {TOOL_ACTION_TIMEOUT}s")
+    task.result()
+
+
+async def _prepare_target(el) -> tuple[Any, dict, Optional[str], bool]:
+    """Scroll `el` into view and hit-test it: (position, probe, why it is unreachable, scrolled)."""
     # First wait out anything still moving it, such as a smooth scroll in progress:
     # a hit test only holds for as long as the element stays put.
     with contextlib.suppress(Exception):
@@ -3666,7 +3892,62 @@ async def _click_and_report(
         recheck = await _click_probe(el)
         reason = _blocked_reason(recheck) or await outer_blocker(el, x, y)
         probe = recheck or probe
+    return pos, probe, reason, scrolled
 
+
+async def _click_point_of(tab, el, label: str, fx: float, fy: float, approach: bool = False) -> str:
+    """Click a fraction of the element's box, under the same honesty rules as _click_and_report."""
+    if not (0 <= fx <= 1 and 0 <= fy <= 1):
+        return err(f"{label}: NOT clicked — that point is outside the element "
+                   f"({fx * 100:g}% x {fy * 100:g}% of its box)")
+    pos, probe, reason, scrolled = await _prepare_target(el)
+    target = f"target=<{probe.get('target') or 'unknown'}>"
+    # The centre passing or failing says little about an edge: only the chosen point counts.
+    if reason is not None and not (probe.get("sized") and "obscured" in reason):
+        return err(f"{label}: NOT clicked — {reason}. {target} rect={probe.get('rect')}.")
+    pos = pos or await _settled_position(el)
+    if pos is None:
+        return err(f"{label}: NOT clicked — element has no on-screen position")
+    x, y = pos.left + pos.width * fx, pos.top + pos.height * fy
+    landed = await el.apply(_POINT_HIT_JS % (fx, fy))
+    blocker = await outer_blocker(el, x, y) if landed is True else None
+    if landed is not True or blocker:
+        return err(f"{label}: NOT clicked — something else covers that point of the element "
+                   f"({int(x)},{int(y)}). {target} rect={probe.get('rect')}.")
+    before = await _page_sig(tab, el, pages=True)
+    if approach:
+        await _dispatch_input(tab, humanized_move(tab, x + 120, y - 60, x, y))
+        await asyncio.sleep(0.12)
+    else:
+        await _dispatch_input(tab, move_pointer(tab, x, y))
+    if _dialog_note(tab):
+        return err(f"{label}: NOT clicked — moving the pointer there opened a dialog{_dialog_note(tab)}")
+    await _dispatch_input(tab, tab.mouse_click(x, y))
+    head = f"{label}: clicked"
+    detail = f"method=cdp_mouse {target} at ({int(x)},{int(y)})" + (" (scrolled into view)" if scrolled else "")
+    note = _dialog_note(tab)
+    if note:
+        return ok(f"{head} — {detail}{note}")
+    await asyncio.sleep(0.35)
+    note = _dialog_note(tab)
+    if note:
+        return ok(f"{head} — {detail}{note}")
+    return _click_outcome(head, detail, before, await _page_sig(tab, el, pages=True))
+
+
+async def _click_and_report(
+    tab, el, label: str, verify: bool,
+    js_fallback: bool = False, humanize: bool = False,
+) -> str:
+    """Click `el`, then report what actually happened — never a bare 'clicked'.
+
+    nodriver's Element.click() is itself a JS el.click() preceded by flash(), which
+    inserts a marker into the page: an untrusted event plus a visible DOM mutation.
+    This dispatches real mouse input at the element's position instead. It refuses
+    up-front when the hit-test says the click cannot land, and (with verify) says
+    plainly when the page did not change.
+    """
+    pos, probe, reason, scrolled = await _prepare_target(el)
     target = f"target=<{probe.get('target') or 'unknown'}>"
     if reason is not None:
         if not js_fallback:
@@ -3687,19 +3968,28 @@ async def _click_and_report(
         return _click_outcome(head, detail, before, await _page_sig(tab, el, pages=True))
 
     before = await _page_sig(tab, el, pages=True) if verify else {}
+    x, y = pos.left + pos.width / 2, pos.top + pos.height / 2
     if humanize:
         hx, hy = await _humanized_point(el, pos, x, y)
-        await humanized_click(tab, el, last_pos_ref=BrowserState.last_mouse_xy, point=(hx, hy))
+        await _dispatch_input(tab, humanized_click(
+            tab, el, last_pos_ref=BrowserState.last_mouse_xy, point=(hx, hy)))
         where = f"humanized point ({int(hx)},{int(hy)}) inside the element"
     else:
-        await move_pointer(tab, x, y)
-        await tab.mouse_click(x, y)
+        await _dispatch_input(tab, move_pointer(tab, x, y))
+        if _dialog_note(tab):
+            return err(f"{label}: NOT clicked — moving the pointer there opened a dialog"
+                       f"{_dialog_note(tab)}")
+        await _dispatch_input(tab, tab.mouse_click(x, y))
         where = f"({int(x)},{int(y)})"
     head = f"{label}: clicked"
     detail = f"method=cdp_mouse {target} at {where}" + (" (scrolled into view)" if scrolled else "")
-    if not verify:
-        return ok(f"{head} — {detail}")
+    note = _dialog_note(tab)
+    if note or not verify:
+        return ok(f"{head} — {detail}{note}")
     await asyncio.sleep(0.35)  # let handlers/render settle before re-reading
+    note = _dialog_note(tab)
+    if note:
+        return ok(f"{head} — {detail}{note}")
     return _click_outcome(head, detail, before, await _page_sig(tab, el, pages=True))
 
 
@@ -3724,6 +4014,11 @@ async def click_text(text: str, exact: bool = False, verify: bool = True) -> str
     try:
         tab = BrowserState.active_tab()
         el = await tab.find(text, best_match=not exact)
+        if el is not None and exact:
+            # tab.find only ever matches by containment.
+            whole = await el.apply("function() { return (this.innerText || this.value || '').trim(); }")
+            if str(whole or "").lower() != text.strip().lower():
+                el = None
         in_frame = el is not None and _element_is_in_frame(tab, el)
         if in_frame:
             el = None
@@ -3738,19 +4033,26 @@ async def click_text(text: str, exact: bool = False, verify: bool = True) -> str
         if cand.get("x") is not None:
             before = await _page_sig(tab, pages=True) if verify else {}
             try:
-                await move_pointer(tab, cand["x"], cand["y"])
+                await _dispatch_input(tab, move_pointer(tab, cand["x"], cand["y"]))
             except Exception:
                 pass
-            await tab.mouse_click(cand["x"], cand["y"])
+            if _dialog_note(tab):
+                return err(f"{label}: NOT clicked — moving the pointer there opened a dialog"
+                           f"{_dialog_note(tab)}")
+            await _dispatch_input(tab, tab.mouse_click(cand["x"], cand["y"]))
             note = (f"{label}: clicked — method=cdp_mouse target=<{cand.get('target')}> "
                     f"at {{'x': {cand['x']}, 'y': {cand['y']}}}"
                     + (" (scrolled into view)" if cand.get("scrolled") else "")
                     + (f"; first text match was unreachable, used a visible one "
                        f"of {cand.get('found')} candidates"
                        if el is not None else ""))
+            if _dialog_note(tab):
+                return ok(note + _dialog_note(tab))
             if not verify:
                 return ok(note)
             await asyncio.sleep(0.35)
+            if _dialog_note(tab):
+                return ok(note + _dialog_note(tab))
             head, _, detail = note.partition(" — ")
             return _click_outcome(head, detail, before, await _page_sig(tab, pages=True))
 
@@ -3776,6 +4078,34 @@ async def click_text(text: str, exact: bool = False, verify: bool = True) -> str
         return err(str(e))
 
 
+_IMPLICIT_ROLE_CSS = {
+    "button": 'button, input[type="button"], input[type="submit"], input[type="reset"], summary',
+    "link": "a[href], area[href]",
+    "textbox": ('input:not([type]), input[type="text"], input[type="email"], input[type="tel"], '
+                'input[type="url"], input[type="password"], textarea'),
+    "searchbox": 'input[type="search"]',
+    "checkbox": 'input[type="checkbox"]',
+    "radio": 'input[type="radio"]',
+    "combobox": "select",
+    "listbox": "select[multiple]",
+    "heading": "h1, h2, h3, h4, h5, h6",
+    "img": "img",
+    "listitem": "li",
+    "navigation": "nav",
+    "main": "main",
+    "spinbutton": 'input[type="number"]',
+    "slider": 'input[type="range"]',
+}
+_ACCESSIBLE_NAME_JS = """
+function() {
+  const labels = Array.from(this.labels || []).map(l => l.innerText);
+  return [this.getAttribute('aria-label'), this.getAttribute('title'), this.getAttribute('alt'),
+          this.getAttribute('placeholder'), this.innerText, this.value, ...labels]
+    .filter(Boolean).join(' ');
+}
+"""
+
+
 @mcp.tool()
 async def click_role(role: str, name: Optional[str] = None, verify: bool = True) -> str:
     """Click by ARIA role (e.g. button, link, textbox), optional accessible name.
@@ -3790,34 +4120,33 @@ async def click_role(role: str, name: Optional[str] = None, verify: bool = True)
         # only valid selectors, then narrow by accessible name in Python.
         el = None
         tried: list[str] = []
-        if name:
-            quoted = name.replace("\\", "\\\\").replace('"', '\\"')
-            for sel in (f'[role="{role}"][aria-label*="{quoted}"]',
-                        f'[role="{role}"][title*="{quoted}"]'):
-                tried.append(sel)
-                try:
-                    el = await tab.query_selector(sel)
-                except Exception:
-                    el = None
-                if el is not None:
-                    break
-            if el is None:
+        # Most controls have their role implicitly: a <button> has no role attribute.
+        role_css = f'[role="{role}"]'
+        if _IMPLICIT_ROLE_CSS.get(role):
+            role_css += ", " + _IMPLICIT_ROLE_CSS[role]
+        tried.append(role_css + (f" named {name!r}" if name else ""))
+        try:
+            candidates = await tab.query_selector_all(role_css)
+        except Exception:
+            candidates = []
+        first_rendered = None
+        for candidate in candidates:
+            if name:
                 # A name was asked for, so the first element of that role will not do:
                 # click_role("button", name="Save") must never reach a Delete button.
-                tried.append(f'[role="{role}"] with text {name!r}')
                 try:
-                    for candidate in await tab.query_selector_all(f'[role="{role}"]'):
-                        if name.lower() in (candidate.text_all or "").lower():
-                            el = candidate
-                            break
+                    accessible = await candidate.apply(_ACCESSIBLE_NAME_JS)
                 except Exception:
-                    el = None
-        else:
-            tried.append(f'[role="{role}"]')
-            try:
-                el = await tab.query_selector(f'[role="{role}"]')
-            except Exception:
-                el = None
+                    continue
+                if name.lower() not in str(accessible or "").lower():
+                    continue
+            probe = await _click_probe(candidate)
+            if first_rendered is None:
+                first_rendered = candidate
+            if not probe.get("hidden") and probe.get("sized"):
+                el = candidate
+                break
+        el = el or first_rendered
         if el is None and name:
             el = await tab.find(name, best_match=True)
             if el is not None and _element_is_in_frame(tab, el):
@@ -3915,11 +4244,15 @@ async def hover(ref: Optional[str] = None, selector: Optional[str] = None) -> st
         el = await resolve_ref(ref) if ref else (await tab.query_selector(selector) if selector else None)
         if el is None:
             return err("element not found")
-        pos = await el.get_position()
-        if pos is None:
-            return err("position unavailable")
-        await move_pointer(tab, int(pos.left + pos.width / 2), int(pos.top + pos.height / 2))
-        return ok("hovered")
+        pos, probe, reason, scrolled = await _prepare_target(el)
+        # A disabled control still shows its tooltip, so that alone does not stop a hover.
+        if reason == "element is disabled":
+            pos, reason = await _settled_position(el), None
+        if reason is not None or pos is None:
+            return err(f"NOT hovered — {reason or 'element has no on-screen position'}. "
+                       f"target=<{probe.get('target') or 'unknown'}> rect={probe.get('rect')}.")
+        await _dispatch_input(tab, move_pointer(tab, int(pos.left + pos.width / 2), int(pos.top + pos.height / 2)))
+        return ok(("hovered (scrolled into view)" if scrolled else "hovered") + _dialog_note(tab))
     except Exception as e:
         return err(str(e))
 
@@ -3927,7 +4260,7 @@ async def hover(ref: Optional[str] = None, selector: Optional[str] = None) -> st
 @mcp.tool()
 async def fill(ref: Optional[str] = None, selector: Optional[str] = None,
                value: str = "") -> str:
-    """Fill input/textarea via set_value (fast, works for standard inputs)."""
+    """Clear a field and type into it with real key presses, then read it back."""
     try:
         tab = BrowserState.active_tab()
         el = await resolve_ref(ref) if ref else (await tab.query_selector(selector) if selector else None)
@@ -3951,9 +4284,10 @@ async def fill(ref: Optional[str] = None, selector: Optional[str] = None,
                     if index:
                         await _dispatch_key(el.tab, key_event_params("Enter"))
                     if line:
-                        await el.send_keys(line)
+                        await _type_keys(el.tab, line, press_controls=False)
             else:
-                await el.send_keys(value)
+                await el.apply("function() { this.focus(); }")
+                await _type_keys(el.tab, str(value), press_controls=False)
         except Exception:
             await el.set_value(value)
         actual = await el.apply(
@@ -3979,25 +4313,68 @@ async def fill(ref: Optional[str] = None, selector: Optional[str] = None,
         return err(str(e))
 
 
+# What has focus, seen from outside any open shadow root: "none", "frame", "multi", "single"
+# or "other:<tag>".
+_FOCUSED_FIELD_JS = """
+(() => {
+  let a = document.activeElement;
+  while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement;
+  if (!a || a === document.body || a === document.documentElement) return 'none';
+  if (a.tagName === 'IFRAME' || a.tagName === 'FRAME') return 'frame';
+  if (a.isContentEditable || a.tagName === 'TEXTAREA') return 'multi';
+  const noText = ['button', 'submit', 'reset', 'checkbox', 'radio', 'file', 'image', 'color', 'range'];
+  if (a.tagName === 'INPUT' && !noText.includes(a.type)) return 'single';
+  return 'other:' + a.tagName.toLowerCase();
+})()
+"""
+
+
+async def _type_keys(tab, text: str, mean_delay: Optional[float] = None,
+                     press_controls: bool = True) -> None:
+    """Press a key per character. Element.send_keys sends only a char event: a page sees a
+    keypress with an empty key and no keydown at all, which nothing a person types produces.
+
+    press_controls=False is for filling one field: Enter would submit its form and Tab would
+    leave it, so a newline adds nothing and fill's read-back reports the difference.
+    """
+    from nodriver.cdp import input_ as cdp_input
+    for ch in re.sub(r"\r\n?", "\n", text):
+        if ch == "\n":
+            if press_controls:
+                await _dispatch_key(tab, key_event_params("Enter"))
+        elif ch == "\t" and press_controls:
+            await _dispatch_key(tab, key_event_params("Tab"))
+        elif ch.isascii() and ch.isprintable():
+            await _dispatch_key(tab, key_event_params(ch))
+        else:
+            await tab.send(cdp_input.dispatch_key_event(type_="char", text=ch))
+        if mean_delay is not None:
+            await asyncio.sleep(max(0.02, random.gauss(mean_delay, 0.08)))
+
+
 @mcp.tool()
 async def type_text(text: str, humanize: bool = False,
                      mean_delay: float = 0.12) -> str:
-    """Type into focused element (keystroke-by-keystroke). Use humanize for Gaussian delays."""
+    """Type into the focused element, one real key press per character.
+
+    Each character sends keydown and keyup, as a keyboard does. A newline presses Enter in
+    a textarea or contenteditable and is refused in a single-line field, where it would
+    submit the form. Use press_key for shortcuts when no field has focus.
+    Use humanize for Gaussian delays between keys.
+    """
     try:
         tab = BrowserState.active_tab()
-        active = await tab.evaluate(
-            "document.activeElement ? document.activeElement.tagName : null",
-            return_by_value=True,
-        )
-        if not active:
-            return err("no focused element — click/focus an input first")
-        el = await active_element(tab)
-        if el is None:
-            return err("focused element lookup failed")
-        if humanize:
-            await humanized_type(el, text, mean_delay=mean_delay)
-        else:
-            await el.send_keys(text)
+        raw = await tab.evaluate(_FOCUSED_FIELD_JS, return_by_value=True)
+        kind = raw.value if hasattr(raw, "value") and not isinstance(raw, str) else raw
+        if kind == "none":
+            return err("no field has focus, so nothing was typed — click or focus one first, "
+                       "or use press_key for a shortcut")
+        if isinstance(kind, str) and kind.startswith("other:"):
+            return err(f"the focused <{kind[6:]}> does not take text, so nothing was typed")
+        if kind == "single" and re.search(r"[\r\n]", text):
+            return err("a newline in a single-line field would submit the form; nothing was "
+                       "typed. Type the text without it, then use press_key('Enter').")
+        await _type_keys(tab, text, mean_delay if humanize else None)
         return ok("typed")
     except Exception as e:
         return err(str(e))
@@ -4009,9 +4386,14 @@ async def _dispatch_key(tab: Any, params: dict) -> None:
 
     fields = {k: v for k, v in params.items() if k != "text"}
     text = params.get("text")
+    # On macOS select-all is an editor command, not something Ctrl/Cmd+A does by itself.
+    commands = None
+    if (sys.platform == "darwin" and str(params.get("key", "")).lower() == "a"
+            and params.get("modifiers", 0) & 6):
+        commands = ["selectAll"]
     await tab.send(cdp_input.dispatch_key_event(
         type_="keyDown" if text else "rawKeyDown",
-        text=text, unmodified_text=text, **fields,
+        text=text, unmodified_text=text, commands=commands, **fields,
     ))
     await tab.send(cdp_input.dispatch_key_event(type_="keyUp", **fields))
 
@@ -4022,7 +4404,8 @@ def _key_effect(before: dict, after: dict) -> Optional[str]:
         return None
     if before.get("url") != after.get("url"):
         return f"navigated to {after.get('url')}"
-    if before.get("len") != after.get("len") or before.get("nodes") != after.get("nodes"):
+    if (before.get("len") != after.get("len") or before.get("hash") != after.get("hash")
+            or before.get("nodes") != after.get("nodes")):
         return f"page changed (nodes {before.get('nodes')}→{after.get('nodes')})"
     if before.get("active") != after.get("active"):
         return f"focus moved to <{(after.get('active') or '?').lower()}>"
@@ -4060,7 +4443,9 @@ async def press_key(key: str, verify: bool = True, settle_ms: int = 1000) -> str
             ident = (focused.attrs.get("id") if focused.attrs else None) or ""
             target = f"<{focused.node_name.lower()}{'#' + ident if ident else ''}>"
         before = await _page_sig(tab, focused) if verify else {}
-        await _dispatch_key(tab, params)
+        await _dispatch_input(tab, _dispatch_key(tab, params))
+        if _dialog_note(tab):
+            return ok(f"pressed {key} — sent to {target}{_dialog_note(tab)}")
         if not verify:
             return ok(f"pressed {key} — sent to {target}; effect not checked (verify=False)")
         deadline = time.monotonic() + max(0, settle_ms) / 1000
@@ -4242,8 +4627,15 @@ async def upload_file(
         el = await resolve_ref(ref) if ref else (await tab.query_selector(selector) if selector else None)
         if el is None:
             return err("element not found")
-        await el.send_file(file_path)
-        return ok(f"uploaded {file_path}")
+        # Chrome accepts any path here, and a page then receives an empty file of that name.
+        path = Path(file_path).expanduser()
+        if not path.is_file():
+            return err(f"upload_file: {file_path} is not a file on this machine; nothing was set")
+        await el.send_file(str(path.resolve()))
+        count = await el.apply("function() { return this.files ? this.files.length : 0; }")
+        if count != 1:
+            return err(f"upload_file: the input reports {count} file(s) after setting {path.name}")
+        return ok(f"uploaded {path}")
     except Exception as e:
         return err(str(e))
 
@@ -4251,6 +4643,22 @@ async def upload_file(
 # ══════════════════════════════════════════════════════════════════════════
 # 5. MOUSE XY + DRAG
 # ══════════════════════════════════════════════════════════════════════════
+
+
+async def _outside_viewport(tab, x: float, y: float) -> str:
+    """Why this point cannot receive input, or "". Chrome drops events outside the viewport."""
+    raw = await _wait(tab.evaluate("innerWidth + 'x' + innerHeight", return_by_value=True),
+                      timeout=5.0, what="viewport read")
+    raw = raw.value if hasattr(raw, "value") and not isinstance(raw, str) else raw
+    width, _, height = str(raw).partition("x")
+    if width.isdigit() and height.isdigit() and not (0 <= x < int(width) and 0 <= y < int(height)):
+        return f"({x},{y}) is outside the {width}x{height} viewport, where nothing receives it"
+    return ""
+
+
+def _mouse_button(name: str):
+    from nodriver.cdp.input_ import MouseButton
+    return MouseButton(name)
 
 
 @mcp.tool()
@@ -4267,16 +4675,24 @@ async def mouse_click_xy(x: int, y: int, button: str = "left",
             on hover (Canva, Figma, Notion) are unreachable without it. Set False
             only if a hover handler would interfere.
     """
+    if button not in ("left", "right", "middle"):
+        return err(f"mouse_click_xy: button must be left, right or middle, not {button!r}")
     try:
         tab = BrowserState.active_tab()
+        outside = await _outside_viewport(tab, x, y)
+        if outside:
+            return err(f"mouse_click_xy: NOT clicked — {outside}")
         if move_first:
             # Hover first so hover-rendered targets exist before mousedown.
             try:
-                await move_pointer(tab, x, y)
+                await _dispatch_input(tab, move_pointer(tab, x, y))
             except Exception:
                 pass  # best-effort; the click below is what matters
-        await tab.mouse_click(x, y, button=button)
-        return ok(f"clicked ({x},{y}){' after hover' if move_first else ''}")
+            if _dialog_note(tab):
+                return err(f"mouse_click_xy: NOT clicked — moving the pointer there opened a "
+                           f"dialog{_dialog_note(tab)}")
+        await _dispatch_input(tab, tab.mouse_click(x, y, button=_mouse_button(button)))
+        return ok(f"clicked ({x},{y}){' after hover' if move_first else ''}{_dialog_note(tab)}")
     except Exception as e:
         return err(str(e))
 
@@ -4286,12 +4702,15 @@ async def mouse_move(x: int, y: int, humanize: bool = False) -> str:
     """Move cursor to raw coordinates. humanize=True uses Bezier path."""
     try:
         tab = BrowserState.active_tab()
+        outside = await _outside_viewport(tab, x, y)
+        if outside:
+            return err(f"mouse_move: not moved — {outside}")
         if humanize:
             # Start from a random offset; nodriver has no current-pos getter
-            await humanized_move(tab, x + 100, y + 100, x, y)
+            await _dispatch_input(tab, humanized_move(tab, x + 100, y + 100, x, y))
         else:
-            await move_pointer(tab, x, y)
-        return ok(f"moved to ({x},{y})")
+            await _dispatch_input(tab, move_pointer(tab, x, y))
+        return ok(f"moved to ({x},{y}){_dialog_note(tab)}")
     except Exception as e:
         return err(str(e))
 
@@ -4307,28 +4726,35 @@ async def drag_and_drop(start_x: int, start_y: int, end_x: int, end_y: int) -> s
         from nodriver.cdp import input_ as cdp_input
         left = cdp_input.MouseButton.LEFT
         before = await _page_sig(tab)
-        await move_pointer(tab, start_x, start_y)
-        await tab.send(cdp_input.dispatch_mouse_event(
-            type_="mousePressed", x=start_x, y=start_y, button=left, buttons=1, click_count=1,
-        ))
-        x, y = start_x, start_y
-        try:
-            # Intermediate steps for natural drag
-            steps = 20
-            for i in range(1, steps + 1):
-                t = i / steps
-                x = int(start_x + (end_x - start_x) * t)
-                y = int(start_y + (end_y - start_y) * t)
-                await tab.send(cdp_input.dispatch_mouse_event(
-                    type_="mouseMoved", x=x, y=y, button=left, buttons=1,
-                ))
-                await asyncio.sleep(0.02)
-        finally:
-            # Always let go: a button left down turns every later move into a drag.
+
+        async def gesture():
+            await move_pointer(tab, start_x, start_y)
             await tab.send(cdp_input.dispatch_mouse_event(
-                type_="mouseReleased", x=x, y=y, button=left, buttons=0, click_count=1,
+                type_="mousePressed", x=start_x, y=start_y, button=left, buttons=1, click_count=1,
             ))
-        BrowserState.last_mouse_xy.update(x=x, y=y)
+            x, y = start_x, start_y
+            try:
+                # Intermediate steps for natural drag
+                steps = 20
+                for i in range(1, steps + 1):
+                    t = i / steps
+                    x = int(start_x + (end_x - start_x) * t)
+                    y = int(start_y + (end_y - start_y) * t)
+                    await tab.send(cdp_input.dispatch_mouse_event(
+                        type_="mouseMoved", x=x, y=y, button=left, buttons=1,
+                    ))
+                    await asyncio.sleep(0.02)
+            finally:
+                # Always let go: a button left down turns every later move into a drag.
+                await tab.send(cdp_input.dispatch_mouse_event(
+                    type_="mouseReleased", x=x, y=y, button=left, buttons=0, click_count=1,
+                ))
+            BrowserState.last_mouse_xy.update(x=x, y=y)
+
+        await _dispatch_input(tab, gesture())
+        if _dialog_note(tab):
+            return ok(f"drag from ({start_x},{start_y}) interrupted{_dialog_note(tab)}. "
+                      f"It finishes once the dialog is answered.")
         await asyncio.sleep(0.35)
         return _click_outcome(
             f"dragged ({start_x},{start_y}) to ({end_x},{end_y})", "method=cdp_mouse",
@@ -4341,17 +4767,25 @@ async def drag_and_drop(start_x: int, start_y: int, end_x: int, end_y: int) -> s
 @mcp.tool()
 async def wait_for(selector: Optional[str] = None, text: Optional[str] = None,
                     timeout: float = 10.0) -> str:
-    """Wait until selector exists or text appears on page."""
+    """Wait until selector exists or text is visible on the page. With neither, just sleep."""
     try:
         tab = BrowserState.active_tab()
         if selector:
             await tab.wait_for(selector=selector, timeout=timeout)
             return ok(f"{selector} appeared")
         if text:
-            el = await tab.find(text, best_match=True, timeout=timeout)
-            if el is None:
-                return err(f"{text!r} not found")
-            return ok(f"{text!r} found")
+            # Rendered text. tab.find also matches display:none nodes and <script> bodies.
+            needle = json.dumps(text)
+            expr = (f"[window, ...Array.from(window.frames)].some(w => {{ try {{ "
+                    f"return !!w.document.body && w.document.body.innerText.includes({needle}); "
+                    f"}} catch (e) {{ return false; }} }})")
+            deadline = time.monotonic() + timeout
+            while True:
+                if await _eval_checked(tab, expr) is True:
+                    return ok(f"{text!r} found")
+                if time.monotonic() >= deadline:
+                    return err(f"{text!r} is not visible on the page after {timeout}s")
+                await asyncio.sleep(0.2)
         await asyncio.sleep(timeout)
         return ok(f"slept {timeout}s")
     except Exception as e:
@@ -4403,8 +4837,7 @@ async def wait_for_change(selector: Optional[str] = None, text: Optional[str] = 
                 if url_contains in (cur or ""):
                     return ok(f"url now contains {url_contains!r} after {elapsed}s — {cur}")
             elif expr:
-                v = await tab.evaluate(expr, return_by_value=True)
-                v = v.value if hasattr(v, "value") and not isinstance(v, str) else v
+                v = await _eval_checked(tab, expr)
                 hit = bool(json.loads(v).get("hit")) if v else False
                 if hit != gone:  # gone=False → want hit; gone=True → want !hit
                     what = selector or repr(text)
@@ -4416,6 +4849,7 @@ async def wait_for_change(selector: Optional[str] = None, text: Optional[str] = 
                     cur.get("url") != baseline.get("url")
                     or cur.get("nodes") != baseline.get("nodes")
                     or cur.get("len") != baseline.get("len")
+                    or cur.get("hash") != baseline.get("hash")
                 ):
                     if cur.get("url") != baseline.get("url"):
                         return ok(f"page navigated after {elapsed}s → {cur.get('url')}")
@@ -4435,11 +4869,14 @@ async def wait_for_change(selector: Optional[str] = None, text: Optional[str] = 
 
 @mcp.tool()
 async def wait_for_navigation(timeout: float = 15.0) -> str:
-    """Wait until the page finishes loading."""
+    """Wait until document.readyState is complete, or report that it did not get there."""
     try:
         tab = BrowserState.active_tab()
-        await tab.wait(t=timeout)
+        await asyncio.sleep(min(0.25, max(0.0, timeout)))  # let a navigation just started commit
+        loaded = await _wait_load_complete(tab, timeout)
         url, _title = await _page_facts_for_report(tab)
+        if not loaded:
+            return err(f"the page at {url} had not finished loading after {timeout}s")
         return ok(f"navigated to {url}")
     except Exception as e:
         return err(str(e))
@@ -4559,7 +4996,7 @@ async def tab_new(
             if url != "about:blank":
                 await new_tab.get(url)
                 try:
-                    await _wait(new_tab.wait(), timeout=10, what="tab_new settle")
+                    await _wait_load_complete(new_tab, 10)
                 except Exception:
                     pass
             observed = await _observe_navigation(new_tab, url, disarm())
@@ -4777,12 +5214,16 @@ async def cookie_set(name: str, value: str, domain: str, path: str = "/",
     try:
         if not BrowserState.browser:
             return err("browser not running")
+        if not name:
+            return err("cookie_set: name must not be empty")
         from nodriver.cdp import network as cdp_network
         tab = BrowserState.active_tab()
-        await tab.send(cdp_network.set_cookie(
+        accepted = await tab.send(cdp_network.set_cookie(
             name=name, value=value, domain=domain, path=path,
             secure=secure, http_only=http_only,
         ))
+        if accepted is False:
+            return err(f"the browser refused cookie {name} on {domain}")
         return ok(f"cookie {name} set on {domain}")
     except Exception as e:
         return err(str(e))
@@ -4790,17 +5231,50 @@ async def cookie_set(name: str, value: str, domain: str, path: str = "/",
 
 @mcp.tool()
 async def cookie_delete(name: str, domain: Optional[str] = None) -> str:
-    """Delete cookies matching name (optionally scoped to domain)."""
+    """Delete cookies by name, then read back to prove they are gone.
+
+    domain: only this domain, with or without a leading dot. Omit it to delete what
+    applies to the active tab's host, including its parent domains.
+    """
     try:
         if not BrowserState.browser:
             return err("browser not running")
         from nodriver.cdp import network as cdp_network
+        from urllib.parse import urlsplit
         tab = BrowserState.active_tab()
-        if domain:
-            await tab.send(cdp_network.delete_cookies(name=name, domain=domain))
-        else:
-            await tab.send(cdp_network.delete_cookies(name=name))
-        return ok(f"cookie {name} deleted")
+        host = ""
+        if not domain:
+            host = (urlsplit(await get_url(tab, strict=True)).hostname or "").lower()
+            if not host:
+                return err("cookie_delete: the active tab has no host; pass domain=")
+
+        def applies(cookie_domain: str) -> bool:
+            bare = (cookie_domain or "").lstrip(".").lower()
+            if domain:
+                return bare == domain.lstrip(".").lower()
+            return host == bare or host.endswith("." + bare)
+
+        async def matching() -> list:
+            found = await BrowserState.browser.cookies.get_all()
+            return [c for c in found if c.name == name and applies(c.domain)]
+
+        targets = await matching()
+        if not targets:
+            return err(f"no cookie named {name} on {domain or host}; nothing was deleted")
+        for cookie in targets:
+            # Network.deleteCookies matches the exact stored domain, path and partition, and
+            # answers success whether or not anything matched.
+            kwargs = {"name": name, "domain": cookie.domain, "path": cookie.path}
+            partition = getattr(cookie, "partition_key", None)
+            if partition is not None:
+                kwargs["partition_key"] = partition
+            await tab.send(cdp_network.delete_cookies(**kwargs))
+        left = await matching()
+        if left:
+            where = ", ".join(sorted({f"{c.domain}{c.path}" for c in left}))
+            return err(f"cookie {name} is still present on {where} after the delete")
+        where = ", ".join(sorted({c.domain for c in targets}))
+        return ok(f"cookie {name} deleted from {where} ({len(targets)})")
     except Exception as e:
         return err(str(e))
 
@@ -5012,19 +5486,23 @@ async def cookie_export(filename: Optional[str] = None,
 # ══════════════════════════════════════════════════════════════════════════
 
 
+async def _eval_checked(tab, expression: str) -> Any:
+    """Evaluate and return the value. A script that threw raises, so its error can't read as one."""
+    value = await _wait(tab.evaluate(expression, return_by_value=True), what="page script")
+    if isinstance(value, cdp_runtime.ExceptionDetails):
+        raise RuntimeError(f"JavaScript threw: {_js_exception_text(value)}")
+    if hasattr(value, "value") and not isinstance(value, (str, int, float, bool, list, dict)):
+        return value.value
+    return value
+
+
 @mcp.tool()
 async def localstorage_get(key: Optional[str] = None) -> str:
     """Get localStorage — all keys or one specific key."""
     try:
         tab = BrowserState.active_tab()
         if key:
-            result = await tab.evaluate(
-                f"localStorage.getItem({json.dumps(key)})", return_by_value=True,
-            )
-            # nodriver hands back a raw RemoteObject when the value is falsy
-            # (e.g. empty-string item) — unwrap so we never return its repr.
-            if hasattr(result, "value") and not isinstance(result, (str, int, float, bool, list, dict)):
-                result = result.value
+            result = await _eval_checked(tab, f"localStorage.getItem({json.dumps(key)})")
             return ok(str(result) if result is not None else "null")
         all_ls = await tab.get_local_storage()
         return ok(json.dumps(all_ls, indent=2))
@@ -5037,10 +5515,7 @@ async def localstorage_set(key: str, value: str) -> str:
     """Set a localStorage entry."""
     try:
         tab = BrowserState.active_tab()
-        await tab.evaluate(
-            f"localStorage.setItem({json.dumps(key)}, {json.dumps(value)})",
-            return_by_value=True,
-        )
+        await _eval_checked(tab, f"localStorage.setItem({json.dumps(key)}, {json.dumps(value)})")
         return ok("set")
     except Exception as e:
         return err(str(e))
@@ -5051,7 +5526,7 @@ async def localstorage_clear() -> str:
     """Clear all localStorage for current origin."""
     try:
         tab = BrowserState.active_tab()
-        await tab.evaluate("localStorage.clear()", return_by_value=True)
+        await _eval_checked(tab, "localStorage.clear()")
         return ok("cleared")
     except Exception as e:
         return err(str(e))
@@ -5063,19 +5538,13 @@ async def sessionstorage_get(key: Optional[str] = None) -> str:
     try:
         tab = BrowserState.active_tab()
         if key:
-            result = await tab.evaluate(
-                f"sessionStorage.getItem({json.dumps(key)})", return_by_value=True,
-            )
-            if hasattr(result, "value") and not isinstance(result, (str, int, float, bool, list, dict)):
-                result = result.value
+            result = await _eval_checked(tab, f"sessionStorage.getItem({json.dumps(key)})")
             return ok(str(result) if result is not None else "null")
         # Enumerate all keys
-        result = await tab.evaluate(
+        result = await _eval_checked(
+            tab,
             "(() => {var o={}; for(var i=0;i<sessionStorage.length;i++){var k=sessionStorage.key(i); o[k]=sessionStorage.getItem(k);} return JSON.stringify(o);})()",
-            return_by_value=True,
         )
-        if hasattr(result, "value") and not isinstance(result, (str, int, float, bool, list, dict)):
-            result = result.value
         return ok(str(result or "{}"))
     except Exception as e:
         return err(str(e))
@@ -5086,10 +5555,7 @@ async def sessionstorage_set(key: str, value: str) -> str:
     """Set a sessionStorage entry."""
     try:
         tab = BrowserState.active_tab()
-        await tab.evaluate(
-            f"sessionStorage.setItem({json.dumps(key)}, {json.dumps(value)})",
-            return_by_value=True,
-        )
+        await _eval_checked(tab, f"sessionStorage.setItem({json.dumps(key)}, {json.dumps(value)})")
         return ok("set")
     except Exception as e:
         return err(str(e))
@@ -5100,7 +5566,7 @@ async def sessionstorage_clear() -> str:
     """Clear all sessionStorage for current origin (parity with localstorage_clear)."""
     try:
         tab = BrowserState.active_tab()
-        await tab.evaluate("sessionStorage.clear()", return_by_value=True)
+        await _eval_checked(tab, "sessionStorage.clear()")
         return ok("cleared")
     except Exception as e:
         return err(str(e))
@@ -5164,6 +5630,10 @@ async def indexeddb_delete(database_name: str) -> str:
         if not origin:
             return err(f"cannot derive origin from URL: {url}")
         from nodriver.cdp import indexed_db as cdp_idb
+        await tab.send(cdp_idb.enable())
+        names = await tab.send(cdp_idb.request_database_names(security_origin=origin))
+        if database_name not in (names or []):
+            return err(f"no IndexedDB database {database_name!r} for {origin}; nothing was deleted")
         await tab.send(cdp_idb.delete_database(
             database_name=database_name, security_origin=origin,
         ))
@@ -5183,6 +5653,21 @@ def _js_exception_text(details: Any) -> str:
                or getattr(details, "text", "exception"))
 
 
+def _remote_value_text(remote: Any) -> str:
+    """The result of Runtime.evaluate as text. JSON for anything JSON can say."""
+    value = getattr(remote, "value", None)
+    if value is not None:
+        return value if isinstance(value, str) else json.dumps(value, indent=2, default=str)
+    if getattr(remote, "unserializable_value", None) is not None:  # NaN, Infinity, 5n
+        return str(remote.unserializable_value)
+    kind = str(getattr(getattr(remote, "type_", None), "value", getattr(remote, "type_", "")))
+    if kind == "undefined":
+        return "undefined"
+    if getattr(remote, "subtype", None) == "null" or kind in ("", "object") and not remote.description:
+        return "null"
+    return str(remote.description)  # a function or symbol has a description, not a value
+
+
 @mcp.tool()
 async def evaluate(
     expression: str,
@@ -5199,25 +5684,27 @@ async def evaluate(
     """
     if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int) or not 1 <= timeout_ms <= 600_000:
         return err("timeout_ms must be an integer between 1 and 600000")
+    page = None
     try:
         page = select_tab(tab)
+        with contextlib.suppress(Exception):
+            await _watch_dialogs(page)
         attempts = 2 if survive_navigation else 1
         for attempt in range(attempts):
             try:
-                result = await _wait(
-                    page.evaluate(expression, await_promise=await_promise, return_by_value=True),
+                # Not Tab.evaluate: it also asks for deep serialization, and then Chrome
+                # leaves `value` empty for any object or array, which read as null.
+                remote, thrown = await _wait(
+                    page.send(cdp_runtime.evaluate(
+                        expression=expression, user_gesture=True, await_promise=await_promise,
+                        return_by_value=True, allow_unsafe_eval_blocked_by_csp=True,
+                    )),
                     timeout=timeout_ms / 1000,
                     what="evaluate",
                 )
-                if isinstance(result, cdp_runtime.ExceptionDetails):
-                    return err(f"JavaScript threw: {_js_exception_text(result)}")
-                if hasattr(result, "value") and not isinstance(result, (str, int, float, bool, list, dict)):
-                    result = result.value
-                if result is None:
-                    return ok("null")
-                if isinstance(result, (dict, list)):
-                    return ok(json.dumps(result, indent=2, default=str))
-                return ok(str(result))
+                if thrown:
+                    return err(f"JavaScript threw: {_js_exception_text(thrown)}")
+                return ok(_remote_value_text(remote))
             except RuntimeError as exc:
                 message = str(exc).lower()
                 interrupted = "interrupted by target navigation" in message
@@ -5230,7 +5717,7 @@ async def evaluate(
                 )
         return err("evaluate did not produce a result")
     except Exception as e:
-        return err(str(e))
+        return err(str(e) + (_dialog_note(page) if page is not None else ""))
 
 
 @mcp.tool()
@@ -5290,6 +5777,8 @@ async def inject_init_script(script: str) -> str:
     try:
         tab = BrowserState.active_tab()
         from nodriver.cdp import page as cdp_page
+        # Without the Page domain the script registers and then never runs.
+        await tab.send(cdp_page.enable())
         await tab.send(cdp_page.add_script_to_evaluate_on_new_document(source=script))
         return ok("init script registered")
     except Exception as e:
@@ -5367,14 +5856,14 @@ async def query_selector_all(selector: str, limit: int = 50) -> str:
     """Return count + attrs of all elements matching CSS selector."""
     try:
         tab = BrowserState.active_tab()
-        result = await tab.evaluate(
+        result = await _eval_checked(
+            tab,
             f"(() => {{ var els = document.querySelectorAll({json.dumps(selector)}); "
             f"var out = []; for(var i=0;i<Math.min(els.length,{limit});i++){{"
             "var el=els[i]; var r=el.getBoundingClientRect(); "
             "out.push({tag:el.tagName.toLowerCase(), text:(el.innerText||'').slice(0,80), "
             "href:el.href||'', id:el.id||'', class:el.className||'', x:r.x, y:r.y}); }"
             "return JSON.stringify({count:els.length,items:out}); })()",
-            return_by_value=True,
         )
         return ok(str(result))
     except Exception as e:
@@ -5474,7 +5963,7 @@ async def frame_evaluate(frame_url_pattern: str, expression: str) -> str:
             return ok(f"{json.dumps(remote.value, default=str)}\n"
                       f"(ran in an isolated world of {found['frame'].url}: DOM shared, "
                       f"the frame's own JS globals not visible)")
-        return ok("no frame matched")
+        return err(f"no frame matched {frame_url_pattern!r}")
     except Exception as e:
         return err(str(e))
 
@@ -5559,8 +6048,12 @@ async def fill_form(fields: list[dict], submit_ref: Optional[str] = None) -> str
     results = []
     failed = 0
     for f in fields:
-        r = str(await fill(ref=f.get("ref"), selector=f.get("selector"),
-                           value=f.get("value", "")))
+        if "value" not in f:
+            # Filling with a default would silently empty a field the caller never meant to.
+            failed += 1
+            results.append(f"{f.get('ref') or f.get('selector')}: Error: no value given")
+            continue
+        r = str(await fill(ref=f.get("ref"), selector=f.get("selector"), value=f["value"]))
         failed += r.startswith("Error:")
         results.append(f"{f.get('ref') or f.get('selector')}: {r}")
     if failed:
@@ -5626,6 +6119,8 @@ async def set_viewport_size(width: int, height: int) -> str:
     The size given is the whole window, so with a visible browser the viewport comes out
     smaller by the height of its toolbars. emulate_device sets an exact viewport.
     """
+    if width <= 0 or height <= 0:
+        return err(f"set_viewport_size: width and height must be positive, got {width}x{height}")
     try:
         tab = BrowserState.active_tab()
         # set_window_size defaults to the top left corner, which moves the window.
@@ -5655,29 +6150,45 @@ async def scroll(
     humanize=False: instant scroll (faster, less stealthy).
 
     Directions: up | down | top | bottom
+
+    Reports how far the window really moved. "did not move" means it is already at that
+    end, cannot scroll, or the wheel went to a scrollable element under the pointer.
     """
+    if direction not in ("up", "down", "top", "bottom"):
+        return err(f"scroll: direction must be up, down, top or bottom, not {direction!r}")
     try:
         tab = BrowserState.active_tab()
+        before = await _eval_checked(tab, "window.scrollY")
         if direction == "top":
-            await tab.evaluate("window.scrollTo(0,0)", return_by_value=True)
-            return ok("scrolled to top")
-        if direction == "bottom":
-            await tab.evaluate(
-                "window.scrollTo(0, document.body.scrollHeight)",
-                return_by_value=True,
-            )
-            return ok("scrolled to bottom")
-
-        dy = amount if direction == "down" else -amount
-        if humanize:
-            actual = await humanized_scroll(tab, dy)
-            return ok(f"scrolled {direction} {actual}px (humanized wheel events)")
-        # Instant mode — single wheel dispatch (still real event)
-        from nodriver.cdp import input_ as cdp_input
-        await tab.send(cdp_input.dispatch_mouse_event(
-            type_="mouseWheel", x=500, y=400, delta_x=0, delta_y=dy,
-        ))
-        return ok(f"scrolled {direction} {amount}px (instant wheel)")
+            await _eval_checked(tab, "window.scrollTo(0,0)")
+            how = "to top"
+        elif direction == "bottom":
+            await _eval_checked(tab, "window.scrollTo(0, document.documentElement.scrollHeight)")
+            how = "to bottom"
+        else:
+            dy = amount if direction == "down" else -amount
+            if humanize:
+                sent = await humanized_scroll(tab, dy)
+                how = f"{direction} {sent}px (humanized wheel events)"
+            else:
+                # Instant mode — single wheel dispatch (still real event)
+                from nodriver.cdp import input_ as cdp_input
+                await tab.send(cdp_input.dispatch_mouse_event(
+                    type_="mouseWheel", x=500, y=400, delta_x=0, delta_y=dy,
+                ))
+                how = f"{direction} {amount}px (instant wheel)"
+        # The wheel is applied after the dispatch returns.
+        after = before
+        for _ in range(8):
+            after = await _eval_checked(tab, "window.scrollY")
+            if after != before:
+                await asyncio.sleep(0.05)
+                after = await _eval_checked(tab, "window.scrollY")
+                break
+            await asyncio.sleep(0.05)
+        if after == before:
+            return ok(f"scroll {how}: the window did not move (scrollY stays {before})")
+        return ok(f"scrolled {how}; scrollY {before}→{after}")
     except Exception as e:
         return err(str(e))
 
@@ -5701,33 +6212,30 @@ async def scroll_to(
     """
     if not ref and not selector:
         return err("ref or selector required")
+    if block not in ("start", "center", "end", "nearest"):
+        return err(f"scroll_to: block must be start, center, end or nearest, not {block!r}")
     try:
         tab = BrowserState.active_tab()
         behavior = "smooth" if smooth else "auto"
-        if ref:
-            el = await resolve_ref(ref)
-            await el.apply(
-                f"function() {{ this.scrollIntoView("
-                f"{{block:{json.dumps(block)}, behavior:{json.dumps(behavior)}}}); }}"
-            )
-            # A smooth scroll is still moving when this returns; the next tool
-            # would otherwise measure a position that is already out of date.
-            await _settled_position(el)
-            return ok(f"scrolled to ref {ref} (block={block})")
-        target_sel = selector
-        js = (
-            f"(() => {{ var el = document.querySelector({json.dumps(target_sel)}); "
-            f"if (!el) return 'not_found'; "
-            f"el.scrollIntoView({{block:{json.dumps(block)}, behavior:{json.dumps(behavior)}}}); "
-            f"return 'ok'; }})()"
+        el = await resolve_ref(ref) if ref else await tab.query_selector(selector)
+        if el is None:
+            return err(f"element not found: {selector}")
+        if await el.apply("function() { return this.getClientRects().length === 0; }") is True:
+            return err(f"{ref or selector} is not rendered, so it cannot be scrolled into view")
+        await el.apply(
+            f"function() {{ this.scrollIntoView("
+            f"{{block:{json.dumps(block)}, behavior:{json.dumps(behavior)}}}); }}"
         )
-        res = await tab.evaluate(js, return_by_value=True)
-        if str(res) == "not_found":
-            return err(f"element not found: {target_sel}")
-        # Wait for smooth scroll to complete
-        if smooth:
-            await asyncio.sleep(random.uniform(0.4, 0.8))
-        return ok(f"scrolled element into view (block={block})")
+        # A smooth scroll is still moving when this returns; the next tool
+        # would otherwise measure a position that is already out of date.
+        await _settled_position(el)
+        visible = await el.apply(
+            "function() { const r = this.getBoundingClientRect(); return r.bottom > 0 "
+            "&& r.right > 0 && r.top < innerHeight && r.left < innerWidth; }"
+        )
+        if visible is not True:
+            return err(f"{ref or selector} is still outside the viewport after scrolling")
+        return ok(f"scrolled {ref or selector} into view (block={block})")
     except Exception as e:
         return err(str(e))
 
@@ -5761,13 +6269,22 @@ _DIALOG_INSTANCE_CFG: dict[tuple[str, str], dict] = {}
 
 @mcp.tool()
 async def dialog_handle(action: str = "accept", text: Optional[str] = None) -> str:
-    """Pre-arm handler for next alert/confirm/prompt. Call BEFORE action that triggers it."""
+    """Answer the next alert/confirm/prompt. Call BEFORE the action that triggers it.
+
+    A click that opened a dialog with nothing armed reports it; call this then too, and
+    the dialog that is already open gets the answer.
+    """
+    if action not in ("accept", "dismiss"):
+        return err(f"dialog_handle: action must be 'accept' or 'dismiss', not {action!r}")
     pre_cfg = _instance_dialog_cfg("pre")
-    pre_cfg["action"] = action
-    pre_cfg["text"] = text
-    pre_cfg["pending"] = True
     try:
         tab = BrowserState.active_tab()
+        answered = await _answer_open_dialog(tab, action, text)
+        if answered:
+            return answered
+        pre_cfg["action"] = action
+        pre_cfg["text"] = text
+        pre_cfg["pending"] = True
         from nodriver.cdp import page as cdp_page
         tid = _target_key(tab)
         if tid in _dialog_pre_action["_registered_tab_ids"]:
@@ -5790,8 +6307,9 @@ async def dialog_handle(action: str = "accept", text: Optional[str] = None) -> s
                 pass
 
         # nodriver up to 0.48 enabled the domain for a registered handler; 0.50 does not,
-        # and without this the dialog event never arrives.
-        await tab.send(cdp_page.enable())
+        # and without this the dialog event never arrives. Bounded, because the renderer
+        # cannot answer while a dialog this server never saw is open.
+        await _wait(tab.send(cdp_page.enable()), timeout=5.0, what="dialog_handle")
         tab.add_handler(cdp_page.JavascriptDialogOpening, handle)
         _dialog_pre_action["_registered_tab_ids"].add(tid)
         return ok(f"dialog handler armed ({action})")
@@ -5837,6 +6355,8 @@ def _clear_tab_scoped_state(tabs: list[Any]) -> None:
         _HUMAN_HELP.pop(key, None)
         _dialog_pre_action["_registered_tab_ids"].discard(key)
         _DIALOG_AUTO_CFG["_registered_tab_ids"].discard(key)
+        _DIALOG_WATCHED.discard(key)
+        _OPEN_DIALOGS.pop(key, None)
         _CONSOLE_ARMED_TAB_IDS.discard(key)
         _NETWORK_ARMED_TAB_IDS.discard(key)
         _NETWORK_CAPTURE_BODIES.pop(key, None)
@@ -5879,7 +6399,7 @@ async def dialog_auto_handle(
     types: Optional[list[str]] = None,
     text: str = "",
 ) -> str:
-    """⭐ Install a PERSISTENT auto-handler for native browser dialogs.
+    """Install a PERSISTENT auto-handler for native browser dialogs.
     Unlike dialog_handle (one-shot, action baked in at arm time), this
     one stays armed across many dialogs and reads its config at fire
     time — call again with new action/types to update without re-arming.
@@ -5906,6 +6426,12 @@ async def dialog_auto_handle(
     Native dialogs only (Chrome's own card UI). HTML/CSS modal overlays
     are regular DOM — use click_text("Cancel") / click_role for those.
     """
+    if action not in ("accept", "dismiss"):
+        return err(f"dialog_auto_handle: action must be 'accept' or 'dismiss', not {action!r}")
+    unknown = set(types or ()) - {"alert", "confirm", "prompt", "beforeunload"}
+    if unknown:
+        return err(f"dialog_auto_handle: unknown dialog type(s) {sorted(unknown)}; "
+                   f"use alert, confirm, prompt or beforeunload")
     auto_cfg = _instance_dialog_cfg("auto")
     auto_cfg["enabled"] = bool(enabled)
     auto_cfg["action"] = action
@@ -5918,6 +6444,7 @@ async def dialog_auto_handle(
     try:
         tab = BrowserState.active_tab()
         tab_id = _target_key(tab)
+        await _answer_open_dialog(tab, action, text)
         if tab_id in _DIALOG_AUTO_CFG["_registered_tab_ids"]:
             return ok(
                 f"auto-handle config updated (action={action}, "
@@ -5942,7 +6469,7 @@ async def dialog_auto_handle(
             except Exception:
                 pass
 
-        await tab.send(cdp_page.enable())
+        await _wait(tab.send(cdp_page.enable()), timeout=5.0, what="dialog_auto_handle")
         tab.add_handler(cdp_page.JavascriptDialogOpening, auto_handler)
         _DIALOG_AUTO_CFG["_registered_tab_ids"].add(tab_id)
         return ok(
@@ -6257,6 +6784,9 @@ async def network_get(
         return err("limit must be >= 0")
     if max_body_bytes < 0:
         return err("max_body_bytes must be >= 0")
+    if not (BrowserState.capture_network or BrowserState.network_logs or BrowserState.network_index):
+        return err("NOT listening: call network_start() before the traffic. An empty list "
+                   "would read as a quiet page when nothing was monitored.")
     if full or include_body:
         # Work on copies: response bodies are fetched on demand, and caching a
         # truncated/error sentinel in network_index made a later call with a
@@ -6487,7 +7017,7 @@ _FINGERPRINT_AUDIT_JS = r"""
 
 @mcp.tool()
 async def fingerprint_audit(url: Optional[str] = None) -> str:
-    """⭐ Audit THIS browser's own fingerprint for the leaks detectors look for.
+    """Audit THIS browser's own fingerprint for the leaks detectors look for.
 
     Self-diagnostic for the stealth claim: after fingerprint_rotate, behind a
     proxy, or in headless, is this browser still coherent? Runs entirely
@@ -6631,7 +7161,7 @@ async def export_curl(
     include_cookies: bool = True,
     reveal_values: bool = False,
 ) -> str:
-    """⭐ Turn a captured browser request into a runnable curl AND an http_request call.
+    """Turn a captured browser request into a runnable curl AND an http_request call.
 
     The browser→script bridge. After network_start() + the action you care about,
     hand this a request and get back the command that reproduces it outside the
@@ -6884,7 +7414,7 @@ async def intercept_start(
     auto_disable_after: float = 180.0,
     max_events: int = 500,
 ) -> str:
-    """⭐ See a request — and optionally stop it — BEFORE the server ever gets it.
+    """See a request — and optionally stop it — BEFORE the server ever gets it.
 
     Answers "what would this button actually send?" without sending it. The usual
     alternative is patching window.fetch by hand, which misses XHR, misses
@@ -7116,7 +7646,7 @@ async def dry_run(
     methods: str = "POST,PUT,PATCH,DELETE",
     auto_disable_after: float = 300.0,
 ) -> str:
-    """⭐ Explore a logged-in account without changing anything.
+    """Explore a logged-in account without changing anything.
 
     Blocks every mutating request (POST/PUT/PATCH/DELETE by default) and records
     what would have been sent — method, URL, headers, body. Reads still work, so
@@ -7336,7 +7866,7 @@ async def extract_structured(
           return JSON.stringify(rows);
         })()
         """
-        result = await tab.evaluate(js, return_by_value=True)
+        result = await _eval_checked(tab, js)
         return ok(str(result))
     except Exception as e:
         return err(str(e))
@@ -7351,6 +7881,7 @@ async def extract_table(selector: str = "table", include_headers: bool = True) -
         (() => {
           var t = document.querySelector(""" + json.dumps(selector) + r""");
           if (!t) return JSON.stringify({error:'table not found'});
+          if (t.tagName !== 'TABLE') return JSON.stringify({error:'not a <table> but <' + t.tagName.toLowerCase() + '>'});
           var rows = [...t.querySelectorAll('tr')];
           var headers = [];
           var out = [];
@@ -7365,7 +7896,10 @@ async def extract_table(selector: str = "table", include_headers: bool = True) -
           return JSON.stringify({headers: headers, rows: out});
         })()
         """
-        result = await tab.evaluate(js, return_by_value=True)
+        result = await _eval_checked(tab, js)
+        problem = (parse_json(result, {}) or {}).get("error")
+        if problem:
+            return err(f"extract_table: {problem} ({selector})")
         return ok(str(result))
     except Exception as e:
         return err(str(e))
@@ -7428,7 +7962,7 @@ async def scrape_page(
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 19. ⭐ DIFFERENTIATORS (vs vibheksoni/patchright-mcp-lite/puppeteer-real)
+# 19. DIFFERENTIATORS (vs vibheksoni/patchright-mcp-lite/puppeteer-real)
 # ══════════════════════════════════════════════════════════════════════════
 
 
@@ -7439,6 +7973,8 @@ async def _apply_storage_state(browser: Browser, path: str) -> dict:
     load must not read as one that did.
     """
     data = json.loads(Path(path).read_text())
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} holds a JSON {type(data).__name__}, not a storage state object")
     from nodriver.cdp import network as cdp_network
     tab = browser.tabs[0] if browser.tabs else await browser.get("about:blank")
     report: dict[str, Any] = {"cookies_set": 0, "cookies_failed": 0,
@@ -7488,7 +8024,7 @@ async def _apply_storage_state(browser: Browser, path: str) -> dict:
 
 @mcp.tool()
 async def storage_state_save(filename: Optional[str] = None) -> str:
-    """⭐ Save cookies + localStorage of current origin to JSON.
+    """Save cookies + localStorage of current origin to JSON.
 
     DIFFERENTIATOR: Per research, session-reuse is THE most reliable way to
     bypass Cloudflare Turnstile — it never triggers if session valid.
@@ -7533,7 +8069,7 @@ async def storage_state_save(filename: Optional[str] = None) -> str:
 
 @mcp.tool()
 async def storage_state_load(file_path: str) -> str:
-    """⭐ Load cookies + localStorage from a saved JSON file.
+    """Load cookies + localStorage from a saved JSON file.
 
     Call BEFORE navigating to protected site so session is ready.
     """
@@ -7612,19 +8148,21 @@ async def solve_captcha(
 
 @mcp.tool()
 async def verify_cf(template_image: Optional[str] = None) -> str:
-    """⭐ Use nodriver's built-in Cloudflare challenge verification.
+    """Use nodriver's built-in Cloudflare challenge verification.
 
     Uses OpenCV template matching to find the Turnstile checkbox on a screenshot
     and click it. template_image is a path to a cropped image of the checkbox;
     without it, the bundled English default is used.
 
-    Works on simple CF interstitials. For managed-mode Turnstile (ChatGPT-level),
-    combine with storage_state or solve_captcha.
+    Reports what the page shows after the click, and errors when no checkbox matched.
+    For managed-mode Turnstile, combine with storage_state or solve_captcha.
     """
     try:
         tab = BrowserState.active_tab()
-        await tab.verify_cf(template_image=template_image, flash=False)
-        return ok("cloudflare challenge attempted via template-matching click")
+        clicked, what = await _cf_template_click(tab, template_image)
+        if not clicked:
+            return err(f"verify_cf: nothing clicked, {what}")
+        return ok(f"verify_cf: {what}; {await _cf_after_click(tab)}")
     except Exception as e:
         return err(str(e))
 
@@ -7698,6 +8236,9 @@ async def fingerprint_rotate(
     (navigator.userAgentData) are derived from the UA so they agree with it, and a UA
     without a platform gets the matching navigator.platform.
     """
+    if not any((user_agent, accept_language, platform, timezone)):
+        return err("fingerprint_rotate: pass at least one of user_agent, accept_language, "
+                   "platform, timezone; nothing was changed")
     try:
         tab = BrowserState.active_tab()
         await _apply_fingerprint_to_tab(tab, {
@@ -7706,6 +8247,10 @@ async def fingerprint_rotate(
             "platform": platform or "",
             "timezone": timezone or "",
         })
+        if timezone:
+            seen = await _eval_checked(tab, "Intl.DateTimeFormat().resolvedOptions().timeZone")
+            if seen != timezone:
+                return err(f"timezone {timezone!r} was not applied; the page reads {seen!r}")
         return ok("fingerprint overrides applied")
     except Exception as e:
         return err(str(e))
@@ -7716,7 +8261,7 @@ async def humanize_click(ref: Optional[str] = None,
                           selector: Optional[str] = None,
                           x: Optional[int] = None,
                           y: Optional[int] = None) -> str:
-    """⭐ Click with Bezier-curve mouse approach + randomized dwell.
+    """Click with Bezier-curve mouse approach + randomized dwell.
 
     Targets an element (ref/selector) OR a raw viewport point (x/y, CSS px).
     The coordinate form approaches the point along a Bezier path before pressing,
@@ -7725,11 +8270,17 @@ async def humanize_click(ref: Optional[str] = None,
     if x is not None and y is not None:
         try:
             tab = BrowserState.active_tab()
+            outside = await _outside_viewport(tab, x, y)
+            if outside:
+                return err(f"humanize_click: NOT clicked — {outside}")
             # Approach from an offset so the path has a direction, like a hand does.
-            await humanized_move(tab, x + 120, y + 90, x, y)
+            await _dispatch_input(tab, humanized_move(tab, x + 120, y + 90, x, y))
+            if _dialog_note(tab):
+                return err(f"humanize_click: NOT clicked — moving the pointer there opened a "
+                           f"dialog{_dialog_note(tab)}")
             await asyncio.sleep(random.uniform(0.05, 0.18))
-            await tab.mouse_click(x, y)
-            return ok(f"clicked ({x},{y}) via Bezier approach")
+            await _dispatch_input(tab, tab.mouse_click(x, y))
+            return ok(f"clicked ({x},{y}) via Bezier approach{_dialog_note(tab)}")
         except Exception as e:
             return err(str(e))
     if ref is None and selector is None:
@@ -7739,12 +8290,12 @@ async def humanize_click(ref: Optional[str] = None,
 
 @mcp.tool()
 async def humanize_type(text: str, mean_delay: float = 0.12) -> str:
-    """⭐ Type with Gaussian-distributed keystroke delays."""
+    """Type with Gaussian-distributed keystroke delays. See type_text."""
     return await type_text(text=text, humanize=True, mean_delay=mean_delay)
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 20. ⭐⭐ PRECISION MOUSE KIT (#1 differentiator)
+# 20. PRECISION MOUSE KIT (#1 differentiator)
 # ══════════════════════════════════════════════════════════════════════════
 #
 # Other MCPs click at the CENTER of bounding boxes.
@@ -7773,10 +8324,12 @@ async def click_turnstile(
         offset_y: vertical offset (default = container center)
         fallback_template: if selectors fail, try OpenCV template click (default True)
 
-    Known to work on: 2captcha.com/demo/cloudflare-turnstile, dash.cloudflare.com login,
-    nopecha.com/captcha/turnstile (via template fallback).
-    Does NOT work on: Cloudflare managed-mode interstitials ("Just a moment..." full-page
-    challenges) — use solve_captcha or storage_state_load for those.
+    Reports what the page shows afterwards: whether the cf-turnstile-response token filled,
+    the title, and whether the challenge is still there. A click landing is not a challenge
+    passed. Measured: on nopecha.com/demo/cloudflare the click earned a cf_clearance cookie
+    and the page still answered 403, and the 2captcha demo uses Cloudflare's test sitekey,
+    whose token is a dummy. Neither shows that a real protected site lets you in.
+    Full-page "Just a moment..." challenges: use solve_captcha or storage_state_load.
     """
     try:
         tab = BrowserState.active_tab()
@@ -7850,26 +8403,29 @@ async def click_turnstile(
             target_y = data["top"] + (offset_y if offset_y is not None else data["height"] // 2)
             start_x = target_x + 180
             start_y = target_y - 80
-            await humanized_move(tab, start_x, start_y, target_x, target_y)
+            await _dispatch_input(tab, humanized_move(tab, start_x, start_y, target_x, target_y))
             await asyncio.sleep(0.15)
-            await tab.mouse_click(target_x, target_y)
+            await _dispatch_input(tab, tab.mouse_click(target_x, target_y))
+            if _dialog_note(tab):
+                return ok(f"clicked Turnstile at ({target_x},{target_y}){_dialog_note(tab)}")
             return ok(
                 f"clicked Turnstile at ({target_x},{target_y}) — "
-                f"found via {data['found']} [tier={data.get('tier','primary')}]"
+                f"found via {data['found']} [tier={data.get('tier','primary')}]; "
+                f"{await _cf_after_click(tab)}"
             )
-        # Tier 3: fallback to OpenCV template matching (nodriver built-in)
+        # Tier 3: fallback to OpenCV template matching
         if fallback_template:
             try:
-                await tab.verify_cf(flash=False)
-                return ok(
-                    "clicked Turnstile via template-matching fallback "
-                    "(selector tiers exhausted — out-of-process iframe likely)"
-                )
+                clicked, what = await _cf_template_click(tab)
             except Exception as tpl_err:
                 return err(
                     f"Turnstile widget not found via selectors ({coords_raw}); "
                     f"template fallback also failed: {tpl_err}"
                 )
+            if not clicked:
+                return err(f"Turnstile widget not found via selectors or template: {what}")
+            return ok(f"Turnstile {what}, after the selectors found nothing; "
+                      f"{await _cf_after_click(tab)}")
         return err(f"Turnstile widget not found on page ({coords_raw})")
     except Exception as e:
         return err(str(e))
@@ -7895,16 +8451,10 @@ async def click_element_offset(
         el = await resolve_ref(ref) if ref else (await tab.query_selector(selector) if selector else None)
         if el is None:
             return err("element not found")
-        pos = await el.get_position()
-        if pos is None:
-            return err("element has no position")
-        target_x = int(pos.left + pos.width * (x_percent / 100.0))
-        target_y = int(pos.top + pos.height * (y_percent / 100.0))
-        if humanize:
-            await humanized_move(tab, target_x + 120, target_y - 60, target_x, target_y)
-            await asyncio.sleep(0.12)
-        await tab.mouse_click(target_x, target_y)
-        return ok(f"clicked at ({target_x},{target_y}) = {x_percent}% x {y_percent}% of element")
+        return await _click_point_of(
+            tab, el, f"click_element_offset {x_percent}% x {y_percent}%",
+            x_percent / 100.0, y_percent / 100.0, approach=humanize,
+        )
     except Exception as e:
         return err(str(e))
 
@@ -7929,16 +8479,13 @@ async def click_at_corner(
         pos = await el.get_position()
         if pos is None:
             return err("element has no position")
-        if corner == "top-left":
-            x, y = int(pos.left + offset), int(pos.top + offset)
-        elif corner == "top-right":
-            x, y = int(pos.left + pos.width - offset), int(pos.top + offset)
-        elif corner == "bottom-left":
-            x, y = int(pos.left + offset), int(pos.top + pos.height - offset)
-        else:
-            x, y = int(pos.left + pos.width - offset), int(pos.top + pos.height - offset)
-        await tab.mouse_click(x, y)
-        return ok(f"clicked {corner} at ({x},{y})")
+        fx = offset / pos.width if pos.width else 2.0
+        fy = offset / pos.height if pos.height else 2.0
+        if "right" in corner:
+            fx = 1 - fx
+        if "bottom" in corner:
+            fy = 1 - fy
+        return await _click_point_of(tab, el, f"click_at_corner {corner}", fx, fy)
     except Exception as e:
         return err(str(e))
 
@@ -7948,7 +8495,7 @@ async def find_by_image(
     template_path: str,
     threshold: float = 0.85,
 ) -> str:
-    """⭐ Find an image on the current page via OpenCV template matching.
+    """Find an image on the current page via OpenCV template matching.
 
     Takes a fresh screenshot, matches against template_path image, returns
     (x, y) center of best match. Use for finding visual buttons/icons when
@@ -8012,7 +8559,7 @@ async def click_at_image(
     threshold: float = 0.85,
     humanize: bool = True,
 ) -> str:
-    """⭐ Find image via template matching, then click its center.
+    """Find image via template matching, then click its center.
 
     Combines find_by_image + humanize_move + mouse_click. Useful for visual
     CAPTCHAs, custom buttons without reliable selectors, or interacting with
@@ -8026,10 +8573,13 @@ async def click_at_image(
     try:
         tab = BrowserState.active_tab()
         if humanize:
-            await humanized_move(tab, x + 150, y - 70, x, y)
+            await _dispatch_input(tab, humanized_move(tab, x + 150, y - 70, x, y))
+            if _dialog_note(tab):
+                return err(f"click_at_image: NOT clicked — moving the pointer there opened a "
+                           f"dialog{_dialog_note(tab)}")
             await asyncio.sleep(0.1)
-        await tab.mouse_click(x, y)
-        return ok(f"clicked image match at ({x},{y}) score={data['score']:.3f}")
+        await _dispatch_input(tab, tab.mouse_click(x, y))
+        return ok(f"clicked image match at ({x},{y}) score={data['score']:.3f}{_dialog_note(tab)}")
     except Exception as e:
         return err(str(e))
 
@@ -8039,12 +8589,15 @@ async def mouse_drift(
     duration_seconds: float = 2.0,
     segments: int = 4,
 ) -> str:
-    """⭐ Simulate idle mouse wandering to pass behavioral ML.
+    """Simulate idle mouse wandering to pass behavioral ML.
 
     Random Bezier segments across the viewport — mimics a user thinking.
     Call BEFORE a critical interaction (form submit, button click) to
     establish 'human' behavior pattern before the deterministic action.
     """
+    if duration_seconds <= 0 or segments < 1:
+        return err(f"mouse_drift: needs duration_seconds > 0 and segments >= 1, "
+                   f"got {duration_seconds} and {segments}")
     try:
         import random
         tab = BrowserState.active_tab()
@@ -8059,7 +8612,9 @@ async def mouse_drift(
         for _ in range(segments):
             next_x = random.randint(int(w * 0.1), int(w * 0.9))
             next_y = random.randint(int(h * 0.1), int(h * 0.9))
-            await humanized_move(tab, cur_x, cur_y, next_x, next_y, steps=int(per_segment * 40))
+            await _dispatch_input(tab, humanized_move(tab, cur_x, cur_y, next_x, next_y, steps=int(per_segment * 40)))
+            if _dialog_note(tab):
+                return err(f"mouse_drift stopped{_dialog_note(tab)}")
             cur_x, cur_y = next_x, next_y
             await asyncio.sleep(random.uniform(0.1, 0.4))
         return ok(f"drifted through {segments} segments over {duration_seconds}s")
@@ -8069,7 +8624,7 @@ async def mouse_drift(
 
 @mcp.tool()
 async def mouse_record(duration_seconds: float = 5.0) -> str:
-    """⭐ Record real mouse movements from the page for later replay.
+    """Record real mouse movements from the page for later replay.
 
     Injects a listener that captures mousemove events during duration. Move
     your mouse naturally in the Chrome window while this runs. The recorded
@@ -8126,7 +8681,7 @@ async def mouse_record(duration_seconds: float = 5.0) -> str:
 
 @mcp.tool()
 async def mouse_replay(path_json: str, speed: float = 1.0) -> str:
-    """⭐ Replay a recorded mouse path (from mouse_record).
+    """Replay a recorded mouse path (from mouse_record).
 
     Args:
         path_json: JSON array of {t, x, y} from mouse_record
@@ -8137,12 +8692,21 @@ async def mouse_replay(path_json: str, speed: float = 1.0) -> str:
         events = parse_json(path_json, [])
         if not isinstance(events, list) or not events:
             return err("empty/invalid path")
+        if speed <= 0:
+            return err(f"mouse_replay: speed must be above 0, got {speed}")
+        for ev in events:
+            if not (isinstance(ev, dict) and isinstance(ev.get("x"), (int, float))
+                    and isinstance(ev.get("y"), (int, float))):
+                return err(f"mouse_replay: every point needs numeric x and y, got {ev!r}; "
+                           f"nothing was replayed")
         prev_t = 0
         for ev in events:
             t = ev.get("t", prev_t)
             dt = max(0, (t - prev_t) / 1000.0 / speed)
             await asyncio.sleep(dt)
-            await move_pointer(tab, int(ev.get("x", 0)), int(ev.get("y", 0)))
+            await _dispatch_input(tab, move_pointer(tab, int(ev.get("x", 0)), int(ev.get("y", 0))))
+            if _dialog_note(tab):
+                return err(f"mouse_replay stopped{_dialog_note(tab)}")
             prev_t = t
         return ok(f"replayed {len(events)} mouse events")
     except Exception as e:
@@ -8150,7 +8714,7 @@ async def mouse_replay(path_json: str, speed: float = 1.0) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 21. ⭐⭐ AI VISION CAPTCHA SOLVER — moved to tools/vision.py (v0.4.1)
+# 21. AI VISION CAPTCHA SOLVER — moved to tools/vision.py (v0.4.1)
 # ══════════════════════════════════════════════════════════════════════════
 from .tools import vision as _vision  # noqa: F401  -- registers all vision tools
 # Re-export private helpers AND tool callables. Tools must remain in server globals
@@ -8165,7 +8729,7 @@ from .tools.vision import (  # noqa: F401
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 22. ⭐⭐⭐ DUAL-MODE HTTP — moved to tools/network_http.py (v0.4.1)
+# 22. DUAL-MODE HTTP — moved to tools/network_http.py (v0.4.1)
 # ══════════════════════════════════════════════════════════════════════════
 from .tools import network_http as _network_http  # noqa: F401
 # Re-export so workflow_run + http_request_with_session find them in globals().
@@ -8177,7 +8741,7 @@ from .tools.network_http import (  # noqa: F401
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 23. ⭐ MULTI-INSTANCE BROWSER MANAGEMENT
+# 23. MULTI-INSTANCE BROWSER MANAGEMENT
 # ══════════════════════════════════════════════════════════════════════════
 #
 # Run multiple isolated browsers in parallel — one per account, per site, or
@@ -8402,6 +8966,8 @@ async def _launch_browser_instance(
         if persistent or profile_dir_override:
             clean_profile_state(profile_path)
 
+    if lang and lang != "en-US" and not effective_fingerprint.get("accept_language"):
+        effective_fingerprint = {**effective_fingerprint, "accept_language": lang}
     config = Config(
         user_data_dir=str(profile_path) if profile_path is not None else None,
         headless=headless,
@@ -8419,6 +8985,7 @@ async def _launch_browser_instance(
     config.add_argument(f"--window-size={window_width},{window_height}")
 
     browser: Optional[Browser] = None
+    previous_app = None if headless else await asyncio.to_thread(_frontmost_app)
     try:
         browser = await _start_chrome(config)
     except asyncio.TimeoutError:
@@ -8454,10 +9021,7 @@ async def _launch_browser_instance(
         main_tab = await _first_live_tab(browser)
         await _apply_fingerprint_to_tab(main_tab, effective_fingerprint)
         await asyncio.wait_for(main_tab.get(url), timeout=BROWSER_NAV_TIMEOUT)
-        try:
-            await asyncio.wait_for(main_tab.wait(t=3), timeout=BROWSER_NAV_TIMEOUT)
-        except asyncio.TimeoutError:
-            pass
+        await _wait_load_complete(main_tab, 3)
     except asyncio.TimeoutError:
         await _safe_stop_browser(browser)
         await _remove_privacy_profile(privacy_profile)
@@ -8511,6 +9075,7 @@ async def _launch_browser_instance(
 
     # Kick off the idle reaper (once)
     _ensure_idle_reaper_running()
+    await _give_focus_back(previous_app)
     return True, (
         f"instance {instance_id!r} launched (headless={headless}, "
         f"privacy={privacy}, identity={identity_source}, "
@@ -8705,7 +9270,7 @@ async def spawn_browser(
 
 @mcp.tool()
 async def list_instances() -> str:
-    """⭐ List all browser instances with status + last-active time.
+    """List all browser instances with status + last-active time.
     Also reports external (non-MCP) Chrome processes that may conflict with
     custom --user-data-dir launches."""
     if BrowserState.browser is not None:
@@ -8774,7 +9339,7 @@ async def instance_describe(instance_id: str, desc: str, append: bool = False) -
 
 @mcp.tool()
 async def switch_instance(instance_id: str) -> str:
-    """⭐ Make instance_id the active one for subsequent tool calls.
+    """Make instance_id the active one for subsequent tool calls.
 
     The previous current instance continues running in the background,
     cookies/tabs preserved. Swap back anytime.
@@ -8826,7 +9391,7 @@ async def instance_release(instance_id: str) -> str:
 
 @mcp.tool()
 async def close_instance(instance_id: str) -> str:
-    """⭐ Close a specific browser instance (frees profile + memory)."""
+    """Close a specific browser instance (frees profile + memory)."""
     try:
         _validate_instance_id(instance_id)
     except ValueError as e:
@@ -8912,7 +9477,7 @@ async def close_instance(instance_id: str) -> str:
 
 @mcp.tool()
 async def close_all_instances() -> str:
-    """⭐ Close every running browser instance. Useful for cleanup."""
+    """Close every running browser instance. Useful for cleanup."""
     closed = []
     failures = []
     # Close stored
@@ -8989,7 +9554,7 @@ async def close_all_instances() -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 24. ⭐ CHROME PROFILE INTEGRATION (list / clone existing profiles)
+# 24. CHROME PROFILE INTEGRATION (list / clone existing profiles)
 # ══════════════════════════════════════════════════════════════════════════
 #
 # Let user start from their existing Chrome profile (with all logins, cookies,
@@ -9360,13 +9925,13 @@ async def clone_chrome_profile(
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 24. ⭐ DEVTOOLS & TESTING — moved to tools/devtools.py (v0.4.1 refactor)
+# 24. DEVTOOLS & TESTING — moved to tools/devtools.py (v0.4.1 refactor)
 # ══════════════════════════════════════════════════════════════════════════
 from .tools import devtools as _devtools  # noqa: F401  -- registers tools with mcp
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 27. ⭐⭐⭐ SELF-SUFFICIENT WEB-RESEARCH KIT — tools/research.py
+# 27. SELF-SUFFICIENT WEB-RESEARCH KIT — tools/research.py
 # ══════════════════════════════════════════════════════════════════════════
 # web_search / scrape_markdown / smart_fetch / deep_research / search_page.
 # HTTP-first (curl_cffi, browserless) with stealth-browser fallback — aims to
@@ -9376,7 +9941,7 @@ from .tools import profiles as _profiles  # noqa: F401  -- registers tools with 
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 25. ⭐⭐⭐ LLM-OPTIMIZED ACTION KIT
+# 25. LLM-OPTIMIZED ACTION KIT
 # ══════════════════════════════════════════════════════════════════════════
 #
 # Tools designed for AI-agent workflows: token-efficient page summaries,
@@ -9534,7 +10099,7 @@ async def describe_page(
     max_wait: float = 2.5,
     stable_ms: int = 400,
 ) -> str:
-    """⭐ Compact AI-friendly page summary — replaces accessibility_snapshot
+    """Compact AI-friendly page summary — replaces accessibility_snapshot
     for LLM workflows. Returns JSON with the page's intent + interactable
     surface in ~10× fewer tokens than a full a11y dump.
 
@@ -9675,7 +10240,7 @@ _SMART_FILL_FIND_JS = """
 
 @mcp.tool()
 async def smart_fill(fields: dict, submit_label: Optional[str] = None) -> str:
-    """⭐ Fill form fields by label text (fuzzy match). LLM-friendly alt to
+    """Fill form fields by label text (fuzzy match). LLM-friendly alt to
     fill_form which requires DOM refs.
 
     Args:
@@ -9695,6 +10260,8 @@ async def smart_fill(fields: dict, submit_label: Optional[str] = None) -> str:
         tab = BrowserState.active_tab()
         if not isinstance(fields, dict):
             return err("smart_fill: fields must be a dict {label: value}")
+        if not fields:
+            return err("smart_fill: no fields given")
         results: list[dict] = []
         for label, value in fields.items():
             if not isinstance(label, str):
@@ -9722,7 +10289,7 @@ async def smart_fill(fields: dict, submit_label: Optional[str] = None) -> str:
                 # Not for a <select>: clicking one opens a native popup that stays open and
                 # takes the next click, and its value is set directly below.
                 if best.get("type") != "select":
-                    await tab.mouse_click(int(best["x"]), int(best["y"]))
+                    await _dispatch_input(tab, tab.mouse_click(int(best["x"]), int(best["y"])))
                     await asyncio.sleep(0.1)
                 # Native value setter so React/Vue see the change. Each element type has its
                 # own: HTMLInputElement's throws on a <select> or <textarea>.
@@ -9802,7 +10369,7 @@ async def smart_fill(fields: dict, submit_label: Optional[str] = None) -> str:
 
 @mcp.tool()
 async def assert_text_present(text: str, timeout: float = 5.0) -> str:
-    """⭐ Verify text appears anywhere on page within timeout.
+    """Verify text appears anywhere on page within timeout.
     Returns ok(found) or err(not found + sample of body text)."""
     try:
         tab = BrowserState.active_tab()
@@ -9830,7 +10397,7 @@ async def assert_text_present(text: str, timeout: float = 5.0) -> str:
 
 @mcp.tool()
 async def assert_url_matches(pattern: str, timeout: float = 5.0) -> str:
-    """⭐ Verify current URL matches regex within timeout.
+    """Verify current URL matches regex within timeout.
     Returns ok(current_url) or err(timeout + last_url)."""
     import re as _re
     try:
@@ -9857,13 +10424,16 @@ async def assert_element_visible(
     text: Optional[str] = None,
     timeout: float = 5.0,
 ) -> str:
-    """⭐ Verify an element is visible (rendered, non-zero size, not hidden).
+    """Verify an element is visible (rendered, non-zero size, not hidden).
     Pass selector OR text — text uses fuzzy contains match.
     Returns ok(rect) or err(timeout)."""
     if not selector and not text:
         return err("pass selector= or text=")
     try:
         tab = BrowserState.active_tab()
+        if selector:
+            # An invalid selector can never become visible; waiting would misreport it.
+            await _eval_checked(tab, f"document.querySelector({json.dumps(selector)}) && 1")
         deadline = asyncio.get_event_loop().time() + max(0.5, timeout)
         last_state = "not found"
         while asyncio.get_event_loop().time() < deadline:
@@ -10003,7 +10573,7 @@ async def _take_storage_snapshot(tab) -> dict:
 
 @mcp.tool()
 async def storage_snapshot(name: str = "default") -> str:
-    """⭐ Capture cookies + localStorage + sessionStorage + URL into a named slot
+    """Capture cookies + localStorage + sessionStorage + URL into a named slot
     for later diffing. Use BEFORE an action you want to inspect.
 
     Areas that could not be read are reported as unmeasured rather than empty:
@@ -10038,7 +10608,7 @@ async def storage_snapshot(name: str = "default") -> str:
 
 @mcp.tool()
 async def storage_diff(name: str = "default", reveal_values: bool = False) -> str:
-    """⭐ Compare current state vs an earlier storage_snapshot. Returns JSON
+    """Compare current state vs an earlier storage_snapshot. Returns JSON
     showing what changed (added/removed/modified per area + url change).
 
     Diffing across a login is exactly when new values are session tokens, and this
@@ -10176,7 +10746,7 @@ async def workflow_run(
     stop_on_error: bool = True,
     vars: Optional[dict] = None,
 ) -> str:
-    """⭐ Run many tool steps in one call, with branching, loops and earlier results.
+    """Run many tool steps in one call, with branching, loops and earlier results.
 
     A tool step: {"tool": "fill", "args": {...}, "save_as": "x", "label": "...",
     "continue_on_error": false}
@@ -10253,7 +10823,7 @@ async def workflow_run(
 
 @mcp.tool()
 async def detect_and_bypass() -> str:
-    """⭐ One-shot: detect anti-bot wall on current page and apply the best
+    """One-shot: detect anti-bot wall on current page and apply the best
     bypass we have. Returns JSON with detection + bypass result.
 
     Bypass routing:
@@ -10319,7 +10889,8 @@ async def detect_and_bypass() -> str:
             )
         if "(no anti-bot system detected)" in det_lower or "none detected" in det_lower:
             return ok(json.dumps(
-                {"detection": "no anti-bot detected", "bypassed": True,
+                # Nothing was bypassed, because nothing was in the way.
+                {"detection": "no anti-bot detected", "bypassed": False, "needed": False,
                  "method": "n/a", "next_steps": []},
                 indent=2, ensure_ascii=False,
             ))
@@ -10329,7 +10900,7 @@ async def detect_and_bypass() -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 26. ⭐⭐⭐ NETWORK + AUTH + WAIT — paste, click_and_wait, auth_capture,
+# 26. NETWORK + AUTH + WAIT — paste, click_and_wait, auth_capture,
 #     http_request_with_session, wait_for_request, form_introspect
 # ══════════════════════════════════════════════════════════════════════════
 #
@@ -10349,7 +10920,7 @@ async def paste_text(
     selector: Optional[str] = None,
     submit: bool = False,
 ) -> str:
-    """⭐ Set field value by simulating a real paste event sequence.
+    """Set field value by simulating a real paste event sequence.
 
     Use when fill / type_text don't register on modern frameworks (SolidJS
     runes, Svelte 5 runes, some Qwik forms) that ONLY listen for paste
@@ -10386,6 +10957,14 @@ async def paste_text(
             function() {{
               const el = this;
               const text = {json.dumps(text)};
+              const noText = ['button', 'submit', 'reset', 'checkbox', 'radio', 'file', 'image', 'color', 'range'];
+              const editable = el.isContentEditable;
+              const isField = el.tagName === 'TEXTAREA'
+                || (el.tagName === 'INPUT' && !noText.includes(el.type));
+              if (!isField && !editable) return JSON.stringify({{ok: false,
+                error: '<' + el.tagName.toLowerCase() + '> does not take text'}});
+              if (el.disabled) return JSON.stringify({{ok: false, error: 'the field is disabled'}});
+              if (el.readOnly) return JSON.stringify({{ok: false, error: 'the field is read-only'}});
               try {{ el.focus(); }} catch (e) {{}}
               // 1. Paste event with DataTransfer
               try {{
@@ -10405,7 +10984,15 @@ async def paste_text(
                 el.dispatchEvent(beforeEv);
               }} catch (e) {{}}
               // 3. Native value setter so React/Vue/Solid see the change
-              try {{
+              if (editable) {{
+                // A contenteditable has no value to set: the text goes in at the selection.
+                const range = document.createRange();
+                range.selectNodeContents(el);
+                const selection = window.getSelection();
+                selection.removeAllRanges();
+                selection.addRange(range);
+                if (!document.execCommand('insertText', false, text)) el.textContent = text;
+              }} else try {{
                 const proto = el.tagName === 'TEXTAREA'
                   ? HTMLTextAreaElement.prototype
                   : HTMLInputElement.prototype;
@@ -10422,18 +11009,26 @@ async def paste_text(
               }}
               // 5. change event for blur-validators
               el.dispatchEvent(new Event('change', {{bubbles: true}}));
+              const landed = editable ? el.textContent : el.value;
+              const unify = (v) => v.split('\\r\\n').join('\\n').split('\\r').join('\\n');
+              if (unify(landed) !== unify(text)) {{
+                return JSON.stringify({{ok: false, error: 'the field reads ' + landed.length
+                  + ' chars after the paste, not the ' + text.length + ' sent (mask, maxlength or framework state)'}});
+              }}
               return JSON.stringify({{ok: true, value:
-                el.type === 'password' ? `(password, ${{el.value.length}} chars)` : el.value}});
+                el.type === 'password' ? `(password, ${{landed.length}} chars)` : landed}});
             }}
             """,
         ), what="paste_text")
+        if isinstance(result_raw, cdp_runtime.ExceptionDetails):
+            return err(f"paste failed: {_js_exception_text(result_raw)}")
         result_text = result_raw.value if hasattr(result_raw, "value") and not isinstance(result_raw, str) else result_raw
         data = parse_json(str(result_text), {})
         if not isinstance(data, dict) or not data.get("ok"):
             return err(f"paste failed: {data.get('error') if isinstance(data, dict) else result_text}")
         if submit:
             try:
-                await _dispatch_key(tab, key_event_params("Enter"))
+                await _dispatch_input(tab, _dispatch_key(tab, key_event_params("Enter")))
             except Exception:
                 with contextlib.suppress(Exception):
                     await el.apply("function() { this.form?.requestSubmit?.(); }")
@@ -10453,7 +11048,7 @@ async def auth_capture(
     include_response_headers: bool = False,
     reveal_values: bool = False,
 ) -> str:
-    """⭐ Intercept the next N requests matching a URL pattern and return
+    """Intercept the next N requests matching a URL pattern and return
     their headers (Authorization, X-CSRF-*, etc.) — useful for
     SPAs that hold bearer tokens in JS memory and never write them to
     localStorage. Their values are hidden unless reveal_values=True, because
@@ -10608,8 +11203,9 @@ async def http_request_with_session(
     timeout: float = 30.0,
     wait_timeout: Optional[float] = None,
     connect_timeout: Optional[float] = None,
+    reveal_values: bool = False,
 ) -> str:
-    """⭐ Authenticated HTTP request that piggybacks on the BROWSER's session.
+    """Authenticated HTTP request that piggybacks on the BROWSER's session.
 
     Combines:
       - cookies from active tab (use_browser_cookies=True in http_request)
@@ -10647,7 +11243,7 @@ async def http_request_with_session(
         use_browser_cookies=True, headers=headers,
         data=data, json_body=json_body, timeout=timeout,
         return_mode=return_mode, wait_timeout=wait_timeout,
-        connect_timeout=connect_timeout,
+        connect_timeout=connect_timeout, reveal_values=reveal_values,
     )
 
 
@@ -10753,7 +11349,7 @@ async def wait_for_request(
     require_response: bool = True,
     reveal_values: bool = False,
 ) -> str:
-    """⭐ Block until a network request matching url_pattern is observed.
+    """Block until a network request matching url_pattern is observed.
     Replaces the setTimeout(2000)+poll anti-pattern.
 
     Args:
@@ -10842,7 +11438,7 @@ async def click_and_wait(
     expect_request_pattern: Optional[str] = None,
     timeout: float = 8.0,
 ) -> str:
-    """⭐ Click + wait for the side-effect to land. Distinguishes a
+    """Click + wait for the side-effect to land. Distinguishes a
     successful action from a silent failure (e.g. form invalid where
     click() returns success but submit never happened).
 
@@ -10857,6 +11453,7 @@ async def click_and_wait(
             "request"        — outgoing request matches expect_request_pattern
             "network_idle"   — no in-flight requests for 500ms
             "auto"           — try navigation→network_idle→nothing
+                           Passing one expect_* selects its mode instead.
         expect_*: target for the matching expect mode
         timeout: per-mode max wait
 
@@ -10869,6 +11466,17 @@ async def click_and_wait(
     # retry, and that retry submits twice.
     if expect not in ("auto", "navigation", "url", "text", "selector", "request", "network_idle"):
         return err(f"click_and_wait: unknown expect={expect!r}; nothing was clicked")
+    if expect == "auto":
+        # A target with no matching mode used to be ignored, so the call succeeded without
+        # ever looking for it.
+        given = [mode for mode, target in (("url", expect_url_pattern), ("text", expect_text),
+                                           ("selector", expect_selector),
+                                           ("request", expect_request_pattern)) if target]
+        if len(given) > 1:
+            return err(f"click_and_wait: pass one expect_* target, got {', '.join(given)}; "
+                       f"nothing was clicked")
+        if given:
+            expect = given[0]
     required = {"url": ("expect_url_pattern", expect_url_pattern),
                 "text": ("expect_text", expect_text),
                 "selector": ("expect_selector", expect_selector),
@@ -11071,7 +11679,7 @@ _FORM_INTROSPECT_JS = """
 
 @mcp.tool()
 async def form_introspect(form_selector: Optional[str] = None) -> str:
-    """⭐ Detailed form analysis in a single call. Returns label,
+    """Detailed form analysis in a single call. Returns label,
     framework binding (react/vue/solid_or_svelte/lit), validation state,
     and constraints (pattern, min/max length, required) per field.
 
@@ -11110,6 +11718,21 @@ async def form_introspect(form_selector: Optional[str] = None) -> str:
 # Tracks whether current BrowserState was created via attach (True) or
 # spawned by us (False). detach() is a no-op for spawned browsers.
 _ATTACHED_BROWSERS: set[str] = set()
+
+
+def _chrome_flags_from_args(cmd: str) -> tuple[Optional[int], Optional[str]]:
+    """Debugging port and profile from a command line. `ps` drops the quoting, so a value runs
+    to the next flag: the default profile on macOS sits under "Application Support"."""
+    port = None
+    found = re.search(r"--remote-debugging-port=(\d+)", cmd)
+    if found:
+        port = int(found.group(1))
+    found = re.search(r"--user-data-dir=(.+?)(?=\s--|$)", cmd)
+    udd = found.group(1).strip() if found else None
+    if port == 0 and udd:  # Chrome chose the port itself and wrote it here.
+        with contextlib.suppress(OSError, ValueError, IndexError):
+            port = int((Path(udd) / "DevToolsActivePort").read_text().split()[0])
+    return port, udd
 
 
 @mcp.tool()
@@ -11191,14 +11814,7 @@ async def list_external_chrome() -> str:
                 continue
             seen_pids.add(pid)
             cmd = parts[1]
-            port = None
-            udd = None
-            for tok in cmd.split():
-                if tok.startswith("--remote-debugging-port="):
-                    try: port = int(tok.split("=", 1)[1])
-                    except ValueError: pass
-                elif tok.startswith("--user-data-dir="):
-                    udd = tok.split("=", 1)[1]
+            port, udd = _chrome_flags_from_args(cmd)
             out.append({"pid": pid, "debugging_port": port,
                         "user_data_dir": udd, "cmd": cmd[:200]})
             if len(out) >= 30:
@@ -11232,7 +11848,7 @@ async def attach_to_chrome(
     host: str = "127.0.0.1",
     instance_id: str = "attached",
 ) -> str:
-    """⭐ Attach to an existing Chrome instance via CDP — no new browser launch,
+    """Attach to an existing Chrome instance via CDP — no new browser launch,
     no profile lock conflict. Target Chrome must have been started with
     `--remote-debugging-port=<N>`. Auto-detects port if omitted (picks lowest).
 
@@ -11310,7 +11926,7 @@ async def attach_to_chrome(
 
 @mcp.tool()
 async def detach() -> str:
-    """⭐ Release CDP connection to an attached Chrome WITHOUT closing it.
+    """Release CDP connection to an attached Chrome WITHOUT closing it.
     Only valid for browsers connected via attach_to_chrome — for browsers
     spawned by browser_launch/spawn_browser this is equivalent to a no-op
     (use browser_close instead).

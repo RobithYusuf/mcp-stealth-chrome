@@ -412,6 +412,8 @@ async def emulate_cpu(rate: float = 4.0) -> str:
     rate=1 is no throttle; rate=4 makes CPU ~4× slower (matches DevTools default
     "4x slowdown"). rate=6 simulates low-end mobile. Pass 1 to reset.
     """
+    if rate < 1:
+        return err(f"emulate_cpu: rate is a slowdown factor, so it must be 1 or more, not {rate}")
     try:
         tab = BrowserState.active_tab()
         from nodriver.cdp import emulation as cdp_emu
@@ -450,6 +452,7 @@ async def emulate_device(preset: str = "desktop") -> str:
             # answering as an iPhone. Back to the identity this instance launched with,
             # which falls back to the real browser's own UA.
             await tab.send(cdp_emu.clear_device_metrics_override())
+            await tab.send(cdp_emu.set_touch_emulation_enabled(enabled=False))
             identity = dict(BrowserState.current_fingerprint or {})
             identity["user_agent"] = identity.get("user_agent") or strip_headless(version[3])
             await _apply_fingerprint_to_tab(tab, identity)
@@ -460,6 +463,10 @@ async def emulate_device(preset: str = "desktop") -> str:
             height=int(p["height"]),
             device_scale_factor=float(p["dpr"]),
             mobile=bool(p["mobile"]),
+        ))
+        # A phone reporting maxTouchPoints 0 contradicts itself.
+        await tab.send(cdp_emu.set_touch_emulation_enabled(
+            enabled=bool(p["mobile"]), max_touch_points=5 if p["mobile"] else None,
         ))
         note = ""
         if p.get("ua"):

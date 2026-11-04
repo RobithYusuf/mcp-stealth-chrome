@@ -5,7 +5,7 @@ import json
 import re
 import time
 from pathlib import Path
-from urllib.parse import parse_qsl, quote, urlsplit
+from urllib.parse import unquote_plus, urlsplit
 from typing import Any
 
 from nodriver import Tab
@@ -37,25 +37,57 @@ def mask_headers(headers: dict) -> dict:
     return {k: masked_value(v) if is_secret_name(k) else v for k, v in (headers or {}).items()}
 
 
+def _mask_all(node: Any) -> Any:
+    """Everything below a secret key: {"token": {"value": "x"}} is as secret as {"token": "x"}."""
+    if isinstance(node, dict):
+        return {k: _mask_all(v) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_mask_all(item) for item in node]
+    return node if node is None or isinstance(node, bool) else masked_value(node)
+
+
+# A session object usually mixes the user and expiry with its tokens. Those stay readable, and
+# any secret names inside are still caught field by field.
+_CONTAINER_ONLY_NAMES = re.compile(r"^(?:session|sessions)$", re.IGNORECASE)
+
+
 def _mask_json(node: Any) -> Any:
     if isinstance(node, dict):
-        return {
-            k: masked_value(v)
-            if is_secret_name(k) and v is not None and not isinstance(v, (dict, list, bool))
-            else _mask_json(v)
-            for k, v in node.items()
-        }
+        out = {}
+        for k, v in node.items():
+            if not is_secret_name(k):
+                out[k] = _mask_json(v)
+            elif isinstance(v, (dict, list)):
+                out[k] = _mask_json(v) if _CONTAINER_ONLY_NAMES.match(str(k)) else _mask_all(v)
+            elif v is None or isinstance(v, bool):
+                out[k] = v
+            else:
+                out[k] = masked_value(v)
+        return out
     if isinstance(node, list):
         return [_mask_json(item) for item in node]
     return node
 
 
+def mask_json_value(value: Any) -> Any:
+    """Credential fields hidden in an already parsed JSON document."""
+    return _mask_json(value)
+
+
 def _mask_pairs(text: str) -> str | None:
-    """A query or form body with secret fields hidden, or None when it has none."""
-    pairs = parse_qsl(text, keep_blank_values=True)
-    if not any(is_secret_name(k) for k, _ in pairs):
-        return None
-    return "&".join(f"{quote(k)}={'***' if is_secret_name(k) else quote(v)}" for k, v in pairs)
+    """A query or form body with secret fields hidden, or None when it has none.
+
+    Works on the raw pairs. Decoding and re-encoding the rest would rewrite ordinary
+    parameters, and a captured URL has to stay byte for byte what was requested.
+    """
+    pieces = text.split("&")
+    found = False
+    for index, piece in enumerate(pieces):
+        name = unquote_plus(piece.partition("=")[0])
+        if is_secret_name(name):
+            found = True
+            pieces[index] = f"{piece.partition('=')[0]}=***"
+    return "&".join(pieces) if found else None
 
 
 def mask_body(body: Any) -> Any:
@@ -108,6 +140,20 @@ def target_key(tab: Any) -> str:
     """Stable per-tab identity backed by the CDP target id when available."""
     target = getattr(tab, "target", None)
     return str(getattr(target, "target_id", None) or id(tab))
+
+
+# Native dialogs open right now, per tab. A dialog blocks the renderer: input never gets its
+# acknowledgement and anything that needs the page never answers.
+OPEN_DIALOGS: dict[str, dict] = {}
+
+
+def dialog_note(tab: Any) -> str:
+    """Words for a dialog that is open on this tab, or "" when none is."""
+    found = OPEN_DIALOGS.get(target_key(tab))
+    if not found:
+        return ""
+    return (f"; a native {found['type']} dialog is open ({found['message']!r}) and blocks the "
+            f"page until it is answered: call dialog_handle(action='accept' or 'dismiss')")
 
 
 def select_tab(index: int | None = None) -> Tab:

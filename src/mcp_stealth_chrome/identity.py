@@ -262,8 +262,9 @@ def key_event_params(key: str) -> dict[str, Any]:
     return {
         "key": key_value,
         "code": code,
+        # No native_virtual_key_code: Chrome on macOS holds every later mouse event for
+        # 5 seconds after an unhandled key that carries one, until the next navigation.
         "windows_virtual_key_code": vk,
-        "native_virtual_key_code": vk,
         "text": text,
         "modifiers": modifiers,
     }

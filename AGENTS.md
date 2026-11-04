@@ -44,8 +44,10 @@ uvx mcp-stealth-chrome → Python 3.11+ → FastMCP → nodriver → Chrome/Chro
   (`security find-generic-password -s mcp-stealth-chrome-pypi -w`), never in a file in the tree.
   Cookie and token files used during a release go to `/tmp` mode `600` and are `shred`ed after.
 - Captured requests follow the same rule. `network_get`, `intercept_log`, `wait_for_request`, `auth_capture`,
-  `export_curl` and `http_request` response headers go through `helpers.mask_*`, with `reveal_values=True` as the
-  way out where a caller needs the value. `export_curl` stays useful because its `http_request` form takes cookies
+  `export_curl` and `http_request` responses (headers, JSON body, final URL, pending and status payloads) go
+  through `helpers.mask_*`, with `reveal_values=True` as the way out where a caller needs the value. Everything
+  under a secret key is hidden, except that a `session` object keeps its non-secret fields, and `mask_url` works
+  on the raw pairs so an ordinary parameter stays byte for byte. `export_curl` stays useful because its `http_request` form takes cookies
   from the browser. Bodies other than JSON or forms cannot be read field by field and pass through.
 - `nodriver` stays capped at the newest version the E2E suites have passed on (`<0.51`): `uv.lock` hides
   breakage just as it does for `mcp`, and a fresh install gets the newest allowed. 0.50 rebuilt `Connection`
@@ -67,6 +69,12 @@ uvx mcp-stealth-chrome → Python 3.11+ → FastMCP → nodriver → Chrome/Chro
   therefore every PyPI user). Lift the cap only together with a port off FastMCP.
 - Every `@mcp.tool()` is annotated `-> str` and returns through `ok()` / `err()`. Returning a dict
   raises a pydantic error inside FastMCP.
+- That annotation makes FastMCP advertise an output schema requiring `{"result": str}` on all 172 tools, and
+  `ClientSession.call_tool` raises on a reply without it. A `CallToolResult` built by hand (`ImageResult`,
+  `StructuredResult`) must include it. `screenshot`, `screenshot_element` and `inspect_image` failed on every default
+  call for this reason, and only a real client shows it: test through `tests/_protocol.py`.
+- FastMCP parses a string as JSON unless the annotation is exactly `str`, so `Optional[str]` turned `'{"a":1}'` into a
+  validation error and `'null'` into None. `patches._patch_fastmcp_keeps_text` stops that, and `server_status` reports it.
 - Do not add a tool that can fail silently. If an action may not have taken effect, the response says
   so — see the honest-reporting invariants below.
 - Do not weaken a security property to make a test pass: managed paths never escape their root,
@@ -112,6 +120,20 @@ conclusions. Each rule below replaced a real lie.
   another element carrying the same text that is genuinely reachable (scrolling it into view if that
   is the only problem) before giving up. On github.com the fuzzy match is a hidden marketing `<span>`;
   refusing there was truthful and still left the caller unable to click "Issues".
+- `_page_sig` carries a hash of the body HTML. Comparing only its length read a counter going from 1 to 2 as
+  `NO page change`, and an agent clicked again. Focus falling back to `<body>` is not a reaction: it is what clicking
+  anything unfocusable does. Focus arriving on another element is.
+- A native dialog blocks the renderer, so input never gets its acknowledgement and a click on a button calling `alert()`
+  hung forever. `_dispatch_input` stops waiting once `_watch_dialogs` sees one open and the result names it. Pointer moves go
+  through it too, because `onmousemove` can open a dialog before any press. `Page.enable` needs the renderer as well, so the
+  watch is armed before input, and `dialog_handle` answers a dialog already open.
+- Anything else needing the renderer also waits for ever while a dialog is open, timeout or not. `_app._run_unless_a_dialog_blocks`
+  refuses or stops such a tool and names the dialog. A new tool that does not touch the page belongs in `_RUNS_DESPITE_DIALOG`.
+  A dialog only counts once `_watch_dialogs` has armed that tab, so one on a tab no tool has touched yet is not seen.
+- `Transaction` in nodriver up to 0.48 is a Future, so a reply arriving after `wait_for` cancelled it raised inside the CDP
+  listener and killed it: every later call on that tab hung. `patches._patch_transaction_late_reply` closes that.
+- `hover`, `click_element_offset` and `click_at_corner` go through `_prepare_target` like a click. Without it they answered
+  `hovered` and `clicked` at points outside the viewport and on covered elements.
 - A click that opens a tab changes nothing on its own page, so `_page_sig(pages=True)` lists the browser's tabs and
   `_click_outcome` names a new one. Without it a working popup button read as dead, and an agent clicks it again.
 - `fill_form` fails when a field fails and does not click submit. `batch_actions` counts failures by the `Error:`
@@ -183,6 +205,9 @@ conclusions. Each rule below replaced a real lie.
 - nodriver stops probing for Chrome after about 2.3 seconds. `_start_chrome` waits for that same process and adopts it
   (`config.host`/`port` set means connect, not spawn), moving `_process` across or a close would only drop the socket.
   Only one that never answers is ended and respawned, with host and port restored first.
+- A headed launch remembers the frontmost app on macOS (`_frontmost_app`) and gives focus back after the window opens,
+  best effort, never failing the launch. `navigate` defaults to `focus=False`; `tab_focus`, `focus=True` and
+  `request_human_help` still raise the window.
 - A stdio `browser_launch` sets `current_idle_timeout = 0`. Leaving the reaper off is not enough: any `spawn_browser`
   starts it, and it then closed the browser the person was looking at, 15 minutes after its last tool call.
 - `is_up()` false does not mean Chrome stopped: closing the last tab empties `tabs` while the process runs and
@@ -276,7 +301,25 @@ Platform truths, not preferences. Each one cost a release.
 - `tab.evaluate` returns `ExceptionDetails` when the script throws, rather than raising. Anything reporting the
   result checks for it, or the error reads as the value.
 - `tab.evaluate(expr, return_by_value=True)` can STILL return a `RemoteObject`. Unwrap via
-  `v.value if hasattr(v, "value") ...` before casting.
+  `v.value if hasattr(v, "value") ...` before casting. It also always asks for deep serialization, which leaves
+  `value` empty for any object or array, so the `evaluate` tool calls `Runtime.evaluate` itself. `_eval_checked` is the
+  helper for a script whose exception must not read as its result.
+- `Tab.wait(t)` is only `sleep(t)`. `wait_for_navigation` slept its whole timeout and said `navigated`; use `_wait_load_complete`.
+- `Input.dispatchKeyEvent` with `nativeVirtualKeyCode` on a key the page does not consume holds every later mouse event for
+  5 seconds on macOS, until the next navigation. `key_event_params` leaves it out. Raw CDP reproduction with one Chrome per
+  scenario showed this; a shared Chrome hid it, because the stall persists across `reload`.
+- `Element.send_keys` sends only `char` events: a keypress with an empty `key` and no keydown, which no keyboard produces.
+  `_type_keys` presses real keys. macOS select-all also needs `commands=["selectAll"]`.
+- `Tab.verify_cf` clicks the best template match however poor, so on a page with no widget it clicked something and
+  reported success. `_cf_template_click` applies a threshold. A challenge click reports what `_cf_after_click` observes.
+- The first document after startup loads images despite `--blink-settings=imagesEnabled=false`; later ones obey it. Light
+  and testing modes go through `about:blank` first.
+- nodriver 0.50 does not pass `Config.lang` on, its `add_argument` refuses `--lang`, and macOS Chrome ignores the flag
+  anyway. A `lang` other than en-US goes through the same Accept-Language override as a fingerprint.
+- `Network.deleteCookies` answers success whether or not anything matched, and matches the exact stored domain, path and
+  partition. `cookie_delete` reads what exists, deletes those, and reads back.
+- libcurl's cookie engine drops a cookie for a host with no dot, so `localhost` reported `cookies_sent` that never left.
+  Such hosts get a `Cookie` header. libcurl also speaks `file://`, which `http_request` refuses.
 - `tab.evaluate` does not await Promises unless `await_promise=True`. Without it every async
   expression returns `null`, silently.
 - nodriver's `Connection.backup()`-style CDP calls are not the problem, but SQLite's
@@ -325,6 +368,9 @@ uv tool install --force .               # install this tree as the PROD MCP
 uv run mcp-stealth-chrome --http        # one server for many clients (token required)
 ```
 
+- `tests/test_protocol.py` and `tests/test_protocol_e2e.py` drive the server over stdio with `session.call_tool`, so
+  FastMCP's argument parsing and the client's output validation run. `MCP_TEST_SERVER_PYTHON` and `MCP_TEST_SRC` run
+  them against another interpreter or source tree, which is how to cover both nodriver and mcp versions.
 - A green unit suite proves nothing about the paths it skips. The E2E suites only run under
   `MCP_E2E=1`, and a message assertion inside one of them stayed wrong for a full release because
   only the fast suite was re-run after the message changed.

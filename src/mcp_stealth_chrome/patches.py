@@ -1,4 +1,4 @@
-"""Runtime monkey-patches for upstream bugs in nodriver 0.48.x.
+"""Runtime monkey-patches for upstream behaviour in nodriver and FastMCP.
 
 Apply by importing this module once at server startup. Patches are idempotent.
 
@@ -23,9 +23,10 @@ def status() -> dict:
         "failed": failed,
         "healthy": not failed,
         "note": (
-            "A failed patch means nodriver will raise inside the CDP event "
-            "listener, killing it — captures then return empty instead of "
-            "erroring. Upgrade/downgrade nodriver if this is non-empty."
+            "A failed nodriver patch raises inside the CDP event listener, killing it, "
+            "so captures return empty instead of erroring. A failed fastmcp_keeps_text "
+            "makes text that looks like JSON fail validation. Change the nodriver or mcp "
+            "version if this is non-empty."
         ) if failed else None,
     }
 
@@ -138,7 +139,75 @@ def _patch_tab_get_keeps_session() -> None:
         _STATUS["tab_get_keeps_session"] = f"{type(e).__name__}: {e}"
 
 
+def _patch_fastmcp_keeps_text() -> None:
+    """FastMCP parses a string as JSON unless the parameter is annotated exactly `str`.
+
+    So http_request(data='{"a":1}') reached validation as a dict and failed, on all 154
+    Optional[str] parameters, and 'null' silently became None: wait_for(text='null') slept
+    instead of waiting. A parameter that accepts text keeps the text the caller sent.
+    """
+    try:
+        import types
+        import typing
+        from mcp.server.fastmcp.utilities.func_metadata import FuncMetadata
+        if getattr(FuncMetadata, "_mcp_keeps_text", False):
+            return
+
+        def takes_text(annotation) -> bool:
+            if typing.get_origin(annotation) not in (typing.Union, types.UnionType):
+                return annotation is str
+            members = [a for a in typing.get_args(annotation) if a is not type(None)]
+            # A union that also takes a list or dict still wants JSON parsed for it.
+            return str in members and not any(
+                typing.get_origin(a) in (list, dict) or a in (list, dict) for a in members)
+
+        original = FuncMetadata.pre_parse_json
+
+        def pre_parse_json(self, data):
+            parsed = original(self, data)
+            for name, field in self.arg_model.model_fields.items():
+                if takes_text(field.annotation):
+                    for key in (name, field.alias):
+                        if key in data and isinstance(data[key], str):
+                            parsed[key] = data[key]
+            return parsed
+
+        FuncMetadata.pre_parse_json = pre_parse_json
+        FuncMetadata._mcp_keeps_text = True
+        _STATUS["fastmcp_keeps_text"] = True
+    except Exception as e:  # never block server startup on patch failure
+        _STATUS["fastmcp_keeps_text"] = f"{type(e).__name__}: {e}"
+
+
+def _patch_transaction_late_reply() -> None:
+    """nodriver up to 0.48 dies on a reply to a call nobody is waiting for any more.
+
+    A Transaction is a Future, and asyncio.wait_for cancels it on timeout. When Chrome answers
+    later, set_result raises InvalidStateError inside the CDP listener and kills it, so every
+    later call on that tab times out. One slow evaluate wedged the whole browser. Absent from
+    0.50, where Transaction is no longer a Future and there is nothing to patch.
+    """
+    try:
+        from nodriver.core.connection import Transaction
+        if not issubclass(Transaction, asyncio.Future) or getattr(Transaction, "_mcp_late_reply", False):
+            return
+        original_call = Transaction.__call__
+
+        def patched_call(self, **response):
+            if self.done():
+                return None
+            return original_call(self, **response)
+
+        Transaction.__call__ = patched_call
+        Transaction._mcp_late_reply = True
+        _STATUS["transaction_late_reply"] = True
+    except Exception as e:  # never block server startup on patch failure
+        _STATUS["transaction_late_reply"] = f"{type(e).__name__}: {e}"
+
+
 def apply_all() -> None:
+    _patch_fastmcp_keeps_text()
+    _patch_transaction_late_reply()
     _patch_cookie_same_party()
     _patch_client_security_state()
     _patch_tab_get_keeps_session()

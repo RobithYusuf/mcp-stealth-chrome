@@ -3282,3 +3282,28 @@ def test_storage_state_does_not_count_a_rejected_cookie(tmp_path):
     }))
     with pytest.raises(RuntimeError, match="rejected cookie 'sid'"):
         asyncio.run(server._apply_storage_state(_Browser(), str(state)))
+
+
+def test_cookie_delete_says_so_when_the_cookie_survives(monkeypatch):
+    """Network.deleteCookies answers success whether or not anything matched, so only reading
+    back shows a delete that did nothing. Real Chrome deletes these, so a fake has to refuse."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from mcp_stealth_chrome import server
+
+    stubborn = SimpleNamespace(name="cf_clearance", domain=".site.test", path="/", partition_key=None)
+
+    async def get_all():
+        return [stubborn]
+
+    class Tab:
+        async def send(self, *_args):
+            return None
+
+    browser = SimpleNamespace(cookies=SimpleNamespace(get_all=get_all))
+    monkeypatch.setattr(server.BrowserState, "browser", browser, raising=False)
+    monkeypatch.setattr(server.BrowserState, "active_tab", classmethod(lambda cls: Tab()))
+    tool = server.mcp._tool_manager._tools["cookie_delete"].fn
+    out = asyncio.run(tool(name="cf_clearance", domain=".site.test"))
+    assert out.startswith("Error") and "still present" in out, out

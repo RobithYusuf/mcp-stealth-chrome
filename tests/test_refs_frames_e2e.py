@@ -176,8 +176,8 @@ def test_snapshot_writes_nothing_to_the_page(page):
     page_value(page, "window.__mutations.length = 0")
     snap(page)
     assert page_value(page, "JSON.stringify(window.__mutations)").strip() in ("[]", '"[]"')
-    assert page_value(page, "!!document.querySelector('[data-mcp-ref]')") == "False"
-    assert page_value(page, "document.documentElement.hasAttribute('data-mcp-doc')") == "False"
+    assert page_value(page, "!!document.querySelector('[data-mcp-ref]')") == "false"
+    assert page_value(page, "document.documentElement.hasAttribute('data-mcp-doc')") == "false"
     assert "[]" in frame_value(page, "cross", "JSON.stringify(document.querySelectorAll('[data-mcp-ref]').length ? ['x'] : [])")
 
 
@@ -215,7 +215,7 @@ def test_ref_tools_keep_working(page):
     assert "pasted-text" in page_value(page, "document.getElementById('plain').value")
     assert "scrolled" in run(page, "scroll_to", ref=ref_of(shot, '"Far Below"'))
     assert "Free" in run(page, "get_text", ref=ref_of(shot, '"Free"'))
-    assert "hovered" == run(page, "hover", ref=ref_of(shot, '"Free"'))
+    assert run(page, "hover", ref=ref_of(shot, '"Free"')).startswith("hovered")
     assert "button" in run(page, "inspect_element", ref=ref_of(shot, '"Free"'))
     result = run(page, "check", ref=ref_of(shot, "type=checkbox"))
     assert result.startswith("checked") and "cdp_mouse" in result, result
@@ -230,7 +230,7 @@ def test_fill_reports_a_value_the_page_rejected(page):
 def test_styled_checkbox_says_it_needed_js(page):
     out = run(page, "check", selector="#styled")
     assert out.startswith("checked") and "cdp_mouse on its label" in out, out
-    assert page_value(page, "document.getElementById('styled').checked") == "True"
+    assert page_value(page, "document.getElementById('styled').checked") == "true"
 
 
 # ── Task 3: frames and shadow DOM ─────────────────────────────────────────

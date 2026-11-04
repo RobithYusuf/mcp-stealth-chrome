@@ -191,7 +191,7 @@ def _resolve_vision_provider(
     Resolution priority:
       1. Explicit args to solve_recaptcha_ai(provider=, base_url=, api_key=, model=)
       2. OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL         (standard — OpenAI SDK convention)
-      3. AI_VISION_API_KEY / AI_VISION_BASE_URL / AI_VISION_MODEL (DEPRECATED — removed in v0.2.0)
+      3. AI_VISION_API_KEY / AI_VISION_BASE_URL / AI_VISION_MODEL (deprecated, still read)
       4. ANTHROPIC_API_KEY / ANTHROPIC_MODEL                      (Claude)
 
     ⚠️ Model MUST be multimodal (vision-capable):
@@ -208,10 +208,8 @@ def _resolve_vision_provider(
     legacy_prov = os.environ.get("AI_VISION_PROVIDER")
     if any([legacy_key, legacy_url, legacy_model, legacy_prov]) and not os.environ.get("OPENAI_API_KEY"):
         warnings.warn(
-            "AI_VISION_* env vars are deprecated in v0.1.4 — migrate to "
-            "OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL "
-            "(OpenAI SDK standard). Legacy vars still work but will be "
-            "removed in v0.2.0.",
+            "AI_VISION_* env vars are deprecated. Use OPENAI_API_KEY / OPENAI_BASE_URL / "
+            "OPENAI_MODEL (OpenAI SDK standard) instead; the old names still work.",
             DeprecationWarning,
             stacklevel=2,
         )
@@ -295,7 +293,7 @@ async def solve_recaptcha_ai(
     Env vars (OpenAI SDK standard — priority checked if args omitted):
         OPENAI_API_KEY + OPENAI_BASE_URL + OPENAI_MODEL  → OpenAI-compat
         ANTHROPIC_API_KEY + ANTHROPIC_MODEL              → Claude
-        AI_VISION_* (legacy, DEPRECATED — removed v0.2.0) → backward-compat
+        AI_VISION_* (deprecated, still read)             → backward-compat
 
     Explicit override:
         provider="anthropic" | "openai"
@@ -547,7 +545,7 @@ async def vision_locate(
     model: Optional[str] = None,
     provider: Optional[str] = None,
 ) -> str:
-    """⭐ Find an element by natural-language description using a vision LLM.
+    """Find an element by natural-language description using a vision LLM.
 
     Uses the same provider as solve_recaptcha_ai (OPENAI_* / ANTHROPIC_* env).
     Reuses solve_recaptcha_ai's vision plumbing so any vision-capable model
