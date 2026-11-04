@@ -1076,7 +1076,7 @@ JSON.stringify({
 _OSCURSOR_HINT = (
     "next step for a full-page challenge: solve_turnstile_oscursor, which clicks with the "
     "real OS cursor in a separate Chrome and copies the cookies back. It needs the main "
-    "browser on this page, takes over the mouse during the call (30 s by default), and "
+    "browser on this page, takes over the mouse during the call (up to 50 s by default), and "
     "needs the [os-cursor] "
     "extra plus macOS Accessibility and Screen Recording permission (Windows and Linux "
     "not field-tested)")

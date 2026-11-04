@@ -203,3 +203,14 @@ def test_sidecar_rejection_or_ua_mismatch_never_reaches_handoff(tmp_path, monkey
     assert asyncio.run(solver._attempt("https://example.test/demo", 30, report, resources)) is False
     assert report["sidecar"]["cf_clearance_present"] is True
     assert not (tmp_path / "state.json").exists()
+
+
+def test_default_timeout_covers_a_run_inside_the_mcp_server():
+    """Inside the server native input runs slower than standalone: 35 s timed out
+    during scoring and 50 s passed, so the default 30 could not finish."""
+    import inspect
+
+    from mcp_stealth_chrome.tools import turnstile_oscursor
+
+    default = inspect.signature(turnstile_oscursor.solve_turnstile_oscursor).parameters["timeout_s"].default
+    assert default >= 50, default
