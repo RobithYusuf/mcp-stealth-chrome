@@ -110,8 +110,8 @@ def test_every_optional_text_parameter_takes_json_looking_text(mcp):
 
 
 def test_descriptions_are_clean_on_every_listed_tool(mcp):
+    # The tool count is pinned in test_registry; here we only guard description hygiene.
     tools = _listed_tools(mcp)
-    assert len(tools) == 172
     assert all("⭐" not in (t.description or "") for t in tools)
     assert not [t.name for t in tools if "removed v0.2.0" in (t.description or "")]
 

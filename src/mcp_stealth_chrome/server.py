@@ -1221,6 +1221,7 @@ async def _auto_verify_cf(tab: Tab, max_attempts: int = 2, budget: float = 24.0)
 
 from ._app import mcp  # single FastMCP instance shared with tools/* submodules
 from . import image_output as _image_output  # registers native image inspection tools
+from .tools import turnstile_oscursor as _turnstile_oscursor  # registers the native-cursor tool
 
 
 # ── Utility: ensure active tab after operations that may shift tabs ────────

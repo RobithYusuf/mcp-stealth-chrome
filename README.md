@@ -4,7 +4,7 @@
 
 # MCP Stealth Chrome
 
-An MCP server with 172 tools that gives an AI agent a real Chrome browser and an HTTP client with Chrome's TLS fingerprint.
+An MCP server with 173 tools that gives an AI agent a real Chrome browser and an HTTP client with Chrome's TLS fingerprint.
 
 [![PyPI version](https://img.shields.io/pypi/v/mcp-stealth-chrome.svg)](https://pypi.org/project/mcp-stealth-chrome/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -499,9 +499,9 @@ Open a group to see its tools.
 </details>
 
 <details>
-<summary><b>Anti-bot and identity</b> (10)</summary>
+<summary><b>Anti-bot and identity</b> (11)</summary>
 
-`detect_anti_bot`, `detect_and_bypass`, `click_turnstile`, `verify_cf`, `solve_captcha`, `solve_recaptcha_ai`, `fingerprint_audit`, `fingerprint_rotate`, `identity_pin`, `identity_show`
+`detect_anti_bot`, `detect_and_bypass`, `click_turnstile`, `verify_cf`, `solve_captcha`, `solve_recaptcha_ai`, `solve_turnstile_oscursor`, `fingerprint_audit`, `fingerprint_rotate`, `identity_pin`, `identity_show`
 </details>
 
 <details>
@@ -567,6 +567,15 @@ These run without a browser and without a search API key, and use the stealth br
 <summary><b>Anti-bot</b></summary>
 
 `detect_anti_bot` identifies Cloudflare, DataDome, PerimeterX, Akamai, Kasada and Imperva on the current page. `detect_and_bypass` also applies the best approach this server has. `click_turnstile` and `verify_cf` click a Turnstile checkbox, with template matching as a fallback. `fingerprint_audit` checks this browser's own fingerprint for inconsistencies, and states what it cannot see from inside a page, such as TLS or IP against timezone. `identity_pin` keeps a stable identity and proxy per instance. `mouse_drift`, `mouse_record`, `mouse_replay`, `humanize_click` and `humanize_type` add natural movement.
+
+`solve_turnstile_oscursor(url=None, timeout_s=30.0)` tries a different path for an interactive full-page challenge. It opens a fresh headed Chrome without a CDP client, locates the checkbox in an OS screenshot, clicks with the real desktop cursor, then waits eight seconds before attaching CDP to read cookies. It transfers only site cookies through the storage-state loader and reports success only after the main browser returns HTTP 200 with no detected challenge. A click or a clearance cookie alone is not proof of access. An unsuccessful challenge is reported, not retried automatically.
+
+- Launch the main browser first. Omit `url` to use its active tab. The main browser and sidecar need the same IP route and natural user agent; an explicit main-browser proxy or a user-agent mismatch is refused.
+- This tool intentionally takes focus and moves the shared OS cursor. Keep the desktop free during the call. A per-user OS lock prevents simultaneous solver calls across server processes, but cannot stop a person or another desktop program from moving the pointer.
+- macOS: install with `uvx 'mcp-stealth-chrome[os-cursor]'` (or `uv sync --extra os-cursor` for development). Grant the controlling app/terminal **Accessibility** and **Screen Recording** in System Settings. The Python helper `os_input.is_available(prompt=True)` can request the Accessibility prompt; the MCP tool never silently changes permissions.
+- Windows uses native SendInput. Linux requires X11 and `xdotool`, or the `os-cursor` extra's python-xlib/XTEST fallback. Native Wayland is refused. Windows and Linux implementations have not been field-tested.
+- `timeout_s` must be at least 16 seconds and bounds the attempt, not process cleanup. Only the tool's own temporary profile, screenshot and mode-600 cookie file are overwritten and deleted. Overwriting is best effort, not a secure-erasure guarantee on SSD or copy-on-write storage. Cookies already transferred to the main browser remain there until expiry or deletion.
+- Verification: a macOS local fixture passed native input, cookie handoff and main-browser HTTP 200 through a real MCP client. A live `nopecha.com/demo/cloudflare` attempt clicked a matched checkbox but produced no clearance cookie; no site cookies were transferred. This is not a claim of reliable Cloudflare access.
 </details>
 
 <details>
@@ -591,7 +600,7 @@ These run without a browser and without a search API key, and use the stealth br
 
 ## API keys
 
-✅ 166 of the 172 tools need no key. These six do:
+✅ 167 of the 173 tools need no key. These six do:
 
 | Tools | Key | Approximate cost |
 |-------|-----|------------------|

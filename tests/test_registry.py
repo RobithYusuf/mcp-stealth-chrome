@@ -11,7 +11,7 @@ both surfaced by the registry gate).
 """
 import sys
 
-EXPECTED_COUNT = 172
+EXPECTED_COUNT = 173
 EXPECTED_TOOLS = {
     # Lifecycle
     "browser_launch", "browser_close", "browser_recover",
@@ -65,6 +65,7 @@ EXPECTED_TOOLS = {
     "find_by_image", "click_at_image",
     "mouse_drift", "mouse_record", "mouse_replay",
     "solve_recaptcha_ai",
+    "solve_turnstile_oscursor",
     # HTTP / behavioral
     "http_request", "http_session_cookies", "session_warmup",
     "detect_anti_bot", "http_request_with_session", "http_request_status",
