@@ -228,6 +228,8 @@ Add to `~/.omp/agent/mcp.json`:
 
 See [docs/INSTALL.md](docs/INSTALL.md) for verification and troubleshooting.
 
+`solve_turnstile_oscursor` needs the optional `os-cursor` extra. On macOS, use `uvx 'mcp-stealth-chrome[os-cursor]'` in your client config (`"args": ["mcp-stealth-chrome[os-cursor]@latest"]`), or install it with `uv tool install 'mcp-stealth-chrome[os-cursor]'`. Then give the app or terminal that runs your client **Accessibility** and **Screen Recording** permission in System Settings > Privacy & Security. `server_status` shows under `os_cursor` whether this is ready. Windows and Linux backends exist but have not been field-tested.
+
 ## Usage examples
 
 An agent usually reads the page, then acts on the refs it got back:
@@ -293,18 +295,28 @@ Sites change, so read these as results from the screenshots below and not as a g
 | `browserscan.net/bot-detection` | WebDriver, Selenium, CDP, headless | ✅ All "Normal" |
 | `arh.antoinevastel.com` areyouheadless | Headless Chrome | ✅ "You are not Chrome headless" |
 | `2captcha.com/demo/cloudflare-turnstile` | Turnstile widget, with Cloudflare's test key | ✅ Checkbox reaches "Success!" with `click_turnstile` |
-| `nopecha.com/demo/cloudflare` | Full-page "Just a moment..." challenge | ❌ Stays on the challenge, 2 of 2 tries |
+| `nopecha.com/demo/cloudflare` | Full-page "Just a moment..." challenge | ❌ Stays on the challenge with `click_turnstile`, 0 of 3 |
+| `nopecha.com/demo/cloudflare` | Same challenge | ✅ Main browser gets the page with `solve_turnstile_oscursor`, 3 of 3 (one macOS machine, one IP) |
 | `google.com/recaptcha/api2/demo` | reCAPTCHA v2 images | ✅ 5 of 5 runs with `solve_recaptcha_ai` |
 | `tls.browserleaks.com` | JA3 and JA4 | ✅ Shows the JA3 of the browser it impersonates |
 
-### Cloudflare Turnstile with click_turnstile
+### Cloudflare Turnstile
+
+| Situation | Tool |
+|-----------|------|
+| Checkbox embedded in a page, such as a login or signup form | `click_turnstile` |
+| Full-page "Just a moment..." challenge, on macOS, with the desktop free for half a minute | `solve_turnstile_oscursor` |
+| Full-page challenge where the mouse cannot be taken over, or on Windows or Linux | A saved session with `storage_state_load`, or `solve_captcha` (paid) |
+
+`click_turnstile`, `verify_cf` and `auto_verify` click through CDP. When a challenge is still there afterwards, their result says so and names `solve_turnstile_oscursor`.
 
 <img src="https://raw.githubusercontent.com/RobithYusuf/mcp-stealth-chrome/main/docs/images/turnstile.jpg" alt="Cloudflare Turnstile widget showing Success" width="500">
 
 One call moves the checkbox from "Verify you are human" to "Success!". This demo uses Cloudflare's test sitekey and returns a dummy token, so it shows that the click lands on the widget. It does not show that a protected site lets you through.
 
 - ✅ Finds and clicks the embedded widget (`.cf-turnstile`, `[data-sitekey]`, or a `challenges.cloudflare.com` iframe). Earlier runs also passed the `dash.cloudflare.com` login and `nopecha.com/captcha/turnstile`, not retested since
-- ❌ Does not get through Cloudflare's full-page "Just a moment..." challenge. On `nopecha.com/demo/cloudflare`, the click earned a `cf_clearance` cookie, but the page stayed at status 403, in 2 of 2 tries from one machine and IP. `solve_captcha` and a saved session are the alternatives to try. Neither was tested on this page
+- ❌ `click_turnstile` does not get through Cloudflare's full-page "Just a moment..." challenge. On `nopecha.com/demo/cloudflare`, the click earned a `cf_clearance` cookie, but the page stayed at status 403, in 3 of 3 tries, one of them with the VPN off
+- ✅ `solve_turnstile_oscursor` got the main browser through the same page in 3 of 3 tries: status 200, title "NopeCHA - CAPTCHA Demo", no challenge, checked from the main browser. Measured in November 2026 on one macOS machine with one home IP. It is not a claim about other sites, other IPs, or Windows and Linux
 
 ### bot.sannysoft.com
 
@@ -389,7 +401,7 @@ Results describe what was observed. A tool that reports success when nothing hap
 - ✅ `evaluate`, `frame_evaluate` and `wait_for_function` report a JavaScript exception as an error, and promises are awaited. Objects and arrays come back as JSON.
 - ✅ `type_text`, `humanize_type` and `fill` send a keydown and keyup per character. `type_text` refuses when no field has focus, and refuses a newline in a single-line field.
 - ✅ `upload_file` refuses a path that is not a file. `paste_text` refuses a field that cannot take text and reports what landed, contenteditable included.
-- ✅ `click_turnstile`, `verify_cf` and `auto_verify` report what the page shows after the click: whether the token filled, the title, and whether the challenge is still there. A click alone is not a pass, and no click happens when no checkbox matched.
+- ✅ `click_turnstile`, `verify_cf` and `auto_verify` report what the page shows after the click: whether the token filled, the title, and whether the challenge is still there. A click alone is not a pass, and no click happens when no checkbox matched. A challenge still present names `solve_turnstile_oscursor` as the next step.
 - ✅ `press_key` reports what the key did: navigation, page change, focus, or nothing.
 - ✅ `fill_form` fails when a field fails and then does not submit. `batch_actions` counts it as failed.
 - ✅ Empty results say whether anything was measured. `console_get`, `intercept_log` and `storage_snapshot` report that state, and `network_get` is an error before `network_start`.
@@ -572,10 +584,10 @@ These run without a browser and without a search API key, and use the stealth br
 
 - Launch the main browser first. Omit `url` to use its active tab. The main browser and sidecar need the same IP route and natural user agent; an explicit main-browser proxy or a user-agent mismatch is refused.
 - This tool intentionally takes focus and moves the shared OS cursor. Keep the desktop free during the call. A per-user OS lock prevents simultaneous solver calls across server processes, but cannot stop a person or another desktop program from moving the pointer.
-- macOS: install with `uvx 'mcp-stealth-chrome[os-cursor]'` (or `uv sync --extra os-cursor` for development). Grant the controlling app/terminal **Accessibility** and **Screen Recording** in System Settings. The Python helper `os_input.is_available(prompt=True)` can request the Accessibility prompt; the MCP tool never silently changes permissions.
-- Windows uses native SendInput. Linux requires X11 and `xdotool`, or the `os-cursor` extra's python-xlib/XTEST fallback. Native Wayland is refused. Windows and Linux implementations have not been field-tested.
+- macOS: run it with `uvx 'mcp-stealth-chrome[os-cursor]'` or install it with `uv tool install 'mcp-stealth-chrome[os-cursor]'` (`uv sync --extra os-cursor` for development). Without the extra the tool stops before doing anything and says the module is missing. Grant the controlling app or terminal **Accessibility** and **Screen Recording** in System Settings. `server_status` reports `os_cursor.available` without moving anything. The Python helper `os_input.is_available(prompt=True)` can request the Accessibility prompt; the MCP tool never changes permissions by itself.
+- **Windows and Linux: not field-tested.** Windows uses native SendInput. Linux requires X11 and `xdotool`, or the `os-cursor` extra's python-xlib/XTEST fallback. Native Wayland is refused.
 - `timeout_s` must be at least 16 seconds and bounds the attempt, not process cleanup. Only the tool's own temporary profile, screenshot and mode-600 cookie file are overwritten and deleted. Overwriting is best effort, not a secure-erasure guarantee on SSD or copy-on-write storage. Cookies already transferred to the main browser remain there until expiry or deletion.
-- Verification: a macOS local fixture passed native input, cookie handoff and main-browser HTTP 200 through a real MCP client. A live `nopecha.com/demo/cloudflare` attempt clicked a matched checkbox but produced no clearance cookie; no site cookies were transferred. This is not a claim of reliable Cloudflare access.
+- Verification: a macOS local fixture passed native input, cookie handoff and main-browser HTTP 200 through a real MCP client. On `nopecha.com/demo/cloudflare` it passed 3 of 3 from one macOS machine and one IP, checked from the main browser (see Test results). This is not a claim of reliable Cloudflare access elsewhere.
 </details>
 
 <details>

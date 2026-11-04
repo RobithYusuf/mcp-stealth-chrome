@@ -1071,6 +1071,17 @@ JSON.stringify({
 """
 
 
+# Measured on one macOS machine and one IP: CDP clicks failed 3 of 3 on a full-page
+# challenge and solve_turnstile_oscursor passed 3 of 3. So a failed click names it.
+_OSCURSOR_HINT = (
+    "next step for a full-page challenge: solve_turnstile_oscursor, which clicks with the "
+    "real OS cursor in a separate Chrome and copies the cookies back. It needs the main "
+    "browser on this page, takes over the mouse during the call (30 s by default), and "
+    "needs the [os-cursor] "
+    "extra plus macOS Accessibility and Screen Recording permission (Windows and Linux "
+    "not field-tested)")
+
+
 async def _cf_after_click(tab: Tab, wait: float = 3.0) -> str:
     """What the page shows after a challenge click. A click landing is not a challenge passed."""
     deadline = time.monotonic() + wait
@@ -1091,7 +1102,7 @@ async def _cf_after_click(tab: Tab, wait: float = 3.0) -> str:
     if token_len and not interstitial and not still:
         verdict = "challenge passed as far as the page shows"
     elif still or interstitial:
-        verdict = "challenge still present: NOT passed"
+        verdict = f"challenge still present: NOT passed; {_OSCURSOR_HINT}"
     else:
         verdict = "no sign either way: check the page before relying on it"
     return f"observed after {wait:g}s: {token}, title {title[:60]!r}, {verdict}"
@@ -1204,7 +1215,7 @@ async def _auto_verify_cf(tab: Tab, max_attempts: int = 2, budget: float = 24.0)
             pass
 
     if not actions:
-        return " [auto-verify: CF detected but no clickable widget found]"
+        return f" [auto-verify: CF detected but no clickable widget found; {_OSCURSOR_HINT}]"
     # The caller is about to read this page, so whether the challenge is still on it matters
     # more than which clicks were tried.
     still = await _has_cf_challenge(tab, active=True)
@@ -1215,9 +1226,9 @@ async def _auto_verify_cf(tab: Tab, max_attempts: int = 2, budget: float = 24.0)
     # well-timed, score below a real HID click and the server re-issues the
     # challenge (cf_chl_rc_ni). Say so and point at the paths that do work rather
     # than implying another click would help.
-    return (f" [auto-verify: {' → '.join(actions)}; challenge still present — interactive "
-            f"Turnstile is not solvable by click simulation; load a warm session with "
-            f"storage_state_load (reuses a valid cf_clearance) or use solve_captcha]")
+    return (f" [auto-verify: {' → '.join(actions)}; challenge still present: CDP clicks did "
+            f"not pass it; {_OSCURSOR_HINT}. Other options: storage_state_load with a warm "
+            f"session that holds a valid cf_clearance, or solve_captcha]")
 
 from ._app import mcp  # single FastMCP instance shared with tools/* submodules
 from . import image_output as _image_output  # registers native image inspection tools
@@ -7015,8 +7026,22 @@ async def server_status() -> str:
         "intercepting": bool(_INTERCEPT.get("active")),
         "profile_dir": _status_profile(),
         "compat_patches": _patches.status(),
+        "os_cursor": await _os_cursor_status(),
     }
     return ok(json.dumps(status, indent=2, default=str))
+
+
+async def _os_cursor_status() -> dict:
+    """Whether solve_turnstile_oscursor could run here, checked without any input.
+
+    Missing the [os-cursor] extra otherwise shows only when the tool is called.
+    """
+    from . import os_input
+    try:
+        available, reason = await asyncio.wait_for(asyncio.to_thread(os_input.is_available), timeout=5)
+    except Exception as exc:
+        available, reason = False, f"not measured ({type(exc).__name__})"
+    return {"available": bool(available), "detail": reason}
 
 
 @mcp.tool()
@@ -8281,7 +8306,8 @@ async def verify_cf(template_image: Optional[str] = None) -> str:
     without it, the bundled English default is used.
 
     Reports what the page shows after the click, and errors when no checkbox matched.
-    For managed-mode Turnstile, combine with storage_state or solve_captcha.
+    Clicks go through CDP. A full-page "Just a moment..." challenge did not pass that way
+    in our tests: use solve_turnstile_oscursor, or storage_state_load / solve_captcha.
     """
     try:
         tab = BrowserState.active_tab()
@@ -8455,7 +8481,10 @@ async def click_turnstile(
     passed. Measured: on nopecha.com/demo/cloudflare the click earned a cf_clearance cookie
     and the page still answered 403, and the 2captcha demo uses Cloudflare's test sitekey,
     whose token is a dummy. Neither shows that a real protected site lets you in.
-    Full-page "Just a moment..." challenges: use solve_captcha or storage_state_load.
+    Does NOT work on a full-page "Just a moment..." challenge: CDP clicks failed 3 of 3
+    there. Use solve_turnstile_oscursor, which clicks with the real OS cursor (needs the
+    [os-cursor] extra and macOS Accessibility + Screen Recording; takes over the mouse),
+    or storage_state_load with a warm session, or solve_captcha.
     """
     try:
         tab = BrowserState.active_tab()

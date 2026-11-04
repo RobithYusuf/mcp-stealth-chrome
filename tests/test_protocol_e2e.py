@@ -621,6 +621,7 @@ def test_click_turnstile_reports_a_challenge_not_passed(page, base):
     page.call("navigate", url=f"{base}/turnstile.html", auto_verify=False)
     reply = page.call("click_turnstile")
     assert "clicked Turnstile" in reply.text and "NOT passed" in reply.text and "token empty" in reply.text, reply.text
+    assert "solve_turnstile_oscursor" in reply.text, reply.text
 
 
 def test_click_turnstile_reports_a_filled_token(page, base):

@@ -3307,3 +3307,78 @@ def test_cookie_delete_says_so_when_the_cookie_survives(monkeypatch):
     tool = server.mcp._tool_manager._tools["cookie_delete"].fn
     out = asyncio.run(tool(name="cf_clearance", domain=".site.test"))
     assert out.startswith("Error") and "still present" in out, out
+
+
+# ── 0.12.7: a failed Turnstile click names the path that passed ──
+
+
+def test_failed_turnstile_click_points_to_the_os_cursor_tool(monkeypatch):
+    """CDP clicks failed 3 of 3 on a full-page challenge and the OS cursor passed 3 of 3,
+    yet the failure only said NOT passed and left the agent to click again."""
+    import asyncio
+
+    from mcp_stealth_chrome import server
+
+    class _Tab:
+        async def evaluate(self, _js, return_by_value=True):
+            return '{"title": "Just a moment...", "token": ""}'
+
+    async def still(_tab, active=False):
+        return True
+
+    monkeypatch.setattr(server, "_cf_challenge_state", still)
+    _real_sleep = asyncio.sleep
+    monkeypatch.setattr(server.asyncio, "sleep", lambda *_a: _real_sleep(0))
+    out = asyncio.run(server._cf_after_click(_Tab(), wait=0))
+    assert "NOT passed" in out and "solve_turnstile_oscursor" in out and "[os-cursor]" in out, out
+
+
+def test_passed_turnstile_click_does_not_suggest_another_tool(monkeypatch):
+    import asyncio
+
+    from mcp_stealth_chrome import server
+
+    class _Tab:
+        async def evaluate(self, _js, return_by_value=True):
+            return '{"title": "Shop", "token": "abcdefghij"}'
+
+    async def gone(_tab, active=False):
+        return False
+
+    monkeypatch.setattr(server, "_cf_challenge_state", gone)
+    _real_sleep = asyncio.sleep
+    monkeypatch.setattr(server.asyncio, "sleep", lambda *_a: _real_sleep(0))
+    out = asyncio.run(server._cf_after_click(_Tab(), wait=0))
+    assert "passed as far as the page shows" in out and "solve_turnstile_oscursor" not in out, out
+
+
+@pytest.mark.parametrize("clicks", [True, False])
+def test_auto_verify_failure_points_to_the_os_cursor_tool(monkeypatch, clicks):
+    import asyncio
+
+    from mcp_stealth_chrome import server
+
+    async def present(_tab, active=False):
+        return True
+
+    async def dom_click(_tab, offset_x=30):
+        return (10, 10) if clicks else None
+
+    async def template_click(_tab, _template=None):
+        return False, "no match"
+
+    monkeypatch.setattr(server, "_has_cf_challenge", present)
+    monkeypatch.setattr(server, "_attempt_turnstile_click", dom_click)
+    monkeypatch.setattr(server, "_cf_template_click", template_click)
+    _real_sleep = asyncio.sleep
+    monkeypatch.setattr(server.asyncio, "sleep", lambda *_a: _real_sleep(0))
+    out = asyncio.run(server._auto_verify_cf(object(), max_attempts=1, budget=3.0))
+    assert "solve_turnstile_oscursor" in out and "[os-cursor]" in out, out
+
+
+def test_click_turnstile_description_points_to_the_os_cursor_tool():
+    from mcp_stealth_chrome import server
+
+    for name in ("click_turnstile", "verify_cf"):
+        doc = server.mcp._tool_manager._tools[name].description
+        assert "solve_turnstile_oscursor" in doc, name

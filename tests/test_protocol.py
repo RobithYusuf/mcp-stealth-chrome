@@ -160,3 +160,12 @@ def test_secret_key_hides_what_is_under_it_except_session():
     text = json.dumps(masked)
     assert not any(s in text for s in ("S1", "S2", "S3", "S4"))
     assert masked["session"]["user"] == "budi"
+
+
+def test_server_status_says_whether_the_os_cursor_backend_can_run(mcp):
+    """A missing [os-cursor] extra showed only when solve_turnstile_oscursor was called."""
+    from mcp_stealth_chrome import os_input
+
+    seen = mcp.call("server_status").json()["os_cursor"]
+    available, _reason = os_input.is_available()
+    assert seen["available"] is available and seen["detail"], seen
