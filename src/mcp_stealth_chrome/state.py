@@ -622,6 +622,9 @@ class _SessionState:
     )
 
     instances: dict[str, InstanceSnapshot] = field(default_factory=dict)  # does NOT include current
+    # instance id -> why the server ended it after its last window went away, so the next
+    # call says so instead of a bare "not running".
+    window_closed: dict[str, str] = field(default_factory=dict)
 
 
 _SESSION_FIELDS = frozenset(_SessionState.__dataclass_fields__)
@@ -821,12 +824,17 @@ class BrowserState(metaclass=_SessionRouted):
 
     @classmethod
     def active_tab(cls) -> Tab:
+        closed = cls.window_closed.get(cls.current_instance_id)
         if cls.browser is not None and not cls._browser_alive():
+            if closed:
+                raise RuntimeError(f"Browser not running: {closed} Call browser_launch to start it again.")
             raise RuntimeError(
                 "Browser died (Chrome closed or CDP websocket lost). Handle retained for "
                 "verified cleanup: call browser_recover() then browser_launch()."
             )
         if not cls.is_up():
+            if closed and cls.browser is None:
+                raise RuntimeError(f"Browser not running: {closed} Call browser_launch to start it again.")
             raise RuntimeError("Browser not running. Call browser_launch first.")
         cls.current_last_active = time.time()
         if cls.active_tab_index >= len(cls.tabs):

@@ -1593,7 +1593,10 @@ async def browser_launch(
         url: initial URL to load
         headless: run without UI (many sites detect headless — prefer False). A visible
             window opens behind the app in use and does not take the keyboard. A click that
-            calls window.open still brings Chrome forward for about 130 ms before focus returns
+            calls window.open still brings Chrome forward for about 130 ms before focus returns.
+            When the person quits it (Cmd+Q, Dock > Quit) or closes every window, the server
+            ends that Chrome within a few seconds, and the next call says it was closed and
+            why; call browser_launch again to continue. tab_close on the last tab does not.
         proxy: "http://user:pass@host:port" or "socks5://host:port"
         user_agent: override UA string
         window_width, window_height: viewport size
@@ -2069,6 +2072,9 @@ async def browser_launch(
         BrowserState.current_idle_timeout = DEFAULT_IDLE_TIMEOUT if BrowserState.http_mode() else 0
         if BrowserState.http_mode():
             _ensure_idle_reaper_running()
+        BrowserState.window_closed.pop(BrowserState.current_instance_id, None)
+        if not headless:
+            _watch_windows(browser)
         suffix = (
             f" [{profile_info.get('session_state_source')}]"
             if used_fallback else ""
@@ -5175,6 +5181,8 @@ async def tab_close(index: Optional[int] = None) -> str:
         await closed_tab.close()
         _clear_tab_scoped_state([closed_tab])
         await _refresh_tabs()
+        if not BrowserState.tabs:
+            _window_watch_tool_closed(BrowserState.browser)
         if BrowserState.active_tab_index >= len(BrowserState.tabs):
             BrowserState.active_tab_index = max(0, len(BrowserState.tabs) - 1)
         return ok(f"closed tab {idx}")
@@ -9235,6 +9243,9 @@ async def _launch_browser_instance(
 
     # Kick off the idle reaper (once)
     _ensure_idle_reaper_running()
+    BrowserState.window_closed.pop(instance_id, None)
+    if not headless:
+        _watch_windows(browser)
     await _give_focus_back(previous_app)
     return True, (
         f"instance {instance_id!r} launched (headless={headless}, "
@@ -9243,56 +9254,63 @@ async def _launch_browser_instance(
     )
 
 
+async def _end_stored_instance(iid: str, snap: InstanceSnapshot) -> bool:
+    """Close a stored instance like close_instance does. True once its Chrome is verified gone."""
+    _tabs = list(snap.tabs)
+    # stop() can return without raising when the socket is gone. Keep the instance
+    # reachable and retry later unless the process is really gone; dropping it
+    # would leak a live Chrome with no remaining handle.
+    if snap.browser:
+        _dead = await _ensure_browser_dead(snap.browser, snap.profile_dir)
+        if _close_incomplete(_dead):
+            return False
+    # Mark profile cleanly exited (matches close_instance) so the
+    # next launch doesn't hit a "Restore pages?" / stale-lock state.
+    if snap.privacy:
+        if not await _remove_privacy_profile(snap.profile_dir):
+            snap.browser = None
+            snap.tabs = []
+            _clear_tab_scoped_state(_tabs)
+            return True
+    elif snap.profile_dir:
+        clean_profile_state(snap.profile_dir)
+    _clear_tab_scoped_state(_tabs)
+    BrowserState.instances.pop(iid, None)
+    return True
+
+
+async def _end_current_instance() -> bool:
+    """Close the calling session's current instance. True once its Chrome is verified gone."""
+    _cur_profile = BrowserState.current_profile_dir
+    _cur_privacy = BrowserState.current_privacy
+    _cur_tabs = list(BrowserState.tabs)
+    if BrowserState.browser:
+        _dead = await _ensure_browser_dead(BrowserState.browser, _cur_profile)
+        if _close_incomplete(_dead):
+            # State must remain reachable so the next sweep can retry.
+            return False
+    BrowserState.reset()
+    _clear_tab_scoped_state(_cur_tabs)
+    BrowserState.current_headless = False
+    BrowserState.current_privacy = False
+    if _cur_privacy:
+        if not await _remove_privacy_profile(_cur_profile):
+            BrowserState.current_profile_dir = _cur_profile
+            BrowserState.current_privacy = True
+    elif _cur_profile:
+        clean_profile_state(_cur_profile)
+    return True
+
+
 async def _sweep_idle_instances() -> None:
     """Close the calling session's instances that are past their idle timeout."""
-    # Check stored instances
-    to_close = []
     for iid, snap in list(BrowserState.instances.items()):
         if snap.is_running() and snap.is_idle_expired():
-            to_close.append((iid, snap))
-    for iid, snap in to_close:
-        _tabs = list(snap.tabs)
-        # stop() can return without raising when the socket is gone. Keep the instance
-        # reachable and retry next sweep unless the process is really gone; dropping it
-        # would leak a live Chrome with no remaining handle.
-        if snap.browser:
-            _dead = await _ensure_browser_dead(snap.browser, snap.profile_dir)
-            if _close_incomplete(_dead):
-                continue
-        # Mark profile cleanly exited (matches close_instance) so the
-        # next launch doesn't hit a "Restore pages?" / stale-lock state.
-        if snap.privacy:
-            if not await _remove_privacy_profile(snap.profile_dir):
-                snap.browser = None
-                snap.tabs = []
-                _clear_tab_scoped_state(_tabs)
-                continue
-        elif snap.profile_dir:
-            clean_profile_state(snap.profile_dir)
-        _clear_tab_scoped_state(_tabs)
-        BrowserState.instances.pop(iid, None)
-    # Check current instance
+            await _end_stored_instance(iid, snap)
     if (BrowserState.is_up()
         and BrowserState.current_idle_timeout > 0
         and (time.time() - BrowserState.current_last_active) > BrowserState.current_idle_timeout):
-        _cur_profile = BrowserState.current_profile_dir
-        _cur_privacy = BrowserState.current_privacy
-        _cur_tabs = list(BrowserState.tabs)
-        if BrowserState.browser:
-            _dead = await _ensure_browser_dead(BrowserState.browser, _cur_profile)
-            if _close_incomplete(_dead):
-                # State must remain reachable so the next sweep can retry.
-                return
-        BrowserState.reset()
-        _clear_tab_scoped_state(_cur_tabs)
-        BrowserState.current_headless = False
-        BrowserState.current_privacy = False
-        if _cur_privacy:
-            if not await _remove_privacy_profile(_cur_profile):
-                BrowserState.current_profile_dir = _cur_profile
-                BrowserState.current_privacy = True
-        elif _cur_profile:
-            clean_profile_state(_cur_profile)
+        await _end_current_instance()
 
 
 async def _idle_reaper_loop() -> None:
@@ -9327,6 +9345,121 @@ def _ensure_idle_reaper_running() -> None:
         pass  # no event loop yet — will try again on next launch
 
 
+# A headed Chrome starts with --no-startup-window so it never takes the keyboard, and Chrome
+# started that way does not exit on Quit: the quit Apple Event closes every window and the
+# process stays, with its Dock icon and the profile lock. Measured: still running 10 s after the
+# quit, while the same Chrome started normally exits in 0.3 s. Nothing in CDP tells a Quit from
+# closing every window by hand. So once such a browser has no page left that a tool did not
+# close, the server ends it the way the idle reaper does and the next call says why.
+_WINDOWLESS_GRACE = float(os.environ.get("MCP_WINDOWLESS_CLOSE_SECONDS", "3"))
+_WINDOW_WATCH_INTERVAL = 1.0
+_WINDOW_WATCH: dict[int, dict] = {}  # id(browser) -> {"browser", "zero_since", "tool_closed"}
+_window_watch_task: Optional[asyncio.Task] = None
+
+
+def _watch_windows(browser: Any) -> None:
+    """Watch a headed browser started with _BACKGROUND_WINDOW_FLAGS for losing every window."""
+    _WINDOW_WATCH[id(browser)] = {"browser": browser, "zero_since": None, "tool_closed": False}
+    _ensure_window_watcher_running()
+
+
+def _window_watch_tool_closed(browser: Any) -> None:
+    """A tool closed the last tab on purpose: that is not the person quitting."""
+    entry = _WINDOW_WATCH.get(id(browser))
+    if entry is not None:
+        entry["tool_closed"] = True
+        entry["zero_since"] = None
+
+
+async def _page_target_count(browser: Any) -> Optional[int]:
+    """Pages the browser has, or None when it could not be asked."""
+    from nodriver.cdp import target as cdp_target
+    try:
+        infos = await asyncio.wait_for(
+            (getattr(browser, "connection", None) or browser).send(cdp_target.get_targets()), timeout=3)
+    except Exception:
+        return None
+    return sum(1 for info in infos if getattr(info, "type_", "") == "page")
+
+
+async def _sweep_windowless() -> set[int]:
+    """End the calling session's watched browsers that lost every window. Returns the ids of
+    the browsers this session holds, so entries for closed browsers can be dropped."""
+    held: set[int] = set()
+    candidates = [(BrowserState.current_instance_id, None, BrowserState.browser)]
+    candidates += [(iid, snap, snap.browser) for iid, snap in list(BrowserState.instances.items())]
+    for iid, snap, browser in candidates:
+        if browser is None:
+            continue
+        held.add(id(browser))
+        entry = _WINDOW_WATCH.get(id(browser))
+        if entry is None or entry["browser"] is not browser:
+            continue
+        pages = await _page_target_count(browser)
+        now = time.monotonic()
+        if pages is None:
+            entry["zero_since"] = None  # unanswered is not "no windows"
+            continue
+        if pages:
+            entry["zero_since"] = None
+            entry["tool_closed"] = False
+            continue
+        if entry["tool_closed"]:
+            continue
+        if entry["zero_since"] is None:
+            entry["zero_since"] = now
+            continue
+        if now - entry["zero_since"] < _WINDOWLESS_GRACE:
+            continue
+        # Said before closing starts: a call arriving while Chrome is being ended must not
+        # read as a crash that needs browser_recover.
+        BrowserState.window_closed[iid] = (
+            f"instance {iid!r} was closed at {time.strftime('%H:%M:%S')} because its last window "
+            f"was closed (Quit, or closing every window).")
+        ended = await (_end_current_instance() if snap is None else _end_stored_instance(iid, snap))
+        if not ended:
+            BrowserState.window_closed.pop(iid, None)
+            entry["zero_since"] = time.monotonic()  # Chrome did not die: retry after another grace
+            continue
+        _WINDOW_WATCH.pop(id(browser), None)
+    return held
+
+
+async def _window_watch_loop() -> None:
+    while True:
+        try:
+            await asyncio.sleep(_WINDOW_WATCH_INTERVAL)
+        except asyncio.CancelledError:
+            return
+        if not _WINDOW_WATCH:
+            continue
+        held: set[int] = set()
+        for key in BrowserState.session_keys():
+            token = BrowserState.in_session(key)
+            try:
+                held |= await _sweep_windowless()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                continue  # one session's failure must not stop the others
+            finally:
+                BrowserState.unbind_session(token)
+        for stale in [k for k in _WINDOW_WATCH if k not in held]:
+            _WINDOW_WATCH.pop(stale, None)
+
+
+def _ensure_window_watcher_running() -> None:
+    global _window_watch_task
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    task = _window_watch_task
+    if task is not None and not task.done() and task.get_loop() is loop:
+        return
+    _window_watch_task = loop.create_task(_window_watch_loop())
+
+
 @mcp.tool()
 async def spawn_browser(
     instance_id: str,
@@ -9348,7 +9481,8 @@ async def spawn_browser(
 ) -> str:
     """Create a new named browser instance running in parallel with main.
     Each instance has its own profile, cookies, tabs, logs. Use for multi-account
-    scraping or isolated sessions.
+    scraping or isolated sessions. A headed instance the person quits, or whose windows
+    are all closed, is ended by the server, and later calls on it say so.
 
     Args:
         instance_id: unique name (e.g., "scraper_1", "acct_alice")

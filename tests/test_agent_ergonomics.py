@@ -3382,3 +3382,68 @@ def test_click_turnstile_description_points_to_the_os_cursor_tool():
     for name in ("click_turnstile", "verify_cf"):
         doc = server.mcp._tool_manager._tools[name].description
         assert "solve_turnstile_oscursor" in doc, name
+
+
+# ── Quit on a headed browser: Chrome started with --no-startup-window keeps running ──
+
+
+def _window_watch_setup(monkeypatch, pages):
+    import asyncio
+
+    from mcp_stealth_chrome import server
+
+    browser = object()
+    ended = []
+
+    async def count(_browser):
+        return pages[0]
+
+    async def end_current():
+        ended.append("current")
+        server.BrowserState.browser = None
+        return True
+
+    monkeypatch.setattr(server, "_page_target_count", count)
+    monkeypatch.setattr(server, "_end_current_instance", end_current)
+    monkeypatch.setattr(server, "_WINDOWLESS_GRACE", 0.0)
+    monkeypatch.setattr(server, "_WINDOW_WATCH", {id(browser): {"browser": browser, "zero_since": None,
+                                                                "tool_closed": False}})
+    monkeypatch.setattr(server.BrowserState, "browser", browser, raising=False)
+    monkeypatch.setattr(server.BrowserState, "instances", {}, raising=False)
+    monkeypatch.setattr(server.BrowserState, "window_closed", {}, raising=False)
+    sweep = lambda: asyncio.run(server._sweep_windowless())  # noqa: E731
+    return server, browser, ended, sweep
+
+
+def test_browser_without_windows_is_ended_and_the_next_call_says_why(monkeypatch):
+    """Quit closed every window and left Chrome running with its Dock icon: the server must
+    end it and say so, not keep a windowless process alive."""
+    server, _browser, ended, sweep = _window_watch_setup(monkeypatch, [0])
+    sweep()
+    assert ended == []  # the first sighting only starts the grace period
+    sweep()
+    assert ended == ["current"]
+    note = server.BrowserState.window_closed[server.BrowserState.current_instance_id]
+    assert "last window" in note
+    monkeypatch.setattr(server.BrowserState, "tabs", [], raising=False)
+    with pytest.raises(RuntimeError, match="last window"):
+        server.BrowserState.active_tab()
+
+
+def test_browser_with_a_window_is_left_alone(monkeypatch):
+    _server, _browser, ended, sweep = _window_watch_setup(monkeypatch, [1])
+    sweep(); sweep()
+    assert ended == []
+
+
+def test_last_tab_closed_by_a_tool_is_not_a_quit(monkeypatch):
+    server, browser, ended, sweep = _window_watch_setup(monkeypatch, [0])
+    server._window_watch_tool_closed(browser)
+    sweep(); sweep()
+    assert ended == []
+
+
+def test_unanswered_target_query_never_closes(monkeypatch):
+    _server, _browser, ended, sweep = _window_watch_setup(monkeypatch, [None])
+    sweep(); sweep(); sweep()
+    assert ended == []

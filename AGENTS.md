@@ -219,6 +219,12 @@ conclusions. Each rule below replaced a real lie.
   starts it, and it then closed the browser the person was looking at, 15 minutes after its last tool call.
 - `is_up()` false does not mean Chrome stopped: closing the last tab empties `tabs` while the process runs and
   holds the profile. Close paths branch on `BrowserState.browser is None`, never on `is_up()`.
+- Chrome started with `--no-startup-window` does not exit on Quit: the quit Apple Event closes every window and
+  the process stays, with its Dock icon and the profile lock (still running 10 s later; without the flag it exits in
+  0.3 s). CDP cannot tell a Quit from closing every window by hand, so `_sweep_windowless` ends a headed browser
+  that has had no page for `_WINDOWLESS_GRACE` seconds, unless `tab_close` emptied it, and records why in
+  `BrowserState.window_closed` before closing starts, or a call arriving meanwhile reads as a crash.
+  An unanswered `Target.getTargets` never counts as no windows. `tests/test_headed_quit.py` quits a real one.
 - `clean_profile_state` and `browser_recover` leave a locked profile completely alone, Preferences included.
   The lock can belong to another instance or another session, and `browser_recover` sweeps every profile dir.
 - Window placement is remembered per instance in `~/.mcp-stealth/window-state/`. Validation applies
@@ -319,6 +325,11 @@ Platform truths, not preferences. Each one cost a release.
   `_type_keys` presses real keys. macOS select-all also needs `commands=["selectAll"]`.
 - `Tab.verify_cf` clicks the best template match however poor, so on a page with no widget it clicked something and
   reported success. `_cf_template_click` applies a threshold. A challenge click reports what `_cf_after_click` observes.
+- A Turnstile checkbox vanishing after the click is not a pass. It goes while the page submits (`?__cf_chl_tk=...`),
+  before verification and the redirect, so `solve_turnstile_oscursor` keeps its fixed 8 s of scoring. Shortening it
+  needs a pass signal that holds on any site, not the look of one demo page.
+- `solve_turnstile_oscursor` runs about 16 to 20 s standalone and 45 to 50 s inside the MCP server, where its native
+  steps run slower. 35 s timed out during scoring, hence the default of 50.
 - The first document after startup loads images despite `--blink-settings=imagesEnabled=false`; later ones obey it. Light
   and testing modes go through `about:blank` first.
 - nodriver 0.50 does not pass `Config.lang` on, its `add_argument` refuses `--lang`, and macOS Chrome ignores the flag
