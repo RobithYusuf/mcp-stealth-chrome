@@ -161,7 +161,7 @@ def test_screenshot_base64_shrinks_to_fit_then_refuses_honestly(loop):
     should it decline — and then it must say that downscaling was already tried,
     so the caller does not retry the same thing.
     """
-    import mcp_stealth_chrome.server as srv
+    import mcp_stealth_chrome.tools.page as srv
 
     prev = srv.B64_INLINE_LIMIT
     try:

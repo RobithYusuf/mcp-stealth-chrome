@@ -171,7 +171,9 @@ def test_browser_snapshot_rejects_unmeasured_invalid_json(monkeypatch):
         "active_tab",
         classmethod(lambda cls: object()),
     )
-    monkeypatch.setattr(server, "collect_snapshot", _collect)
+    from mcp_stealth_chrome.tools import page
+
+    monkeypatch.setattr(page, "collect_snapshot", _collect)
     snapshot = server.mcp._tool_manager._tools["browser_snapshot"].fn
     result = asyncio.run(snapshot())
     assert result.startswith("Error: snapshot script returned invalid JSON")
@@ -341,7 +343,9 @@ def test_tab_cache_cleanup_preserves_other_live_targets(monkeypatch):
     class _TabA:
         target = _TargetA()
 
-    monkeypatch.setattr(server, "_SNAPSHOT_CACHE", {
+    from mcp_stealth_chrome.tools import page
+
+    monkeypatch.setattr(page, "_SNAPSHOT_CACHE", {
         "TARGET-A": {"hash": "a"}, "TARGET-B": {"hash": "b"},
     })
     monkeypatch.setattr(server, "_HUMAN_HELP", {
@@ -354,7 +358,7 @@ def test_tab_cache_cleanup_preserves_other_live_targets(monkeypatch):
 
     server._clear_tab_scoped_state([_TabA()])
 
-    assert set(server._SNAPSHOT_CACHE) == {"TARGET-B"}
+    assert set(page._SNAPSHOT_CACHE) == {"TARGET-B"}
     assert set(server._HUMAN_HELP) == {"TARGET-B"}
     assert server._NETWORK_ARMED_TAB_IDS == {"TARGET-B"}
     assert server._NETWORK_CAPTURE_BODIES == {"TARGET-B": False}
@@ -774,7 +778,7 @@ def test_export_curl_uses_chrome_url_cookie_rules(monkeypatch):
 
 
 def test_cookie_domain_filter_never_sends_child_cookie_to_parent():
-    from mcp_stealth_chrome.server import _cookie_domain_match
+    from mcp_stealth_chrome.tools.storage import _cookie_domain_match
 
     assert _cookie_domain_match(".example.com", "https://sub.example.com/x") is True
     assert _cookie_domain_match("sub.example.com", "https://example.com/x") is False
@@ -1775,11 +1779,11 @@ def test_no_handle_at_all_is_still_not_running(monkeypatch):
 
 @pytest.fixture()
 def intercept(monkeypatch):
-    from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import capture
 
-    fresh = dict(server._INTERCEPT, log=[], counts=dict(server._INTERCEPT["counts"]),
+    fresh = dict(capture._INTERCEPT, log=[], counts=dict(capture._INTERCEPT["counts"]),
                  active=False, tab=None, handler=None, handler_tab=None, watchdog=None, session=None)
-    monkeypatch.setattr(server, "_INTERCEPT", fresh)
+    monkeypatch.setattr(capture, "_INTERCEPT", fresh)
     return fresh
 
 
@@ -2493,9 +2497,11 @@ def test_samesite_survives_export_and_import(monkeypatch, tmp_path):
     class _Browser:
         cookies = _Jar()
 
+    from mcp_stealth_chrome.tools import storage
+
     monkeypatch.setattr(server.BrowserState, "browser", _Browser())
-    monkeypatch.setattr(server, "STORAGE_STATE_DIR", tmp_path)
-    monkeypatch.setattr(server, "ensure_dirs", lambda: None)
+    monkeypatch.setattr(storage, "STORAGE_STATE_DIR", tmp_path)
+    monkeypatch.setattr(storage, "ensure_dirs", lambda: None)
     assert not asyncio.run(_tool("cookie_export")("c.json")).startswith("Error:")
     saved = _json.loads((tmp_path / "c.json").read_text())
     assert saved[0]["sameSite"] == "None"
@@ -2552,8 +2558,10 @@ def test_screenshot_region_is_converted_to_page_space(monkeypatch, tmp_path, kwa
             return base64.b64encode(b"not really a png").decode()
 
     tab = _active(monkeypatch, _Tab())
-    monkeypatch.setattr(server, "SCREENSHOT_DIR", tmp_path)
-    monkeypatch.setattr(server, "ensure_dirs", lambda: None)
+    from mcp_stealth_chrome.tools import page
+
+    monkeypatch.setattr(page, "SCREENSHOT_DIR", tmp_path)
+    monkeypatch.setattr(page, "ensure_dirs", lambda: None)
     asyncio.run(_tool("screenshot")(filename="s.png", max_dimension=0, **kwargs))
     clip = tab.sent[0]["params"]["clip"]
     assert (clip["x"], clip["y"], clip["width"], clip["height"]) == (17, 520, 30, 40)

@@ -153,7 +153,7 @@ def _first_party_partition(cookie: dict, host: str) -> bool:
 
 
 def _site_cookies(cookies: list[dict], url: str) -> tuple[list[dict], bool, bool]:
-    from ..server import _cookie_domain_match
+    from .storage import _cookie_domain_match
     host = (urlsplit(url).hostname or "").lower().strip(".")
     selected = [cookie for cookie in cookies
                 if _cookie_domain_match(cookie.get("domain"), url)

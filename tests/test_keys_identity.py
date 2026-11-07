@@ -481,8 +481,10 @@ def fake_jar(monkeypatch, tmp_path):
     class _Browser:
         cookies = _Jar()
 
+    from mcp_stealth_chrome.tools import storage
+
     monkeypatch.setattr(server.BrowserState, "browser", _Browser())
-    monkeypatch.setattr(server, "STORAGE_STATE_DIR", tmp_path)
+    monkeypatch.setattr(storage, "STORAGE_STATE_DIR", tmp_path)
     return tmp_path
 
 
@@ -847,7 +849,9 @@ def test_region_screenshot_of_a_scrolled_page_is_the_right_strip(loop, browser, 
 
     from mcp_stealth_chrome import server
 
-    monkeypatch.setattr(server, "SCREENSHOT_DIR", tmp_path)
+    from mcp_stealth_chrome.tools import page
+
+    monkeypatch.setattr(page, "SCREENSHOT_DIR", tmp_path)
     browser()
     run(loop, "navigate", f"{base_url}/keys.html")
     run(loop, "evaluate", """(() => {
@@ -1011,8 +1015,9 @@ def test_samesite_round_trip_through_a_real_cookie_jar(loop, browser, base_url, 
     from nodriver.cdp import network as cdp_network
 
     from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import storage
 
-    monkeypatch.setattr(server, "STORAGE_STATE_DIR", tmp_path)
+    monkeypatch.setattr(storage, "STORAGE_STATE_DIR", tmp_path)
     browser()
     run(loop, "navigate", f"{base_url}/keys.html")
     tab = server.BrowserState.active_tab()

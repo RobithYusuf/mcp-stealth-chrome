@@ -664,9 +664,11 @@ def test_failed_intercept_start_leaves_another_sessions_interception(monkeypatch
     async def fake_disable(reason="stopped"):
         disabled.append(reason)
 
-    monkeypatch.setattr(server, "_intercept_disable", fake_disable)
-    monkeypatch.setitem(server._INTERCEPT, "active", True)
-    monkeypatch.setitem(server._INTERCEPT, "session", "session-other")
+    from mcp_stealth_chrome.tools import capture
+
+    monkeypatch.setattr(capture, "_intercept_disable", fake_disable)
+    monkeypatch.setitem(capture._INTERCEPT, "active", True)
+    monkeypatch.setitem(capture._INTERCEPT, "session", "session-other")
     monkeypatch.setattr(BrowserState, "active_tab",
                         classmethod(lambda cls: (_ for _ in ()).throw(RuntimeError("Browser not running"))))
     out = asyncio.run(server.mcp._tool_manager._tools["intercept_start"].fn())

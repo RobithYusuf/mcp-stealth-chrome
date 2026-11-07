@@ -14,7 +14,7 @@ import sys
 
 
 def test_cookie_parser():
-    from mcp_stealth_chrome.server import _parse_cookie_text
+    from mcp_stealth_chrome.tools.storage import _parse_cookie_text
     # JSON array
     r = _parse_cookie_text('[{"name":"a","value":"1"},{"name":"b","value":"2"}]', None)
     assert len(r) == 2 and r[0]["name"] == "a", f"JSON array parse failed: {r}"

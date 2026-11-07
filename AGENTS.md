@@ -28,8 +28,11 @@ uvx mcp-stealth-chrome → Python 3.11+ → FastMCP → nodriver → Chrome/Chro
 - `src/mcp_stealth_chrome/patches.py` — runtime monkey-patches for nodriver/CDP drift.
 - `src/mcp_stealth_chrome/identity.py` — key events, client hints and languages. `humanize.py` — pointer and typing input.
 - `src/mcp_stealth_chrome/_app.py` — `StealthMCP`, the FastMCP boundary. `captcha.py`, `image_output.py`, `result_types.py` — their named helpers.
-- `src/mcp_stealth_chrome/tools/` — `research.py`, `devtools.py`, `vision.py`, `network_http.py`, `profiles.py`;
-  each registers itself on import.
+- `src/mcp_stealth_chrome/tools/` — `research.py`, `devtools.py`, `vision.py`, `network_http.py`, `profiles.py`,
+  `storage.py` (cookies, web storage, IndexedDB, cache), `capture.py` (request interception, HAR, dry_run),
+  `page.py` (snapshot, reading, screenshot, PDF, inspection, frames, scraping),
+  `turnstile_oscursor.py`; each registers itself on import.
+  `server.py` is being split into these one section at a time, with no change in behaviour.
 - `tests/test_registry.py` — the tool-surface gate. `tests/test_reliability_e2e.py` and
   `tests/test_agent_ergonomics.py` — behaviour, real browser and fast unit respectively.
   `tests/test_old_tools_e2e.py` and `tests/test_slow_start_e2e.py` — tools and launch paths on real Chrome.
@@ -397,6 +400,10 @@ uv run mcp-stealth-chrome --http        # one server for many clients (token req
   real Chrome (`tests/test_old_tools_e2e.py`) before calling it covered.
 - The E2E suites need a module-scoped event loop. A per-test `asyncio.run()` hangs: the CDP
   connection is bound to the loop that opened it.
+- Moving code out of `server.py` silently disarms a test's `monkeypatch.setattr(server, X)` or `server.X = ...`: the moved
+  code reads its own import of `X` (`srv.B64_INLINE_LIMIT = 500` stopped reaching `screenshot` this way). A fixture patching `server.STORAGE_STATE_DIR` let the `cookie_export` tests write into the real
+  `~/.mcp-stealth/storage-states` after the cookie tools moved. Before each move, grep the tests for every module-level
+  name the moved code reads and point those patches at the new module, then check the real folders stayed untouched.
 - Mutation-check a new guard: reintroduce the bug and confirm the test fails. Two tests in this repo
   passed against a deliberately reintroduced defect and had to be rewritten.
 - After editing `src/`, reinstall (`uv tool install --force .`) and restart the MCP client — a
