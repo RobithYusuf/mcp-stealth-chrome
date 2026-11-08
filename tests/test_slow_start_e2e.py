@@ -192,6 +192,7 @@ def server_command(pid):
 def test_relaunch_ends_a_half_open_privacy_browser_first(how):
     """Closing the last tab leaves Chrome running, and its profile was deleted under it."""
     from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import navigation
     from mcp_stealth_chrome.state import BrowserState
 
     async def scenario():
@@ -201,7 +202,7 @@ def test_relaunch_ends_a_half_open_privacy_browser_first(how):
         assert profile.exists()
         try:
             if how == "tab_close":
-                await server.tab_close(index=0)
+                await navigation.tab_close(index=0)
             else:
                 await BrowserState.active_tab().close()
                 await asyncio.sleep(0.3)
@@ -219,13 +220,14 @@ def test_relaunch_ends_a_half_open_privacy_browser_first(how):
 
 def test_relaunch_after_the_last_tab_keeps_no_orphan():
     from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import navigation
     from mcp_stealth_chrome.state import BrowserState
 
     async def scenario():
         out = await server.browser_launch(headless=True, persistent=False)
         assert not out.startswith("Error"), out
         pid = BrowserState.browser._process_pid
-        await server.tab_close(index=0)
+        await navigation.tab_close(index=0)
         out = await server.browser_launch(headless=True, persistent=False)
         assert not out.startswith("Error"), out
         assert not _alive(pid), "the old Chrome outlived the relaunch"

@@ -31,8 +31,11 @@ uvx mcp-stealth-chrome → Python 3.11+ → FastMCP → nodriver → Chrome/Chro
 - `src/mcp_stealth_chrome/tools/` — `research.py`, `devtools.py`, `vision.py`, `network_http.py`, `profiles.py`,
   `storage.py` (cookies, web storage, IndexedDB, cache), `capture.py` (request interception, HAR, dry_run),
   `page.py` (snapshot, reading, screenshot, PDF, inspection, frames, scraping),
+  `navigation.py` (history, tabs, handing over to a person; `navigate` itself stays in `server.py`),
   `turnstile_oscursor.py`; each registers itself on import.
-  `server.py` is being split into these one section at a time, with no change in behaviour.
+  `server.py` is being split into these one section at a time, with no change in behaviour. Code that still
+  shares helpers with `server.py` reaches them as `_srv.<name>` at call time, so tests patching `server.<name>`
+  keep working; a module-level `from ..server import x` would freeze a copy.
 - `tests/test_registry.py` — the tool-surface gate. `tests/test_reliability_e2e.py` and
   `tests/test_agent_ergonomics.py` — behaviour, real browser and fast unit respectively.
   `tests/test_old_tools_e2e.py` and `tests/test_slow_start_e2e.py` — tools and launch paths on real Chrome.
