@@ -605,7 +605,8 @@ These run without a browser and without a search API key, and use the stealth br
 | `browser_snapshot(mode="viewport")`, `max_elements`, `container_selector` | Returns less on long pages |
 | `browser_snapshot(diff_from_last=True)`, `delta=True` | Near-instant on an unchanged page, or marks only what changed |
 | `screenshot(format="jpeg")`, `region`, `region_selector` | Smaller files and faster crops. Base64 output stays opt-in |
-| `browser_launch(profile_mode="light")` | No images or background Chrome services, for ordinary pages. Keep the default on protected sites |
+| `browser_launch(profile_mode="light")` | No images, background Chrome services or Chrome's built-in component extensions, for ordinary pages. It also drops the "Google" speech voices, which pages can see. Keep the default on protected sites |
+| Every launch | Chrome's default apps (Google Docs Offline, Web Store Payments) are not installed. On a fresh profile, one page took 10 processes and about 0.9 GB instead of 12 and 1.1 GB, measured on one machine. Pages cannot tell the difference: `fingerprint_audit` reads the same |
 | `browser_launch(testing_mode=True)` | Faster regression runs, with less stealth |
 | `profile_report`, `profile_cleanup` | Size and use of every profile, and cleanup of caches. Cleanup previews unless `confirm=True`, and refuses main and named profiles and anything in use |
 </details>

@@ -1441,12 +1441,15 @@ LIGHT_MODE_FLAGS = (
     "--disable-background-networking",
     "--disable-component-update",
     "--disable-sync",
-    "--disable-default-apps",
     "--disable-domain-reliability",
     "--disable-client-side-phishing-detection",
     "--disable-notifications",
     "--autoplay-policy=user-gesture-required",
     "--mute-audio",
+    # Gemini in Chrome, Google Network Speech and Hangouts run as component extensions, about
+    # 0.27 GB together on one page. Light mode only: Network Speech supplies the "Google ..."
+    # speechSynthesis voices every Google Chrome lists, and pages read that list.
+    "--disable-component-extensions-with-background-pages",
 )
 
 
@@ -1456,6 +1459,30 @@ LIGHT_MODE_FLAGS = (
 # never activates, and the first window is created in the background over CDP. A window
 # behind others would then count as occluded and report visibilityState hidden.
 _BACKGROUND_WINDOW_FLAGS = ("--no-startup-window", "--disable-backgrounding-occluded-windows")
+
+# Every launch, every mode. A new profile otherwise installs Chrome's default apps (Google Docs
+# Offline, Chrome Web Store Payments), each with its own renderer: measured on a temporary
+# profile, 12 processes and about 1.1 GB became 10 processes and about 0.9 GB, images still
+# loading. persistent=False makes a new profile on every launch, so it paid this each time.
+# --disable-background-networking saved the same but also stops Safe Browsing and variations
+# updates, which leaves a long-lived profile drifting from an ordinary Chrome, so it stays light-only.
+_LEAN_FLAGS = ("--disable-default-apps",)
+
+
+def _disable_features_arg(config: Any, extra: tuple[str, ...]) -> str:
+    """One --disable-features carrying nodriver's list and ours.
+
+    Chrome honours only the last --disable-features. nodriver places its own list
+    (IsolateOrigins,site-per-process, plus more on some versions) before the caller's
+    arguments, so passing a second flag silently dropped nodriver's list: testing_mode ran
+    with site isolation back on. Read what this nodriver version passes, then append.
+    """
+    features: list[str] = []
+    for arg in config():
+        if arg.startswith("--disable-features="):
+            features += [f for f in arg.split("=", 1)[1].split(",") if f]
+    features += list(extra)
+    return "--disable-features=" + ",".join(dict.fromkeys(features))
 
 
 async def _open_background_window(browser: Any, width: Optional[int] = None,
@@ -1893,6 +1920,8 @@ async def browser_launch(
         config.add_argument("--disable-session-crashed-bubble")
         config.add_argument("--disable-restore-session-state")
         config.add_argument("--no-default-browser-check")
+        for _flag in _LEAN_FLAGS:
+            config.add_argument(_flag)
         if effective_fingerprint.get("user_agent"):
             config.add_argument(f"--user-agent={effective_fingerprint['user_agent']}")
         if effective_proxy:
@@ -1913,7 +1942,7 @@ async def browser_launch(
         if testing_mode:
             for _flag in (
                 "--blink-settings=imagesEnabled=false",
-                "--disable-features=Translate,BackForwardCache,AcceptCHFrame",
+                _disable_features_arg(config, ("Translate", "BackForwardCache", "AcceptCHFrame")),
                 "--disable-background-timer-throttling",
                 "--disable-renderer-backgrounding",
                 "--disable-backgrounding-occluded-windows",
@@ -4880,6 +4909,19 @@ _FINGERPRINT_AUDIT_JS = r"""
 """
 
 
+_SPEECH_VOICES_JS = """
+new Promise((resolve) => {
+  const report = () => {
+    const v = speechSynthesis.getVoices();
+    return JSON.stringify({total: v.length, google: v.filter((x) => x.name.startsWith("Google")).length});
+  };
+  if (speechSynthesis.getVoices().length) return resolve(report());
+  speechSynthesis.addEventListener("voiceschanged", () => resolve(report()), {once: true});
+  setTimeout(() => resolve(report()), 2500);
+})
+"""
+
+
 @mcp.tool()
 async def fingerprint_audit(url: Optional[str] = None) -> str:
     """Audit THIS browser's own fingerprint for the leaks detectors look for.
@@ -4990,6 +5032,26 @@ async def fingerprint_audit(url: Optional[str] = None) -> str:
         check(fp.get("canvas_stable") is not False, "canvas stability",
               "canvas output changes between identical draws — a randomiser is "
               "itself a detectable signal", "warning")
+
+        # Voices load asynchronously, so they are read apart from the synchronous audit script.
+        # Every Google Chrome lists "Google ..." voices from its Network Speech component; light
+        # mode turns that component off, and a page reading the list sees them missing.
+        voices = None
+        with contextlib.suppress(Exception):
+            raw_voices = await _wait(tab.evaluate(_SPEECH_VOICES_JS, await_promise=True, return_by_value=True),
+                                     timeout=5, what="fingerprint_audit voices")
+            raw_voices = raw_voices.value if hasattr(raw_voices, "value") and not isinstance(raw_voices, str) else raw_voices
+            voices = json.loads(raw_voices) if raw_voices else None
+        if not voices or not voices.get("total"):
+            not_checked_hints.append("speechSynthesis voices: the list did not load, so it was not compared")
+        else:
+            fp["speech_voices"] = voices
+            if "Google Chrome" in json.dumps((ua_data or {}).get("brands") or []) or (
+                    ua_data is None and "Chrome/" in ua and "Edg/" not in ua and "OPR/" not in ua):
+                check(voices.get("google", 0) > 0, "speechSynthesis voices",
+                      f"{voices['total']} voices and none from Google; Google Chrome lists its Google "
+                      f"voices, so the list reads as a different browser (light mode turns them off)",
+                      "warning")
 
         try:
             ow, oh = (fp.get("outer") or "0x0").split("x")
@@ -5527,6 +5589,8 @@ async def _launch_browser_instance(
     config.add_argument("--disable-session-crashed-bubble")
     config.add_argument("--disable-restore-session-state")
     config.add_argument("--no-default-browser-check")
+    for _flag in _LEAN_FLAGS:
+        config.add_argument(_flag)
     if effective_fingerprint.get("user_agent"):
         config.add_argument(f"--user-agent={effective_fingerprint['user_agent']}")
     if effective_proxy:

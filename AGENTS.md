@@ -340,6 +340,16 @@ Platform truths, not preferences. Each one cost a release.
   needs a pass signal that holds on any site, not the look of one demo page.
 - `solve_turnstile_oscursor` runs about 16 to 20 s standalone and 45 to 50 s inside the MCP server, where its native
   steps run slower. 35 s timed out during scoring, hence the default of 50.
+- Chrome honours only the last `--disable-features`, and nodriver puts its own (`IsolateOrigins,site-per-process`)
+  before ours, so a second one silently drops nodriver's list: `testing_mode` ran with site isolation back on.
+  Build one flag with `_disable_features_arg`. Every launch adds `--disable-default-apps`: a new profile otherwise
+  installs Google Docs Offline and Web Store Payments, two more renderers and about 0.2 GB, and `persistent=False`
+  pays that on every launch. `--disable-background-networking` saved the same but also stops Safe Browsing and
+  variations updates, so it stays in light mode only.
+- Chrome 157 lists 19 speech voices, all "Google ...", from its Network Speech component extension, headless or not.
+  `--disable-component-extensions-with-background-pages` saves about 0.27 GB but replaces them with 180 local voices
+  and no Google one, which pages can read, so it is light mode only and `fingerprint_audit` warns on it. No
+  `--disable-features` name was found that turns off Gemini or Hangouts alone.
 - The first document after startup loads images despite `--blink-settings=imagesEnabled=false`; later ones obey it. Light
   and testing modes go through `about:blank` first.
 - nodriver 0.50 does not pass `Config.lang` on, its `add_argument` refuses `--lang`, and macOS Chrome ignores the flag

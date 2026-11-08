@@ -3461,3 +3461,19 @@ def test_unanswered_target_query_never_closes(monkeypatch):
     _server, _browser, ended, sweep = _window_watch_setup(monkeypatch, [None])
     sweep(); sweep(); sweep()
     assert ended == []
+
+
+def test_testing_mode_features_join_nodrivers_list(tmp_path):
+    """Chrome honours only the last --disable-features, and nodriver's own comes first, so
+    testing_mode's flag dropped IsolateOrigins,site-per-process."""
+    import nodriver
+
+    from mcp_stealth_chrome import server
+
+    config = nodriver.Config(user_data_dir=str(tmp_path), headless=True)
+    ours = ("Translate", "BackForwardCache", "AcceptCHFrame")
+    config.add_argument(server._disable_features_arg(config, ours))
+    last = [a for a in config() if a.startswith("--disable-features=")][-1]
+    features = last.split("=", 1)[1].split(",")
+    assert {"IsolateOrigins", "site-per-process", *ours} <= set(features), last
+    assert len(features) == len(set(features)), last
