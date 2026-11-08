@@ -1360,8 +1360,10 @@ def test_identity_pin_temp_file_is_private_from_the_first_byte(tmp_path, monkeyp
 
     from mcp_stealth_chrome import server
 
+    from mcp_stealth_chrome.tools import stealth
+
     monkeypatch.setattr(server, "IDENTITIES_DIR", tmp_path)
-    monkeypatch.setattr(server, "ensure_dirs", lambda: None)
+    monkeypatch.setattr(stealth, "ensure_dirs", lambda: None)
     seen = []
     real_replace = _os.replace
 
@@ -3085,7 +3087,9 @@ def test_solve_captcha_reports_whether_the_token_reached_the_page(monkeypatch, p
     async def solved(**_kwargs):
         return "TOK"
 
-    monkeypatch.setattr(server, "capsolver_solve", solved)
+    from mcp_stealth_chrome.tools import stealth
+
+    monkeypatch.setattr(stealth, "capsolver_solve", solved)
     monkeypatch.setattr(server.BrowserState, "is_up", classmethod(lambda cls: up))
     _active(monkeypatch, _Tab())
     out = asyncio.run(_tool("solve_captcha")(
@@ -3101,7 +3105,9 @@ def test_solve_captcha_without_injection_is_unchanged(monkeypatch):
     async def solved(**_kwargs):
         return "TOK"
 
-    monkeypatch.setattr(server, "capsolver_solve", solved)
+    from mcp_stealth_chrome.tools import stealth
+
+    monkeypatch.setattr(stealth, "capsolver_solve", solved)
     assert asyncio.run(_tool("solve_captcha")("turnstile", "https://x.test", "k")) == "token: TOK"
 
 

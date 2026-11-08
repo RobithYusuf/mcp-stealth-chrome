@@ -35,6 +35,7 @@ uvx mcp-stealth-chrome → Python 3.11+ → FastMCP → nodriver → Chrome/Chro
   `interaction.py` (hover, mouse, drag, keys, select, upload, click_role, wait_for; the core click and typing
   tools stay in `server.py`),
   `mouse_kit.py` (precision mouse kit and `click_turnstile`),
+  `stealth.py` (identity, fingerprint, human-like input, saved sessions, `solve_captcha`, `verify_cf`),
   `turnstile_oscursor.py`; each registers itself on import.
   `server.py` is being split into these one section at a time, with no change in behaviour. Code that still
   shares helpers with `server.py` reaches them as `_srv.<name>` at call time, so tests patching `server.<name>`
