@@ -892,9 +892,9 @@ async def session_warmup(
       - referer_chain: goto origin → find link to target → click
       - natural_browse: homepage → scroll → random click → scroll → target
     """
-    # Late import: mouse_drift lives in server.py (precision mouse section).
+    # Late import: mouse_drift lives in tools/mouse_kit.py.
     # By call time, server.py module is fully initialized.
-    from ..server import mouse_drift
+    from .mouse_kit import mouse_drift
     try:
         if not BrowserState.is_up():
             return err("browser_launch first")
