@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, Literal, Optional
@@ -444,7 +445,18 @@ async def _ensure_browser_dead(browser, profile_dir=None, grace: float = 1.5) ->
     report["verified"] = not report["still_alive"]
     if report["verified"]:
         await _discard_temp_profile(browser)
+        _forget_dock_copy(browser)
     return report
+
+
+def _forget_dock_copy(browser: Any) -> None:
+    """A browser run from the Dock-icon copy has ended: stop listing the copy beside the
+    person's Chrome, unless another browser still runs from it. On a thread, never awaited."""
+    with contextlib.suppress(Exception):
+        executable = getattr(getattr(browser, "config", None), "browser_executable_path", None)
+        if executable:
+            threading.Thread(target=dock_icon.forget_when_idle, args=(str(executable),),
+                             name="dock-icon-forget", daemon=True).start()
 
 
 def _kill_note(report: dict) -> str:
@@ -1570,6 +1582,8 @@ async def _use_dock_icon_copy(config: Config, headless: bool) -> str:
     Returns what to add to the launch result: nothing when the copy is in use or does not
     apply, and the reason when it was wanted and Chrome's own app had to be used instead.
     The copy is the same build with the same signature, so the identity does not change.
+    This never waits for the copy: one that is not ready means Chrome's own app this time,
+    while the build goes on in the background.
     """
     try:
         choice = await asyncio.to_thread(
@@ -1578,7 +1592,25 @@ async def _use_dock_icon_copy(config: Config, headless: bool) -> str:
         return f" [Dock icon: Chrome's own, because {_exc_text(exc)}]"
     if choice.executable:
         config.browser_executable_path = choice.executable
+    if choice.pending:
+        return f" [Dock icon: Chrome's own this time, {choice.note}]"
     return f" [Dock icon: Chrome's own, because {choice.note}]" if choice.note else ""
+
+
+def _chrome_for_dock_icon() -> Optional[str]:
+    """The Chrome a launch would run: nodriver's own choice, as Config makes it."""
+    with contextlib.suppress(Exception):
+        from nodriver.core.config import find_chrome_executable
+        return str(find_chrome_executable())
+    return find_chrome_binary()
+
+
+async def _dock_icon_status() -> dict:
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(
+            lambda: dock_icon.status(_chrome_for_dock_icon())), timeout=3)
+    except Exception as exc:
+        return {"state": "unavailable", "detail": _exc_text(exc)}
 
 
 @mcp.tool()
@@ -1616,8 +1648,10 @@ async def browser_launch(
         headless: run without UI (many sites detect headless — prefer False). A visible
             window opens behind the app in use and does not take the keyboard. A click that
             calls window.open still brings Chrome forward for about 130 ms before focus returns.
-            On macOS it runs from a copy of Chrome with its own Dock icon; if that copy
-            cannot be used the result says why (MCP_STEALTH_DOCK_ICON=0 turns it off).
+            With MCP_STEALTH_DOCK_ICON=1 in the server's environment, on macOS it runs from a
+            copy of Chrome with its own Dock icon. The copy is made in the background and a
+            launch never waits for it: when it is not ready this launch uses Chrome itself and
+            the result says so. Off by default.
             When the person quits it (Cmd+Q, Dock > Quit) or closes every window, the server
             ends that Chrome within a few seconds, and the next call says it was closed and
             why; call browser_launch again to continue. tab_close on the last tab does not.
@@ -4769,6 +4803,11 @@ async def server_status() -> str:
     nodriver compatibility patch that failed to apply does not crash anything —
     it makes the CDP event listener die on the first mismatched payload, so
     console/network capture returns nothing and looks like a quiet page.
+
+    `dock_icon` says where the macOS Chrome copy with its own Dock icon stands: ready,
+    building, stale, off or unavailable, with the reason. Reading it starts no build.
+    Its `disk` gives `own_mb`, what removing the copy would free, and `shown_mb`, what
+    du shows for it: the copy is a clone, so the first is near zero until Chrome updates.
     """
     if BrowserState.browser is not None:
         # A tab the page opened is unknown until asked, which reported one tab too few.
@@ -4791,6 +4830,7 @@ async def server_status() -> str:
         "profile_dir": _status_profile(),
         "compat_patches": _patches.status(),
         "os_cursor": await _os_cursor_status(),
+        "dock_icon": await _dock_icon_status(),
     }
     return ok(json.dumps(status, indent=2, default=str))
 
@@ -8809,6 +8849,9 @@ def main() -> None:
     import signal
 
     cli = _parse_cli(sys.argv[1:])
+    # A thread, so neither the start nor any tool waits on it; a failure stays in there.
+    with contextlib.suppress(Exception):
+        dock_icon.start_in_background(_chrome_for_dock_icon)
     if cli.http:
         # None of the stdio survival rules below apply: there is no parent to
         # outlive, and SIGTERM must be able to stop a long-running service.

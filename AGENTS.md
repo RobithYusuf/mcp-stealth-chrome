@@ -226,7 +226,11 @@ conclusions. Each rule below replaced a real lie.
   this browser's PID is frontmost, about 130 ms measured, so keys typed in that moment still reach Chrome. It compares the
   PID, because a person's own Chrome has the same bundle path. `tests/test_headed_focus.py` measures all this, with
   `MCP_HEADED=1`, and counts this browser's PID so the person's other apps cannot skew it.
-- A headed launch on macOS runs from `~/.mcp-stealth/app/Stealth Chrome.app`, an APFS clone of the installed Chrome with
+- The Dock icon is opt-in: only `MCP_STEALTH_DOCK_ICON=1` (or true, yes, on) turns it on. Off means no build thread, no
+  `~/.mcp-stealth/app` (one left from before is removed), nothing in the launch result, and `dock_icon: off` in
+  `server_status`. It stays off by default
+  because it puts a second Chrome bundle on the person's disk and in LaunchServices, which is theirs to ask for.
+- With it on, a headed launch on macOS runs from `~/.mcp-stealth/app/Stealth Chrome.app`, an APFS clone of the installed Chrome with
   the project icon set as a custom file icon (`Icon\r` plus FinderInfo at the bundle root), so the Dock tells it from the
   person's Chrome. Never edit the copy's `Info.plist` or anything under `Contents/`: that breaks Google's signature, and
   Keychain access to "Chrome Safe Storage" follows the signature, so cookies stop decrypting. The tooltip therefore still
@@ -238,16 +242,47 @@ conclusions. Each rule below replaced a real lie.
   (2.3 s plus `SLOW_CHROME_WAIT`). So `_build` runs the copy once with `--version` after the signature check and before
   the rename, which carries over. A build therefore takes about 18 s, once per Chrome update, and a failed warm-up is
   ignored. A clone gets the slow start again even when an identical clone has run before, so it is not cached by content.
-- `dock_icon.prepare` never fails a launch: any problem is a note in the launch result and Chrome itself is used. `cp -c`
-  quietly falls back to a full copy where it cannot clone, so one file is cloned first with `clonefile(2)`, which cannot.
-  A stale copy is not replaced while a process runs from it, because new renderers start from the bundle path. The copy
-  is rebuilt when Chrome's version, the source browser or the icon changes. Headless, `attach_to_chrome` and the
-  `solve_turnstile_oscursor` sidecar use the installed Chrome.
+- A launch never waits for the copy. `dock_icon.prepare` only looks: a ready copy is used, and anything else means
+  Chrome itself this time with a note in the result, while one background thread (`start_in_background` from `main`, or
+  the launch that found the copy missing or stale) builds it. A build takes about 20 s, which is why it is not paid by a
+  launch: the first headed launch on a new machine, and the first after every Chrome update, used to take that long.
+  Chrome updating while the server runs is the same case: that launch uses Chrome itself and starts the rebuild.
+- A builder holds `app/.lock` exclusively for the whole build; a reader asks for it shared and non-blocking, so a refusal
+  means exactly "someone is building", here or in another server, and readers never block each other. So do not take the
+  exclusive lock just to look: `_ensure_copy` returns without it when the copy is fine and no `.building-*` is left.
+  `server_status` reports `dock_icon` through `status`, which starts nothing and creates nothing.
+- `dock_icon` never fails a launch or the server: any problem is a note in the launch result (`_failed`) or in
+  `server_status` (`_last_note`). `cp -c` quietly falls back to a full copy where it cannot clone, so one file is cloned
+  first with `clonefile(2)`, which cannot. A stale copy is not replaced while a process runs from it, because new
+  renderers start from the bundle path. The copy is rebuilt when Chrome's version, the source browser or the icon
+  changes. Headless, `attach_to_chrome` and the `solve_turnstile_oscursor` sidecar use the installed Chrome.
+- The clone costs no measurable disk (the free-space change of a build is inside the noise, while `du` says 1.5 GB), but a
+  clone stops sharing blocks once the original changes: after a Chrome update the old copy holds its 1.5 GB alone until
+  it is rebuilt. A server killed mid-build leaves `.building-*`, possibly with the previous copy inside, so the builder
+  removes those under the lock even when the copy itself is fine.
+- `discard_copy` deletes, so it is narrow on purpose: only in the configured `app_dir()`, never the home folder or
+  anything above it, never through a link, only a folder holding this module's `.lock`, and only four names
+  (`Stealth Chrome.app`, its marker, `.lock`, `.building-*`). It leaves the copy while a process runs from it, and an
+  unreadable process list counts as in use. It runs when a server starts with the feature off and a folder exists, and
+  when the last browser from the copy closes with the feature off. A copy that went stale while in use is rebuilt at
+  that close (`_refresh_idle_copy`), so 1.5 GB of unshared blocks does not wait for some later launch.
+- `du` cannot say what a clone costs. `_disk_use` reads APFS's private size per file with `getattrlist`
+  (`ATTR_CMNEXT_PRIVATESIZE`), about 30 ms for Chrome's 700 files: a fresh copy reads 0.0 MB of its own and 1535 MB
+  shown. `server_status` reports both as `dock_icon.disk`.
+- `tmutil addexclusion` takes 11 s here, every time. `_exclude_from_backups` writes the same extended attribute directly
+  (0.02 s, and `tmutil isexcluded` agrees), before the signature check so the check covers the final bundle.
+- Running the copy, even `--version`, registers it with LaunchServices: it is then listed for Chrome's bundle id and as a
+  handler for https, beside the person's Chrome. The bundle id kept resolving to `/Applications` in every state measured.
+  `lsregister -u` removes it and the next run registers it again, so `_forget_dock_copy` repeats it after every verified
+  close when nothing else runs from the copy, and `_build` does it for the build folder the warm-up registered. Only a
+  bundle named `Stealth Chrome.app` with our marker beside it is ever unregistered. A copy under a temp folder is not
+  listed by `NSWorkspace` at all, so tests of this need a folder under the home directory.
 - The copy has Chrome's bundle id and the same bundle path as every other launch from it, so anything telling this browser
   from another must keep comparing PIDs (`_win_focus_back_from_popup`, `_pid_recycled` by `--user-data-dir`), never the
-  bundle. The copy is prepared before `_frontmost_app` is read: building takes seconds, and focus goes back to what was
-  frontmost when Chrome started. `tests/conftest.py` points `MCP_STEALTH_APP_DIR` at a temporary folder and stubs
-  `prepare` inside the pytest process, so no test builds in the real `~/.mcp-stealth/app`.
+  bundle. `tests/conftest.py` sets `MCP_STEALTH_DOCK_ICON=0` (so a developer's own setting does not leak in) and a
+  temporary `MCP_STEALTH_APP_DIR` for every server the suite starts and stubs `prepare` inside the pytest process, so
+  nothing builds in the real `~/.mcp-stealth/app` and no server builds at all unless its test passes `DOCK_COPY_ON` and
+  calls `wait_for_dock_copy`.
 - A stdio `browser_launch` sets `current_idle_timeout = 0`. Leaving the reaper off is not enough: any `spawn_browser`
   starts it, and it then closed the browser the person was looking at, 15 minutes after its last tool call.
 - `is_up()` false does not mean Chrome stopped: closing the last tab empties `tabs` while the process runs and
