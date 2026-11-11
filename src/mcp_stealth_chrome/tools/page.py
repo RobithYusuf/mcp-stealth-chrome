@@ -71,13 +71,17 @@ async def browser_snapshot(
     superseded, or whose element is gone, fails with an error saying so instead
     of hitting the wrong element.
 
+    A field carries its label as label="..." (from <label for>, a label around it, or
+    aria-labelledby), and name_contains matches it.
+
     Modes:
       interactive_compact — default. Full fidelity, minus non-interactive
                   elements that carry no accessible name (the nameless
                   ``<img alt="">`` that made a real admin page report ~190
-                  elements). Every drop is counted in the report.
+                  elements), and minus the row of a label whose field is listed.
+                  Every drop is counted in the report.
       full      — same shape as mcp-camoufox; keeps the unnamed decorative
-                  elements compact drops.
+                  elements and the label rows compact drops.
       fast      — reduced selector, no getComputedStyle, minimal attrs (2-3×
                   faster, less info per element)
       viewport  — full fidelity, only elements inside the current scroll

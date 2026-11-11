@@ -478,10 +478,9 @@ async def drag_and_drop(start_x: int, start_y: int, end_x: int, end_y: int) -> s
         if _srv._dialog_note(tab):
             return ok(f"drag from ({start_x},{start_y}) interrupted{_srv._dialog_note(tab)}. "
                       f"It finishes once the dialog is answered.")
-        await asyncio.sleep(0.35)
         return _srv._click_outcome(
             f"dragged ({start_x},{start_y}) to ({end_x},{end_y})", "method=cdp_mouse",
-            before, await _srv._page_sig(tab),
+            before, await _srv._sig_after_action(tab, before),
         )
     except Exception as e:
         return err(str(e))

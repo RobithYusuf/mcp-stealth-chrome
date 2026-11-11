@@ -89,3 +89,32 @@ def test_fingerprint_audit_sees_missing_google_voices(mode, voices_pass):
     flagged = any(w.startswith("speechSynthesis voices") for w in report["warnings"])
     assert ("speechSynthesis voices" in report["passed"]) is voices_pass, report
     assert flagged is not voices_pass, report["warnings"]
+
+
+@pytest.mark.parametrize("extra_args, fits", [(None, True), (["--screen-info={800x600}"], False)])
+def test_headless_window_fits_its_screen(extra_args, fits):
+    """Headless Chrome reports an 800x600 screen whatever the window, so the default 1280x800
+    window was larger than its screen and the audit said "clean"."""
+    import json
+
+    from mcp_stealth_chrome import server
+
+    tools = server.mcp._tool_manager._tools
+
+    async def scenario():
+        out = await tools["browser_launch"].fn(url="about:blank", headless=True, persistent=False,
+                                               extra_args=extra_args)
+        assert not out.startswith("Error"), out
+        try:
+            sizes = await tools["evaluate"].fn(expression=(
+                "[outerWidth, outerHeight, screen.width, screen.height, "
+                "screen.availWidth, screen.availHeight, devicePixelRatio]"))
+            return json.loads(await tools["fingerprint_audit"].fn()), json.loads(sizes)
+        finally:
+            await tools["browser_close"].fn()
+
+    report, (ow, oh, sw, sh, aw, ah, dpr) = asyncio.run(scenario())
+    assert (ow <= sw and oh <= sh) is fits, (ow, oh, sw, sh)
+    assert aw <= sw and ah <= sh and dpr == 1, (aw, ah, sw, sh, dpr)
+    assert ("window vs screen size" in report["passed"]) is fits, report
+    assert any(w.startswith("window vs screen size") for w in report["warnings"]) is not fits, report["warnings"]

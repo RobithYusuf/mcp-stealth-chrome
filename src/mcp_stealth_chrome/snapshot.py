@@ -28,7 +28,7 @@ def snapshot_hash(elements: list[dict]) -> str:
 def element_fingerprint(element: dict) -> str:
     """Stable identity for delta snapshots, excluding the regenerated ref."""
     keys = (
-        "tag", "role", "text", "type", "name", "placeholder", "aria", "alt",
+        "tag", "role", "text", "label", "type", "name", "placeholder", "aria", "alt",
         "href", "checked", "disabled", "hidden", "frame", "shadow",
     )
     row = "|".join(str(element.get(k, "")) for k in keys)
@@ -104,6 +104,8 @@ def format_snapshot(
             parts.append(f"role={el['role']}")
         if el.get("type"):
             parts.append(f"type={el['type']}")
+        if el.get("label"):
+            parts.append(f'label="{el["label"][:80]}"')
         if el.get("text"):
             parts.append(f'"{el["text"][:80]}"')
         if el.get("placeholder"):
@@ -165,7 +167,7 @@ _SNAPSHOT_JS_TEMPLATE = r"""(() => {
     hidden_skipped: 0,
     offscreen_skipped: 0,
     measured: 0,
-    excluded: {unnamed_decorative: 0, role: 0, name: 0},
+    excluded: {unnamed_decorative: 0, role: 0, name: 0, label: 0},
     eligible: 0,
     returned: 0,
     omitted: 0,
@@ -237,9 +239,58 @@ _SNAPSHOT_JS_TEMPLATE = r"""(() => {
     return (el.getAttribute('type') || '').toLowerCase() === 'password' ? '' : el.value;
   }
 
+  // The text of a label, leaving out what belongs to the field it wraps: a label around
+  // a <select> would otherwise read as every option.
+  function textOutside(node, field) {
+    if (!node.contains(field)) return node.innerText || node.textContent || '';
+    var acc = [];
+    var w = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
+    var n;
+    while ((n = w.nextNode())) {
+      var p = n.parentElement;
+      if (p && p.closest('select, textarea, button, option')) continue;
+      acc.push(n.nodeValue);
+    }
+    return acc.join(' ');
+  }
+
+  function isField(el) {
+    var t = el.tagName.toLowerCase();
+    if (t === 'textarea' || t === 'select') return true;
+    if (t === 'input') {
+      var ty = (el.getAttribute('type') || 'text').toLowerCase();
+      return ty !== 'submit' && ty !== 'button' && ty !== 'reset' && ty !== 'image';
+    }
+    if (el.getAttribute('contenteditable') === 'true') return true;
+    var r = (el.getAttribute('role') || '').toLowerCase();
+    return ['textbox', 'checkbox', 'radio', 'combobox', 'listbox', 'slider',
+            'searchbox', 'switch', 'spinbutton'].indexOf(r) >= 0;
+  }
+
+  // What names a field for a person: aria-labelledby, then <label for> or a label around
+  // it. Without it an input read as a bare [input] with its label on a row of its own.
+  function labelOf(el) {
+    if (!isField(el)) return '';
+    var acc = [];
+    var ids = (el.getAttribute('aria-labelledby') || '').trim();
+    if (ids) {
+      var root = el.getRootNode();
+      var list = ids.split(/\s+/);
+      for (var i = 0; i < list.length; i++) {
+        var ref = root.getElementById ? root.getElementById(list[i]) : null;
+        if (ref) acc.push(textOutside(ref, el));
+      }
+    }
+    if (!acc.join('').trim() && el.labels) {
+      for (var j = 0; j < el.labels.length; j++) acc.push(textOutside(el.labels[j], el));
+    }
+    return acc.join(' ').replace(/\s+/g, ' ').trim();
+  }
+
   function accName(el) {
     var parts = [
       el.getAttribute('aria-label'),
+      labelOf(el),
       el.getAttribute('alt'),
       el.getAttribute('title'),
       el.innerText,
@@ -268,6 +319,32 @@ _SNAPSHOT_JS_TEMPLATE = r"""(() => {
   }
 
   var vh = window.innerHeight, vw = window.innerWidth;
+
+  // Whether a label's field gets a row of its own in this snapshot. Only then is the
+  // label's row left out: a label for a hidden input (a styled checkbox) is the thing
+  // to click, and one whose field lies outside the container is the only sign of it.
+  function isListed(field) {
+    try { if (!field.matches(CFG.selectors)) return false; } catch (e) { return false; }
+    var inScope = false;
+    for (var s = 0; s < searchRoots.length && !inScope; s++) {
+      inScope = searchRoots[s] === document || searchRoots[s].contains(field) ||
+                searchRoots[s] === field.getRootNode();
+    }
+    if (!inScope) return false;
+    var r = field.getBoundingClientRect();
+    var hidden = (r.width < 1 || r.height < 1);
+    if (!hidden && CFG.computed_style) {
+      var cs = getComputedStyle(field);
+      if (cs.display === 'none' || cs.visibility === 'hidden') hidden = true;
+    }
+    if (hidden && !CFG.include_hidden) return false;
+    if (CFG.viewport_only &&
+        (r.bottom < 0 || r.top > vh || r.right < 0 || r.left > vw)) return false;
+    if (CFG.roles.length &&
+        CFG.roles.indexOf((field.getAttribute('role') || implicitRole(field)).toLowerCase()) < 0) return false;
+    if (CFG.name_contains && accName(field).toLowerCase().indexOf(CFG.name_contains) < 0) return false;
+    return true;
+  }
   var useSet = (typeof Set === 'function');
   var setSeen = useSet ? new Set() : null;
   var arrSeen = useSet ? null : [];
@@ -302,6 +379,11 @@ _SNAPSHOT_JS_TEMPLATE = r"""(() => {
 
       var role = el.getAttribute('role') || '';
       var irole = implicitRole(el);
+      if (CFG.fold_labels && el.tagName === 'LABEL' && el.control &&
+          CFG.roles.indexOf('label') < 0 && isListed(el.control)) {
+        out.excluded.label++;
+        continue;
+      }
       var nm = accName(el);
 
       if (CFG.drop_unnamed_decorative && !isInteractive(el) && !nm) {
@@ -337,6 +419,7 @@ _SNAPSHOT_JS_TEMPLATE = r"""(() => {
           role: role,
           text: (el.innerText || safeValue(el) || '').trim().slice(0, CFG.text_cap),
           type: el.getAttribute('type') || '',
+          label: labelOf(el).slice(0, CFG.text_cap),
           name: el.getAttribute('name') || '',
           placeholder: el.getAttribute('placeholder') || '',
           aria: el.getAttribute('aria-label') || '',
@@ -346,6 +429,7 @@ _SNAPSHOT_JS_TEMPLATE = r"""(() => {
           disabled: el.disabled || false
         };
       }
+      if (entry.label && (entry.label === entry.aria || entry.label === entry.text)) entry.label = '';
       if (hidden) entry.hidden = true;
       if (el.getRootNode() !== document) entry.shadow = true;
       kept.push([el, entry]);
@@ -398,6 +482,8 @@ def _mode_config(mode: str) -> dict:
             # of them nameless <img alt=""> that no caller can act on. They are
             # dropped here and counted, never silently.
             "drop_unnamed_decorative": True,
+            # A label whose field has its own row is named on that row instead.
+            "fold_labels": True,
             "minimal": False,
             "text_cap": 80,
             "force_viewport": False,
@@ -407,6 +493,7 @@ def _mode_config(mode: str) -> dict:
             "selectors": SNAPSHOT_SELECTORS_FULL,
             "computed_style": True,
             "drop_unnamed_decorative": False,
+            "fold_labels": True,
             "minimal": False,
             "text_cap": 100,
             "force_viewport": True,
@@ -447,6 +534,7 @@ def snapshot_options(
         "selectors": cfg["selectors"],
         "computed_style": cfg["computed_style"],
         "drop_unnamed_decorative": cfg["drop_unnamed_decorative"],
+        "fold_labels": cfg.get("fold_labels", False),
         "minimal": cfg["minimal"],
         "text_cap": cfg["text_cap"],
         "container": container_selector or "",
@@ -533,6 +621,10 @@ def format_counts(counts: dict, options: dict) -> list[str]:
         parts.append(
             f"{excluded['unnamed_decorative']} unnamed decorative "
             f"(non-interactive, no accessible name — mode=\"full\" keeps them)"
+        )
+    if excluded.get("label"):
+        parts.append(
+            f"{excluded['label']} label row(s), shown as label=\"...\" on their field"
         )
     if excluded.get("role"):
         parts.append(f"{excluded['role']} by role filter")

@@ -3159,7 +3159,7 @@ def _nodriver_start(monkeypatch, tmp_path, outcomes):
     monkeypatch.setattr(server.asyncio, "sleep", _no_sleep)
     monkeypatch.setattr(state, "find_chrome_pids_by_profile", lambda _p: [7777])
     monkeypatch.setattr(server, "_pid_recycled", lambda _pid, _browser: False)
-    monkeypatch.setattr(server, "_descendant_pids", lambda _pid: [])
+    monkeypatch.setattr(server, "_descendant_pids", lambda _pid, _data_dir=None: [])
     return spawned, signalled
 
 
@@ -3477,3 +3477,147 @@ def test_testing_mode_features_join_nodrivers_list(tmp_path):
     features = last.split("=", 1)[1].split(",")
     assert {"IsolateOrigins", "site-per-process", *ours} <= set(features), last
     assert len(features) == len(set(features)), last
+
+
+# --- a headless window must fit in its own screen ---------------------------------------------
+
+def _screen_arg(monkeypatch, real, width=1280, height=800, args=None):
+    from mcp_stealth_chrome import server
+    monkeypatch.setattr(server, "_real_screen", lambda: real)
+    return server._headless_screen_arg(width, height, args)
+
+
+def test_headless_screen_is_the_real_display_when_the_window_fits(monkeypatch):
+    real = {"width": 1800, "height": 1169, "top": 39, "bottom": 62, "left": 0, "right": 0}
+    assert _screen_arg(monkeypatch, real) == "--screen-info={1800x1169 workAreaTop=39 workAreaBottom=62}"
+
+
+@pytest.mark.parametrize("real", [None, {"width": 1024, "height": 768, "top": 25, "bottom": 0, "left": 0, "right": 0}])
+def test_headless_screen_falls_back_to_one_that_holds_the_window(monkeypatch, real):
+    """Headless Chrome's own 800x600 screen is smaller than the default window."""
+    import re
+    arg = _screen_arg(monkeypatch, real, width=2000, height=1200)
+    width, height = map(int, re.match(r"--screen-info=\{(\d+)x(\d+)", arg).groups())
+    assert width >= 2000 and height >= 1200, arg
+
+
+def test_headless_screen_grows_past_every_listed_size(monkeypatch):
+    arg = _screen_arg(monkeypatch, None, width=5000, height=3000)
+    assert arg.startswith("--screen-info={5000x3000"), arg
+
+
+def test_a_callers_own_screen_info_is_left_alone(monkeypatch):
+    assert _screen_arg(monkeypatch, None, args=["--screen-info={1024x768}"]) is None
+
+
+# --- closing ends this browser's processes, and only those -------------------------------------
+
+def _launcher_with_a_foreign_child(tmp_path):
+    """A process whose command line names the profile, with one child that does and one that
+    does not, as Chrome has its helpers and also the machine-wide updater it wakes."""
+    import subprocess
+    import sys
+    import time
+
+    profile = str(tmp_path / "profile")
+    nap = "import time; time.sleep(60)"
+    code = (
+        "import subprocess, sys, time\n"
+        f"subprocess.Popen([sys.executable, '-c', {nap!r}, '--user-data-dir={profile}'])\n"
+        f"subprocess.Popen([sys.executable, '-c', {nap!r}, 'updater-wake'])\n"
+        "time.sleep(60)\n"
+    )
+    parent = subprocess.Popen([sys.executable, "-c", code, f"--user-data-dir={profile}"])
+    from mcp_stealth_chrome import server
+    for _ in range(100):
+        if len(server._descendant_pids(parent.pid)) == 2:
+            break
+        time.sleep(0.05)
+    return parent, profile
+
+
+def _end(pids):
+    import contextlib
+    import os
+    import signal
+    for pid in pids:
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
+
+
+def test_the_browsers_family_leaves_out_what_is_not_the_browser(tmp_path):
+    from mcp_stealth_chrome import server
+
+    parent, profile = _launcher_with_a_foreign_child(tmp_path)
+    everyone = server._descendant_pids(parent.pid)
+    try:
+        own = server._descendant_pids(parent.pid, profile)
+        assert len(everyone) == 2 and len(own) == 1, (everyone, own)
+        assert profile in server._process_command(own[0])
+    finally:
+        _end([parent.pid, *everyone])
+        parent.wait()
+
+
+def test_closing_does_not_signal_a_program_the_browser_merely_started(tmp_path):
+    """Chrome wakes GoogleUpdater, which is still running when Chrome has gone. It was counted
+    as the browser: 4 closes in 5 said "CDP stop did not end the process" and sent it SIGTERM."""
+    import asyncio
+    import time
+    import types
+
+    from mcp_stealth_chrome import server
+
+    parent, profile = _launcher_with_a_foreign_child(tmp_path)
+    everyone = server._descendant_pids(parent.pid)
+    own = server._descendant_pids(parent.pid, profile)
+    foreign = [pid for pid in everyone if pid not in own]
+
+    class _Browser:
+        _process_pid = parent.pid
+        _process = parent
+        config = types.SimpleNamespace(user_data_dir=profile, browser_executable_path=None,
+                                       host=None, port=None)
+
+        def stop(self):
+            _end([parent.pid, *own])
+            parent.wait()
+
+    try:
+        started = time.monotonic()
+        report = asyncio.run(server._ensure_browser_dead(_Browser(), None))
+        took = time.monotonic() - started
+        assert report["verified"] is True and report["killed"] == [], report
+        assert server._process_exists(foreign[0]), "the foreign child was ended with the browser"
+        assert took < 1.0, f"a browser that was already gone still took {took:.2f}s to close"
+    finally:
+        _end([parent.pid, *everyone])
+
+
+def test_a_browser_that_ignores_stop_is_still_signalled_and_verified(tmp_path):
+    import asyncio
+    import types
+
+    from mcp_stealth_chrome import server
+
+    parent, profile = _launcher_with_a_foreign_child(tmp_path)
+    everyone = server._descendant_pids(parent.pid)
+    own = server._descendant_pids(parent.pid, profile)
+
+    class _Browser:
+        _process_pid = parent.pid
+        _process = parent
+        config = types.SimpleNamespace(user_data_dir=profile, browser_executable_path=None,
+                                       host=None, port=None)
+
+        def stop(self):
+            return None
+
+    try:
+        import threading
+        threading.Thread(target=parent.wait, daemon=True).start()  # reap, as asyncio does
+        report = asyncio.run(server._ensure_browser_dead(_Browser(), None, grace=0.2))
+        assert sorted(report["killed"]) == sorted([parent.pid, *own]), report
+        assert report["verified"] is True and report["still_alive"] == [], report
+    finally:
+        _end([parent.pid, *everyone])

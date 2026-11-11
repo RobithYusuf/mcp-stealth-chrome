@@ -39,6 +39,37 @@ PAGES = {
                      '<div class="cf-turnstile" data-sitekey="x" style="width:300px;height:65px" '
                      'onclick="document.getElementById(\'tok\').value=\'SYNTHTOKEN\';this.remove()"></div>'
                      '<input name="cf-turnstile-response" type="hidden" id="tok">'),
+    "/latewidget.html": ('<!doctype html><title>Login</title><p>form</p><script>setTimeout(() => {'
+                         'document.body.insertAdjacentHTML("beforeend", \'<div class="cf-turnstile" data-sitekey="x" '
+                         'style="width:300px;height:65px"></div><input name="cf-turnstile-response" type="hidden">\');'
+                         '}, 300); /* turnstile.render comes later */</script>'),
+    "/late.html": ('<!doctype html><title>Late</title><p id="out">0</p>'
+                   '<button id="now" onclick="out.textContent=\'now\'">Now</button>'
+                   '<button id="late" onclick="setTimeout(() => out.textContent=\'late\', 300)">Late</button>'
+                   '<button id="dead">Dead</button>'),
+    "/watched.html": (
+        '<!doctype html><title>Watched</title><script>window.__calls = [];'
+        'const own = location.origin;'
+        'const wrap = (proto, name) => { const orig = proto[name]; proto[name] = function() {'
+        ' const stack = String(new Error().stack).split("\\n").slice(2);'
+        ' if (!stack.some(line => line.includes(own))) window.__calls.push(name);'
+        ' return orig.apply(this, arguments); }; };'
+        'for (const name of ["querySelector", "querySelectorAll", "getElementsByTagName", "elementFromPoint"])'
+        ' wrap(Document.prototype, name);'
+        'for (const name of ["querySelector", "querySelectorAll", "getBoundingClientRect", "getAttribute"])'
+        ' wrap(Element.prototype, name);'
+        'wrap(Node.prototype, "contains"); wrap(Node.prototype, "getRootNode"); wrap(window, "getComputedStyle");'
+        '</script><p id="out">0</p><button id="b" onclick="out.textContent = +out.textContent + 1">Press</button>'
+        '<div style="position:relative;margin-top:30px"><button id="under">Under</button>'
+        '<div id="cover" style="position:absolute;inset:-5px 0 -5px 0;width:200px"></div></div>'),
+    "/labels.html": (
+        '<!doctype html><title>Labels</title>'
+        '<p><label for="email">Email</label> <input id="email" type="email"></p>'
+        '<p><label>Phone <input id="phone" type="tel"></label></p>'
+        '<p><span id="cap">Postal code</span> <input id="zip" aria-labelledby="cap"></p>'
+        '<p><label>Colour <select id="colour"><option>Red</option><option>Blue</option></select></label></p>'
+        '<p><input id="dark" type="checkbox" style="display:none"><label for="dark">Dark mode</label></p>'
+        '<p><input id="bare"></p><p><label>Orphan text</label></p>'),
     "/idb.html": ("<!doctype html><title>IDB</title><script>const r=indexedDB.open('protodb',1);"
                   "r.onupgradeneeded=()=>r.result.createObjectStore('o');r.onsuccess=()=>r.result.close();</script>"),
 }
@@ -58,6 +89,7 @@ def _png(size: int = 64) -> bytes:
 
 class _Fixture(http.server.SimpleHTTPRequestHandler):
     requests: list = []
+    loads = 0
 
     def log_message(self, *_args):
         pass
@@ -74,6 +106,10 @@ class _Fixture(http.server.SimpleHTTPRequestHandler):
         path = self.path.split("?")[0]
         if path in PAGES:
             return self._reply(200, PAGES[path].encode())
+        if path == "/counter.html":
+            time.sleep(0.3)
+            _Fixture.loads += 1
+            return self._reply(200, f"<!doctype html><title>Count</title><p id=n>{_Fixture.loads}</p>".encode())
         if path == "/img.png":
             return self._reply(200, _png(), "image/png")
         if path == "/slow.png":
@@ -640,6 +676,128 @@ def test_nothing_is_clicked_on_a_page_without_a_widget(page, base):
 def test_auto_verify_says_the_challenge_is_still_there(page, base):
     reply = page.call("navigate", url=f"{base}/turnstile.html", _timeout=50)
     assert "challenge still present" in reply.text, reply.text[:300]
+
+
+def test_a_plain_page_is_not_kept_waiting_for_a_challenge(page, base):
+    """navigate slept 0.6 s on every page in case a challenge appeared, and Tab.get another 0.5 s
+    when the URL did not change: 1.13 s to reopen a local page that loads in 60 ms."""
+    page.call("navigate", url=f"{base}/page2.html")
+    times = [page.call("navigate", url=f"{base}/page2.html").seconds for _ in range(3)]
+    assert max(times) < 0.45, times
+
+
+def test_a_challenge_arriving_after_load_is_still_seen(page, base):
+    """The widget is inserted 300 ms after load. The page's own script names turnstile, which is
+    what keeps the short wait for it."""
+    reply = page.call("navigate", url=f"{base}/latewidget.html", _timeout=50)
+    assert "challenge still present" in reply.text, reply.text[:300]
+
+
+def test_reopening_the_same_url_reads_the_new_document(page, base):
+    """Without the fixed wait, the load must still be the new one: the server answers after 0.3 s
+    with a number that goes up on every request."""
+    first = page.call("navigate", url=f"{base}/counter.html")
+    before = int(page.evaluate("document.getElementById('n').textContent").strip('"'))
+    second = page.call("navigate", url=f"{base}/counter.html")
+    after = int(page.evaluate("document.getElementById('n').textContent").strip('"'))
+    assert after == before + 1, (before, after)
+    for reply in (first, second):
+        assert '"status": 200' in reply.text and '"ready_state": "complete"' in reply.text, reply.text
+    assert second.seconds >= 0.3, second.seconds
+
+
+def test_a_click_that_changed_the_page_is_reported_at_once(page, base):
+    """Every click waited a fixed 350 ms before looking: 530 ms for a button that had already
+    changed the page by the time the click was acknowledged."""
+    page.call("navigate", url=f"{base}/late.html")
+    times = []
+    for _ in range(3):
+        reply = page.call("click", selector="#now")
+        assert "page changed" in reply.text, reply.text
+        times.append(reply.seconds)
+        page.evaluate("out.textContent = '0'; 1")
+    assert max(times) < 0.35, times
+
+
+def test_a_handler_that_reacts_late_is_not_reported_dead(page, base):
+    """The page changes 300 ms after the click. Stopping early on a change must not shorten the
+    wait for a page that has not changed yet."""
+    page.call("navigate", url=f"{base}/late.html")
+    for _ in range(3):
+        reply = page.call("click", selector="#late")
+        assert "page changed" in reply.text and "NO page change" not in reply.text, reply.text
+        page.evaluate("out.textContent = '0'; 1")
+        time.sleep(0.1)
+
+
+def test_a_dead_button_still_gets_the_whole_wait(page, base):
+    page.call("navigate", url=f"{base}/late.html")
+    reply = page.call("click", selector="#dead")
+    assert "NO page change detected" in reply.text, reply.text
+    assert reply.seconds >= 0.45, reply.seconds
+
+
+def test_a_click_calls_nothing_the_page_can_replace(page, base):
+    """The hit test and the before and after fingerprints ran in the page's own world: 18 calls
+    to getBoundingClientRect, elementFromPoint, getComputedStyle and the like for one click,
+    each of which a page can replace and so watch. The challenge look on every navigation
+    handed a replaced querySelector the Turnstile selectors."""
+    def calls():
+        return json.loads(page.evaluate("JSON.stringify(window.__calls)"))
+
+    assert not page.call("navigate", url=f"{base}/watched.html").failed
+    assert calls() == [], "navigate"
+    reply = page.call("click", selector="#b")
+    assert "page changed" in reply.text and calls() == [], (reply.text, calls())
+    reply = page.call("click_text", text="Press")
+    assert "page changed" in reply.text and calls() == [], (reply.text, calls())
+    assert not page.call("hover", selector="#b").failed and calls() == [], calls()
+    reply = page.call("click", selector="#under")
+    assert reply.failed and "obscured by <div#cover>" in reply.text and calls() == [], (reply.text, calls())
+    assert page.evaluate("out.textContent").strip('"') == "2"
+
+
+def _row(snapshot, needle):
+    rows = [line for line in snapshot.splitlines() if needle in line]
+    assert len(rows) == 1, (needle, rows)
+    return rows[0]
+
+
+def test_a_field_is_named_by_its_label_on_its_own_row(page, base):
+    """An input with a <label for> read as a bare [input], its label on a row of its own: 75 of
+    the 158 rows of a form, and nothing on the field's row to find it by."""
+    page.call("navigate", url=f"{base}/labels.html")
+    text = page.call("browser_snapshot", diff_from_last=False).text
+    assert 'type=email label="Email"' in _row(text, "type=email"), text
+    assert 'label="Phone"' in _row(text, "type=tel"), text          # a label around the field
+    assert 'label="Postal code"' in text, text                      # aria-labelledby
+    colour = _row(text, "[select]")
+    assert 'label="Colour"' in colour, text                         # not "Colour Red Blue"
+    for folded in ('[label] "Email"', '[label] "Phone', '[label] "Colour'):
+        assert folded not in text, (folded, text)
+    assert "3 label row(s)" in text, text
+
+
+def test_a_label_without_a_listed_field_keeps_its_row(page, base):
+    """The checkbox is display:none, as styled ones are: its label is the thing to click."""
+    page.call("navigate", url=f"{base}/labels.html")
+    text = page.call("browser_snapshot", diff_from_last=False).text
+    assert '[label] "Dark mode"' in text and '[label] "Orphan text"' in text, text
+
+
+def test_a_named_field_is_found_and_filled_by_that_name(page, base):
+    page.call("navigate", url=f"{base}/labels.html")
+    text = page.call("browser_snapshot", diff_from_last=False, name_contains="postal").text
+    row = _row(text, 'label="Postal code"')
+    ref = row.split("ref=")[1].split()[0]
+    assert not page.call("fill", ref=ref, value="12345").failed
+    assert page.evaluate("document.getElementById('zip').value").strip('"') == "12345"
+
+
+def test_full_mode_keeps_the_label_rows(page, base):
+    page.call("navigate", url=f"{base}/labels.html")
+    text = page.call("browser_snapshot", diff_from_last=False, mode="full").text
+    assert '[label] "Email"' in text and 'type=email label="Email"' in text, text
 
 
 def test_an_empty_token_means_the_challenge_is_not_over(page, base):

@@ -97,44 +97,62 @@ def _patch_client_security_state() -> None:
         _STATUS["client_security_state"] = f"{type(e).__name__}: {e}"
 
 
-def _patch_tab_get_keeps_session() -> None:
-    """nodriver 0.50's Tab.get opens a new CDP session after every navigation.
+def _same_page_url(a: str, b: str) -> bool:
+    """Two URLs for the same document, ignoring the fragment and a trailing slash."""
+    return a.split("#", 1)[0].rstrip("/") == b.split("#", 1)[0].rstrip("/")
 
-    Overrides belong to a session, so a cross-site navigation drops them: measured as
-    navigator.platform returning to the real value while the UA stayed overridden.
-    Navigating without re-attaching keeps one session per tab, as up to 0.48.
-    Absent up to 0.48, where Connection has no attach and there is nothing to patch.
+
+def _patch_tab_get_keeps_session() -> None:
+    """Tab.get without a new CDP session and without a fixed wait.
+
+    nodriver 0.50's Tab.get opens a new CDP session after every navigation. Overrides belong
+    to a session, so a cross-site navigation drops them: measured as navigator.platform
+    returning to the real value while the UA stayed overridden. Navigating without
+    re-attaching keeps one session per tab, as up to 0.48.
+
+    Up to 0.48 Tab.get instead ends in `await self`, which is a sleep of half a second on
+    every navigation. Page.navigate answers once the navigation has committed, so there is
+    nothing left to sleep for; callers that need the load poll readyState themselves.
     """
     try:
         from nodriver.core.connection import Connection
         from nodriver.core.tab import Tab
-        if not hasattr(Connection, "attach") or getattr(Tab, "_mcp_get_patched", False):
+        if getattr(Tab, "_mcp_get_patched", False):
             return
         from nodriver import cdp
 
         original_get = Tab.get
+        reattaches = hasattr(Connection, "attach")
 
         async def patched_get(self, url="chrome://welcome", new_tab=False, new_window=False):
             if new_tab or new_window or not self.browser:
                 return await original_get(self, url, new_tab, new_window)
             await self.send(cdp.page.navigate(url))
-            # attach() was also what refreshed this. Without it Tab.url stays stale. Briefly,
-            # since the target only reports the new URL once the navigation commits.
+            # attach() (0.50) and the sleep (0.48) were also what refreshed Tab.url. Briefly,
+            # since the target only reports the new URL once the navigation commits. A
+            # navigation to the URL the tab is already on has nothing to wait for: waiting
+            # for the URL to change cost half a second on every reload by URL.
             before = str(getattr(self.target, "url", "") or "")
             for _ in range(10):
                 try:
                     info = await self.send(cdp.target.get_target_info(self.target.target_id))
                 except Exception:
                     break
-                self.target = info
-                if info.url and info.url != before:
+                try:
+                    self.target = info
+                except AttributeError:  # a read-only property over _target, up to 0.48
+                    self._target = info
+                if info.url and (info.url != before or _same_page_url(info.url, str(url))):
                     break
                 await asyncio.sleep(0.05)
             return self
 
-        Tab.get = patched_get
-        Tab._mcp_get_patched = True
-        _STATUS["tab_get_keeps_session"] = True
+        # Up to 0.48 the class refuses plain attribute assignment through its metaclass.
+        type.__setattr__(Tab, "get", patched_get)
+        type.__setattr__(Tab, "_mcp_get_patched", True)
+        _STATUS["tab_get_no_fixed_wait"] = True
+        if reattaches:
+            _STATUS["tab_get_keeps_session"] = True
     except Exception as e:  # never block server startup on patch failure
         _STATUS["tab_get_keeps_session"] = f"{type(e).__name__}: {e}"
 

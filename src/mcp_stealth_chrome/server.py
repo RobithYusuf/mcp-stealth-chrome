@@ -63,8 +63,10 @@ from .identity import (
     ua_metadata_fields,
 )
 from .refs import (
+    apply_isolated,
     close_connection,
     ensure_in_root_view,
+    evaluate_isolated,
     evaluate_parts,
     forget_refs,
     new_object_group,
@@ -304,28 +306,48 @@ def _pid_recycled(pid: int, browser: Any) -> bool:
     return command is not None and f"--user-data-dir={data_dir}" not in command
 
 
-def _descendant_pids(pid: int) -> list[int]:
-    """Everything started under a PID, found while the parent links still exist.
+def _descendant_pids(pid: int, data_dir: Optional[str] = None) -> list[int]:
+    """Everything this browser started under a PID, found while the parent links still exist.
 
     A launcher script that does not exec is the recorded PID, with Chrome as its child.
     Ending only the script leaves Chrome running, reparented to init, and holding its profile.
+
+    With data_dir, only processes whose command line names that profile count. Chrome also
+    starts programs that are not part of the browser: on macOS it wakes GoogleUpdater, the
+    machine-wide updater, which outlives the browser by a few seconds. Counted as family, it
+    made a clean close read as "did not end the process" and was sent SIGTERM mid-update.
     """
     try:
-        r = subprocess.run(["ps", "-ax", "-o", "pid=,ppid="],
+        r = subprocess.run(["ps", "-ax", "-ww", "-o", "pid=,ppid=,command="],
                            capture_output=True, text=True, timeout=3)
         children: dict[int, list[int]] = {}
+        commands: dict[int, str] = {}
         for line in (r.stdout or "").splitlines():
-            child, parent = line.split()
-            children.setdefault(int(parent), []).append(int(child))
+            parts = line.split(None, 2)
+            if len(parts) < 2:
+                continue
+            child, parent = int(parts[0]), int(parts[1])
+            children.setdefault(parent, []).append(child)
+            commands[child] = parts[2] if len(parts) > 2 else ""
     except Exception:
         return []
     found: list[int] = []
     pending = [pid]
     while pending:
         for child in children.get(pending.pop(), []):
-            found.append(child)
             pending.append(child)
+            if not data_dir or str(data_dir) in commands.get(child, ""):
+                found.append(child)
     return found
+
+
+async def _all_gone(pids: list[int], within: float) -> bool:
+    """Whether every PID ended inside `within` seconds, checked as they go rather than after."""
+    for _ in range(int(max(0.0, within) / 0.05)):
+        if not any(_process_exists(target) for target in pids):
+            return True
+        await asyncio.sleep(0.05)
+    return not any(_process_exists(target) for target in pids)
 
 
 async def _ensure_browser_dead(browser, profile_dir=None, grace: float = 1.5) -> dict:
@@ -354,7 +376,9 @@ async def _ensure_browser_dead(browser, profile_dir=None, grace: float = 1.5) ->
     pid = getattr(browser, "_process_pid", None) if browser else None
     report["pid"] = pid
     recycled = isinstance(pid, int) and pid > 0 and _pid_recycled(pid, browser)
-    family = _descendant_pids(pid) if isinstance(pid, int) and pid > 0 and not recycled else []
+    data_dir = getattr(getattr(browser, "config", None), "user_data_dir", None)
+    family = (_descendant_pids(pid, str(data_dir) if data_dir else None)
+              if isinstance(pid, int) and pid > 0 and not recycled else [])
     # Attached: this server did not start that Chrome and has no process to signal, and
     # from nodriver 0.50 stop() only closes the socket. Ask it to quit, then look for
     # evidence, or an attached browser reads as closed while it keeps running.
@@ -408,7 +432,9 @@ async def _ensure_browser_dead(browser, profile_dir=None, grace: float = 1.5) ->
         # Nothing to check against — cannot prove the process ended.
         return report
 
-    await asyncio.sleep(grace)  # let a graceful stop finish before escalating
+    # Let a graceful stop finish before escalating. Chrome is gone about 0.1 s after stop(),
+    # so this returns then instead of sitting out the whole grace on every close.
+    await _all_gone(candidates, grace)
     for target in candidates:
         try:
             os.kill(target, 0)          # liveness probe only
@@ -420,7 +446,7 @@ async def _ensure_browser_dead(browser, profile_dir=None, grace: float = 1.5) ->
         except Exception:
             continue
     if report["killed"]:
-        await asyncio.sleep(1.0)
+        await _all_gone(report["killed"], 1.0)
         for target in list(report["killed"]):
             try:
                 os.kill(target, 0)
@@ -990,14 +1016,43 @@ _CF_CHALLENGE_PROBE_ACTIVE_JS = """
 """
 
 
+# One look right after load that also says whether a challenge could still be on its way.
+# "none" is the common case and costs nothing more; anything else keeps the old short wait.
+_CF_FIRST_LOOK_JS = """
+(() => {
+  const present = %s;
+  if (present) return 'challenge';
+  if (document.readyState !== 'complete') return 'maybe';
+  const marks = ['challenges.cloudflare.com', 'turnstile'];
+  for (const s of document.scripts) {
+    const text = s.src ? '' : (s.textContent || '');
+    if (marks.some(m => text.includes(m))) return 'maybe';
+  }
+  if (document.querySelector('link[href*="challenges.cloudflare.com"]')) return 'maybe';
+  try {
+    if (performance.getEntriesByType('resource').some(e => e.name.includes('challenges.cloudflare.com'))) return 'maybe';
+  } catch (e) {}
+  return 'none';
+})()
+""" % _CF_CHALLENGE_PROBE_INITIAL_JS.strip()
+
+
+async def _cf_first_look(tab: Tab) -> Optional[str]:
+    """'challenge', 'maybe' or 'none' for a freshly loaded page; None when it could not be asked."""
+    try:
+        # In the isolated world: this runs on every navigation, and in the page's world a
+        # replaced querySelector would be handed the Turnstile selectors each time.
+        v = await asyncio.wait_for(evaluate_isolated(tab, _CF_FIRST_LOOK_JS), timeout=3.0)
+        return v if v in ("challenge", "maybe", "none") else None
+    except Exception:
+        return None
+
+
 async def _cf_challenge_state(tab: Tab, *, active: bool = False) -> Optional[bool]:
     """_has_cf_challenge, with None when the page could not be asked at all."""
     js = _CF_CHALLENGE_PROBE_ACTIVE_JS if active else _CF_CHALLENGE_PROBE_INITIAL_JS
     try:
-        v = await asyncio.wait_for(
-            tab.evaluate(js, return_by_value=True), timeout=3.0
-        )
-        return bool(v.value if hasattr(v, "value") else v)
+        return bool(await asyncio.wait_for(evaluate_isolated(tab, js), timeout=3.0))
     except Exception:
         return None
 
@@ -1155,7 +1210,12 @@ async def _auto_verify_cf(tab: Tab, max_attempts: int = 2, budget: float = 24.0)
     # 1. Let widget initialize. Some pages load the Turnstile script async
     #    and the checkbox iframe needs ~1.5-2s to render before any click
     #    target (DOM or pixel) is reachable.
-    if not await _has_cf_challenge(tab):
+    #    That wait is only paid when something points at a challenge: it used to be 0.6 s on
+    #    every navigation, which made a plain page five times slower to open than it is.
+    first = await _cf_first_look(tab)
+    if first == "none":
+        return ""
+    if first != "challenge":
         await asyncio.sleep(0.6)
         if not await _has_cf_challenge(tab):
             return ""
@@ -1480,6 +1540,60 @@ _BACKGROUND_WINDOW_FLAGS = ("--no-startup-window", "--disable-backgrounding-occl
 # --disable-background-networking saved the same but also stops Safe Browsing and variations
 # updates, which leaves a long-lived profile drifting from an ordinary Chrome, so it stays light-only.
 _LEAN_FLAGS = ("--disable-default-apps",)
+
+
+# Headless Chrome reports an 800x600 screen whatever the window size, so the default
+# 1280x800 window is larger than its own screen, which no real machine shows.
+_FALLBACK_SCREENS = ((1920, 1080), (2560, 1440), (3840, 2160))
+
+
+def _real_screen() -> Optional[dict]:
+    """Size and work-area insets of the main display in CSS pixels, or None when unreadable."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        from AppKit import NSScreen
+        screen = NSScreen.mainScreen()
+        if screen is None:
+            return None
+        frame, visible = screen.frame(), screen.visibleFrame()
+        width, height = int(frame.size.width), int(frame.size.height)
+        bottom = int(visible.origin.y - frame.origin.y)
+        top = height - bottom - int(visible.size.height)
+        left = int(visible.origin.x - frame.origin.x)
+        right = width - left - int(visible.size.width)
+        if width <= 0 or height <= 0 or min(top, bottom, left, right) < 0:
+            return None
+        return {"width": width, "height": height, "top": top, "bottom": bottom,
+                "left": left, "right": right}
+    except Exception:
+        return None
+
+
+def _headless_screen_arg(window_width: int, window_height: int,
+                         args: Optional[list[str]] = None) -> Optional[str]:
+    """--screen-info giving headless Chrome a screen its window fits in.
+
+    The machine's own main display when it is readable and large enough, since identity
+    defaults to the real machine; otherwise the smallest common size that holds the window.
+    Only the size and the work area are set: devicePixelRatio and colorDepth stay as
+    headless reports them. None when the caller passed --screen-info.
+    """
+    if any((a or "").startswith("--screen-info") for a in (args or [])):
+        return None
+    screen = _real_screen()
+    if screen is None or screen["width"] < window_width or screen["height"] < window_height:
+        width, height = next(
+            (size for size in _FALLBACK_SCREENS if size[0] >= window_width and size[1] >= window_height),
+            (max(window_width, 1920), max(window_height, 1080)))
+        # The menu bar on macOS and the taskbar on Windows; a Linux screen is left whole.
+        screen = {"width": width, "height": height, "left": 0, "right": 0,
+                  "top": 25 if sys.platform == "darwin" else 0,
+                  "bottom": 48 if sys.platform == "win32" else 0}
+    parts = [f"{screen['width']}x{screen['height']}"]
+    parts += [f"workArea{side.capitalize()}={screen[side]}"
+              for side in ("left", "right", "top", "bottom") if screen[side]]
+    return "--screen-info={" + " ".join(parts) + "}"
 
 
 def _disable_features_arg(config: Any, extra: tuple[str, ...]) -> str:
@@ -1981,6 +2095,10 @@ async def browser_launch(
         if effective_proxy:
             config.add_argument(f"--proxy-server={effective_proxy}")
         config.add_argument(f"--window-size={window_width},{window_height}")
+        if headless:
+            _screen_arg = _headless_screen_arg(window_width, window_height, merged_extra_args)
+            if _screen_arg:
+                config.add_argument(_screen_arg)
         # Force a deterministic on-screen position. Without this, Chrome
         # restores its last saved position from the persistent profile —
         # which after a macOS sleep/wake cycle is often off-screen or 0×0,
@@ -2609,14 +2727,10 @@ async def _observe_navigation(
     probe_error = None
     try:
         probe = await _wait(
-            tab.evaluate(
-                "JSON.stringify([window.location.href, document.readyState])",
-                return_by_value=True,
-            ),
+            evaluate_isolated(tab, "JSON.stringify([window.location.href, document.readyState])"),
             timeout=5,
             what="navigation postcondition probe",
         )
-        probe = probe.value if hasattr(probe, "value") and not isinstance(probe, str) else probe
         final_url, ready_state = json.loads(probe)
     except Exception as exc:
         probe_error = f"{type(exc).__name__}: {exc}"
@@ -2714,10 +2828,9 @@ async def _wait_load_complete(tab, timeout: float) -> bool:
     while True:
         with contextlib.suppress(Exception):
             state = await asyncio.wait_for(
-                tab.evaluate("document.readyState", return_by_value=True),
+                evaluate_isolated(tab, "document.readyState"),
                 timeout=max(0.2, min(2.0, deadline - time.monotonic())),
             )
-            state = state.value if hasattr(state, "value") and not isinstance(state, str) else state
             if state == "complete":
                 return True
         if time.monotonic() >= deadline:
@@ -2959,8 +3072,7 @@ function() {
 async def _click_probe(el) -> dict:
     """Hit-test the element before clicking. Returns {} if the probe can't run."""
     try:
-        v = await el.apply(_CLICK_PROBE_JS)
-        v = v.value if hasattr(v, "value") and not isinstance(v, str) else v
+        v = await apply_isolated(el, _CLICK_PROBE_JS)
         return json.loads(v) if v else {}
     except Exception:
         return {}
@@ -2975,15 +3087,13 @@ async def _page_sig(tab, el=None, pages: bool = False) -> dict:
     """
     try:
         # Bounded: a native dialog opened by the action under test blocks the renderer.
-        v = await _wait(tab.evaluate(_PAGE_SIG_JS, return_by_value=True), timeout=5.0, what="page read")
-        v = v.value if hasattr(v, "value") and not isinstance(v, str) else v
+        v = await _wait(evaluate_isolated(tab, _PAGE_SIG_JS), timeout=5.0, what="page read")
         sig = json.loads(v) if v else {}
     except Exception:
         return {}
     if el is not None and sig:
         try:
-            own = await el.apply(_ELEMENT_SIG_JS)
-            own = own.value if hasattr(own, "value") and not isinstance(own, str) else own
+            own = await apply_isolated(el, _ELEMENT_SIG_JS)
             sig["element"] = json.loads(own) if own else {}
         except Exception:
             sig["element"] = {}
@@ -3082,8 +3192,7 @@ async def _click_text_rescue(tab, text: str, exact: bool) -> dict:
     try:
         expr = _CLICK_TEXT_RESCUE_JS % (json.dumps(text.lower()),
                                         "true" if exact else "false")
-        v = await tab.evaluate(expr, return_by_value=True)
-        v = v.value if hasattr(v, "value") and not isinstance(v, str) else v
+        v = await evaluate_isolated(tab, expr)
         return json.loads(v) if v else {}
     except Exception:
         return {}
@@ -3119,19 +3228,17 @@ def _new_tab_note(before: dict, after: dict) -> str:
             f"(the active tab did not change; tab_list and tab_select reach it)")
 
 
-def _click_outcome(head: str, detail: str, before: dict, after: dict) -> str:
-    """Compare fingerprints and say what the click did, never a bare 'clicked'.
+def _click_change(before: dict, after: dict) -> Optional[str]:
+    """What changed between two fingerprints, as the tail of a result line; None for nothing.
 
     A real mouse click moves focus onto its target by itself, so that alone is not
     the page reacting; a dead button must still read as "NO page change". Focus
     moving somewhere ELSE is a reaction, and focus arriving on a field is exactly
     what clicking a field is for, so it gets its own wording.
     """
-    if not (before and after):
-        return ok(f"{head} — {detail}")
     opened = _new_tab_note(before, after)
     if before.get("url") != after.get("url"):
-        return ok(f"{head} — {detail}; navigated to {after.get('url')}{opened}")
+        return f"; navigated to {after.get('url')}{opened}"
     own_before = {k: v for k, v in (before.get("element") or {}).items() if k != "focused"}
     own_after = {k: v for k, v in (after.get("element") or {}).items() if k != "focused"}
     # With no element fingerprint the caller clicked a raw point, and whether focus
@@ -3152,17 +3259,58 @@ def _click_outcome(head: str, detail: str, before: dict, after: dict) -> str:
         or focus_moved
     )
     if changed:
-        return ok(f"{head} — {detail}; page changed "
-                  f"(nodes {before.get('nodes')}→{after.get('nodes')}){opened}")
+        return f"; page changed (nodes {before.get('nodes')}→{after.get('nodes')}){opened}"
     if opened:
-        return ok(f"{head} — {detail}{opened}")
+        return opened
     if own_after.get("editable") and (after.get("element") or {}).get("focused"):
-        return ok(f"{head} — {detail}; the field took focus")
+        return "; the field took focus"
+    return None
+
+
+def _click_outcome(head: str, detail: str, before: dict, after: dict) -> str:
+    """Compare fingerprints and say what the click did, never a bare 'clicked'."""
+    if not (before and after):
+        return ok(f"{head} — {detail}")
+    change = _click_change(before, after)
+    if change is not None:
+        return ok(f"{head} — {detail}{change}")
     return ok(
         f"{head} but NO page change detected — {detail}. The event was dispatched; "
         f"the page did not react (handler not bound, click swallowed, or the change "
         f"is purely visual)."
     )
+
+
+# After an action the page is read again at these pauses (0, 50, 120, 220, 330 and 450 ms
+# in all) and the reading stops at the first one that differs. A fixed 350 ms was paid by
+# every click, although a handler that changes the page has done so before the click is even
+# acknowledged. Only "NO page change" needs the whole wait, and it gets a longer one than
+# before, so a handler that reacts after 300 ms is not reported as dead.
+_VERIFY_PAUSES = (0.0, 0.05, 0.07, 0.10, 0.11, 0.12)
+# One more reading after the first change, so a handler that updates the page and then
+# navigates or opens a tab is reported with where it ended up.
+_VERIFY_SETTLE = 0.06
+
+
+async def _sig_after_action(tab, before: dict, el=None, pages: bool = False) -> dict:
+    """The page fingerprint once the action shows, or after the full wait when it never does.
+
+    Stops reading when a native dialog opens, since reading would block on it: the caller
+    checks _dialog_note again afterwards.
+    """
+    after: dict = {}
+    for pause in _VERIFY_PAUSES:
+        if pause:
+            await asyncio.sleep(pause)
+        if _dialog_note(tab):
+            return after
+        after = await _page_sig(tab, el, pages=pages)
+        if before and after and _click_change(before, after) is not None:
+            await asyncio.sleep(_VERIFY_SETTLE)
+            if not _dialog_note(tab):
+                after = await _page_sig(tab, el, pages=pages) or after
+            return after
+    return after
 
 
 # The probe above tests the centre. A humanized click lands elsewhere in the box, where an
@@ -3185,7 +3333,7 @@ async def _humanized_point(el, pos, centre_x: float, centre_y: float) -> tuple[f
         fx, fy = random.uniform(0.3, 0.7), random.uniform(0.3, 0.7)
         x, y = pos.left + pos.width * fx, pos.top + pos.height * fy
         with contextlib.suppress(Exception):
-            if (await el.apply(_POINT_HIT_JS % (fx, fy)) is True
+            if (await apply_isolated(el, _POINT_HIT_JS % (fx, fy)) is True
                     and await outer_blocker(el, x, y) is None):
                 return x, y
     return centre_x, centre_y
@@ -3314,8 +3462,9 @@ async def _prepare_target(el) -> tuple[Any, dict, Optional[str], bool]:
     """Scroll `el` into view and hit-test it: (position, probe, why it is unreachable, scrolled)."""
     # First wait out anything still moving it, such as a smooth scroll in progress:
     # a hit test only holds for as long as the element stays put.
+    settled = None
     with contextlib.suppress(Exception):
-        await _settled_position(el)
+        settled = await _settled_position(el)
     probe = await _click_probe(el)
     scrolled = False
     if probe.get("sized") and not probe.get("in_viewport"):
@@ -3324,18 +3473,23 @@ async def _prepare_target(el) -> tuple[Any, dict, Optional[str], bool]:
                 backend_node_id=el.backend_node_id))
             # A smooth scroll is still moving at this point; probing now would
             # refuse an element that is about to be in view.
-            await _settled_position(el)
+            settled = await _settled_position(el)
             probe = await _click_probe(el)
             scrolled = True
     with contextlib.suppress(Exception):
         if await ensure_in_root_view(el):
-            await _settled_position(el)
+            settled = await _settled_position(el)
             probe = await _click_probe(el)
             scrolled = True
     reason = _blocked_reason(probe)
     pos = None
     if reason is None:
-        pos = await _settled_position(el)
+        # It was just watched until it stopped. One more reading says whether it stayed
+        # put through the hit test; only an element that moved again is waited out again.
+        pos = await el.get_position()
+        if pos is None or settled is None or (
+                abs(pos.left - settled.left) >= 1 or abs(pos.top - settled.top) >= 1):
+            pos = await _settled_position(el)
         if pos is None:
             reason = "element has no on-screen position"
     if reason is None:
@@ -3362,7 +3516,7 @@ async def _click_point_of(tab, el, label: str, fx: float, fy: float, approach: b
     if pos is None:
         return err(f"{label}: NOT clicked — element has no on-screen position")
     x, y = pos.left + pos.width * fx, pos.top + pos.height * fy
-    landed = await el.apply(_POINT_HIT_JS % (fx, fy))
+    landed = await apply_isolated(el, _POINT_HIT_JS % (fx, fy))
     blocker = await outer_blocker(el, x, y) if landed is True else None
     if landed is not True or blocker:
         return err(f"{label}: NOT clicked — something else covers that point of the element "
@@ -3381,11 +3535,11 @@ async def _click_point_of(tab, el, label: str, fx: float, fy: float, approach: b
     note = _dialog_note(tab)
     if note:
         return ok(f"{head} — {detail}{note}")
-    await asyncio.sleep(0.35)
+    after = await _sig_after_action(tab, before, el, pages=True)
     note = _dialog_note(tab)
     if note:
         return ok(f"{head} — {detail}{note}")
-    return _click_outcome(head, detail, before, await _page_sig(tab, el, pages=True))
+    return _click_outcome(head, detail, before, after)
 
 
 async def _click_and_report(
@@ -3417,8 +3571,7 @@ async def _click_and_report(
         detail = f"method=js_click {target}"
         if not verify:
             return ok(f"{head} — {detail}")
-        await asyncio.sleep(0.35)
-        return _click_outcome(head, detail, before, await _page_sig(tab, el, pages=True))
+        return _click_outcome(head, detail, before, await _sig_after_action(tab, before, el, pages=True))
 
     before = await _page_sig(tab, el, pages=True) if verify else {}
     x, y = pos.left + pos.width / 2, pos.top + pos.height / 2
@@ -3439,11 +3592,11 @@ async def _click_and_report(
     note = _dialog_note(tab)
     if note or not verify:
         return ok(f"{head} — {detail}{note}")
-    await asyncio.sleep(0.35)  # let handlers/render settle before re-reading
+    after = await _sig_after_action(tab, before, el, pages=True)
     note = _dialog_note(tab)
     if note:
         return ok(f"{head} — {detail}{note}")
-    return _click_outcome(head, detail, before, await _page_sig(tab, el, pages=True))
+    return _click_outcome(head, detail, before, after)
 
 
 @mcp.tool()
@@ -3503,11 +3656,11 @@ async def click_text(text: str, exact: bool = False, verify: bool = True) -> str
                 return ok(note + _dialog_note(tab))
             if not verify:
                 return ok(note)
-            await asyncio.sleep(0.35)
+            after = await _sig_after_action(tab, before, pages=True)
             if _dialog_note(tab):
                 return ok(note + _dialog_note(tab))
             head, _, detail = note.partition(" — ")
-            return _click_outcome(head, detail, before, await _page_sig(tab, pages=True))
+            return _click_outcome(head, detail, before, after)
 
         if el is None and not cand.get("found"):
             if in_frame:
@@ -3553,14 +3706,14 @@ async def fill(ref: Optional[str] = None, selector: Optional[str] = None,
                 # send_keys types each character, and a newline typed that way adds nothing.
                 # Enter is what a person presses, and only here: in a single-line field it
                 # would submit the form.
-                await el.apply("function() { this.focus(); }")
+                await apply_isolated(el, "function() { this.focus(); }")
                 for index, line in enumerate(lines):
                     if index:
                         await _dispatch_key(el.tab, key_event_params("Enter"))
                     if line:
                         await _type_keys(el.tab, line, press_controls=False)
             else:
-                await el.apply("function() { this.focus(); }")
+                await apply_isolated(el, "function() { this.focus(); }")
                 await _type_keys(el.tab, str(value), press_controls=False)
         except Exception:
             await el.set_value(value)
@@ -5120,6 +5273,18 @@ async def fingerprint_audit(url: Optional[str] = None) -> str:
                   f"{fp.get('outer')} — zeros are a classic headless giveaway")
         except Exception:
             pass
+        with contextlib.suppress(Exception):
+            ow, oh = (int(v) for v in (fp.get("outer") or "").split("x"))
+            sw, sh = (int(v) for v in (fp.get("screen") or "").split("x"))
+            aw, ah = (int(v) for v in (fp.get("avail") or "").split("x"))
+            if ow > 0 and oh > 0 and sw > 0 and sh > 0:
+                check(ow <= sw and oh <= sh, "window vs screen size",
+                      f"window {fp.get('outer')} is larger than its screen {fp.get('screen')}; "
+                      f"headless Chrome reports an 800x600 screen unless --screen-info sets one",
+                      "warning")
+            if sw > 0 and sh > 0:
+                check(aw <= sw and ah <= sh, "screen.avail vs screen size",
+                      f"available area {fp.get('avail')} is larger than the screen {fp.get('screen')}")
 
         verdict = ("clean" if not critical and not warnings else
                    "warnings only" if not critical else "leaks detected")
@@ -5657,6 +5822,10 @@ async def _launch_browser_instance(
     if effective_proxy:
         config.add_argument(f"--proxy-server={effective_proxy}")
     config.add_argument(f"--window-size={window_width},{window_height}")
+    if headless:
+        _screen_arg = _headless_screen_arg(window_width, window_height, extra_args)
+        if _screen_arg:
+            config.add_argument(_screen_arg)
 
     browser: Optional[Browser] = None
     dock_note = await _use_dock_icon_copy(config, headless)

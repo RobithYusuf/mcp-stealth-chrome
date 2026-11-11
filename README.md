@@ -300,6 +300,30 @@ Sites change, so read these as results from the screenshots below and not as a g
 | `google.com/recaptcha/api2/demo` | reCAPTCHA v2 images | ✅ 5 of 5 runs with `solve_recaptcha_ai` |
 | `tls.browserleaks.com` | JA3 and JA4 | ✅ Shows the JA3 of the browser it impersonates |
 
+### Speed and size, measured
+
+Measured in November 2026 on one Mac (M4 Pro, Chrome 157, headless, a throwaway profile), with both servers driven over MCP by the same script. The other server is Google's `chrome-devtools-mcp` 1.12.0. Each number is the median of 5 runs, or of 9 clicks. One machine and one day, so read the ratios, not the digits.
+
+| What | This server | chrome-devtools-mcp |
+|------|-------------|---------------------|
+| Open a local page in a running browser | 63 ms | 131 ms |
+| Open `en.wikipedia.org/wiki/Cat`, cached | 276 ms | 370 ms |
+| Click a button that changes the page | 160 ms | 253 ms |
+| Click a button that does nothing | 577 ms, says `NO page change detected` | 262 ms, says it clicked |
+| Click a button under an overlay | 88 ms, refuses and names the overlay | 252 ms, says it clicked; the overlay took the click |
+| Click a disabled button | 89 ms, says it is disabled | 5.0 s, then a timeout |
+| Fill a text field | 12 ms | 248 ms |
+| Close the browser | 0.11 s | 0.11 s |
+| Snapshot of a form with 158 elements | 2,181 tokens | 3,888 tokens |
+| Snapshot of the Wikipedia page | 2,405 tokens for the first 100 elements, 100,127 for all | 225,658 tokens |
+| Start the browser and load the first page | 1.07 s | 0.66 s |
+| Memory with one page open | 941 MB in 10 processes | 585 MB in 6 processes |
+| Tool definitions sent to the client | 39,877 tokens for 173 tools | 7,300 tokens for 32 tools |
+
+- ✅ Faster at opening pages, clicking, filling and reading, and smaller snapshots. A snapshot here lists what can be acted on; the other server's lists the whole accessibility tree including text, so the two are not the same content.
+- ❌ Slower to start, heavier in memory, and its tool list costs a client that loads every definition about five times as much. `profile_mode="light"` brought one page to about 630 MB in 7 processes, at the cost described under Speed, memory and disk.
+- Tokens were counted with the `o200k_base` tokenizer as an estimate.
+
 ### Cloudflare Turnstile
 
 | Situation | Tool |
@@ -393,9 +417,11 @@ Runtime data lives in `~/.mcp-stealth/`: `profile/`, `profiles/<id>/`, `screensh
 Results describe what was observed. A tool that reports success when nothing happened would leave an agent building on a false result, so these rules hold across the server:
 
 - ✅ Clicks are real mouse input. `click`, `click_text`, `click_role`, `click_element_offset`, `click_at_corner` and `hover` test the target first and refuse by name when something covers it. Clicks say `clicked but NO page change detected` when nothing happened, and name any new tab the click opened. A JS click only happens with `js_fallback=True`, and the result says so.
+- ✅ A click is checked as soon as it lands and reported when the page changes, about 160 ms for a button that works. Only a click that changes nothing waits the full 450 ms before saying so, so a handler that reacts after 300 ms is not reported as dead.
+- ✅ The hit test before a click and the before and after comparison run in an isolated world, like the snapshot. A page that replaces `getBoundingClientRect`, `elementFromPoint`, `getComputedStyle` or `querySelector` to watch for automation sees none of them called by a click, a hover or a navigation: 0 calls, where one click used to make 37.
 - ✅ A native dialog cannot hang the server. A click, key or pointer move that opens one returns and names it, any other tool that needs the page says so instead of waiting, and `dialog_handle` answers the one already open.
 - ✅ `select_option` sets the value from JS because a native dropdown cannot be driven with page input. The result states `isTrusted=false`, and the value is read back.
-- ✅ `browser_snapshot` writes nothing to the page. Refs live on the server and reach into iframes, cross-origin ones included, and open shadow roots.
+- ✅ `browser_snapshot` writes nothing to the page. Refs live on the server and reach into iframes, cross-origin ones included, and open shadow roots. A field shows its label as `label="..."`, taken from `<label for>`, a label around it or `aria-labelledby`, and `name_contains` finds it by that. The label's own row is left out when its field is listed, and the count of those rows is reported.
 - ✅ `navigate` reports the final URL, redirects, status and ready state, and waits for the load event up to 15 seconds. `expect_url` and `expect_status` turn a redirect into a failure. A page that did not load is an error, and `batch_actions` and `workflow_run` count it as failed. It no longer raises the window unless you pass `focus=True`.
 - ✅ A visible browser stays behind the app you are using. `browser_launch`, `spawn_browser`, `tab_new`, `tab_select` and page actions do not take the keyboard, measured with `lsappinfo` on macOS. `tab_new` opens its own background window, and `tab_select` only changes which tab tools act on unless you pass `focus=True`. A click that calls `window.open` still brings Chrome forward for about 130 ms before focus returns, so keys typed in that moment reach Chrome. `tab_focus` raises the window on request. Quitting it with Cmd+Q, or closing all its windows, ends it within a few seconds, and the next tool call says so.
 - ✅ Own Dock icon (macOS, off by default). Set `MCP_STEALTH_DOCK_ICON=1` and a visible browser shows the project icon in the Dock, so you can tell it from your own Chrome. What that does:
@@ -615,6 +641,9 @@ These run without a browser and without a search API key, and use the stealth br
 | `screenshot(format="jpeg")`, `region`, `region_selector` | Smaller files and faster crops. Base64 output stays opt-in |
 | `browser_launch(profile_mode="light")` | No images, background Chrome services or Chrome's built-in component extensions, for ordinary pages. It also drops the "Google" speech voices, which pages can see. Keep the default on protected sites |
 | Every launch | Chrome's default apps (Google Docs Offline, Web Store Payments) are not installed. On a fresh profile, one page took 10 processes and about 0.9 GB instead of 12 and 1.1 GB, measured on one machine. Pages cannot tell the difference: `fingerprint_audit` reads the same |
+| `navigate` | Looks for a Cloudflare challenge once after load and waits only when something points at one. Opening a local page went from 669 ms to 63 ms |
+| `browser_close` | Returns when the browser's processes are seen gone, 0.11 s instead of 1.6 to 2.6 s. Programs Chrome starts that are not part of the browser, such as the system updater, are left alone |
+| Headless | The reported screen is your display's size, or 1920x1080 when it cannot be read, so the window fits its screen. Headless Chrome otherwise reports 800x600 with a 1280x800 window. `fingerprint_audit` warns when a window is larger than its screen |
 | `browser_launch(testing_mode=True)` | Faster regression runs, with less stealth |
 | `profile_report`, `profile_cleanup` | Size and use of every profile, and cleanup of caches. Cleanup previews unless `confirm=True`, and refuses main and named profiles and anything in use |
 </details>

@@ -134,6 +134,17 @@ conclusions. Each rule below replaced a real lie.
 - `_page_sig` carries a hash of the body HTML. Comparing only its length read a counter going from 1 to 2 as
   `NO page change`, and an agent clicked again. Focus falling back to `<body>` is not a reaction: it is what clicking
   anything unfocusable does. Focus arriving on another element is.
+- After a click the page is read at 0, 50, 120, 220, 330 and 450 ms (`_VERIFY_PAUSES`) and the reading stops at the
+  first one that differs, plus one more 60 ms later so a handler that then navigates or opens a tab is named.
+  A handler has changed the page before the click is acknowledged, so a fixed 350 ms was wasted on every click
+  that worked. Only "NO page change" takes the whole wait, which is longer than before on purpose: a handler
+  reacting after 300 ms sat at the edge of the old one. Do not shorten the last pause to make a dead click faster.
+- The hit test, the fingerprints and the challenge look run in the frame's isolated world (`refs.apply_isolated`,
+  `refs.evaluate_isolated`). In the page's own world a page can replace `getBoundingClientRect`, `elementFromPoint`,
+  `getComputedStyle` or `querySelector` and watch them: one click made 37 such calls. The DOM is shared between
+  worlds, so the answers are the same. Page globals are not: `window.turnstile` reads undefined there. Both
+  helpers fall back to the page's world when the isolated one cannot be used, and a context kept from before a
+  navigation fails once and is made again. A new probe that only reads the DOM belongs there too.
 - A native dialog blocks the renderer, so input never gets its acknowledgement and a click on a button calling `alert()`
   hung forever. `_dispatch_input` stops waiting once `_watch_dialogs` sees one open and the result names it. Pointer moves go
   through it too, because `onmousemove` can open a dialog before any press. `Page.enable` needs the renderer as well, so the
@@ -210,8 +221,12 @@ conclusions. Each rule below replaced a real lie.
 - `is_up()` false with a handle means a half-open Chrome: `browser_launch` ends it before launching, or the handle is
   overwritten and a privacy profile is deleted under a live process that writes it back.
 - `_ensure_browser_dead` snapshots the PID's descendants before stopping it, because a launcher that does not exec is
-  the recorded PID and ending it alone orphans Chrome. It skips a PID whose command line no longer names the profile:
-  that number was recycled. Once death is verified it removes nodriver's `uc_*` temp profile, which nodriver otherwise
+  the recorded PID and ending it alone orphans Chrome. Only descendants whose command line names the profile count:
+  Chrome also wakes `GoogleUpdater`, the machine-wide updater, which outlives the browser by a few seconds. Counted
+  as family it made 4 closes in 5 say "CDP stop did not end the process" and was sent SIGTERM mid-update. The wait
+  for the processes to end is a poll (`_all_gone`), not a sleep: Chrome is gone about 0.1 s after `stop()`, and
+  the fixed 1.5 s made every close take 1.6 s. `verified` still means every one of them was seen gone.
+  It skips a PID whose command line no longer names the profile: that number was recycled. Once death is verified it removes nodriver's `uc_*` temp profile, which nodriver otherwise
   leaves for an exit hook, one per launch, that at exit on 0.48.1 stops after the first (it prints to the closed stdout).
 - nodriver stops probing for Chrome after about 2.3 seconds. `_start_chrome` waits for that same process and adopts it
   (`config.host`/`port` set means connect, not spawn), moving `_process` across or a close would only drop the socket.
@@ -318,6 +333,12 @@ conclusions. Each rule below replaced a real lie.
   `DOM.resolveNode` plus `isConnected`, as `resolve_ref` does.
 - Set attributes on a nodriver `Element` only with a leading underscore. `Element.__setattr__` silently
   forwards any other name to the HTML attributes, so `el.foo = x` reads back as `None`.
+- A field carries its label as `label="..."` (aria-labelledby, then `<label for>` or a wrapping label, read
+  without the text of the field it wraps). In `interactive_compact` and `viewport` the label's own row is left
+  out and counted, but only when its field has a row in the same snapshot: a label for a hidden input, as
+  styled checkboxes have, is the thing to click and keeps its row. `full` keeps every label row. On a form of
+  158 elements the whole form went from 2,689 tokens to 2,188, and the default 100-element cap no longer cuts
+  off the submit button. `fast` is unchanged.
 - `delta=True` marks elements added or changed since the tab's previous snapshot with `*`. The
   fingerprint deliberately EXCLUDES the ref: refs are regenerated every snapshot, so including them
   would mark everything as changed, every time.
@@ -386,6 +407,16 @@ Platform truths, not preferences. Each one cost a release.
   `value` empty for any object or array, so the `evaluate` tool calls `Runtime.evaluate` itself. `_eval_checked` is the
   helper for a script whose exception must not read as its result.
 - `Tab.wait(t)` is only `sleep(t)`. `wait_for_navigation` slept its whole timeout and said `navigated`; use `_wait_load_complete`.
+- `Tab.get` up to 0.48 ends in `await self`, the same half-second sleep, on every navigation. From 0.50 our
+  patch waited up to half a second for the target's URL to change, so reopening the URL a tab is already on
+  always paid it. `patches._patch_tab_get_keeps_session` now replaces `Tab.get` on both: `Page.navigate` answers
+  once the navigation has committed, and a URL that already matches is not waited on. The class refuses plain
+  assignment up to 0.48 (`type.__setattr__`), and `Tab.target` is read-only there (`_target`).
+- `auto_verify` looks once after load (`_cf_first_look`) and returns at once on "none". It keeps the old 0.6 s
+  second look only when something points at a challenge still on its way: the page is not `complete`, an inline
+  script or a `link` names Turnstile, or a request to `challenges.cloudflare.com` was already made. A widget
+  injected after load by a bundled script that leaves none of those traces is no longer waited for; the old
+  wait only covered the first 0.6 s of that case, and cost every navigation 0.6 s.
 - `Input.dispatchKeyEvent` with `nativeVirtualKeyCode` on a key the page does not consume holds every later mouse event for
   5 seconds on macOS, until the next navigation. `key_event_params` leaves it out. Raw CDP reproduction with one Chrome per
   scenario showed this; a shared Chrome hid it, because the stall persists across `reload`.
@@ -404,10 +435,18 @@ Platform truths, not preferences. Each one cost a release.
   installs Google Docs Offline and Web Store Payments, two more renderers and about 0.2 GB, and `persistent=False`
   pays that on every launch. `--disable-background-networking` saved the same but also stops Safe Browsing and
   variations updates, so it stays in light mode only.
-- Chrome 157 lists 19 speech voices, all "Google ...", from its Network Speech component extension, headless or not.
-  `--disable-component-extensions-with-background-pages` saves about 0.27 GB but replaces them with 180 local voices
+- Chrome 157 on macOS lists 199 speech voices: 180 local ones and 19 "Google ..." ones from its Network Speech
+  component extension, headless or not, and the same in a Chrome with no CDP client at all. They arrive in two
+  steps, so a list read at the first `voiceschanged` can hold only the 19; read it after it settles.
+  `--disable-component-extensions-with-background-pages` saves about 0.27 GB but leaves the 180 local voices
   and no Google one, which pages can read, so it is light mode only and `fingerprint_audit` warns on it. No
   `--disable-features` name was found that turns off Gemini or Hangouts alone.
+- Headless Chrome reports an 800x600 screen whatever `--window-size` says, so the default 1280x800 window was
+  larger than its own screen, which no machine shows. `_headless_screen_arg` passes `--screen-info` with the
+  main display's size and work area (`NSScreen` on macOS), or the smallest common size that holds the window.
+  It sets nothing else: `devicePixelRatio` stays 1 and `colorDepth` 24, as headless reports them. Headed is
+  untouched, and a caller's own `--screen-info` wins. `fingerprint_audit` warns when a window is larger than its
+  screen.
 - The first document after startup loads images despite `--blink-settings=imagesEnabled=false`; later ones obey it. Light
   and testing modes go through `about:blank` first.
 - nodriver 0.50 does not pass `Config.lang` on, its `add_argument` refuses `--lang`, and macOS Chrome ignores the flag

@@ -140,7 +140,7 @@ async def resolve_ref(ref: str, tab: Optional[Tab] = None) -> RefElement:
         # tree=node: Element.get_position reads .parent, which raises with no tree.
         el = RefElement(node, entry.conn, tree=node)
         el._ref_entry = entry
-        connected = await el.apply("(e) => e.isConnected")
+        connected = await apply_isolated(el, "(e) => e.isConnected")
         if connected is not True:
             raise LookupError("the element was removed from the document")
         return el
@@ -240,6 +240,87 @@ async def _isolated_world(conn: Any, frame: Any) -> int:
     ctx = await conn.send(cdp.page.create_isolated_world(frame_id=frame.id_))
     _WORLDS[key] = (str(frame.loader_id), ctx)
     return ctx
+
+
+def _world_of(el: Any) -> tuple[Any, str]:
+    """The connection and frame an element lives in."""
+    entry: Optional[RefEntry] = getattr(el, "ref_entry", None)
+    conn = entry.conn if entry is not None else el.tab
+    # In Chrome the main frame's id is its target's id, for a page and for an OOPIF alike.
+    frame_id = entry.frame_id if entry is not None and entry.frame_id else str(conn.target.target_id)
+    return conn, str(frame_id)
+
+
+async def _world_context(conn: Any, frame_id: str, fresh: bool = False) -> int:
+    """The isolated world of a frame, without asking for the frame tree first.
+
+    A context kept from before a navigation no longer exists, which the next use reports;
+    the caller then asks again with fresh=True. The empty loader id makes the snapshot,
+    which knows the real one, replace this entry rather than trust it.
+    """
+    key = (target_key(conn), frame_id)
+    cached = _WORLDS.get(key)
+    if cached and not fresh:
+        return cached[1]
+    ctx = await conn.send(cdp.page.create_isolated_world(frame_id=cdp.page.FrameId(frame_id)))
+    _WORLDS[key] = ("", ctx)
+    return ctx
+
+
+async def apply_isolated(el: Any, js_function: str) -> Any:
+    """Element.apply in the frame's isolated world, by value. Raises when the script throws.
+
+    Element.apply runs in the page's own world, where the page can have replaced
+    getBoundingClientRect, elementFromPoint or getComputedStyle with its own and so watch
+    every hit test: 18 such calls for one click. The DOM is shared between the worlds and
+    the page's replacements are not, so the answers are the same and the page sees nothing.
+    Falls back to the page's world when the isolated one cannot be used.
+    """
+    try:
+        conn, frame_id = _world_of(el)
+    except Exception:
+        return await el.apply(js_function)
+    for fresh in (False, True):
+        group = new_object_group()
+        try:
+            ctx = await _world_context(conn, frame_id, fresh)
+            remote = await conn.send(cdp.dom.resolve_node(
+                backend_node_id=el.backend_node_id, object_group=group, execution_context_id=ctx))
+            result, exc = await conn.send(cdp.runtime.call_function_on(
+                js_function, object_id=remote.object_id,
+                arguments=[cdp.runtime.CallArgument(object_id=remote.object_id)],
+                return_by_value=True,
+            ))
+        except Exception:
+            continue
+        finally:
+            await release_group(conn, group)
+        if exc is not None:
+            detail = getattr(exc.exception, "description", None) if exc.exception else None
+            raise RuntimeError(detail or exc.text or "script threw")
+        return result.value
+    return await el.apply(js_function)
+
+
+async def evaluate_isolated(tab: Any, expression: str) -> Any:
+    """Evaluate in the isolated world of a tab's main frame, by value.
+
+    For reading the page without calling anything the page can have replaced. Falls back
+    to the page's world when the isolated one cannot be used.
+    """
+    for fresh in (False, True):
+        try:
+            ctx = await _world_context(tab, str(tab.target.target_id), fresh)
+            result, exc = await tab.send(cdp.runtime.evaluate(
+                expression, context_id=ctx, return_by_value=True))
+        except Exception:
+            continue
+        if exc is not None:
+            detail = getattr(exc.exception, "description", None) if exc.exception else None
+            raise RuntimeError(detail or exc.text or "script threw")
+        return result.value
+    value = await tab.evaluate(expression, return_by_value=True)
+    return value.value if hasattr(value, "value") and not isinstance(value, str) else value
 
 
 async def _props(conn: Any, object_id: Any) -> dict[str, Any]:
@@ -380,7 +461,7 @@ class SnapshotWalk:
     counts: dict[str, Any] = field(default_factory=lambda: {
         **{k: 0 for k in COUNT_KEYS},
         "truncated": False,
-        "excluded": {"unnamed_decorative": 0, "role": 0, "name": 0},
+        "excluded": {"unnamed_decorative": 0, "role": 0, "name": 0, "label": 0},
         "container": {"requested": False, "selector": "", "matched": 0, "found": False},
         "unresolved": 0,
     })
@@ -553,10 +634,8 @@ async def outer_blocker(el: Any, x: float, y: float) -> Optional[str]:
     # DOM.getNodeForLocation takes DOCUMENT coordinates, unlike every other position
     # here. Passing viewport ones hit-tests the wrong spot once the page is scrolled.
     try:
-        raw = await entry.root.evaluate(
-            "JSON.stringify([window.scrollX, window.scrollY])", return_by_value=True)
-        raw = raw.value if hasattr(raw, "value") else raw
-        scroll_x, scroll_y = json.loads(raw)
+        scroll_x, scroll_y = json.loads(await evaluate_isolated(
+            entry.root, "JSON.stringify([window.scrollX, window.scrollY])"))
         located = await entry.root.send(cdp.dom.get_node_for_location(
             int(x + scroll_x), int(y + scroll_y), include_user_agent_shadow_dom=False,
         ))
@@ -587,8 +666,8 @@ async def ensure_in_root_view(el: Any) -> bool:
     if entry is None or not entry.frame_label:
         return False
     pos = await el.get_position()
-    raw = await entry.root.evaluate("JSON.stringify([innerWidth, innerHeight])", return_by_value=True)
-    width, height = json.loads(raw.value if hasattr(raw, "value") else raw)
+    width, height = json.loads(await evaluate_isolated(
+        entry.root, "JSON.stringify([innerWidth, innerHeight])"))
     if pos is not None and (0 <= pos.left + pos.width / 2 <= width
                             and 0 <= pos.top + pos.height / 2 <= height):
         return False
