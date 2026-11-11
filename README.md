@@ -386,7 +386,7 @@ To use logins from your own browser, `list_chrome_profiles` shows every Chromium
 
 A browser started with `browser_launch` over stdio stays open until you close it. Instances from `spawn_browser` and browsers in HTTP mode close after `BROWSER_IDLE_TIMEOUT`.
 
-Runtime data lives in `~/.mcp-stealth/`: `profile/`, `profiles/<id>/`, `screenshots/`, `exports/`, `storage-states/`.
+Runtime data lives in `~/.mcp-stealth/`: `profile/`, `profiles/<id>/`, `screenshots/`, `exports/`, `storage-states/`, `app/` (the Chrome copy with the Dock icon, macOS).
 
 ## What tool results tell you
 
@@ -398,6 +398,7 @@ Results describe what was observed. A tool that reports success when nothing hap
 - ✅ `browser_snapshot` writes nothing to the page. Refs live on the server and reach into iframes, cross-origin ones included, and open shadow roots.
 - ✅ `navigate` reports the final URL, redirects, status and ready state, and waits for the load event up to 15 seconds. `expect_url` and `expect_status` turn a redirect into a failure. A page that did not load is an error, and `batch_actions` and `workflow_run` count it as failed. It no longer raises the window unless you pass `focus=True`.
 - ✅ A visible browser stays behind the app you are using. `browser_launch`, `spawn_browser`, `tab_new`, `tab_select` and page actions do not take the keyboard, measured with `lsappinfo` on macOS. `tab_new` opens its own background window, and `tab_select` only changes which tab tools act on unless you pass `focus=True`. A click that calls `window.open` still brings Chrome forward for about 130 ms before focus returns, so keys typed in that moment reach Chrome. `tab_focus` raises the window on request. Quitting it with Cmd+Q, or closing all its windows, ends it within a few seconds, and the next tool call says so.
+- ✅ On macOS a visible browser has its own Dock icon, so you can tell it from your own Chrome. It runs from a copy of your installed Chrome in `~/.mcp-stealth/app/` that carries the project icon. The copy is an APFS clone, so it takes no extra disk space, it is made on the first visible launch (about 18 seconds, once per Chrome update), and your installed Chrome is never changed. The Dock tooltip still says Google Chrome. If the copy cannot be made, the launch uses Chrome itself and the result says why. Headless launches and `attach_to_chrome` are not affected.
 - ✅ `evaluate`, `frame_evaluate` and `wait_for_function` report a JavaScript exception as an error, and promises are awaited. Objects and arrays come back as JSON.
 - ✅ `type_text`, `humanize_type` and `fill` send a keydown and keyup per character. `type_text` refuses when no field has focus, and refuses a newline in a single-line field.
 - ✅ `upload_file` refuses a path that is not a file. `paste_text` refuses a field that cannot take text and reports what landed, contenteditable included.
@@ -672,6 +673,8 @@ Things to know:
 | `BROWSER_LAUNCH_TIMEOUT`, `BROWSER_NAV_TIMEOUT`, `TOOL_ACTION_TIMEOUT` | Time limits for launching, navigating, and single actions |
 | `CAPTURE_MAX_EVENTS`, `CAPTURE_MAX_INDEXED` | Size of the capture buffers |
 | `MCP_STEALTH_TOKEN` | Token for HTTP mode |
+| `MCP_STEALTH_DOCK_ICON` | Set to `0` to run visible browsers from Chrome itself, with Chrome's own Dock icon (macOS). Default on |
+| `MCP_STEALTH_APP_DIR` | Folder for the Chrome copy that carries the Dock icon. Default `~/.mcp-stealth/app`. It must be on the same APFS volume as Chrome |
 | `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL` | Vision model through any OpenAI-compatible API |
 | `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL` | Vision model through Anthropic |
 | `CAPSOLVER_KEY` | Enables `solve_captcha` |

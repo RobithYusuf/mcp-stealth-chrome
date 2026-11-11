@@ -71,6 +71,7 @@ from .refs import (
     release_group,
     resolve_ref,
 )
+from . import dock_icon
 from .workflow import WorkflowError, run_workflow
 from .humanize import humanized_click, humanized_move, humanized_mouse_press, humanized_scroll, move_pointer
 from .state import (
@@ -1563,6 +1564,23 @@ async def _give_focus_back(app: Optional[str]) -> None:
         pass
 
 
+async def _use_dock_icon_copy(config: Config, headless: bool) -> str:
+    """Point a headed launch at the Chrome copy that carries the project's Dock icon.
+
+    Returns what to add to the launch result: nothing when the copy is in use or does not
+    apply, and the reason when it was wanted and Chrome's own app had to be used instead.
+    The copy is the same build with the same signature, so the identity does not change.
+    """
+    try:
+        choice = await asyncio.to_thread(
+            dock_icon.prepare, str(config.browser_executable_path or ""), headless=headless)
+    except Exception as exc:
+        return f" [Dock icon: Chrome's own, because {_exc_text(exc)}]"
+    if choice.executable:
+        config.browser_executable_path = choice.executable
+    return f" [Dock icon: Chrome's own, because {choice.note}]" if choice.note else ""
+
+
 @mcp.tool()
 async def browser_launch(
     url: str = "about:blank",
@@ -1598,6 +1616,8 @@ async def browser_launch(
         headless: run without UI (many sites detect headless — prefer False). A visible
             window opens behind the app in use and does not take the keyboard. A click that
             calls window.open still brings Chrome forward for about 130 ms before focus returns.
+            On macOS it runs from a copy of Chrome with its own Dock icon; if that copy
+            cannot be used the result says why (MCP_STEALTH_DOCK_ICON=0 turns it off).
             When the person quits it (Cmd+Q, Dock > Quit) or closes every window, the server
             ends that Chrome within a few seconds, and the next call says it was closed and
             why; call browser_launch again to continue. tab_close on the last tab does not.
@@ -1954,6 +1974,7 @@ async def browser_launch(
                 config.add_argument(_flag)
 
         browser: Optional[Browser] = None
+        dock_note = await _use_dock_icon_copy(config, headless)
         # Read before Chrome starts, while the person's app is still the frontmost one.
         previous_app = None if headless else await asyncio.to_thread(_frontmost_app)
         if not headless:
@@ -2155,7 +2176,7 @@ async def browser_launch(
             f"privacy={privacy}, identity={identity_source}). Loaded",
             _launch_observed,
             expect_url=expect_url, expect_status=expect_status,
-            suffix=f"{suffix}{verify_suffix}{health_suffix}{place_suffix}",
+            suffix=f"{suffix}{verify_suffix}{health_suffix}{place_suffix}{dock_note}",
         )
 
 
@@ -5598,6 +5619,7 @@ async def _launch_browser_instance(
     config.add_argument(f"--window-size={window_width},{window_height}")
 
     browser: Optional[Browser] = None
+    dock_note = await _use_dock_icon_copy(config, headless)
     previous_app = None if headless else await asyncio.to_thread(_frontmost_app)
     if not headless:
         for _flag in _BACKGROUND_WINDOW_FLAGS:
@@ -5701,6 +5723,7 @@ async def _launch_browser_instance(
         f"instance {instance_id!r} launched (headless={headless}, "
         f"privacy={privacy}, identity={identity_source}, "
         f"profile={profile_path.name if profile_path else '(ephemeral Chrome temp)'})"
+        f"{dock_note}"
     )
 
 

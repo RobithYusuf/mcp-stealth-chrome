@@ -27,6 +27,7 @@ uvx mcp-stealth-chrome → Python 3.11+ → FastMCP → nodriver → Chrome/Chro
 - `src/mcp_stealth_chrome/helpers.py` — `ok`/`err`, tab selection, path confinement, JSON parsing.
 - `src/mcp_stealth_chrome/patches.py` — runtime monkey-patches for nodriver/CDP drift.
 - `src/mcp_stealth_chrome/identity.py` — key events, client hints and languages. `humanize.py` — pointer and typing input.
+- `src/mcp_stealth_chrome/dock_icon.py` — the Chrome copy a headed launch runs from, for its own Dock icon. `assets/dock_icon.png` is that icon.
 - `src/mcp_stealth_chrome/_app.py` — `StealthMCP`, the FastMCP boundary. `captcha.py`, `image_output.py`, `result_types.py` — their named helpers.
 - `src/mcp_stealth_chrome/tools/` — `research.py`, `devtools.py`, `vision.py`, `network_http.py`, `profiles.py`,
   `storage.py` (cookies, web storage, IndexedDB, cache), `capture.py` (request interception, HAR, dry_run),
@@ -45,7 +46,7 @@ uvx mcp-stealth-chrome → Python 3.11+ → FastMCP → nodriver → Chrome/Chro
   `tests/test_old_tools_e2e.py` and `tests/test_slow_start_e2e.py` — tools and launch paths on real Chrome.
 - `README.md` — the authoritative tool list. `docs/` — install and troubleshooting, plus the proof images the README links.
 - Runtime data lives outside the repo: `~/.mcp-stealth/{profile,profiles,screenshots,exports,
-  storage-states,identities,window-state}`.
+  storage-states,identities,window-state,app}`.
 
 ## Hard constraints
 
@@ -225,6 +226,28 @@ conclusions. Each rule below replaced a real lie.
   this browser's PID is frontmost, about 130 ms measured, so keys typed in that moment still reach Chrome. It compares the
   PID, because a person's own Chrome has the same bundle path. `tests/test_headed_focus.py` measures all this, with
   `MCP_HEADED=1`, and counts this browser's PID so the person's other apps cannot skew it.
+- A headed launch on macOS runs from `~/.mcp-stealth/app/Stealth Chrome.app`, an APFS clone of the installed Chrome with
+  the project icon set as a custom file icon (`Icon\r` plus FinderInfo at the bundle root), so the Dock tells it from the
+  person's Chrome. Never edit the copy's `Info.plist` or anything under `Contents/`: that breaks Google's signature, and
+  Keychain access to "Chrome Safe Storage" follows the signature, so cookies stop decrypting. The tooltip therefore still
+  says "Google Chrome". `codesign --verify --deep` is the test (`--strict` fails on the installed Chrome too, over its
+  xattrs). It takes about 6 s, so it runs once per build, before the rename into place, and the marker file written after
+  it is what says a copy at that path was verified.
+- macOS takes about 11 s over the first start of a freshly cloned Chrome and under 1 s after that (measured twice each:
+  11.4 and 11.8 s cold, 0.6 to 0.7 s warmed). Left to the launch, that is the edge of what `_start_chrome` waits for
+  (2.3 s plus `SLOW_CHROME_WAIT`). So `_build` runs the copy once with `--version` after the signature check and before
+  the rename, which carries over. A build therefore takes about 18 s, once per Chrome update, and a failed warm-up is
+  ignored. A clone gets the slow start again even when an identical clone has run before, so it is not cached by content.
+- `dock_icon.prepare` never fails a launch: any problem is a note in the launch result and Chrome itself is used. `cp -c`
+  quietly falls back to a full copy where it cannot clone, so one file is cloned first with `clonefile(2)`, which cannot.
+  A stale copy is not replaced while a process runs from it, because new renderers start from the bundle path. The copy
+  is rebuilt when Chrome's version, the source browser or the icon changes. Headless, `attach_to_chrome` and the
+  `solve_turnstile_oscursor` sidecar use the installed Chrome.
+- The copy has Chrome's bundle id and the same bundle path as every other launch from it, so anything telling this browser
+  from another must keep comparing PIDs (`_win_focus_back_from_popup`, `_pid_recycled` by `--user-data-dir`), never the
+  bundle. The copy is prepared before `_frontmost_app` is read: building takes seconds, and focus goes back to what was
+  frontmost when Chrome started. `tests/conftest.py` points `MCP_STEALTH_APP_DIR` at a temporary folder and stubs
+  `prepare` inside the pytest process, so no test builds in the real `~/.mcp-stealth/app`.
 - A stdio `browser_launch` sets `current_idle_timeout = 0`. Leaving the reaper off is not enough: any `spawn_browser`
   starts it, and it then closed the browser the person was looking at, 15 minutes after its last tool call.
 - `is_up()` false does not mean Chrome stopped: closing the last tab empties `tabs` while the process runs and
