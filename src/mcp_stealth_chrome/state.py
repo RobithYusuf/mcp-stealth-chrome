@@ -835,9 +835,25 @@ class BrowserState(metaclass=_SessionRouted):
         return True
 
     @classmethod
+    def _quit_watcher_note(cls) -> Optional[str]:
+        """The quit watcher's verdict on a browser that just died, before the sweep has
+        recorded it: a Quit read in that second must not look like a crash."""
+        try:
+            from . import quit_watch
+            at = quit_watch.quit_time(cls.browser)
+        except Exception:
+            return None
+        if at is None:
+            return None
+        note = quit_watch.closed_note(cls.current_instance_id, at)
+        cls.window_closed[cls.current_instance_id] = note
+        return note
+
+    @classmethod
     def active_tab(cls) -> Tab:
         closed = cls.window_closed.get(cls.current_instance_id)
         if cls.browser is not None and not cls._browser_alive():
+            closed = closed or cls._quit_watcher_note()
             if closed:
                 raise RuntimeError(f"Browser not running: {closed} Call browser_launch to start it again.")
             raise RuntimeError(

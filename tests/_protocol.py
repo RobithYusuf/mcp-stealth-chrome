@@ -43,8 +43,9 @@ class Reply:
 
 
 class Client:
-    def __init__(self, env: dict | None = None):
+    def __init__(self, env: dict | None = None, python: str | None = None):
         self._env = env
+        self._python = python
         self._loop = asyncio.new_event_loop()
         self._ready = threading.Event()
         self._stop: asyncio.Event | None = None
@@ -64,7 +65,7 @@ class Client:
         env["PYTHONPATH"] = os.environ.get("MCP_TEST_SRC", str(REPO / "src"))
         env.update(self._env or {})
         params = StdioServerParameters(
-            command=os.environ.get("MCP_TEST_SERVER_PYTHON", sys.executable),
+            command=self._python or os.environ.get("MCP_TEST_SERVER_PYTHON", sys.executable),
             args=["-c", "from mcp_stealth_chrome.server import main; main()"],
             env=env,
         )

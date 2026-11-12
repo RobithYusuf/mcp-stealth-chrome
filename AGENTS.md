@@ -29,6 +29,7 @@ uvx mcp-stealth-chrome → Python 3.11+ → FastMCP → nodriver → Chrome/Chro
 - `src/mcp_stealth_chrome/identity.py` — key events, client hints and languages. `humanize.py` — pointer and typing input.
 - `src/mcp_stealth_chrome/dock_icon.py` — Chrome Beta with the project icon for headed launches, and removal of the 0.13.0 Chrome copy. `assets/dock_icon.png` is that icon.
 - `src/mcp_stealth_chrome/profile_version.py` — which Chrome may open a profile: the version guard and `beta_verdict`.
+- `src/mcp_stealth_chrome/quit_watch.py` — starts the per-browser quit watcher and keeps its state files; `_quit_watcher.py` is that watcher, a standalone script.
 - `src/mcp_stealth_chrome/cookie_migration.py` — moving a profile's `v10` cookies to Chrome 158's `v11` before it loses them.
 - `src/mcp_stealth_chrome/_app.py` — `StealthMCP`, the FastMCP boundary. `captcha.py`, `image_output.py`, `result_types.py` — their named helpers.
 - `src/mcp_stealth_chrome/tools/` — `research.py`, `devtools.py`, `vision.py`, `network_http.py`, `profiles.py`,
@@ -185,6 +186,9 @@ conclusions. Each rule below replaced a real lie.
 - Absence of evidence is not evidence. `_ensure_browser_dead()` sets `verified` only when a process
   was positively observed to be gone; with no PID and no profile to scan it stays false and the
   caller must not claim a clean close.
+- `server_status` measures `os_cursor` on a thread started with the server and answers `still being measured`
+  (`available: null`) until it has a result. Importing Quartz and AppKit cold takes seconds while profile_gc and the
+  Dock check run, and a timed wait answered `not measured (TimeoutError)` on the first call.
 - `server_status` exposes `compat_patches`. A patch that fails to apply does not crash anything — it
   makes the CDP listener die on the first mismatched payload, so captures return empty and look like
   a quiet page.
@@ -326,10 +330,31 @@ conclusions. Each rule below replaced a real lie.
   holds the profile. Close paths branch on `BrowserState.browser is None`, never on `is_up()`.
 - Chrome started with `--no-startup-window` does not exit on Quit: the quit Apple Event closes every window and
   the process stays, with its Dock icon and the profile lock (still running 10 s later; without the flag it exits in
-  0.3 s). CDP cannot tell a Quit from closing every window by hand, so `_sweep_windowless` ends a headed browser
-  that has had no page for `_WINDOWLESS_GRACE` seconds, unless `tab_close` emptied it, and records why in
-  `BrowserState.window_closed` before closing starts, or a call arriving meanwhile reads as a crash.
-  An unanswered `Target.getTargets` never counts as no windows. `tests/test_headed_quit.py` quits a real one.
+  0.3 s). CDP cannot tell a Quit from closing every window by hand. Ending it from inside the server failed whenever
+  the server was not healthy: a stdio server exits on a `/mcp` reconnect and left its Chrome with no watcher, and one
+  started before `uv tool install --force` kept running old code for hours. So each headed browser gets its own
+  watcher process (`quit_watch.start`, `_quit_watcher.py`): started detached (own session), from the base
+  interpreter with `-I` and the source on stdin, standard library only, imports at the top, so it reads nothing
+  from the installed package after it starts. It polls `/json/list` every 0.5 s; after `_WINDOWLESS_GRACE` seconds
+  with no `page` target it writes the `.quit` verdict, sends `Browser.close` over the browser websocket, waits
+  `_CLOSE_WAIT` for the PID, and only then signals that one PID, each time after checking its command line still
+  names the same `--user-data-dir`. It exits when Chrome is gone and never acts on another process. An unanswered
+  endpoint never counts as no windows. Chrome's DevTools HTTP server keeps the connection open whatever the client
+  asks, so the body is read to its Content-Length: read to EOF, every poll timed out and read as unanswered.
+- `tab_close` writes `<key>.tool-closed` BEFORE closing the last tab, or the watcher can read the empty browser
+  first. It counts only while the server that wrote it is the watcher's parent (`getppid`, no signal): nobody can
+  use an empty browser whose server is gone. A tool close (`_ensure_browser_dead`) stops the watcher first. The
+  in-process `_sweep_windowless` never closes while a watcher runs; it records `window_closed` as soon as the
+  `.quit` verdict appears and cleans up the handle once the watcher has exited, and it ends the browser itself
+  only when no watcher runs (failed to start, died, or not POSIX). `BrowserState.active_tab` reads the verdict
+  too, so a call in the second between the watcher's close and the sweep says "last window", not "crashed".
+  The state files live in `$TMPDIR/mcp-stealth-quit-watch` (0700, files 0600; `MCP_STEALTH_QUIT_WATCH_DIR`), keyed by
+  Chrome PID and port, and the verdict names the profile. `tests/test_headed_quit.py` quits real ones with the
+  server alive, killed, and with its venv deleted and rebuilt.
+- Nothing starts a browser on its own. Every launch goes through `browser_launch`, `spawn_browser`, the cookie
+  reader of `cookie_migration` (headless, closed before it returns) or `attach_to_chrome`. A Chrome seen running
+  again on the same port and profile after it ended, with parent PID 1 and no CDP client, was not started by a
+  server (nodriver's child would have the live server as parent).
 - `clean_profile_state` and `browser_recover` leave a locked profile completely alone, Preferences included.
   The lock can belong to another instance or another session, and `browser_recover` sweeps every profile dir.
 - Window placement is remembered per instance in `~/.mcp-stealth/window-state/`. Validation applies

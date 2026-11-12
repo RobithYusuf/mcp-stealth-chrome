@@ -498,6 +498,10 @@ async def tab_close(index: Optional[int] = None) -> str:
         if idx < 0 or idx >= len(BrowserState.tabs):
             return err(f"tab {idx} out of range")
         closed_tab = BrowserState.tabs[idx]
+        if len(BrowserState.tabs) == 1:
+            # Said before the close: the quit watcher polls on its own and must never see this
+            # browser empty without knowing a tool emptied it.
+            _srv._window_watch_tool_closed(BrowserState.browser)
         await closed_tab.close()
         _srv._clear_tab_scoped_state([closed_tab])
         await _srv._refresh_tabs()

@@ -3,6 +3,7 @@ client validates results, and calling a tool function directly skips both."""
 import http.server
 import json
 import threading
+import time
 
 import pytest
 
@@ -168,4 +169,24 @@ def test_server_status_says_whether_the_os_cursor_backend_can_run(mcp):
 
     seen = mcp.call("server_status").json()["os_cursor"]
     available, _reason = os_input.is_available()
+    for _ in range(40):
+        if seen["available"] is not None:
+            break
+        assert "still being measured" in seen["detail"], seen
+        time.sleep(0.25)
+        seen = mcp.call("server_status").json()["os_cursor"]
     assert seen["available"] is available and seen["detail"], seen
+
+
+def test_first_server_status_is_fast_and_never_a_timeout():
+    """Right after a start, a 3 s probe racing profile_gc and the Dock check answered
+    "not measured (TimeoutError)". The first answer is a measurement or says it is under way."""
+    client = Client()
+    try:
+        reply = client.call("server_status")
+        cursor = reply.json()["os_cursor"]
+        assert "not measured" not in cursor["detail"] and "Timeout" not in cursor["detail"], cursor
+        assert cursor["available"] is not None or "still being measured" in cursor["detail"], cursor
+        assert reply.seconds < 2.5, reply.seconds
+    finally:
+        client.close()

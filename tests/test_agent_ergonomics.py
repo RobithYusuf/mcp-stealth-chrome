@@ -3463,6 +3463,141 @@ def test_unanswered_target_query_never_closes(monkeypatch):
     assert ended == []
 
 
+class _FakeWatcher:
+    def __init__(self, running):
+        self.running = running
+
+    def poll(self):
+        return None if self.running else 0
+
+
+def _watched_browser(tmp_path, monkeypatch, watcher_running, verdict):
+    import time
+    from types import SimpleNamespace
+
+    from mcp_stealth_chrome import quit_watch
+
+    monkeypatch.setenv("MCP_STEALTH_QUIT_WATCH_DIR", str(tmp_path))
+    browser = SimpleNamespace(_process=None, _process_pid=4242, stopped=True,
+                              config=SimpleNamespace(host="127.0.0.1", port=9, user_data_dir="/p"),
+                              _quit_watcher=_FakeWatcher(watcher_running))
+    if verdict:
+        (tmp_path / "chrome-4242-9.quit").write_text(
+            json.dumps({"pid": 4242, "port": 9, "user_data_dir": "/p", "at": time.time()}))
+    return browser, quit_watch
+
+
+def _sweep_with(monkeypatch, browser):
+    import asyncio
+
+    from mcp_stealth_chrome import server
+
+    asked, ended = [], []
+
+    async def count(_browser):
+        asked.append(1)
+        return 0
+
+    async def end_current():
+        ended.append("current")
+        server.BrowserState.browser = None
+        return True
+
+    monkeypatch.setattr(server, "_page_target_count", count)
+    monkeypatch.setattr(server, "_end_current_instance", end_current)
+    monkeypatch.setattr(server, "_WINDOWLESS_GRACE", 0.0)
+    monkeypatch.setattr(server, "_WINDOW_WATCH", {id(browser): {"browser": browser, "zero_since": None,
+                                                                "tool_closed": False}})
+    monkeypatch.setattr(server.BrowserState, "browser", browser, raising=False)
+    monkeypatch.setattr(server.BrowserState, "instances", {}, raising=False)
+    monkeypatch.setattr(server.BrowserState, "window_closed", {}, raising=False)
+    sweep = lambda: asyncio.run(server._sweep_windowless())  # noqa: E731
+    return server, asked, ended, sweep
+
+
+def test_a_running_quit_watcher_is_the_only_one_that_closes(tmp_path, monkeypatch):
+    """Two closers would race into a double close. While the watcher runs, the sweep neither
+    asks for pages nor ends the browser."""
+    browser, _qw = _watched_browser(tmp_path, monkeypatch, watcher_running=True, verdict=False)
+    _server, asked, ended, sweep = _sweep_with(monkeypatch, browser)
+    sweep(); sweep(); sweep()
+    assert asked == [] and ended == []
+
+
+def test_the_watchers_verdict_is_recorded_at_once_and_cleaned_up_after(tmp_path, monkeypatch):
+    browser, qw = _watched_browser(tmp_path, monkeypatch, watcher_running=True, verdict=True)
+    server, _asked, ended, sweep = _sweep_with(monkeypatch, browser)
+    sweep()
+    note = server.BrowserState.window_closed[server.BrowserState.current_instance_id]
+    assert "last window" in note and ended == []  # still closing: the watcher's job
+    browser._quit_watcher.running = False
+    sweep()
+    assert ended == ["current"] and qw.quit_time(browser) is None
+
+
+def test_a_quit_read_before_the_sweep_is_not_a_crash(tmp_path, monkeypatch):
+    """The watcher ended Chrome a moment ago and the sweep has not run yet: the next call must
+    say the last window was closed, not that the browser died and needs browser_recover."""
+    from mcp_stealth_chrome import server
+
+    browser, _qw = _watched_browser(tmp_path, monkeypatch, watcher_running=False, verdict=True)
+    monkeypatch.setattr(server.BrowserState, "browser", browser, raising=False)
+    monkeypatch.setattr(server.BrowserState, "window_closed", {}, raising=False)
+    monkeypatch.setattr(server.BrowserState, "tabs", [object()], raising=False)
+    with pytest.raises(RuntimeError, match="last window") as raised:
+        server.BrowserState.active_tab()
+    assert "browser_recover" not in str(raised.value)
+
+
+def test_a_crash_without_a_verdict_still_reads_as_a_crash(tmp_path, monkeypatch):
+    from mcp_stealth_chrome import server
+
+    browser, _qw = _watched_browser(tmp_path, monkeypatch, watcher_running=False, verdict=False)
+    monkeypatch.setattr(server.BrowserState, "browser", browser, raising=False)
+    monkeypatch.setattr(server.BrowserState, "window_closed", {}, raising=False)
+    monkeypatch.setattr(server.BrowserState, "tabs", [object()], raising=False)
+    with pytest.raises(RuntimeError, match="browser_recover"):
+        server.BrowserState.active_tab()
+
+
+def test_a_dead_watcher_hands_back_to_the_sweep(tmp_path, monkeypatch):
+    """A watcher that failed to start or died: the server's own sweep still ends the browser."""
+    browser, _qw = _watched_browser(tmp_path, monkeypatch, watcher_running=False, verdict=False)
+    _server, asked, ended, sweep = _sweep_with(monkeypatch, browser)
+    sweep(); sweep()
+    assert asked and ended == ["current"]
+
+
+def test_tab_close_marks_the_browser_before_closing_its_last_tab(monkeypatch):
+    """The watcher polls on its own; marked after the close, it could read the empty browser
+    first."""
+    import asyncio
+
+    from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import navigation
+
+    order = []
+
+    class Tab:
+        target = None
+
+        async def close(self):
+            order.append("close")
+
+    async def refresh():
+        return None
+
+    tab = Tab()
+    monkeypatch.setattr(server, "_refresh_tabs", refresh)
+    monkeypatch.setattr(server, "_clear_tab_scoped_state", lambda tabs: None)
+    monkeypatch.setattr(server, "_window_watch_tool_closed", lambda b: order.append("mark"))
+    monkeypatch.setattr(server.BrowserState, "tabs", [tab], raising=False)
+    monkeypatch.setattr(server.BrowserState, "active_tab_index", 0, raising=False)
+    monkeypatch.setattr(server.BrowserState, "browser", object(), raising=False)
+    asyncio.run(navigation.tab_close())
+    assert order[:2] == ["mark", "close"], order
+
+
 def test_testing_mode_features_join_nodrivers_list(tmp_path):
     """Chrome honours only the last --disable-features, and nodriver's own comes first, so
     testing_mode's flag dropped IsolateOrigins,site-per-process."""
@@ -3621,3 +3756,42 @@ def test_a_browser_that_ignores_stop_is_still_signalled_and_verified(tmp_path):
         assert report["verified"] is True and report["still_alive"] == [], report
     finally:
         _end([parent.pid, *everyone])
+
+
+def test_a_close_by_a_tool_stops_the_quit_watcher_first(monkeypatch):
+    """browser_close and close_instance end the browser themselves; a watcher left running
+    could see the closing browser empty and close it a second time."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from mcp_stealth_chrome import quit_watch, server
+
+    stopped = []
+    monkeypatch.setattr(quit_watch, "stop", lambda browser: stopped.append(browser))
+    browser = SimpleNamespace(_process=None, _process_pid=None, connection=None,
+                              config=SimpleNamespace(port=None, user_data_dir=None), stop=lambda: None)
+    asyncio.run(server._ensure_browser_dead(browser))
+    assert stopped == [browser]
+
+
+def test_os_cursor_status_does_not_wait_for_a_slow_first_measurement(monkeypatch):
+    """Importing Quartz and AppKit the first time took seconds while the server started, and
+    the first server_status said "not measured (TimeoutError)"."""
+    import asyncio
+    import time as _time
+
+    from mcp_stealth_chrome import os_input, server
+
+    def slow():
+        _time.sleep(2.5)
+        return True, "measured"
+
+    monkeypatch.setattr(os_input, "is_available", slow)
+    monkeypatch.setattr(server, "_OS_CURSOR_PROBE",
+                        {"thread": None, "started": None, "result": None, "measured_at": None})
+    started = _time.monotonic()
+    first = asyncio.run(server._os_cursor_status())
+    assert _time.monotonic() - started < 1.5
+    assert first["available"] is None and "still being measured" in first["detail"], first
+    server._OS_CURSOR_PROBE["thread"].join(5)
+    assert asyncio.run(server._os_cursor_status()) == {"available": True, "detail": "measured"}

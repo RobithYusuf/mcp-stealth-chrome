@@ -79,6 +79,7 @@ from . import dock_icon
 from . import profile_gc
 from . import profile_version
 from . import cookie_migration
+from . import quit_watch
 from .state import data_root as state_data_root
 from .workflow import WorkflowError, run_workflow
 from .humanize import humanized_click, humanized_move, humanized_mouse_press, humanized_scroll, move_pointer
@@ -405,6 +406,9 @@ async def _ensure_browser_dead(browser, profile_dir=None, grace: float = 1.5) ->
     # so it stays False and the caller must not claim a clean close.
     report = {"stopped": False, "verified": False, "pid": None, "killed": [],
               "still_alive": [], "detail": ""}
+    # A close by a tool: the quit watcher must not also act on this browser meanwhile.
+    if browser is not None:
+        await asyncio.to_thread(quit_watch.stop, browser)
     pid = getattr(browser, "_process_pid", None) if browser else None
     report["pid"] = pid
     recycled = isinstance(pid, int) and pid > 0 and _pid_recycled(pid, browser)
@@ -5290,16 +5294,56 @@ async def server_status() -> str:
     return ok(json.dumps(status, indent=2, default=str))
 
 
+# Importing Quartz and AppKit for the first time takes seconds while the server is starting
+# (profile_gc and the Dock check run then too), and a 3 s wait on it made the first
+# server_status say "not measured (TimeoutError)". So it is measured on a thread from the start,
+# and a status call that comes before the answer says it is still being measured.
+_OS_CURSOR_PROBE: dict = {"thread": None, "started": None, "result": None, "measured_at": None}
+_OS_CURSOR_PROBE_LOCK = threading.Lock()
+_OS_CURSOR_REMEASURE = 60.0
+
+
+def _start_os_cursor_probe() -> None:
+    """Measure the OS cursor backend on its own thread, unless a measurement is running."""
+    with _OS_CURSOR_PROBE_LOCK:
+        thread = _OS_CURSOR_PROBE["thread"]
+        if thread is not None and thread.is_alive():
+            return
+
+        def work() -> None:
+            from . import os_input
+            try:
+                result = os_input.is_available()
+            except Exception as exc:
+                result = (False, f"could not be measured ({type(exc).__name__}: {exc})")
+            _OS_CURSOR_PROBE["result"] = result
+            _OS_CURSOR_PROBE["measured_at"] = time.monotonic()
+
+        _OS_CURSOR_PROBE["started"] = time.monotonic()
+        thread = threading.Thread(target=work, name="os-cursor-probe", daemon=True)
+        _OS_CURSOR_PROBE["thread"] = thread
+        thread.start()
+
+
 async def _os_cursor_status() -> dict:
     """Whether solve_turnstile_oscursor could run here, checked without any input.
 
-    Missing the [os-cursor] extra otherwise shows only when the tool is called.
+    Missing the [os-cursor] extra otherwise shows only when the tool is called. Never waits
+    long: an answer not ready yet is reported as still being measured, not as a failure.
     """
-    from . import os_input
-    try:
-        available, reason = await asyncio.wait_for(asyncio.to_thread(os_input.is_available), timeout=5)
-    except Exception as exc:
-        available, reason = False, f"not measured ({type(exc).__name__})"
+    if _OS_CURSOR_PROBE["thread"] is None:
+        _start_os_cursor_probe()
+    thread = _OS_CURSOR_PROBE["thread"]
+    if _OS_CURSOR_PROBE["result"] is None and thread is not None:
+        await asyncio.to_thread(thread.join, 0.5)  # a warm measurement takes milliseconds
+    result, measured_at = _OS_CURSOR_PROBE["result"], _OS_CURSOR_PROBE["measured_at"]
+    if result is None:
+        waited = time.monotonic() - (_OS_CURSOR_PROBE["started"] or time.monotonic())
+        return {"available": None,
+                "detail": f"still being measured (started {waited:.1f} s ago); ask again shortly"}
+    if measured_at is not None and time.monotonic() - measured_at > _OS_CURSOR_REMEASURE:
+        _start_os_cursor_probe()  # permissions can change; this answer stands until the next one
+    available, reason = result
     return {"available": bool(available), "detail": reason}
 
 
@@ -6366,8 +6410,12 @@ def _ensure_idle_reaper_running() -> None:
 # started that way does not exit on Quit: the quit Apple Event closes every window and the
 # process stays, with its Dock icon and the profile lock. Measured: still running 10 s after the
 # quit, while the same Chrome started normally exits in 0.3 s. Nothing in CDP tells a Quit from
-# closing every window by hand. So once such a browser has no page left that a tool did not
-# close, the server ends it the way the idle reaper does and the next call says why.
+# closing every window by hand. Ending it from inside this server only worked while the server
+# was alive and healthy: a stdio server exits on a client reconnect, and one started before a
+# reinstall keeps running old code. So each such browser gets its own detached watcher process
+# (quit_watch, _quit_watcher.py) that ends it after the grace, server or not. The sweep below
+# records why for the next call and cleans up after it, and ends the browser itself only when
+# no watcher runs for it, so the two never both close it.
 _WINDOWLESS_GRACE = float(os.environ.get("MCP_WINDOWLESS_CLOSE_SECONDS", "3"))
 _WINDOW_WATCH_INTERVAL = 1.0
 _WINDOW_WATCH: dict[int, dict] = {}  # id(browser) -> {"browser", "zero_since", "tool_closed"}
@@ -6377,11 +6425,13 @@ _window_watch_task: Optional[asyncio.Task] = None
 def _watch_windows(browser: Any) -> None:
     """Watch a headed browser started with _BACKGROUND_WINDOW_FLAGS for losing every window."""
     _WINDOW_WATCH[id(browser)] = {"browser": browser, "zero_since": None, "tool_closed": False}
+    quit_watch.start(browser, _WINDOWLESS_GRACE, _CLOSE_WAIT)
     _ensure_window_watcher_running()
 
 
 def _window_watch_tool_closed(browser: Any) -> None:
     """A tool closed the last tab on purpose: that is not the person quitting."""
+    quit_watch.mark_tool_closed(browser)
     entry = _WINDOW_WATCH.get(id(browser))
     if entry is not None:
         entry["tool_closed"] = True
@@ -6412,6 +6462,23 @@ async def _sweep_windowless() -> set[int]:
         entry = _WINDOW_WATCH.get(id(browser))
         if entry is None or entry["browser"] is not browser:
             continue
+        quit_at = quit_watch.quit_time(browser)
+        if quit_at is not None:
+            # The watcher is ending it because its last window went: say so at once, and
+            # clean up once the watcher is done.
+            BrowserState.window_closed[iid] = quit_watch.closed_note(iid, quit_at)
+            if quit_watch.running(browser):
+                continue
+            if await (_end_current_instance() if snap is None else _end_stored_instance(iid, snap)):
+                quit_watch.forget(browser)
+                _WINDOW_WATCH.pop(id(browser), None)
+            continue
+        if quit_watch.running(browser):
+            # The watcher decides; two closers would race. A verdict it withdrew (Chrome
+            # survived its close and it tries again later) must not outlive it here.
+            BrowserState.window_closed.pop(iid, None)
+            continue
+        quit_watch.reap(browser)
         pages = await _page_target_count(browser)
         now = time.monotonic()
         if pages is None:
@@ -9359,6 +9426,9 @@ def main() -> None:
     # Leftover privacy and fallback profiles: one pass on its own thread, see profile_gc.
     with contextlib.suppress(Exception):
         profile_gc.start_in_background(state_data_root())
+    # Measured off the critical path, so the first server_status has an answer, not a timeout.
+    with contextlib.suppress(Exception):
+        _start_os_cursor_probe()
     if cli.http:
         # None of the stdio survival rules below apply: there is no parent to
         # outlive, and SIGTERM must be able to stop a long-running service.
