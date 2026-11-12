@@ -38,6 +38,23 @@ def _dock_icon_copy_in_a_temp_folder():
         shutil.rmtree(folder, ignore_errors=True)
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _no_profile_cleanup_on_real_data():
+    """Every server a test starts runs main(), and main() starts the leftover-profile pass.
+    Pointed at the real ~/.mcp-stealth, it would act on the person's own folders. Servers
+    inherit it off; a test about the pass turns it on together with MCP_STEALTH_DATA_DIR."""
+    from mcp_stealth_chrome import profile_gc
+    previous = os.environ.get(profile_gc.ENV_SWITCH)
+    os.environ[profile_gc.ENV_SWITCH] = "0"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(profile_gc.ENV_SWITCH, None)
+        else:
+            os.environ[profile_gc.ENV_SWITCH] = previous
+
+
 @pytest.fixture(autouse=True)
 def _no_dock_icon_copy_in_process(request, monkeypatch):
     if request.module.__name__ != "test_dock_icon":

@@ -219,19 +219,30 @@ def test_humanize_click_by_coordinates(loop):
     assert "FREE CLICK" in state
 
 
-def test_profile_affinity_survives_recover():
-    """browser_recover freeing the default profile must not migrate the session."""
+def test_profile_affinity_survives_recover(tmp_path):
+    """browser_recover freeing the default profile must not migrate the session.
+
+    The fallback this resolves to is created on disk, so it goes in tmp_path: in the person's
+    ~/.mcp-stealth it left one empty profile-pid<N> behind on every run of this suite.
+    """
     import mcp_stealth_chrome.state as st
     orig = st.is_chrome_profile_locked
+    previous = os.environ.get(st.ENV_DATA_DIR)
+    os.environ[st.ENV_DATA_DIR] = str(tmp_path / "data")
     try:
         st.is_chrome_profile_locked = lambda p: p == st.PROFILE_DIR   # default busy
         first = st.resolve_default_profile(True)
         st.set_profile_affinity(first)
         st.is_chrome_profile_locked = lambda p: False                 # default freed
         assert st.resolve_default_profile(True) == first
+        assert str(first).startswith(str(tmp_path)), first
     finally:
         st.is_chrome_profile_locked = orig
         st.set_profile_affinity(None)
+        if previous is None:
+            os.environ.pop(st.ENV_DATA_DIR, None)
+        else:
+            os.environ[st.ENV_DATA_DIR] = previous
 
 
 def test_snapshot_delta_marks_only_new_elements(loop):

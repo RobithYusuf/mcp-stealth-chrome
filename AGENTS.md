@@ -92,6 +92,22 @@ uvx mcp-stealth-chrome → Python 3.11+ → FastMCP → nodriver → Chrome/Chro
   identity files are written `0600`, and a profile clone only ever opens the source read-only.
 - Anything that deletes a profile (`clone_chrome_profile(overwrite=True)`, `profile_cleanup(confirm=True)`,
   privacy cleanup, `browser_recover`) needs an explicit request. The shared profile holds the developer's real logins.
+  The one exception is `profile_gc`, the pass at server start, and it is narrow on purpose. It removes only
+  `privacy-profiles/<name>` and `profile-pid<number>` (exact names, directly in the data folder, no links), only
+  when no lock, no running process and no session of this server holds it and nothing changed in 10 minutes, and a
+  `profile-pid<N>` only when PID N has ended or now runs something that is not this server (judged by how the
+  command starts, `is_server_command`: a path through a folder called mcp-stealth-chrome is not a server) and it
+  holds no cookies, logins (also `Login Data For Account`), history, autofill or cards (`Web Data`), top sites,
+  sessions, local storage, IndexedDB, extensions or bookmarks. Unreadable means data. A fallback that holds
+  something waits for `profile_cleanup` with `confirm=True`. It never touches `profile/`, `profiles/` or `app/`.
+- Every function in `profile_gc` takes the data folder as an argument; only `main()` in a production server passes
+  `data_root()`, and `run_once` refuses the real `~/.mcp-stealth` while pytest runs. Tests hand a folder under
+  tmp_path, and a guard is proved with a stand-in built like the real folder, never by disabling it in place:
+  a mutation check that replaced the pytest refusal with `if False`, in a test that unset `MCP_STEALTH_DATA_DIR`,
+  ran one real pass and removed 13 privacy profiles and 54 empty fallbacks from the developer's own folder, beyond
+  recovery except from Time Machine. `tests/conftest.py` turns the pass off for every server the suite starts;
+  a test that needs it passes `MCP_STEALTH_PROFILE_GC=1` together with `MCP_STEALTH_DATA_DIR`, never a temporary
+  HOME (Keychain dialog).
 
 ## Working defaults
 
@@ -237,6 +253,17 @@ conclusions. Each rule below replaced a real lie.
   is what keeps that window `visibilityState: visible`; without it a covered window reads hidden. `tab_new` opens its own
   background window for the same reason, because a background tab in the same window is hidden. `tab_select` does not
   activate unless `focus=True`; `navigate` defaults to `focus=False`. `tab_focus` and `request_human_help` still raise it.
+- `tab_new(new_window=False)` headed opens a background tab (`createTarget(background=True)`) and turns on
+  `Emulation.setFocusEmulationEnabled` for it (`_keep_painting_behind`). Measured on Chrome 157, 3 rounds each: that
+  tab reads `visible` with requestAnimationFrame at full rate and Chrome is frontmost 0 ms. A bare background tab
+  reads `hidden` with no frames; `Page.setWebLifecycleState(active)` does not change that. `Target.activateTarget`,
+  `Page.bringToFront` and `background=False` all show the page but make Chrome the front app for about 1.6 to 2.1 s
+  and hide the tab it replaced. Two costs keep it opt-in: the page reads `document.hasFocus()` true while Chrome is
+  not in front, and Chrome picks the window. No CDP call names one, and it used the browser's first window in 2 of 2
+  tries whichever tab was selected, since windows opened behind are never activated. So the result reads back
+  the tab's window (`Browser.getWindowForTarget`) and the page's own `visibilityState`, and says "reads as hidden"
+  when the emulation did not take. `tab_select` without focus says so too when the selected page reads hidden.
+  The quit watcher counts page targets, not windows, so tabs sharing a window do not change what it sees.
 - `window.open` activates Chrome and no flag or CDP call stops that. `_win_focus_back_from_popup` sends focus back as soon as
   this browser's PID is frontmost, about 130 ms measured, so keys typed in that moment still reach Chrome. It compares the
   PID, because a person's own Chrome has the same bundle path. `tests/test_headed_focus.py` measures all this, with

@@ -800,6 +800,28 @@ def test_full_mode_keeps_the_label_rows(page, base):
     assert '[label] "Email"' in text and 'type=email label="Email"' in text, text
 
 
+def _tab_count(mcp):
+    return sum(1 for line in mcp.call("tab_list").text.splitlines() if line[1:2] == "[")
+
+
+@pytest.mark.parametrize("new_window, where", [(True, "in its own window"), (False, "as a tab"),
+                                               (None, "as a tab")])
+def test_tab_new_headless_opens_where_it_was_asked(page, base, new_window, where):
+    """Headless can open a window too; new_window=True used to have no way to ask for one."""
+    count = _tab_count(page)
+    kw = {} if new_window is None else {"new_window": new_window}
+    try:
+        reply = page.call("tab_new", url=f"{base}/page2.html", **kw)
+        assert not reply.failed and f"] {where}:" in reply.text, reply.text
+        assert _tab_count(page) == count + 1
+        assert page.evaluate("document.title").strip('"') == "Page Two"
+        assert page.evaluate("document.visibilityState").strip('"') == "visible"
+    finally:
+        page.call("tab_close")
+        page.call("tab_select", index=0)
+    assert _tab_count(page) == count
+
+
 def test_an_empty_token_means_the_challenge_is_not_over(page, base):
     """The title reads normally here, so only the empty token says the widget is unsolved."""
     reply = page.call("navigate", url=f"{base}/widget.html", _timeout=50)

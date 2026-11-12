@@ -22,17 +22,29 @@ from typing import Any, Callable, Optional
 from nodriver import Browser, Tab
 
 HOME = Path(os.environ.get("HOME") or os.environ.get("USERPROFILE") or ".")
-PROFILES_ROOT = HOME / ".mcp-stealth" / "profiles"
-PROFILE_DIR = HOME / ".mcp-stealth" / "profile"  # legacy default ("main" instance)
-SCREENSHOT_DIR = HOME / ".mcp-stealth" / "screenshots"
-EXPORT_DIR = HOME / ".mcp-stealth" / "exports"
-STORAGE_STATE_DIR = HOME / ".mcp-stealth" / "storage-states"
-IDENTITIES_DIR = HOME / ".mcp-stealth" / "identities"
-PRIVACY_PROFILE_ROOT = HOME / ".mcp-stealth" / "privacy-profiles"
+# MCP_STEALTH_DATA_DIR replaces ~/.mcp-stealth as a whole, profiles included, while Chrome
+# keeps the real HOME: a temporary HOME shows macOS's "Keychain Not Found" dialog.
+ENV_DATA_DIR = "MCP_STEALTH_DATA_DIR"
+
+
+def data_root() -> Path:
+    """The folder this server keeps everything in, read at call time."""
+    override = os.environ.get(ENV_DATA_DIR)
+    return Path(override).expanduser() if override else HOME / ".mcp-stealth"
+
+
+DATA_ROOT = data_root()
+PROFILES_ROOT = DATA_ROOT / "profiles"
+PROFILE_DIR = DATA_ROOT / "profile"  # legacy default ("main" instance)
+SCREENSHOT_DIR = DATA_ROOT / "screenshots"
+EXPORT_DIR = DATA_ROOT / "exports"
+STORAGE_STATE_DIR = DATA_ROOT / "storage-states"
+IDENTITIES_DIR = DATA_ROOT / "identities"
+PRIVACY_PROFILE_ROOT = DATA_ROOT / "privacy-profiles"
 # Where a window was last placed, per instance. Kept in our own file rather than
 # relying on Chrome's Preferences, because wipe_window_state() deliberately
 # clears Chrome's copy to cure the corrupt-placement / invisible-window bug.
-WINDOW_STATE_DIR = HOME / ".mcp-stealth" / "window-state"
+WINDOW_STATE_DIR = DATA_ROOT / "window-state"
 
 DEFAULT_IDLE_TIMEOUT = int(os.environ.get("BROWSER_IDLE_TIMEOUT", "600"))  # 10 min
 IDLE_REAPER_INTERVAL = int(os.environ.get("BROWSER_IDLE_REAPER_INTERVAL", "60"))
@@ -281,7 +293,7 @@ def find_external_chrome_pids() -> list[int]:
         # bare pgrep 'chrome' matches our own subprocess and substring-only
         # false hits (e.g. chrome-devtools-mcp). Parse `ps` and drop any
         # process whose argv references an MCP-managed profile.
-        mcp_root = str(HOME / ".mcp-stealth")
+        mcp_root = str(data_root())
         r = subprocess.run(
             ["ps", "-ax", "-o", "pid=,command="],
             capture_output=True, text=True, timeout=3,
@@ -439,7 +451,7 @@ def per_process_profile() -> Path:
     """Per-PID profile path. Used when the shared default profile is held by
     another live MCP server process — lets parallel Claude sessions coexist
     instead of hanging on Chrome's SingletonLock."""
-    return HOME / ".mcp-stealth" / f"profile-pid{os.getpid()}"
+    return data_root() / f"profile-pid{os.getpid()}"
 
 
 # Profile this process has committed to. Deliberately a module global so it

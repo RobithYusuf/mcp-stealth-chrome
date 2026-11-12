@@ -75,6 +75,8 @@ from .refs import (
     resolve_ref,
 )
 from . import dock_icon
+from . import profile_gc
+from .state import data_root as state_data_root
 from .workflow import WorkflowError, run_workflow
 from .humanize import humanized_click, humanized_move, humanized_mouse_press, humanized_scroll, move_pointer
 from .state import (
@@ -1625,6 +1627,62 @@ async def _open_background_window(browser: Any, width: Optional[int] = None,
         if str(tab.target.target_id) == str(target_id):
             return tab
     raise RuntimeError("Chrome did not list the window it was asked to open")
+
+
+async def _open_background_tab(browser: Any) -> Any:
+    """A new page as a tab behind the active one, in a window Chrome picks, without activating Chrome.
+
+    Chrome has no way to name the window: it uses the browser window it considers current.
+    Callers read back where the tab landed (_window_of) instead of assuming.
+    """
+    from nodriver.cdp import target as cdp_target
+    target_id = await (getattr(browser, "connection", None) or browser).send(cdp_target.create_target(
+        "about:blank", background=True,
+    ))
+    await browser.update_targets()
+    for tab in browser.tabs:
+        if str(tab.target.target_id) == str(target_id):
+            return tab
+    raise RuntimeError("Chrome did not list the tab it was asked to open")
+
+
+async def _keep_painting_behind(tab: Any) -> Optional[str]:
+    """Let a tab behind another one in its window keep reading as visible. None, or why not.
+
+    A background tab is document.hidden and runs no requestAnimationFrame, which pages notice
+    and which stops lazy content. Focus emulation makes the page behave as the focused one
+    (visible, painting, document.hasFocus() true) without activating the tab or Chrome:
+    measured 0 ms frontmost, where Target.activateTarget and Page.bringToFront both made
+    Chrome the front app for about 2 s. It belongs to the tab's own CDP session.
+    """
+    from nodriver.cdp import emulation as cdp_emulation
+    try:
+        await _wait(tab.send(cdp_emulation.set_focus_emulation_enabled(True)), timeout=5,
+                    what="Emulation.setFocusEmulationEnabled")
+        return None
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+
+
+async def _window_of(browser: Any, tab: Any) -> Optional[int]:
+    """The id of the window a tab is in, or None when Chrome would not say."""
+    from nodriver.cdp import browser as cdp_browser
+    with contextlib.suppress(Exception):
+        window_id, _bounds = await _wait(
+            (getattr(browser, "connection", None) or browser).send(
+                cdp_browser.get_window_for_target(tab.target.target_id)),
+            timeout=3, what="Browser.getWindowForTarget")
+        return int(window_id)
+    return None
+
+
+async def _page_visibility(tab: Any) -> Optional[str]:
+    """What the page itself reads as document.visibilityState, or None when unreadable."""
+    with contextlib.suppress(Exception):
+        state = await _wait(evaluate_isolated(tab, "document.visibilityState"), timeout=3,
+                            what="visibility read")
+        return state if state in ("visible", "hidden") else None
+    return None
 
 
 def _frontmost_pid() -> Optional[int]:
@@ -4961,6 +5019,12 @@ async def server_status() -> str:
     building, stale, off or unavailable, with the reason. Reading it starts no build.
     Its `disk` gives `own_mb`, what removing the copy would free, and `shown_mb`, what
     du shows for it: the copy is a clone, so the first is near zero until Chrome updates.
+
+    `profile_gc` is the startup pass over leftover privacy-profiles/* and profile-pid<N>
+    folders: what it removed, what it kept because it holds data, what was in use, and
+    errors. A fallback with cookies, logins, storage, extensions or bookmarks is never
+    removed by it; `fallback_profiles_left` counts those for profile_report and
+    profile_cleanup.
     """
     if BrowserState.browser is not None:
         # A tab the page opened is unknown until asked, which reported one tab too few.
@@ -4984,6 +5048,7 @@ async def server_status() -> str:
         "compat_patches": _patches.status(),
         "os_cursor": await _os_cursor_status(),
         "dock_icon": await _dock_icon_status(),
+        "profile_gc": profile_gc.status(),
     }
     return ok(json.dumps(status, indent=2, default=str))
 
@@ -9021,6 +9086,9 @@ def main() -> None:
     # A thread, so neither the start nor any tool waits on it; a failure stays in there.
     with contextlib.suppress(Exception):
         dock_icon.start_in_background(_chrome_for_dock_icon)
+    # Leftover privacy and fallback profiles: one pass on its own thread, see profile_gc.
+    with contextlib.suppress(Exception):
+        profile_gc.start_in_background(state_data_root())
     if cli.http:
         # None of the stdio survival rules below apply: there is no parent to
         # outlive, and SIGTERM must be able to stop a long-running service.

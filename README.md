@@ -412,6 +412,15 @@ A browser started with `browser_launch` over stdio stays open until you close it
 
 Runtime data lives in `~/.mcp-stealth/`: `profile/`, `profiles/<id>/`, `screenshots/`, `exports/`, `storage-states/`, `app/` (the Chrome copy with the Dock icon, macOS).
 
+Two kinds of profile get left behind: `privacy-profiles/<name>`, when a server stops before it could delete one, and `profile-pid<N>`, which a server uses when another one holds `profile/`. A few seconds after it starts, the server checks both on a background thread and removes a folder only when all of these hold:
+
+- ✅ It is a real folder directly in its place, with exactly that name, not a link.
+- ✅ No Chrome holds its lock, no running program names it, and this server does not use it.
+- ✅ Nothing in it changed in the last 10 minutes.
+- ✅ For `profile-pid<N>`: the server with PID N has ended, and the profile holds none of these: cookies, saved passwords, history, autofill or cards, top sites, saved tabs, local storage, IndexedDB, extensions, bookmarks. A file it cannot read counts as holding something.
+
+It never touches `profile/`, `profiles/`, `app/` or anything else. `server_status` shows what the last run removed and what it kept, under `profile_gc`. A `profile-pid<N>` that holds something stays: `profile_report` lists what is in each one (counts and cookie domains, no values), and `profile_cleanup(action="remove_fallback", names=[...], confirm=True)` removes the ones you name. Removal is permanent.
+
 ## What tool results tell you
 
 Results describe what was observed. A tool that reports success when nothing happened would leave an agent building on a false result, so these rules hold across the server:
@@ -423,7 +432,7 @@ Results describe what was observed. A tool that reports success when nothing hap
 - ✅ `select_option` sets the value from JS because a native dropdown cannot be driven with page input. The result states `isTrusted=false`, and the value is read back.
 - ✅ `browser_snapshot` writes nothing to the page. Refs live on the server and reach into iframes, cross-origin ones included, and open shadow roots. A field shows its label as `label="..."`, taken from `<label for>`, a label around it or `aria-labelledby`, and `name_contains` finds it by that. The label's own row is left out when its field is listed, and the count of those rows is reported.
 - ✅ `navigate` reports the final URL, redirects, status and ready state, and waits for the load event up to 15 seconds. `expect_url` and `expect_status` turn a redirect into a failure. A page that did not load is an error, and `batch_actions` and `workflow_run` count it as failed. It no longer raises the window unless you pass `focus=True`.
-- ✅ A visible browser stays behind the app you are using. `browser_launch`, `spawn_browser`, `tab_new`, `tab_select` and page actions do not take the keyboard, measured with `lsappinfo` on macOS. `tab_new` opens its own background window, and `tab_select` only changes which tab tools act on unless you pass `focus=True`. A click that calls `window.open` still brings Chrome forward for about 130 ms before focus returns, so keys typed in that moment reach Chrome. `tab_focus` raises the window on request. Quitting it with Cmd+Q, or closing all its windows, ends it within a few seconds, and the next tool call says so.
+- ✅ A visible browser stays behind the app you are using. `browser_launch`, `spawn_browser`, `tab_new`, `tab_select` and page actions do not take the keyboard, measured with `lsappinfo` on macOS. `tab_new` opens its own background window, or with `new_window=False` a tab behind the one its window shows, which pages still read as visible (Chrome picks the window and the result names it). `tab_select` only changes which tab tools act on unless you pass `focus=True`, and says when the page it selected reads as hidden. A click that calls `window.open` still brings Chrome forward for about 130 ms before focus returns, so keys typed in that moment reach Chrome. `tab_focus` raises the window on request. Quitting it with Cmd+Q, or closing all its windows, ends it within a few seconds, and the next tool call says so.
 - Own Dock icon (macOS): withdrawn in 0.13.1. Running the copy registered it with Google's updater, which then updated the copy instead of your installed Chrome. `MCP_STEALTH_DOCK_ICON=1` is now ignored, `server_status` reports `dock_icon: withdrawn`, and a copy left in `~/.mcp-stealth/app` is removed once no browser runs from it. If your Chrome stayed on an old version, open Chrome > About Google Chrome after the copy is gone. The notes below describe how it worked:
   - The browser runs from a copy of your installed Chrome in `~/.mcp-stealth/app/`. Your installed Chrome is never changed, and the Dock tooltip still says Google Chrome.
   - The copy is an APFS clone. `du` shows about 1.5 GB for the folder, but it shares its blocks with the original: the free space measured before and after making it did not change beyond normal drift. After Chrome updates, the old copy holds that space by itself until it is rebuilt, which happens when the server next starts, at the next visible launch, or when the last browser running from it closes. `server_status` reports both numbers under `dock_icon.disk`: `own_mb` is what removing the copy would free, `shown_mb` is what `du` shows.
@@ -464,6 +473,8 @@ Open a group to see its tools.
 <summary><b>Navigation and tabs</b> (11)</summary>
 
 `navigate`, `navigate_and_snapshot`, `go_back`, `go_forward`, `reload`, `get_url`, `tab_list`, `tab_new`, `tab_select`, `tab_close`, `tab_focus`
+
+`tab_new(new_window=...)` picks where the tab opens. Left unset, a visible browser opens it in its own window behind the app you use, and headless opens a tab. `True` gives it its own window in both. `False` opens a tab in an existing window. In a visible browser that tab stays behind, so Chrome does not come to the front, and the page still reads as visible and focused. The result says which window it landed in and whether the page reads as visible.
 </details>
 
 <details>
@@ -711,6 +722,8 @@ Things to know:
 | `MCP_STEALTH_TOKEN` | Token for HTTP mode |
 | `MCP_STEALTH_DOCK_ICON` | Ignored since 0.13.1, when the Dock icon was withdrawn. See "Own Dock icon" under What tool results tell you for what it costs |
 | `MCP_STEALTH_APP_DIR` | Folder for the Chrome copy that carries the Dock icon. Default `~/.mcp-stealth/app`. It must be on the same APFS volume as Chrome |
+| `MCP_STEALTH_DATA_DIR` | Folder used instead of `~/.mcp-stealth` for profiles, screenshots, exports and the rest. Chrome keeps your real home folder. The HTTP token stays in `~/.mcp-stealth` |
+| `MCP_STEALTH_PROFILE_GC` | Set to `0` to turn off the cleanup of leftover profiles when the server starts |
 | `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL` | Vision model through any OpenAI-compatible API |
 | `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL` | Vision model through Anthropic |
 | `CAPSOLVER_KEY` | Enables `solve_captcha` |

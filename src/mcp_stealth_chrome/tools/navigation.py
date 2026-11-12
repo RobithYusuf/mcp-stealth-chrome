@@ -7,6 +7,7 @@ so a test that patches server.<name> still reaches this code.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import subprocess
 import sys
@@ -357,28 +358,81 @@ async def tab_list() -> str:
         return err(str(e))
 
 
+def _tab_new_mode(headless: bool, new_window: Optional[bool]) -> str:
+    """'window' (its own window), 'tab' (a tab, headless) or 'behind' (a tab behind, headed).
+
+    Headed defaults to its own window: a tab brought to the front activates Chrome, and a
+    tab left behind reads as hidden unless _keep_painting_behind succeeds.
+    """
+    if new_window is None:
+        new_window = not headless
+    if new_window:
+        return "window"
+    return "tab" if headless else "behind"
+
+
+async def _behind_note(browser, new_tab, before_tab, emulation_error: Optional[str]) -> str:
+    """Where a tab opened behind another one ended up, and what its page reads."""
+    new_window = await _srv._window_of(browser, new_tab)
+    old_window = await _srv._window_of(browser, before_tab) if before_tab is not None else None
+    if new_window is not None and old_window is not None and new_window != old_window:
+        place = "in another existing window, behind its current tab (Chrome picks the window)"
+    elif new_window is not None and old_window is not None:
+        place = "in the same window, behind the tab it shows"
+    else:
+        place = "behind the tab its window shows (Chrome would not say which window)"
+    state = await _srv._page_visibility(new_tab)
+    if state == "visible":
+        return (f"{place}; the page reads as visible and has focus as far as it can tell "
+                f"(focus emulation), while the window keeps showing the other tab")
+    why = f" (focus emulation failed: {emulation_error})" if emulation_error else ""
+    if state == "hidden":
+        return (f"{place}; the page reads as hidden until it is shown{why}: tab_select with "
+                f"focus=True or tab_focus shows it, and brings Chrome to the front")
+    return f"{place}; its visibility could not be read{why}, so it may be hidden"
+
+
 @mcp.tool()
 async def tab_new(
     url: str = "about:blank",
     expect_url: Optional[str] = None,
     expect_status: Optional[int] = None,
+    new_window: Optional[bool] = None,
 ) -> str:
-    """Open a new tab and make it active.
+    """Open a new tab and make it the active one for every later tool.
 
     Reports the same observed postconditions as navigate() — a new tab that
     redirects is otherwise reported as sitting on the URL you asked for.
     See navigate() for the expect_* rules.
+
+    new_window: where it opens. Left unset: headed, its own window behind the app the
+        person is using; headless, a tab. True: its own window in both. False: a tab in
+        an existing window. Headed, that tab stays behind the tab its window shows, so
+        Chrome never comes to the front, and focus emulation keeps the page reading as
+        visible (and focused). Chrome picks the window, usually the browser's first one
+        rather than the active tab's, so the result says where it landed and what the
+        page reads, and says so when the page reads as hidden.
     """
     try:
         if not BrowserState.browser:
             return err("browser not running")
-        # Apply the instance identity before the destination sees any script.
+        browser = BrowserState.browser
+        mode = _tab_new_mode(BrowserState.current_headless, new_window)
+        before_tab = None
+        if mode == "behind":
+            with contextlib.suppress(Exception):
+                before_tab = BrowserState.active_tab()
         # Headed, a foreground tab activates Chrome, and a background tab in the same window
         # is hidden from the page. Its own window behind the person's app is neither.
-        new_tab = (await BrowserState.browser.get("about:blank", new_tab=True)
-                   if BrowserState.current_headless
-                   else await _srv._open_background_window(BrowserState.browser))
+        if mode == "tab":
+            new_tab = await browser.get("about:blank", new_tab=True)
+        elif mode == "window":
+            new_tab = await _srv._open_background_window(browser)
+        else:
+            new_tab = await _srv._open_background_tab(browser)
+        # Apply the instance identity before the destination sees any script.
         await _srv._apply_fingerprint_to_tab(new_tab, BrowserState.current_fingerprint)
+        emulation_error = await _srv._keep_painting_behind(new_tab) if mode == "behind" else None
         doc_state, disarm = await _srv._arm_document_watch(new_tab)
         try:
             if url != "about:blank":
@@ -392,8 +446,15 @@ async def tab_new(
             disarm()
         await _srv._refresh_tabs()
         BrowserState.active_tab_index = BrowserState.tabs.index(new_tab)
+        if mode == "behind":
+            where = await _behind_note(browser, new_tab, before_tab, emulation_error)
+        elif mode == "window":
+            where = ("in its own window" if BrowserState.current_headless
+                     else "in its own window, behind the app in use")
+        else:
+            where = "as a tab"
         return _srv._nav_result(
-            f"opened tab [{BrowserState.active_tab_index}]", observed,
+            f"opened tab [{BrowserState.active_tab_index}] {where}", observed,
             expect_url=expect_url, expect_status=expect_status,
         )
     except Exception as e:
@@ -416,6 +477,13 @@ async def tab_select(index: int, focus: bool = False) -> str:
         if focus or BrowserState.current_headless:
             # Headless has no foreground to take, and an unselected tab there stops painting.
             await BrowserState.tabs[index].activate()
+            return ok(f"switched to tab {index}")
+        # Headed and left where it is: a tab behind another one in its window reads as hidden
+        # unless tab_new kept it painting, and an agent must not take its page for a shown one.
+        if await _srv._page_visibility(BrowserState.tabs[index]) == "hidden":
+            return ok(f"switched to tab {index}; its page reads as hidden, because another tab "
+                      f"is shown in its window: focus=True or tab_focus shows it, and brings "
+                      f"Chrome to the front")
         return ok(f"switched to tab {index}")
     except Exception as e:
         return err(str(e))

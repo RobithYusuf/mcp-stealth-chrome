@@ -1,5 +1,7 @@
 """A headed window must not take focus from the person. Fakes only: no window opens here."""
 import asyncio
+
+import pytest
 import inspect
 import subprocess
 from types import SimpleNamespace
@@ -386,3 +388,112 @@ def test_chrome_flags_keep_a_profile_path_with_spaces(tmp_path):
     assert server._chrome_flags_from_args(cmd) == (54321, str(root))
     assert server._chrome_flags_from_args("/x/Chrome --user-data-dir=/a/b") == (None, "/a/b")
     assert server._chrome_flags_from_args("/x/Chrome --remote-debugging-port=9222") == (9222, None)
+
+
+# --- tab_new: its own window, or a tab behind in an existing one ------------------------------
+
+@pytest.mark.parametrize("headless, new_window, mode", [
+    (False, None, "window"), (False, True, "window"), (False, False, "behind"),
+    (True, None, "tab"), (True, False, "tab"), (True, True, "window"),
+])
+def test_tab_new_mode(headless, new_window, mode):
+    from mcp_stealth_chrome.tools import navigation
+    assert navigation._tab_new_mode(headless, new_window) == mode
+
+
+def _behind(monkeypatch, windows, state, emulation_error=None):
+    from mcp_stealth_chrome.tools import navigation
+    old, new = SimpleNamespace(name="old"), SimpleNamespace(name="new")
+
+    async def window_of(_browser, tab):
+        return windows[tab.name]
+
+    async def visibility(_tab):
+        return state
+
+    monkeypatch.setattr(server, "_window_of", window_of)
+    monkeypatch.setattr(server, "_page_visibility", visibility)
+    return asyncio.run(navigation._behind_note(object(), new, old, emulation_error))
+
+
+def test_a_tab_behind_that_reads_visible_says_so(monkeypatch):
+    note = _behind(monkeypatch, {"old": 1, "new": 1}, "visible")
+    assert "in the same window" in note and "reads as visible" in note and "hidden" not in note
+
+
+def test_a_tab_behind_that_reads_hidden_says_so_and_why(monkeypatch):
+    """Focus emulation failing leaves the page hidden. Saying "opened" alone would read as shown."""
+    note = _behind(monkeypatch, {"old": 1, "new": 1}, "hidden", "RuntimeError: nope")
+    assert "reads as hidden" in note and "focus emulation failed" in note and "focus=True" in note
+    assert "reads as visible" not in note
+
+
+def test_a_tab_that_landed_in_another_window_says_so(monkeypatch):
+    note = _behind(monkeypatch, {"old": 1, "new": 2}, "visible")
+    assert "another existing window" in note and "same window" not in note
+
+
+def test_an_unreadable_visibility_is_not_reported_as_visible(monkeypatch):
+    note = _behind(monkeypatch, {"old": None, "new": None}, None)
+    assert "could not be read" in note and "reads as visible" not in note
+
+
+def test_tab_select_says_when_the_selected_page_reads_hidden(monkeypatch):
+    activated, select = _tab_select_fixture(monkeypatch, headless=False)
+
+    async def hidden(_tab):
+        return "hidden"
+
+    monkeypatch.setattr(server, "_page_visibility", hidden)
+    out = asyncio.run(select(index=1))
+    assert "switched to tab 1" in out and "reads as hidden" in out and activated == []
+
+
+def test_tab_select_with_focus_does_not_warn(monkeypatch):
+    activated, select = _tab_select_fixture(monkeypatch, headless=False)
+
+    async def hidden(_tab):
+        return "hidden"
+
+    monkeypatch.setattr(server, "_page_visibility", hidden)
+    assert "hidden" not in asyncio.run(select(index=1, focus=True)) and activated == [True]
+
+
+def test_tab_new_same_window_headed_uses_a_background_tab_with_emulation(monkeypatch):
+    calls = []
+
+    async def behind(_browser):
+        calls.append("behind")
+        raise RuntimeError("stop here")
+
+    async def window(_browser, *_a):
+        calls.append("window")
+        raise RuntimeError("stop here")
+
+    monkeypatch.setattr(server, "_open_background_tab", behind)
+    monkeypatch.setattr(server, "_open_background_window", window)
+    monkeypatch.setattr(server.BrowserState, "browser", SimpleNamespace(tabs=[]), raising=False)
+    fn = server.mcp._tool_manager._tools["tab_new"].fn
+    monkeypatch.setattr(server.BrowserState, "current_headless", False, raising=False)
+    asyncio.run(fn(url="about:blank", new_window=False))
+    monkeypatch.setattr(server.BrowserState, "current_headless", True, raising=False)
+    asyncio.run(fn(url="about:blank", new_window=True))
+    assert calls == ["behind", "window"]
+
+
+def test_background_tab_is_asked_for_without_a_new_window():
+    sent = []
+
+    class Conn:
+        async def send(self, command):
+            sent.append(_cdp_params(command))
+            return "new-target"
+
+    async def update():
+        return None
+
+    tab = SimpleNamespace(target=SimpleNamespace(target_id="new-target"))
+    browser = SimpleNamespace(connection=Conn(), update_targets=update, tabs=[tab])
+    assert asyncio.run(server._open_background_tab(browser)) is tab
+    assert sent[0]["method"] == "Target.createTarget"
+    assert sent[0]["params"]["background"] is True and not sent[0]["params"].get("newWindow")

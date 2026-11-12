@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 from typing import Literal
 
+from .. import profile_gc as _gc
 from .. import state as _state
 from .._app import mcp
 from ..helpers import err, ok
@@ -36,7 +37,7 @@ _CACHE_PER_PROFILE = (
 
 
 def _root() -> Path:
-    return _state.HOME / ".mcp-stealth"
+    return _state.data_root()
 
 
 def _tree_size(path: Path) -> int:
@@ -129,6 +130,13 @@ def _describe(name: str, profile: Path, kind: str) -> dict:
         owner = int(match.group(1))
         row["owner_pid"] = owner
         row["owner_alive"] = _state._pid_alive(owner)
+        # What would go with it, without a single secret value: counts and cookie domains.
+        found = _gc.contents(profile)
+        row["contents"] = {k: found[k] for k in (
+            "cookies", "cookie_domains", "logins", "history", "autofill", "top_sites", "sessions",
+            "local_storage", "indexeddb", "extensions", "bookmarks", "readable", "has_data")}
+        why, _ = _gc.fallback_refusal(profile, _root(), inspected=found)
+        row["automatic_cleanup"] = "removes it at the next server start" if why is None else f"keeps it: {why}"
     row["removable"] = _removal_refusal(name, profile, row) is None
     return row
 
@@ -196,7 +204,10 @@ async def profile_report() -> str:
 
     `kind` is main, named or fallback. A fallback (profile-pid<N>) was created when
     another server process held the shared profile, and is `removable` only once its
-    owner has exited and no browser has it open. Pass names from here to
+    owner has exited and no browser has it open. Each fallback also lists `contents`
+    (cookie count and top domains, logins, storage, extensions, bookmarks; no values)
+    and what the automatic cleanup at server start does with it: an empty one goes,
+    one holding any of that stays until you remove it here. Pass names from here to
     profile_cleanup. Walks every file, so a large tree takes a moment.
     """
     try:
@@ -251,7 +262,13 @@ def _remove_fallback(name: str, confirm: bool) -> dict:
         return {"name": name, "ok": False, "error": f"refused: {refusal}"}
     size = _tree_size(profile)
     if not confirm:
-        return {"name": name, "ok": True, "would_free": _human(size)}
+        found = _gc.contents(profile)
+        return {"name": name, "ok": True, "would_free": _human(size),
+                "would_lose": {k: found[k] for k in ("cookies", "cookie_domains", "logins",
+                                                    "history", "autofill", "top_sites",
+                                                    "sessions", "local_storage",
+                                                    "indexeddb", "extensions", "bookmarks",
+                                                    "readable")}}
     # Asked again immediately before deleting: the report may be minutes old.
     refusal = _removal_refusal(name, profile)
     if refusal:
