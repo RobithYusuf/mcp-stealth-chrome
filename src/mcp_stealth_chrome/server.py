@@ -266,6 +266,11 @@ async def _debug_port_closed(browser: Any, grace: float) -> bool:
 
 
 def _process_exists(pid: int) -> bool:
+    if sys.platform == "win32":
+        # os.kill(pid, 0) is no probe on Windows: 0 is CTRL_C_EVENT, sent to the process group
+        # through GenerateConsoleCtrlEvent. It read every Chrome as still running after close.
+        from .state import _pid_alive
+        return _pid_alive(pid)
     try:
         os.kill(pid, 0)
     except (ProcessLookupError, PermissionError, OSError):
@@ -481,9 +486,7 @@ async def _ensure_browser_dead(browser, profile_dir=None, grace: float = 1.5) ->
     # so this returns then instead of sitting out the whole grace on every close.
     await _all_gone(candidates, grace)
     for target in candidates:
-        try:
-            os.kill(target, 0)          # liveness probe only
-        except (ProcessLookupError, PermissionError, OSError):
+        if not _process_exists(target):
             continue                    # already gone, or not ours to signal
         try:
             os.kill(target, _signal.SIGTERM)
@@ -493,12 +496,11 @@ async def _ensure_browser_dead(browser, profile_dir=None, grace: float = 1.5) ->
     if report["killed"]:
         await _all_gone(report["killed"], 1.0)
         for target in list(report["killed"]):
-            try:
-                os.kill(target, 0)
-            except (ProcessLookupError, PermissionError, OSError):
+            if not _process_exists(target):
                 continue
             try:
-                os.kill(target, _signal.SIGKILL)
+                # Windows has no SIGKILL; os.kill with any other signal is TerminateProcess there.
+                os.kill(target, getattr(_signal, "SIGKILL", _signal.SIGTERM))
             except Exception:
                 report["still_alive"].append(target)
         # SIGKILL takes a moment, and the verdict below decides whether the handle is kept.
@@ -507,12 +509,8 @@ async def _ensure_browser_dead(browser, profile_dir=None, grace: float = 1.5) ->
                 break
             await asyncio.sleep(0.1)
     for target in candidates:
-        try:
-            os.kill(target, 0)
-            if target not in report["still_alive"]:
-                report["still_alive"].append(target)
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
+        if _process_exists(target) and target not in report["still_alive"]:
+            report["still_alive"].append(target)
     report["verified"] = not report["still_alive"]
     if report["verified"]:
         await _discard_temp_profile(browser)
@@ -3639,10 +3637,11 @@ async def _humanized_point(el, pos, centre_x: float, centre_y: float) -> tuple[f
     return centre_x, centre_y
 
 
-async def _settled_position(el):
+async def _settled_position(el, quiet: int = 2):
     """The element's position once it stops moving (smooth scroll, entry animation).
 
-    Bounded: something animating forever is clicked where it is now.
+    Bounded: something animating forever is clicked where it is now. `quiet` is how many
+    still 40 ms readings count as stopped.
     """
     pos = await el.get_position()
     still = 0
@@ -3654,7 +3653,7 @@ async def _settled_position(el):
         moved = abs(again.left - pos.left) >= 1 or abs(again.top - pos.top) >= 1
         pos = again
         still = 0 if moved else still + 1
-        if still >= 2:  # one quiet interval can be a smooth scroll's first frame
+        if still >= quiet:  # one quiet interval can be a smooth scroll's first frame
             break
     return pos
 
@@ -4615,12 +4614,25 @@ async def scroll_to(
             f"{{block:{json.dumps(block)}, behavior:{json.dumps(behavior)}}}); }}"
         )
         # A smooth scroll is still moving when this returns; the next tool
-        # would otherwise measure a position that is already out of date.
-        await _settled_position(el)
-        visible = await el.apply(
-            "function() { const r = this.getBoundingClientRect(); return r.bottom > 0 "
-            "&& r.right > 0 && r.top < innerHeight && r.left < innerWidth; }"
-        )
+        # would otherwise measure a position that is already out of date. On a busy machine a
+        # smooth scroll stalls between frames for longer than two readings, and macOS CI saw
+        # it reported done 58 px short; four still readings (160 ms) ride that out.
+        quiet = 4 if smooth else 2
+        await _settled_position(el, quiet)
+        in_view = ("function() { const r = this.getBoundingClientRect(); return r.bottom > 0 "
+                   "&& r.right > 0 && r.top < innerHeight && r.left < innerWidth; }")
+        visible = await el.apply(in_view)
+        if visible is not True and smooth:
+            # On a busy machine a smooth scroll can sit still for longer than the two quiet
+            # frames _settled_position waits for before its first step, which reads as settled
+            # where the element was. macOS CI refused that way in 2 of 2 runs. Wait for it to
+            # arrive, bounded, and let it settle there.
+            deadline = time.monotonic() + 2.0
+            while visible is not True and time.monotonic() < deadline:
+                await asyncio.sleep(0.05)
+                visible = await el.apply(in_view)
+            if visible is True:
+                await _settled_position(el, quiet)
         if visible is not True:
             return err(f"{ref or selector} is still outside the viewport after scrolling")
         return ok(f"scrolled {ref or selector} into view (block={block})")

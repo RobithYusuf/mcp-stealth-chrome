@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
-import fcntl
 import functools
 import hashlib
 import os
@@ -34,6 +33,11 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
+
+try:
+    import fcntl
+except ImportError:  # Windows. Importing it unguarded stopped the server from starting there.
+    fcntl = None
 
 ENV_SWITCH = "MCP_STEALTH_DOCK_ICON"
 ENV_APP_DIR = "MCP_STEALTH_APP_DIR"
@@ -443,6 +447,10 @@ def discard_copy(root: Optional[Path] = None) -> str:
         # Every folder this module built in has its lock file. Without it the folder is
         # someone else's, whatever it happens to contain.
         return f"refused: {root} was not made by this server"
+    if fcntl is None:
+        # The 0.13.0 copy was only ever built on macOS, and without a lock this cannot tell
+        # whether another server is building there.
+        return "left alone: no file lock on this platform"
     with open(lock, "r") as handle:
         try:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)

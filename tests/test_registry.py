@@ -156,7 +156,7 @@ def test_no_tool_is_registered_twice(caplog):
     root = pathlib.Path(__file__).parent.parent / "src" / "mcp_stealth_chrome"
     seen: dict[str, str] = {}
     for path in root.rglob("*.py"):
-        for node in ast.walk(ast.parse(path.read_text())):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
             if isinstance(node, ast.AsyncFunctionDef) and any(
                 isinstance(d, ast.Call) and ast.unparse(d.func) == "mcp.tool"
                 for d in node.decorator_list
@@ -172,7 +172,7 @@ def test_readme_lists_every_tool():
 
     from mcp_stealth_chrome.server import mcp
 
-    readme = (pathlib.Path(__file__).parent.parent / "README.md").read_text()
+    readme = (pathlib.Path(__file__).parent.parent / "README.md").read_text(encoding="utf-8")
     table = readme[readme.index("## Tools"):readme.index("## Main features")]
     listed = set(re.findall(r"`([a-z_]+)`", table))
     registered = set(mcp._tool_manager._tools)

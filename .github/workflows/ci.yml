@@ -1,0 +1,142 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUNBUFFERED: "1"
+  # The runner has no person behind it, but no server a test starts should act on
+  # the runner's home folder either.
+  MCP_STEALTH_PROFILE_GC: "0"
+
+jobs:
+  fast:
+    name: fast (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+      - run: uv sync --locked
+      - run: uv run pytest tests/ -q
+
+  install:
+    # A lock-free install of the built wheel, as uvx and PyPI users get it. uv.lock hides a
+    # dependency that breaks at import; this resolves the newest versions the caps allow.
+    name: install (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - run: uv build
+      - name: Install the wheel into a fresh venv without uv.lock
+        shell: bash
+        run: |
+          venv="$RUNNER_TEMP/wheel-venv"
+          uv venv --python 3.13 "$venv"
+          VIRTUAL_ENV="$venv" uv pip install --no-cache dist/*.whl
+          if [ "$RUNNER_OS" = "Windows" ]; then py="$venv/Scripts/python.exe"; else py="$venv/bin/python"; fi
+          echo "VENV_PY=$py" >> "$GITHUB_ENV"
+      - name: Start the installed server and call server_status
+        shell: bash
+        # Run from outside the checkout so nothing imports the source tree.
+        working-directory: ${{ runner.temp }}
+        run: |
+          wheel=$(ls "$GITHUB_WORKSPACE"/dist/*.whl)
+          "$VENV_PY" -I "$GITHUB_WORKSPACE/.github/scripts/installed_smoke.py" "$wheel"
+
+  e2e:
+    # Real Chrome, headless, local fixtures only. Suites that open visible windows
+    # (MCP_HEADED) or need Chrome Beta on macOS skip themselves here.
+    name: e2e (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    env:
+      MCP_E2E: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      # Linux: Chrome for Testing from setup-chrome. nodriver takes the shortest matching path
+      # on PATH, and the runner's /bin/chromium beat /usr/bin/google-chrome, so the stable build
+      # is linked as /bin/chrome (shorter still). Ubuntu 24.04 blocks the unprivileged user
+      # namespaces Chrome's sandbox needs for a binary outside /opt/google/chrome; allowing them
+      # keeps the sandbox on rather than adding --no-sandbox.
+      # Windows and macOS: the runner's own Google Chrome, installed where a person's is
+      # (Program Files, /Applications). nodriver only looks there, and on Windows a system-level
+      # install is what turns on App-Bound cookie encryption, which the cookie tests are about.
+      - uses: browser-actions/setup-chrome@48ad923757ca74d66703209fe939badbdf80f2f4 # v2.2.0
+        if: runner.os == 'Linux'
+        id: chrome
+        with:
+          chrome-version: stable
+          install-dependencies: true
+      - name: Make the stable Chrome the one the server launches
+        if: runner.os == 'Linux'
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+        run: |
+          sudo ln -sf "$CHROME_PATH" /usr/bin/chrome
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - run: uv sync --locked
+      - name: Show the Chrome the server will launch
+        shell: bash
+        run: |
+          uv run python - <<'PY'
+          from mcp_stealth_chrome.server import _default_chrome
+          from mcp_stealth_chrome import profile_version
+          path = _default_chrome()
+          print("server picks:", path)
+          print("version:", profile_version.binary_version(path))
+          PY
+      - name: Real-Chrome suites
+        run: >-
+          uv run pytest -v -rs --durations=20
+          tests/test_cookie_close_e2e.py
+          tests/test_lean_launch_e2e.py
+          tests/test_keys_identity.py
+          tests/test_old_tools_e2e.py
+          tests/test_protocol_e2e.py
+          tests/test_reliability_e2e.py
+          tests/test_refs_frames_e2e.py
+          tests/test_slow_start_e2e.py
+          tests/test_profile_gc_e2e.py
+          tests/test_sessions_http.py

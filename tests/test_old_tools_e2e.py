@@ -10,6 +10,7 @@ import json
 import os
 import pathlib
 import stat
+import sys
 import threading
 
 import pytest
@@ -340,7 +341,8 @@ def test_export_har_is_a_har_and_private(loop, page):
     try:
         assert not out.startswith("Error"), out
         _no_secrets(out)
-        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        if sys.platform != "win32":  # Windows keeps no POSIX mode bits
+            assert stat.S_IMODE(path.stat().st_mode) == 0o600
         entries = json.loads(path.read_text())["log"]["entries"]
         entry = next(e for e in entries if "api/login" in e["request"]["url"])
         assert entry["request"]["method"] == "POST" and entry["response"]["status"] == 200

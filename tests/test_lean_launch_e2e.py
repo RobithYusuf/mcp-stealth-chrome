@@ -6,6 +6,7 @@ Each default app runs in its own renderer. On a temporary profile that was 12 pr
 """
 import asyncio
 import os
+import sys
 
 import pytest
 
@@ -39,6 +40,7 @@ def test_ephemeral_launch_runs_no_default_apps():
     assert not running & set(DEFAULT_APPS), [DEFAULT_APPS[x] for x in running & set(DEFAULT_APPS)]
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="reads Chrome's command line with ps, which Windows lacks")
 def test_testing_mode_keeps_nodrivers_disabled_features():
     """Chrome honours only the last --disable-features. testing_mode's own flag used to replace
     nodriver's, which turned site isolation back on in that mode only."""
@@ -64,6 +66,9 @@ def test_testing_mode_keeps_nodrivers_disabled_features():
     assert {"IsolateOrigins", "site-per-process", "Translate", "BackForwardCache"} <= features, last
 
 
+@pytest.mark.skipif(sys.platform.startswith("linux"), reason=(
+    "Linux CI has no speech-dispatcher, so Chrome lists no voices at all and the audit rightly "
+    "says it could not compare; the Google voices this checks are a macOS and Windows list."))
 @pytest.mark.parametrize("mode, voices_pass", [("default", True), ("light", False)])
 def test_fingerprint_audit_sees_missing_google_voices(mode, voices_pass):
     """Light mode turns off Chrome's component extensions, which takes the "Google" speech voices

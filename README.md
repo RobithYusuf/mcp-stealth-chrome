@@ -9,6 +9,7 @@ An MCP server with 173 tools that gives an AI agent a real Chrome browser and an
 [![PyPI version](https://img.shields.io/pypi/v/mcp-stealth-chrome.svg)](https://pypi.org/project/mcp-stealth-chrome/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org)
+[![CI](https://github.com/RobithYusuf/mcp-stealth-chrome/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/RobithYusuf/mcp-stealth-chrome/actions/workflows/ci.yml)
 
 </div>
 
@@ -393,6 +394,7 @@ Average: 113 s
 - Headless is easier to detect, so keep `headless=false` on difficult sites.
 - A Chrome profile can only be open once at a time. A second browser on the same profile moves to a separate one and says so.
 - Closed shadow roots cannot be read.
+- On Windows, tests saw Google Chrome read back none of a profile's cookies after a relaunch, so a login may not survive a restart there. Linux and macOS keep them. This is being looked into.
 
 ## Profiles and privacy
 
@@ -757,6 +759,8 @@ uv run mcp-stealth-chrome                # stdio server
 uv run pytest tests/ -q                  # fast tests
 MCP_E2E=1 uv run pytest tests/ -q        # adds the real Chrome tests
 ```
+
+CI runs the fast tests on macOS, Ubuntu and Windows with Python 3.11 and 3.13, installs the built wheel without `uv.lock` and calls `server_status` through a real MCP client, and runs the real Chrome tests headless on all three. Tests that need a visible window or Chrome Beta run only on a developer's Mac.
 
 [AGENTS.md](AGENTS.md) records the rules and platform facts behind the code.
 

@@ -12,6 +12,10 @@ import pytest
 from mcp_stealth_chrome import profile_gc as gc
 from mcp_stealth_chrome import state
 
+pytestmark = pytest.mark.skipif(sys.platform == "win32", reason=(
+    "Windows: profile_gc._processes returns None (no ps), and an unreadable process list removes "
+    "nothing, so the pass never removes a folder there. These tests describe the POSIX pass."))
+
 DEAD = 99_999_998  # above any PID macOS or Linux hands out
 
 

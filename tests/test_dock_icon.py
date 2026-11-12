@@ -2,7 +2,6 @@
 Fakes only, apart from tests marked for macOS that set a real icon on a bundle in a temp folder:
 nothing here touches /Applications."""
 import asyncio
-import fcntl
 import json
 import os
 import plistlib
@@ -16,7 +15,12 @@ from types import SimpleNamespace
 import pytest
 
 from mcp_stealth_chrome import dock_icon, server
+
 from test_focus_restore import _fake_launch, _launch
+
+pytestmark = pytest.mark.skipif(sys.platform == "win32", reason=(
+    "The Dock icon is macOS only, and the fake bundles here use names Windows cannot create "
+    "(the custom-icon file is `Icon\\r`). The module importing on Windows is test_smoke's job."))
 
 
 def _make_app(folder: Path, name: str, binary: str, version: str) -> Path:
@@ -534,10 +538,18 @@ def test_an_old_copy_in_use_is_left_and_said_so(mac, monkeypatch):
 
 
 def test_the_copy_is_not_removed_while_another_server_builds(mac):
+    fcntl = pytest.importorskip("fcntl", reason="flock is POSIX")
     copy = _old_copy(mac)
     with open(mac.root / ".lock", "a+") as other:
         fcntl.flock(other, fcntl.LOCK_EX)
         assert dock_icon.discard_copy() == "left alone: a server is building there"
+    assert copy.is_dir() and (mac.root / dock_icon.MARKER_NAME).is_file()
+
+
+def test_without_a_file_lock_the_copy_is_left_alone(mac, monkeypatch):
+    copy = _old_copy(mac)
+    monkeypatch.setattr(dock_icon, "fcntl", None)
+    assert dock_icon.discard_copy() == "left alone: no file lock on this platform"
     assert copy.is_dir() and (mac.root / dock_icon.MARKER_NAME).is_file()
 
 

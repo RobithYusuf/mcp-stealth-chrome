@@ -529,6 +529,21 @@ Platform truths, not preferences. Each one cost a release.
   partition. `cookie_delete` reads what exists, deletes those, and reads back.
 - libcurl's cookie engine drops a cookie for a host with no dot, so `localhost` reported `cookies_sent` that never left.
   Such hosts get a `Cookie` header. libcurl also speaks `file://`, which `http_request` refuses.
+- `os.kill(pid, 0)` is no liveness probe on Windows: 0 is `CTRL_C_EVENT`, sent through `GenerateConsoleCtrlEvent`, and
+  `signal.SIGKILL` does not exist. Every close there reported Chrome still running until `_process_exists` asked
+  `OpenProcess`/`GetExitCodeProcess` (`state._win_pid_alive`). Probe through `_process_exists`, never `os.kill(pid, 0)`.
+- A module-level import of a POSIX-only module (`fcntl`) stopped the server from starting on Windows from 0.12.12 to
+  0.15.0, and nothing noticed because no test ran there. CI's Windows jobs are the guard; `test_smoke` imports the
+  server with `fcntl` hidden.
+- Windows keeps no POSIX mode bits: files read back as `0o666` whatever was asked. Tests of `0600` skip there, and
+  `http_transport.load_or_create_token` refuses its own token file from the second `--http` start (open).
+- Windows CI (Google Chrome 156, system install): a profile outside the default user-data folder gets none of its
+  cookies back on the next launch. They are written (`v10`, DPAPI key intact in `Local State`) and not deleted, and
+  nodriver alone does the same, so it is Chrome's behaviour there; App-Bound reports `SupportLevel` 4 (not the default
+  folder). Open. On Linux and macOS the same round trip passes (`test_cookie_close_e2e.py`).
+- On Windows CI the first screenshot a server process takes (`screenshot`, or `click_turnstile`'s template match) does
+  not answer within 60 s (150 s in a probe); every later one takes 1.2 s. Not the `cv2` import. Open; an `xfail` in
+  `test_protocol_e2e.py` records it.
 - `tab.evaluate` does not await Promises unless `await_promise=True`. Without it every async
   expression returns `null`, silently.
 - nodriver's `Connection.backup()`-style CDP calls are not the problem, but SQLite's
@@ -577,6 +592,9 @@ uv tool install --force .               # install this tree as the PROD MCP
 uv run mcp-stealth-chrome --http        # one server for many clients (token required)
 ```
 
+- `.github/workflows/ci.yml` runs the fast suite on macOS, Ubuntu and Windows (Python 3.11 and 3.13), a lock-free
+  install of the built wheel that checks the `mcp<2` and `nodriver<0.51` caps and calls `server_status`, and the
+  headless real-Chrome suites on all three. A test that cannot hold on one OS skips there with a reason naming the code.
 - `tests/test_protocol.py` and `tests/test_protocol_e2e.py` drive the server over stdio with `session.call_tool`, so
   FastMCP's argument parsing and the client's output validation run. `MCP_TEST_SERVER_PYTHON` and `MCP_TEST_SRC` run
   them against another interpreter or source tree, which is how to cover both nodriver and mcp versions.

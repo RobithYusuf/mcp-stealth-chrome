@@ -17,6 +17,7 @@ import asyncio
 import json
 import os
 import pathlib
+import sys
 
 import pytest
 
@@ -165,8 +166,13 @@ def test_screenshot_base64_shrinks_to_fit_then_refuses_honestly(loop):
 
     prev = srv.B64_INLINE_LIMIT
     try:
+        # Measure the full copy first: fonts differ per OS, and on Windows this page encodes
+        # to about 15 KB, under a fixed 20,000-byte budget, so nothing needed shrinking.
+        srv.B64_INLINE_LIMIT = 10_000_000
+        full = loop.run_until_complete(tool("screenshot")(
+            filename="t_b64_full.png", return_base64=True)).split("---base64---")[1].strip()
         # Room for a small image: the inline copy must be shrunk and delivered.
-        srv.B64_INLINE_LIMIT = 20000
+        srv.B64_INLINE_LIMIT = max(len(full) // 2, 2000)
         out = loop.run_until_complete(tool("screenshot")(
             filename="t_b64_fit.png", return_base64=True))
         assert "---base64---" in out, "a shrunken copy should still be inlined"
@@ -293,6 +299,8 @@ def test_instance_descriptions_survive_switch_roundtrip(loop):
         loop.run_until_complete(tool("switch_instance")("main"))
 
 
+@pytest.mark.skipif(sys.platform.startswith("linux") and not os.environ.get("DISPLAY"),
+                    reason="opens a headed Chrome, and this Linux has no display")
 def test_human_handoff_focuses_headed_and_times_out_honestly(loop):
     iid = f"human_{os.getpid()}"
     try:

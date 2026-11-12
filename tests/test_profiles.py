@@ -10,6 +10,12 @@ import pytest
 from mcp_stealth_chrome import state
 from mcp_stealth_chrome.server import mcp
 
+# tools/profiles.py `_in_use` sets `unprovable` on Windows: no lock or process check can show a
+# folder is free there, so every profile reads as in use and nothing is removed or cleared.
+WINDOWS_IN_USE = pytest.mark.skipif(sys.platform == "win32", reason=(
+    "Windows: profile tools treat every profile as in use by design (tools/profiles.py, "
+    "`unprovable`), and find_chrome_pids_by_profile reads ps, which Windows lacks."))
+
 
 def tool(name):
     return mcp._tool_manager._tools[name].fn
@@ -53,6 +59,7 @@ def cleanup(action, names, **kwargs):
     return asyncio.run(tool("profile_cleanup")(action, names, **kwargs))
 
 
+@WINDOWS_IN_USE
 def test_report_classifies_and_measures(home):
     pid = dead_pid()
     make_profile(home / f"profile-pid{pid}")
@@ -71,6 +78,7 @@ def test_report_changes_nothing(home):
     assert sorted(str(p) for p in home.rglob("*")) == before
 
 
+@WINDOWS_IN_USE
 def test_remove_is_a_preview_without_confirm(home):
     name = f"profile-pid{dead_pid()}"
     make_profile(home / name)
@@ -79,6 +87,7 @@ def test_remove_is_a_preview_without_confirm(home):
     assert (home / name).is_dir()
 
 
+@WINDOWS_IN_USE
 def test_remove_deletes_only_with_confirm(home):
     name = f"profile-pid{dead_pid()}"
     make_profile(home / name)
@@ -98,6 +107,7 @@ def test_main_named_and_escaping_names_are_refused(home, name):
     assert home.exists()
 
 
+@WINDOWS_IN_USE
 def test_live_owner_refuses_removal(home):
     name = f"profile-pid{os.getppid()}"
     make_profile(home / name)
@@ -105,6 +115,7 @@ def test_live_owner_refuses_removal(home):
     assert (home / name).is_dir()
 
 
+@WINDOWS_IN_USE
 def test_own_fallback_profile_refuses_removal(home):
     name = f"profile-pid{os.getpid()}"
     make_profile(home / name)
@@ -134,6 +145,7 @@ def test_profile_in_use_is_left_alone(home, monkeypatch, blocker):
     assert (home / "profile" / "Default" / "Cache" / "blob").exists()
 
 
+@WINDOWS_IN_USE
 def test_clear_cache_keeps_every_login_artifact(home):
     preview = json.loads(cleanup("clear_cache", ["profile"]))
     assert preview["dry_run"] is True and (home / "profile" / "Default" / "Cache").exists()
@@ -150,6 +162,7 @@ def test_clear_cache_keeps_every_login_artifact(home):
     assert (default / "Local Storage" / "x").read_bytes() == b"LS"
 
 
+@WINDOWS_IN_USE
 def test_clear_cache_can_target_one_profile(home):
     cleanup("clear_cache", ["profiles/work"], confirm=True)
     assert (home / "profile" / "Default" / "Cache" / "blob").exists()
@@ -181,6 +194,7 @@ def test_planted_symlink_cannot_aim_cache_cleanup_outside(home, tmp_path):
     assert (outside / "keep").read_text() == "x"
 
 
+@WINDOWS_IN_USE
 def test_process_match_does_not_cover_sibling_profiles(tmp_path, monkeypatch):
     """A substring match made closing one browser signal every other one."""
     root = tmp_path / ".mcp-stealth"

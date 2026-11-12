@@ -10,6 +10,7 @@ Browser-required smoke (manual):
 - browser_close
 """
 import json
+import subprocess
 import sys
 
 
@@ -98,10 +99,17 @@ def test_snapshot_js_intact():
     print(f"  9 JS templates intact")
 
 
+def test_the_server_imports_where_fcntl_does_not_exist():
+    """An unguarded `import fcntl` stopped the server from starting on Windows from 0.12.12."""
+    code = "import sys; sys.modules['fcntl'] = None; import mcp_stealth_chrome.server"
+    done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0, done.stderr[-2000:]
+
+
 if __name__ == "__main__":
     for fn in (test_cookie_parser, test_helpers_module_state,
                 test_workflow_dispatch_table, test_vision_provider_resolve,
-                test_snapshot_js_intact):
+                test_snapshot_js_intact, test_the_server_imports_where_fcntl_does_not_exist):
         print(f"\n{fn.__name__}:")
         try:
             fn()

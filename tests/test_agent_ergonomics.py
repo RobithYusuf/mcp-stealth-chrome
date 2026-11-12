@@ -1,10 +1,21 @@
 """Fast unit coverage for the agent-facing snapshot and identity helpers."""
 
 import json
+import sys
 
 import pytest
 
 from mcp_stealth_chrome.snapshot import element_fingerprint, format_snapshot
+
+# Issue-style reasons for what does not hold on Windows yet. Each names the code to change.
+POSIX_PROCESS_CHECKS = pytest.mark.skipif(sys.platform == "win32", reason=(
+    "These fake the POSIX probe, os.kill(pid, 0), and SIGKILL. On Windows _process_exists asks "
+    "OpenProcess/GetExitCodeProcess instead (state._win_pid_alive) and there is no SIGKILL; "
+    "the e2e close tests cover it there."))
+POSIX_MODE_BITS = pytest.mark.skipif(sys.platform == "win32", reason=(
+    "Windows keeps no POSIX mode bits: chmod only sets read-only and stat reports 0o666, so "
+    "0600 cannot be written or checked; the user profile's ACLs are what protect the file."))
+
 
 
 def test_managed_output_paths_and_instance_names_cannot_escape_roots(tmp_path):
@@ -629,6 +640,7 @@ def test_named_ephemeral_launch_does_not_claim_or_create_persistent_profile(monk
     ) is None
 
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))  # what expanduser reads on Windows
     override = server._instance_profile_path(
         "worker", persistent=False, privacy=False,
         profile_dir_override="~/chosen-profile",
@@ -1039,6 +1051,7 @@ def test_compat_patch_status_is_visible():
     assert "client_security_state" in st["applied"]
 
 
+@POSIX_PROCESS_CHECKS
 def test_close_kills_the_process_when_cdp_cannot(monkeypatch):
     """A dead CDP socket must not turn into an orphaned Chrome.
 
@@ -1314,6 +1327,7 @@ def test_multi_profile_dir_opens_the_last_used_profile(tmp_path):
     assert args(tmp_path / "Default", []) == []  # no sub-profile: leave Chrome to it
 
 
+@POSIX_PROCESS_CHECKS
 def test_closing_a_browser_with_a_known_pid_never_scans_for_others(monkeypatch):
     """persistent=False recorded the shared profile, so its close signalled the real one."""
     import asyncio
@@ -1353,6 +1367,7 @@ def test_ephemeral_launch_claims_no_profile():
     assert "resolved_profile or PROFILE_DIR" not in inspect.getsource(server.browser_launch)
 
 
+@POSIX_MODE_BITS
 def test_identity_pin_temp_file_is_private_from_the_first_byte(tmp_path, monkeypatch):
     import asyncio
     import os as _os
@@ -2624,6 +2639,7 @@ def test_a_large_result_with_many_headers_still_fits():
     assert _json.loads(text)["meta"]["truncated"] is True
 
 
+@POSIX_PROCESS_CHECKS
 def test_a_process_that_takes_a_moment_to_die_after_sigkill_counts_as_dead(monkeypatch):
     """Checked at once, it read as still alive, and that now keeps the handle and fails the close."""
     import asyncio
@@ -2663,7 +2679,7 @@ def test_a_small_result_is_untouched():
     "y" * 40000,
     '"\\\n' * 20000,          # escapes to several times its length
     "é" * 40000,              # \uXXXX under ensure_ascii
-])
+], ids=["rows", "plain", "escapes", "non-ascii"])  # a 40,000-char id overflows Windows' env limit
 def test_a_large_result_stays_valid_json_and_says_it_was_cut(body):
     """A 30KB response came back as 25,000 chars of invalid JSON with no marker."""
     out = _bounded(body)
@@ -3167,6 +3183,7 @@ async def _no_sleep(_seconds=0):
     return None
 
 
+@POSIX_PROCESS_CHECKS
 def test_slow_chrome_is_ended_and_really_started_again(tmp_path, monkeypatch):
     """A retry keeping nodriver's port spawns nothing, so it counts spawns, not calls."""
     import asyncio
@@ -3680,6 +3697,7 @@ def _end(pids):
             os.kill(pid, signal.SIGKILL)
 
 
+@POSIX_PROCESS_CHECKS
 def test_the_browsers_family_leaves_out_what_is_not_the_browser(tmp_path):
     from mcp_stealth_chrome import server
 
@@ -3694,6 +3712,7 @@ def test_the_browsers_family_leaves_out_what_is_not_the_browser(tmp_path):
         parent.wait()
 
 
+@POSIX_PROCESS_CHECKS
 def test_closing_does_not_signal_a_program_the_browser_merely_started(tmp_path):
     """Chrome wakes GoogleUpdater, which is still running when Chrome has gone. It was counted
     as the browser: 4 closes in 5 said "CDP stop did not end the process" and sent it SIGTERM."""
@@ -3729,6 +3748,7 @@ def test_closing_does_not_signal_a_program_the_browser_merely_started(tmp_path):
         _end([parent.pid, *everyone])
 
 
+@POSIX_PROCESS_CHECKS
 def test_a_browser_that_ignores_stop_is_still_signalled_and_verified(tmp_path):
     import asyncio
     import types

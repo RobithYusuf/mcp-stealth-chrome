@@ -14,7 +14,11 @@ import pytest
 
 from _protocol import SAFE_ARGS, Client
 
-pytestmark = pytest.mark.skipif(not os.environ.get("MCP_E2E"), reason="needs a real Chrome")
+pytestmark = [
+    pytest.mark.skipif(not os.environ.get("MCP_E2E"), reason="needs a real Chrome"),
+    pytest.mark.skipif(sys.platform == "win32", reason=(
+        "Windows: profile_gc._processes returns None (no ps), so the pass removes nothing there.")),
+]
 
 DEAD = 99_999_997
 

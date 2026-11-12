@@ -7,10 +7,15 @@ import os
 import pathlib
 import stat
 import subprocess
+import sys
 
 import pytest
 
-pytestmark = pytest.mark.skipif(not os.environ.get("MCP_E2E"), reason="MCP_E2E not set")
+pytestmark = [
+    pytest.mark.skipif(not os.environ.get("MCP_E2E"), reason="MCP_E2E not set"),
+    pytest.mark.skipif(sys.platform == "win32", reason=(
+        "the stand-in Chromes are shell scripts, which Windows cannot run as an executable")),
+]
 
 
 def _late_chrome(tmp_path, real, late_spawns):

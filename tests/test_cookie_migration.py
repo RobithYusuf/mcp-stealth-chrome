@@ -6,6 +6,7 @@ import os
 import plistlib
 import sqlite3
 import stat
+import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -114,6 +115,9 @@ def test_v10_written_again_by_the_same_chrome_does_not_loop(tmp_path, chromes):
     assert cm.plan(profile, ARGS, chromes.c158).kind == "migrate"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason=(
+    "Windows keeps no POSIX mode bits (stat reports 0o666), so 0600 cannot be checked there; "
+    "the migration itself only runs on macOS."))
 def test_files_are_private(tmp_path):
     cm.write_marker(tmp_path, {"state": "pending"})
     assert stat.S_IMODE((tmp_path / cm.MARKER).stat().st_mode) == 0o600
@@ -124,7 +128,7 @@ def test_databases_are_copied_and_put_back_exactly(tmp_path):
     (profile / "Default" / "Cookies-journal").write_bytes(b"journal")
     databases = cm.cookie_databases(profile, "Default")
     copied = cm.backup_databases(databases, profile, tmp_path / "copy")
-    assert sorted(copied) == ["Default/Cookies", "Default/Cookies-journal"]
+    assert sorted(Path(c).as_posix() for c in copied) == ["Default/Cookies", "Default/Cookies-journal"]
     original = (profile / "Default" / "Cookies").read_bytes()
     (profile / "Default" / "Cookies").write_bytes(b"emptied by Chrome")
     (profile / "Default" / "Cookies-wal").write_bytes(b"written since")
