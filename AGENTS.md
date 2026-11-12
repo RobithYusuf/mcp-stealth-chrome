@@ -27,7 +27,9 @@ uvx mcp-stealth-chrome → Python 3.11+ → FastMCP → nodriver → Chrome/Chro
 - `src/mcp_stealth_chrome/helpers.py` — `ok`/`err`, tab selection, path confinement, JSON parsing.
 - `src/mcp_stealth_chrome/patches.py` — runtime monkey-patches for nodriver/CDP drift.
 - `src/mcp_stealth_chrome/identity.py` — key events, client hints and languages. `humanize.py` — pointer and typing input.
-- `src/mcp_stealth_chrome/dock_icon.py` — the Chrome copy a headed launch runs from, for its own Dock icon. `assets/dock_icon.png` is that icon.
+- `src/mcp_stealth_chrome/dock_icon.py` — Chrome Beta with the project icon for headed launches, and removal of the 0.13.0 Chrome copy. `assets/dock_icon.png` is that icon.
+- `src/mcp_stealth_chrome/profile_version.py` — which Chrome may open a profile: the version guard and `beta_verdict`.
+- `src/mcp_stealth_chrome/cookie_migration.py` — moving a profile's `v10` cookies to Chrome 158's `v11` before it loses them.
 - `src/mcp_stealth_chrome/_app.py` — `StealthMCP`, the FastMCP boundary. `captcha.py`, `image_output.py`, `result_types.py` — their named helpers.
 - `src/mcp_stealth_chrome/tools/` — `research.py`, `devtools.py`, `vision.py`, `network_http.py`, `profiles.py`,
   `storage.py` (cookies, web storage, IndexedDB, cache), `capture.py` (request interception, HAR, dry_run),
@@ -240,10 +242,15 @@ conclusions. Each rule below replaced a real lie.
   the recorded PID and ending it alone orphans Chrome. Only descendants whose command line names the profile count:
   Chrome also wakes `GoogleUpdater`, the machine-wide updater, which outlives the browser by a few seconds. Counted
   as family it made 4 closes in 5 say "CDP stop did not end the process" and was sent SIGTERM mid-update. The wait
-  for the processes to end is a poll (`_all_gone`), not a sleep: Chrome is gone about 0.1 s after `stop()`, and
-  the fixed 1.5 s made every close take 1.6 s. `verified` still means every one of them was seen gone.
+  for the processes to end is a poll (`_all_gone`), not a sleep: the fixed 1.5 s made every close take 1.6 s. `verified` still means every one of them was seen gone.
   It skips a PID whose command line no longer names the profile: that number was recycled. Once death is verified it removes nodriver's `uc_*` temp profile, which nodriver otherwise
   leaves for an exit hook, one per launch, that at exit on 0.48.1 stops after the first (it prints to the closed stdout).
+- A browser this server started is asked to quit with `Browser.close` (`_request_browser_close`) and given
+  `_CLOSE_WAIT` (5 s, `MCP_STEALTH_CLOSE_WAIT`) to exit, polled with `_all_gone`, before `stop()` and the signals.
+  nodriver's `stop()` disconnects and sends SIGTERM, and Chrome then exits without writing its cookie store, which it
+  writes about every 30 s: three cookies set and closed at once left 0 rows. With `Browser.close` they were written
+  and the close took 0.75 s. A lost reply counts as asked when the socket dropped, since Chrome closes it on its way
+  out; whether it really went is decided by watching the process, and `verified` keeps its meaning.
 - nodriver stops probing for Chrome after about 2.3 seconds. `_start_chrome` waits for that same process and adopts it
   (`config.host`/`port` set means connect, not spawn), moving `_process` across or a close would only drop the socket.
   Only one that never answers is ended and respawned, with host and port restored first.
@@ -268,68 +275,51 @@ conclusions. Each rule below replaced a real lie.
   this browser's PID is frontmost, about 130 ms measured, so keys typed in that moment still reach Chrome. It compares the
   PID, because a person's own Chrome has the same bundle path. `tests/test_headed_focus.py` measures all this, with
   `MCP_HEADED=1`, and counts this browser's PID so the person's other apps cannot skew it.
-- The Dock icon is withdrawn since 0.13.1 (`dock_icon.WITHDRAWN`): the switch is ignored and an old copy is removed
-  once nothing runs from it. Running the copy registered it with Google's updater (`ap_path` in GoogleUpdater's prefs
-  pointed at the copy's `Info.plist`), which then updated the copy, removing its `Icon\r`, and left
-  `/Applications/Google Chrome.app` on the old version. Do not lift it until a launch from a copy is shown to leave the
-  updater's registration on the installed Chrome. The rules below describe the code as it stays for that day.
-- The Dock icon is opt-in: only `MCP_STEALTH_DOCK_ICON=1` (or true, yes, on) turns it on. Off means no build thread, no
-  `~/.mcp-stealth/app` (one left from before is removed), nothing in the launch result, and `dock_icon: off` in
-  `server_status`. It stays off by default
-  because it puts a second Chrome bundle on the person's disk and in LaunchServices, which is theirs to ask for.
-- With it on, a headed launch on macOS runs from `~/.mcp-stealth/app/Stealth Chrome.app`, an APFS clone of the installed Chrome with
-  the project icon set as a custom file icon (`Icon\r` plus FinderInfo at the bundle root), so the Dock tells it from the
-  person's Chrome. Never edit the copy's `Info.plist` or anything under `Contents/`: that breaks Google's signature, and
-  Keychain access to "Chrome Safe Storage" follows the signature, so cookies stop decrypting. The tooltip therefore still
-  says "Google Chrome". `codesign --verify --deep` is the test (`--strict` fails on the installed Chrome too, over its
-  xattrs). It takes about 6 s, so it runs once per build, before the rename into place, and the marker file written after
-  it is what says a copy at that path was verified.
-- macOS takes about 11 s over the first start of a freshly cloned Chrome and under 1 s after that (measured twice each:
-  11.4 and 11.8 s cold, 0.6 to 0.7 s warmed). Left to the launch, that is the edge of what `_start_chrome` waits for
-  (2.3 s plus `SLOW_CHROME_WAIT`). So `_build` runs the copy once with `--version` after the signature check and before
-  the rename, which carries over. A build therefore takes about 18 s, once per Chrome update, and a failed warm-up is
-  ignored. A clone gets the slow start again even when an identical clone has run before, so it is not cached by content.
-- A launch never waits for the copy. `dock_icon.prepare` only looks: a ready copy is used, and anything else means
-  Chrome itself this time with a note in the result, while one background thread (`start_in_background` from `main`, or
-  the launch that found the copy missing or stale) builds it. A build takes about 20 s, which is why it is not paid by a
-  launch: the first headed launch on a new machine, and the first after every Chrome update, used to take that long.
-  Chrome updating while the server runs is the same case: that launch uses Chrome itself and starts the rebuild.
-- A builder holds `app/.lock` exclusively for the whole build; a reader asks for it shared and non-blocking, so a refusal
-  means exactly "someone is building", here or in another server, and readers never block each other. So do not take the
-  exclusive lock just to look: `_ensure_copy` returns without it when the copy is fine and no `.building-*` is left.
-  `server_status` reports `dock_icon` through `status`, which starts nothing and creates nothing.
-- `dock_icon` never fails a launch or the server: any problem is a note in the launch result (`_failed`) or in
-  `server_status` (`_last_note`). `cp -c` quietly falls back to a full copy where it cannot clone, so one file is cloned
-  first with `clonefile(2)`, which cannot. A stale copy is not replaced while a process runs from it, because new
-  renderers start from the bundle path. The copy is rebuilt when Chrome's version, the source browser or the icon
-  changes. Headless, `attach_to_chrome` and the `solve_turnstile_oscursor` sidecar use the installed Chrome.
-- The clone costs no measurable disk (the free-space change of a build is inside the noise, while `du` says 1.5 GB), but a
-  clone stops sharing blocks once the original changes: after a Chrome update the old copy holds its 1.5 GB alone until
-  it is rebuilt. A server killed mid-build leaves `.building-*`, possibly with the previous copy inside, so the builder
-  removes those under the lock even when the copy itself is fine.
-- `discard_copy` deletes, so it is narrow on purpose: only in the configured `app_dir()`, never the home folder or
-  anything above it, never through a link, only a folder holding this module's `.lock`, and only four names
-  (`Stealth Chrome.app`, its marker, `.lock`, `.building-*`). It leaves the copy while a process runs from it, and an
-  unreadable process list counts as in use. It runs when a server starts with the feature off and a folder exists, and
-  when the last browser from the copy closes with the feature off. A copy that went stale while in use is rebuilt at
-  that close (`_refresh_idle_copy`), so 1.5 GB of unshared blocks does not wait for some later launch.
-- `du` cannot say what a clone costs. `_disk_use` reads APFS's private size per file with `getattrlist`
-  (`ATTR_CMNEXT_PRIVATESIZE`), about 30 ms for Chrome's 700 files: a fresh copy reads 0.0 MB of its own and 1535 MB
-  shown. `server_status` reports both as `dock_icon.disk`.
-- `tmutil addexclusion` takes 11 s here, every time. `_exclude_from_backups` writes the same extended attribute directly
-  (0.02 s, and `tmutil isexcluded` agrees), before the signature check so the check covers the final bundle.
-- Running the copy, even `--version`, registers it with LaunchServices: it is then listed for Chrome's bundle id and as a
-  handler for https, beside the person's Chrome. The bundle id kept resolving to `/Applications` in every state measured.
-  `lsregister -u` removes it and the next run registers it again, so `_forget_dock_copy` repeats it after every verified
-  close when nothing else runs from the copy, and `_build` does it for the build folder the warm-up registered. Only a
-  bundle named `Stealth Chrome.app` with our marker beside it is ever unregistered. A copy under a temp folder is not
-  listed by `NSWorkspace` at all, so tests of this need a folder under the home directory.
-- The copy has Chrome's bundle id and the same bundle path as every other launch from it, so anything telling this browser
-  from another must keep comparing PIDs (`_win_focus_back_from_popup`, `_pid_recycled` by `--user-data-dir`), never the
-  bundle. `tests/conftest.py` sets `MCP_STEALTH_DOCK_ICON=0` (so a developer's own setting does not leak in) and a
-  temporary `MCP_STEALTH_APP_DIR` for every server the suite starts and stubs `prepare` inside the pytest process, so
-  nothing builds in the real `~/.mcp-stealth/app` and no server builds at all unless its test passes `DOCK_COPY_ON` and
-  calls `wait_for_dock_copy`.
+- The Dock icon is opt-in: only `MCP_STEALTH_DOCK_ICON=1` (or true, yes, on) turns it on. Off changes nothing: Google
+  Chrome as before, nothing in the launch result, nothing written to Chrome Beta, and `dock_icon: off` in `server_status`,
+  whose detail only offers the switch as working when Beta is installed.
+- With it on, a headed launch on macOS runs from `/Applications/Google Chrome Beta.app`, which carries the project icon as a
+  custom Finder icon (`Icon\r` plus the FinderInfo flag at the bundle root, and `org.mcp-stealth.icon` on `Icon\r` naming
+  the icon's sha256). Nothing under `Contents/` is written, so `codesign --verify --deep` passes (`--strict` fails on the
+  installed Chrome too, over its xattrs). Beta has its own bundle id and registers with GoogleUpdater as
+  `com.google.chrome.beta` at its own path: three 60-second headed runs left the `com.google.chrome` entry unchanged.
+  That is why it replaced the 0.13.0 clone of Chrome, whose runs re-registered `com.google.chrome` at the clone and let
+  the updater update the clone instead of `/Applications/Google Chrome.app`. Chrome calls the updater about 20 s after it
+  starts and then every few hours, so a short test run proves nothing about registration.
+- `put_icon_on` only ever writes to a bundle named `Google Chrome Beta.app` that does not resolve to
+  `/Applications/Google Chrome.app`. The person's Chrome is never written to.
+- Beta only opens a profile it cannot damage (`profile_version.beta_verdict`): none (`persistent=False`), a privacy
+  profile, a folder that does not exist or is empty, or one only Beta can open (last opened by a newer major than Google
+  Chrome, no newer than Beta, and no `v10` cookie in any `*/Cookies` or `*/Network/Cookies`). Anything else, a
+  `--user-data-dir` in `extra_args`, a link, an unreadable folder or cookie database, means Google Chrome and a note
+  naming why. The choice (`_launch_choice`) is made before `clean_profile_state`, the window-state wipe or `mkdir`, which
+  write to the folder. The reason is the Chrome 158 fact below: Beta deletes the cookies of a profile Chrome 157 used.
+- An update of Beta replaces the bundle and the icon with it. `prepare` checks with a stat and an xattr read (0.012 ms)
+  and never waits: a missing icon goes back on in a background thread (0.3 s through JXA) while Beta starts. The custom-icon
+  flag left without `Icon\r` shows a folder in the Dock, so `prepare` clears a dangling flag first (two syscalls, 0.14 ms)
+  and that launch shows Beta's own icon. An icon that cannot be set is remembered per Beta `Info.plist` and icon, and
+  Beta is still used with its own icon and a note. A running app's icon follows the bundle at once.
+- Headless, `attach_to_chrome` and the `solve_turnstile_oscursor` sidecar use Google Chrome. The sidecar refuses at once
+  when the main browser's Chrome major differs from its own, since a clearance bound to the user agent cannot be moved.
+- `dock_icon` never fails a launch or the server: any problem is a note in the launch result or in `server_status`
+  (`last_note`). `status` starts nothing and creates nothing.
+- The 0.13.0 copy is only removed now. `discard_copy` deletes, so it is narrow on purpose: only in the configured
+  `app_dir()`, never the home folder or anything above it, never through a link, only a folder holding this module's
+  `.lock`, and only four names (`Stealth Chrome.app`, its marker, `.lock`, `.building-*`). It leaves the copy while a
+  process runs from it, and an unreadable process list counts as in use. It runs on a thread when any server starts and
+  the folder exists, and takes the copy out of LaunchServices (`lsregister -u`) before deleting it.
+- Beta has its own bundle path, but anything telling this browser from another still compares PIDs
+  (`_win_focus_back_from_popup`, `_pid_recycled` by `--user-data-dir`): the person may run Beta too. Process filters in the
+  headed tests match both `/Google Chrome ` and `/Google Chrome Beta `. `tests/conftest.py` sets `MCP_STEALTH_DOCK_ICON=0`
+  and a temporary `MCP_STEALTH_APP_DIR` for every server the suite starts and stubs `prepare` in the pytest process;
+  `MCP_TEST_DOCK_ICON=1` runs the whole suite with the switch on instead. `test_dock_icon_e2e.py` (`MCP_HEADED=1`) sets
+  the icon on the real Beta, takes it off once to stand in for an update, and checks Chrome.app is unchanged.
+- A launch that would open a profile with a Chrome older than the one that last opened it is refused
+  (`profile_version.refusal`), before anything writes to the profile. Chrome writes its full version to `Last Version` in
+  the user-data folder and to `Local State` `user_experience_metrics.stability.stats_version` at every start (measured
+  for Chrome 157 and Beta 158); the newer of the two counts, and the Chrome's own version is read from its Info.plist.
+  So a profile Beta made is refused to Google Chrome 157, headless too, until Chrome 158. A launch that moves a profile
+  to a newer major says so once in its result.
 - A stdio `browser_launch` sets `current_idle_timeout = 0`. Leaving the reaper off is not enough: any `spawn_browser`
   starts it, and it then closed the browser the person was looking at, 15 minutes after its last tool call.
 - `is_up()` false does not mean Chrome stopped: closing the last tab empties `tabs` while the process runs and
@@ -409,6 +399,33 @@ conclusions. Each rule below replaced a real lie.
 
 Platform truths, not preferences. Each one cost a release.
 
+- Chrome 158 on macOS encrypts with a different key in any profile outside its default user-data folder, which is every
+  profile this server opens. With `KeychainKeyProviderUserDataDirProtection` (new in 158, `ENABLED_BY_DEFAULT`, Chromium
+  CL 8603400, "Use alternate key for non-default user data dirs"), `browser_process_impl.cc` registers the old `v10` key
+  as unavailable and writes `v11` (same "Chrome Safe Storage" Keychain item, salt "pepper"). Measured on Beta 158: it
+  reads none of the `v10` cookies Chrome 157 wrote and deletes them, 1172 to 0 rows on a copy of a real profile. With
+  `--disable-features=KeychainKeyProviderUserDataDirProtection` (the CL's kill switch) it read `v10` and kept it. Google
+  Chrome 157 reads only `v10`. The Keychain ACL (which lists `com.google.Chrome.beta`, no dialog) is not the problem.
+  The framework of 157.0.8103.39 holds no string naming the feature and 158.0.8127.18 holds two, so `applies` decides
+  by the major version from Info.plist (free) rather than reading the framework (1 to 2.4 s). Stable 158 was due
+  17 Nov 2026, with the feature on at the tip of its branch and no field trial for it.
+- Moving cookies to `v11` (`cookie_migration`, `_prepare_cookie_move`, `_finish_cookie_move`): when Chrome 158+ on macOS
+  is about to open a profile outside Chrome's default folders whose launched sub-profile holds a `v10` cookie, the
+  databases are copied aside, a headless Chrome reads every cookie with the flag (`_cookie_flag_arg`, built by
+  `_disable_features_arg` so nodriver's list survives), the backup is written (`storage-states/pre-v11-migration-*`,
+  0600, `storage_state_load` reads it), that Chrome is closed and verified dead, and only then is a marker
+  (`.mcp-stealth-v11-migration.json`, `pending`) written into the profile. The requested launch then runs without the
+  flag, sets the cookies with `Storage.setCookies` and compares names, domains, paths and partitions read back; all
+  there marks it `done`, anything missing is an error naming them and the backup, and stays `pending`.
+- The order is the guarantee: no Chrome 158 opens a `v10` profile without the flag before the backup is complete and
+  the marker says so. Any failure before that means this launch runs with the flag and the next launch starts over; a
+  pending marker with its backup means the next launch sets the cookies from it. Reading fewer cookies than the
+  database's persistent unexpired rows means the flag did not work, and the copied databases are put back: without
+  the copy, Chrome 158 left 0 rows. `v10` again after a `done` by the same major means this Chrome writes `v10` there
+  (the kill switch was turned on remotely), so the flag is used and nothing moves, instead of moving on every launch.
+  Unreadable means the flag. Beta never opens a profile with data (`beta_verdict`), so it never migrates; tests use
+  Beta 158 as Chrome 158 through a `chrome` script on the server's PATH, shorter than Google Chrome's path because
+  nodriver takes the shortest candidate.
 - `Network.setUserAgentOverride` needs `user_agent_metadata`, or `navigator.userAgentData.brands` comes back
   EMPTY, which no real Chrome reports. It also requires a UA even to change only the language. Identity
   defaults to the real browser and machine in every mode, and `_apply_fingerprint_to_tab` derives the hints

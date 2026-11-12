@@ -1,51 +1,55 @@
-"""A headed stealth Chrome with its own Dock icon, so it is not mistaken for the person's Chrome.
+"""A headed stealth browser with its own Dock icon, so it is not mistaken for the person's Chrome.
 
-Opt-in, with MCP_STEALTH_DOCK_ICON=1. macOS takes the Dock icon from the app bundle a process
-runs out of. So, when asked for, a headed launch runs
-from a copy of the installed Chrome, `~/.mcp-stealth/app/Stealth Chrome.app`, that carries the
-project icon. The copy is an APFS clone: made in well under a second, sharing its blocks with
-the original. The icon goes on as a custom file icon (an `Icon\\r` file and a FinderInfo flag
-at the bundle root), which leaves `Contents/` byte for byte what Google signed. Info.plist is
-never edited: that would break the signature, and with it the Keychain access that decrypts
-cookies. The Dock tooltip therefore still says "Google Chrome".
+Opt-in, with MCP_STEALTH_DOCK_ICON=1, on macOS. The Dock takes its icon from the app bundle a
+process runs out of, and the person's own browser is Google Chrome. So a headed launch runs
+from Google Chrome Beta instead, `/Applications/Google Chrome Beta.app`, which carries the
+project icon as a custom Finder icon: an `Icon\\r` file and a FinderInfo flag at the bundle
+root. `Contents/` stays byte for byte what Google signed, so `codesign --verify --deep` passes
+and the Keychain still lets it read "Chrome Safe Storage" (that item trusts every Chrome
+channel). Beta has its own bundle id and its own entry with Google's updater, which is why it
+replaces the Chrome copy withdrawn in 0.13.1: running that copy re-registered Chrome's own
+updater entry at the copy.
 
-Nothing here may stop a launch, or make one wait. The copy is built on a background thread,
-started when the server starts and again whenever a launch finds the copy missing or out of
-date. `prepare` only looks: a copy that is ready is used, and otherwise it answers with a note
-and the caller starts the installed Chrome this time. The installed Chrome is only ever read.
+An update of Beta replaces the bundle and takes the icon with it. `prepare` notices that with
+one stat call and puts the icon back on a background thread; a launch never waits for it.
+`/Applications/Google Chrome.app` is never written to. Headless has no Dock icon and keeps
+Google Chrome.
+
+What is left of the copy is its removal: a server that starts deletes an old
+`~/.mcp-stealth/app/Stealth Chrome.app` once nothing runs from it (`discard_copy`).
 """
 from __future__ import annotations
 
 import contextlib
 import ctypes
-import errno
 import fcntl
 import functools
 import hashlib
-import json
 import os
 import plistlib
 import shutil
-import struct
 import subprocess
 import sys
 import threading
-import time
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
 ENV_SWITCH = "MCP_STEALTH_DOCK_ICON"
 ENV_APP_DIR = "MCP_STEALTH_APP_DIR"
+# Where Google installs it. The person's own Chrome, which this module never writes to.
+BETA_APP = Path("/Applications/Google Chrome Beta.app")
+BETA_BINARY = Path("Contents/MacOS/Google Chrome Beta")
+CHROME_APP = Path("/Applications/Google Chrome.app")
+# The Chrome copy made by 0.13.0, only ever removed now.
 APP_NAME = "Stealth Chrome.app"
 MARKER_NAME = "Stealth Chrome.json"
 ICON_PATH = Path(__file__).parent / "assets" / "dock_icon.png"
 ICON_FILE = "Icon\r"
+# Which icon was put on, kept on the `Icon\r` file itself: outside Contents/, gone with it.
+ICON_MARK = "org.mcp-stealth.icon"
 _BUILD_PREFIX = ".building-"
-_LOCK_WAIT = 90.0
-_WARM_UP_TIMEOUT = 60.0
-_BACKUP_EXCLUDE = "com.apple.metadata:com_apple_backup_excludeItem"
+_ICON_TIMEOUT = 60.0
 _LSREGISTER = ("/System/Library/Frameworks/CoreServices.framework/Frameworks/"
                "LaunchServices.framework/Support/lsregister")
 
@@ -66,54 +70,27 @@ _SET_ICON_JXA = (
     'return $.NSWorkspace.sharedWorkspace.setIconForFileOptions(image,argv[1],0)?"ok":"refused";}'
 )
 
-# A build that failed is not tried again by this process: an unsigned Chromium would otherwise
-# cost a clone and a signature check on every headed launch.
-_failed: dict[tuple, str] = {}
-
-
-# One build at a time in this process. The file lock does the same job between processes.
+# One background job at a time in this process: putting the icon on, or removing the old copy.
 _guard = threading.Lock()
-_builder: Optional[threading.Thread] = None
-# Why the last background build did not produce a copy, for server_status.
+_worker: Optional[threading.Thread] = None
+# Why the last background job did not finish, for server_status and the next launch.
 _last_note = ""
+# An icon that could not be put on is not tried again for the same Beta and icon: a Beta the
+# person cannot write to would otherwise cost a subprocess on every headed launch.
+_icon_failed: dict[tuple, str] = {}
 
-PENDING_NOTE = "the copy is still being prepared"
+PENDING_NOTE = ("the project icon is being put back on Chrome Beta (an update removes it), "
+                "so this window may show Beta's own icon")
 
 
 @dataclass(frozen=True)
 class DockChrome:
-    """`executable` is the copy's binary, or None to launch the installed Chrome.
-    `note` says why, when the copy was wanted and could not be used. `pending` means a build
-    is under way, so a later launch can expect the copy."""
+    """`executable` is Chrome Beta's binary, or None to launch Google Chrome as usual.
+    `note` is what the launch result should say: why Beta was not used, or that its icon is
+    on its way."""
     executable: Optional[str] = None
     note: str = ""
-    pending: bool = False
-
-
-@dataclass(frozen=True)
-class _Plan:
-    binary: Path
-    source: Path
-    source_real: Path
-    root: Path
-    version: tuple
-    target: Path
-    copy_binary: Path
-    key: tuple
-
-
-class _Unusable(Exception):
-    """The copy cannot be made or used; the message is the note the caller reports."""
-
-
-# Withdrawn in 0.13.1. Running the copy registered it with Google's updater, which then
-# updated the copy instead of /Applications/Google Chrome.app: the copy lost its icon and the
-# person's own Chrome stayed on the old version. Until a launch is proved not to register
-# with the updater, the switch is ignored and a copy left from before is removed when
-# nothing runs from it. Tests of the build code set this to False.
-WITHDRAWN = True
-WITHDRAWN_NOTE = ("withdrawn in 0.13.1: running the copy registered it with Google's updater, "
-                  "which updated the copy instead of your installed Chrome")
+    version: str = ""
 
 
 def asked_for() -> bool:
@@ -121,9 +98,8 @@ def asked_for() -> bool:
 
 
 def enabled() -> bool:
-    """Opt-in. It puts a second Chrome bundle on the person's disk and in LaunchServices, so
-    it happens only when they ask: unset, or any other value, is off. Withdrawn wins."""
-    return not WITHDRAWN and asked_for()
+    """Opt-in: unset, or any value but 1/true/yes/on, is off, and off changes nothing."""
+    return asked_for()
 
 
 def app_dir() -> Path:
@@ -131,57 +107,321 @@ def app_dir() -> Path:
     return Path(override).expanduser() if override else Path.home() / ".mcp-stealth" / "app"
 
 
-def prepare(chrome_binary: Optional[str], *, headless: bool, root: Optional[Path] = None) -> DockChrome:
-    """The executable a headed launch should run. Looks, starts a build if one is needed, and
-    answers at once: it never waits for a build or for the lock.
+def beta_binary() -> Optional[Path]:
+    binary = BETA_APP / BETA_BINARY
+    return binary if binary.is_file() and os.access(binary, os.X_OK) else None
 
-    Headless has no Dock icon and other systems have no Dock, so both answer with nothing to
-    report, as does anyone who has not turned this on. Never raises.
+
+def prepare(chrome_binary: Optional[str] = None, *, headless: bool,
+            profile_refusal: str = "") -> DockChrome:
+    """The executable a headed launch should run, answered at once. Never raises, never waits.
+
+    Headless has no Dock icon and other systems have no Dock, so both get nothing, as does
+    anyone who has not turned this on. Beta missing means Google Chrome with a note, and so
+    does `profile_refusal`: why this launch's profile must not be opened by Beta (see
+    profile_version.beta_verdict). The icon check is one stat call; a missing icon is put back
+    on a thread while Beta starts anyway.
     """
-    if headless or sys.platform != "darwin" or not enabled() or not chrome_binary:
+    if headless or sys.platform != "darwin" or not enabled():
         return DockChrome()
+    if profile_refusal:
+        return DockChrome(note=f"Google Chrome, because {profile_refusal}")
     try:
-        plan = _plan(Path(str(chrome_binary)), root or app_dir())
-        if plan.key in _failed:
-            return DockChrome(note=_failed[plan.key])
-        state, detail = _peek(plan)
-        if state == "ready":
-            return DockChrome(executable=str(plan.copy_binary))
-        if state == "building":
-            return DockChrome(note=PENDING_NOTE, pending=True)
-        if plan.target.exists() and _running_from(plan.target):
-            return DockChrome(note=_in_use_note(detail))
-        _start(lambda: _ensure_copy(plan))
-        return DockChrome(note=PENDING_NOTE, pending=True)
-    except _Unusable as why:
-        return DockChrome(note=str(why))
+        binary = chosen(headless=headless)
+        if binary is None:
+            return DockChrome(note=missing_note())
+        version = (_bundle_version(BETA_APP) or ("",))[0]
+        if _icon_current(BETA_APP):
+            return DockChrome(executable=binary, version=version)
+        # The custom-icon flag without its `Icon\r` shows a folder in the Dock, so this launch
+        # gets Beta's own icon instead while the project's goes back on.
+        _clear_dangling_flag(BETA_APP)
+        key = _icon_key(BETA_APP)
+        if key in _icon_failed:
+            return DockChrome(executable=binary, version=version,
+                              note=f"Chrome Beta shows its own icon: {_icon_failed[key]}")
+        _start(lambda: put_icon_on(BETA_APP))
+        return DockChrome(executable=binary, version=version, note=PENDING_NOTE)
     except Exception as exc:  # a launch must never fail over an icon
         return DockChrome(note=f"{type(exc).__name__}: {exc}")
 
 
-def start_in_background(find_chrome: Callable[[], Optional[str]], root: Optional[Path] = None) -> bool:
-    """Bring the copy up to date on a thread, so the first headed launch finds it ready.
+def chosen(*, headless: bool) -> Optional[str]:
+    """Chrome Beta's binary when this launch would run from it, else None. Reads only."""
+    if headless or sys.platform != "darwin" or not enabled():
+        return None
+    binary = beta_binary()
+    return str(binary) if binary is not None else None
 
-    Called when the server starts. Finding Chrome and checking the copy both happen on that
-    thread, so this costs the caller nothing. True when a thread was started.
-    """
+
+def missing_note() -> str:
+    return f"Google Chrome Beta is not installed in {BETA_APP.parent}, so this is Google Chrome"
+
+
+def start_in_background(root: Optional[Path] = None) -> bool:
+    """Called when the server starts, on a thread so it costs the caller nothing: removes an
+    old Chrome copy when nothing runs from it, and puts the icon on Beta when that is turned
+    on and an update took it off. True when a thread was started."""
     if sys.platform != "darwin":
         return False
+    old_copy = (root or app_dir()).is_dir()
+    wants_icon = enabled() and beta_binary() is not None and not _icon_current(BETA_APP)
+    if not old_copy and not wants_icon:
+        return False
+
+    def job() -> None:
+        notes = []
+        if old_copy:
+            outcome = discard_copy(root)
+            if outcome != "removed" and outcome != "nothing to remove":
+                notes.append(f"old Chrome copy {outcome}")
+        if wants_icon:
+            put_icon_on(BETA_APP)
+        if notes:
+            raise _Note("; ".join(notes))
+
+    return _start(job)
+
+
+class _Note(Exception):
+    """A background job that finished without doing all it set out to; the message is kept."""
+
+
+def put_icon_on(app: Path) -> None:
+    """Set the project icon as the custom Finder icon of `app`. Only ever Chrome Beta.
+
+    NSWorkspace writes `Icon\\r` and the FinderInfo flag at the bundle root and nothing under
+    `Contents/`. Which icon went on is recorded on `Icon\\r`, so a new project icon is noticed.
+    A failure is remembered for this Beta and icon, and raised for the thread to keep.
+    """
+    target = Path(os.path.abspath(app))
+    if os.path.realpath(target) == os.path.realpath(CHROME_APP) or target.name != BETA_APP.name:
+        raise _Note(f"refused: the icon only goes on {BETA_APP.name}, not {target}")
+    key = _icon_key(target)
+    try:
+        if not ICON_PATH.is_file():
+            raise _Note("the icon file is missing from this install")
+        _set_icon(target, ICON_PATH)
+        if not _has_icon(target):
+            raise _Note("the icon did not take")
+        _write_mark(target / ICON_FILE, _icon_digest())
+    except _Note as why:
+        _icon_failed[key] = str(why)
+        raise
+    except Exception as exc:
+        _icon_failed[key] = f"{type(exc).__name__}: {exc}"
+        raise _Note(_icon_failed[key]) from exc
+
+
+def status(root: Optional[Path] = None) -> dict:
+    """Where the Dock icon stands, for server_status. Reads only: nothing is started or made.
+
+    state: off, unavailable (not macOS), beta-missing, beta-ready, or icon-missing. `detail`
+    says what that means here; `old_copy` appears while a Chrome copy from 0.13 is still on disk.
+    """
+    try:
+        report = _status()
+    except Exception as exc:
+        report = {"state": "unavailable", "detail": f"{type(exc).__name__}: {exc}"}
+    with contextlib.suppress(Exception):
+        copy = Path(os.path.abspath(root or app_dir())) / APP_NAME
+        if copy.is_dir() and not copy.is_symlink():
+            report["old_copy"] = (f"{copy} is still there: removed when a server starts and "
+                                  "no browser runs from it")
+    if _last_note:
+        report["last_note"] = _last_note
+    return report
+
+
+def _status() -> dict:
+    if sys.platform != "darwin":
+        return {"state": "unavailable", "detail": "only on macOS"}
+    binary = beta_binary()
+    version = (_bundle_version(BETA_APP) or ("",))[0] if binary else ""
     if not enabled():
-        # Turned off, or never on. A copy left from before would sit there for good, and after
-        # a Chrome update it holds 1.5 GB of its own. No folder, the usual case, means no thread.
-        if not (root or app_dir()).is_dir():
+        if binary is None:
+            return {"state": "off", "detail": (
+                f"off. {ENV_SWITCH}=1 runs visible browsers from Google Chrome Beta with the "
+                f"project icon; Beta is not installed in {BETA_APP.parent}, so it would have "
+                "no effect here")}
+        return {"state": "off", "detail": (
+            f"off. {ENV_SWITCH}=1 runs visible browsers from Google Chrome Beta {version} "
+            "with the project icon")}
+    if binary is None:
+        return {"state": "beta-missing", "detail": missing_note()}
+    if _icon_current(BETA_APP):
+        return {"state": "beta-ready",
+                "detail": f"visible browsers run from {BETA_APP} ({version}) with the project icon"}
+    failed = _icon_failed.get(_icon_key(BETA_APP))
+    detail = (f"Chrome Beta {version} is used with its own icon: {failed}" if failed else
+              f"Chrome Beta {version} has no project icon yet; it is put on at the next "
+              "visible launch")
+    return {"state": "icon-missing", "detail": detail}
+
+
+def building() -> bool:
+    """Whether this process has a background job running."""
+    return _worker is not None and _worker.is_alive()
+
+
+def wait(timeout: Optional[float] = None) -> bool:
+    """Wait for this process's background job. For tests and tools; a launch never calls it."""
+    thread = _worker
+    if thread is not None:
+        thread.join(timeout)
+    return not building()
+
+
+def _start(job: Callable[[], object]) -> bool:
+    global _worker
+    with _guard:
+        if building():
             return False
-        return _start(lambda: discard_copy(root))
+        _worker = threading.Thread(target=_run, args=(job,), name="dock-icon", daemon=True)
+        _worker.start()
+        return True
 
-    def plan() -> _Plan:
-        binary = find_chrome()
-        if not binary:
-            raise _Unusable("Chrome was not found")
-        return _plan(Path(str(binary)), root or app_dir())
 
-    return _start(lambda: _ensure_copy(plan()))
+def _run(job: Callable[[], object]) -> None:
+    """The background thread. Whatever happens stays here, kept in `_last_note`."""
+    global _last_note
+    try:
+        job()
+        _last_note = ""
+    except _Note as why:
+        _last_note = str(why)
+    except BaseException as exc:
+        _last_note = f"{type(exc).__name__}: {exc}"
 
+
+def _icon_current(app: Path) -> bool:
+    """The project's icon is on `app`: about 0.1 ms, cheap enough for every launch."""
+    if not _has_icon(app):
+        return False
+    return _read_mark(app / ICON_FILE) == _icon_digest()
+
+
+_XATTR_NOFOLLOW = 0x0001
+
+
+@functools.lru_cache(maxsize=1)
+def _libc():
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.getxattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t,
+                              ctypes.c_uint32, ctypes.c_int]
+    libc.getxattr.restype = ctypes.c_ssize_t
+    libc.setxattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t,
+                              ctypes.c_uint32, ctypes.c_int]
+    libc.setxattr.restype = ctypes.c_int
+    return libc
+
+
+def _read_mark(path: Path) -> str:
+    """The icon digest recorded on `Icon\\r`, or "". Python's os.getxattr is Linux only."""
+    try:
+        buffer = ctypes.create_string_buffer(128)
+        size = _libc().getxattr(os.fsencode(path), ICON_MARK.encode(), buffer, 128, 0,
+                                _XATTR_NOFOLLOW)
+    except Exception:
+        return ""
+    return buffer.raw[:size].decode(errors="replace") if size > 0 else ""
+
+
+_FINDER_INFO = b"com.apple.FinderInfo"
+_HAS_CUSTOM_ICON = 0x04  # kHasCustomIcon (0x0400) in the big-endian Finder flags at byte 8
+
+
+def _clear_dangling_flag(app: Path) -> bool:
+    """Clear the custom-icon flag on `app` when its `Icon\\r` is gone. Two system calls, no
+    subprocess, so it may run on the launch path. True when it cleared something."""
+    if _has_icon(app):
+        return False
+    try:
+        buffer = ctypes.create_string_buffer(32)
+        path = os.fsencode(app)
+        if _libc().getxattr(path, _FINDER_INFO, buffer, 32, 0, _XATTR_NOFOLLOW) != 32:
+            return False
+        info = bytearray(buffer.raw)
+        if not info[8] & _HAS_CUSTOM_ICON:
+            return False
+        info[8] &= ~_HAS_CUSTOM_ICON & 0xFF
+        data = bytes(info)
+        return _libc().setxattr(path, _FINDER_INFO, data, 32, 0, _XATTR_NOFOLLOW) == 0
+    except Exception:
+        return False
+
+
+def _write_mark(path: Path, digest: str) -> None:
+    data = digest.encode()
+    if _libc().setxattr(os.fsencode(path), ICON_MARK.encode(), data, len(data), 0,
+                        _XATTR_NOFOLLOW) != 0:
+        code = ctypes.get_errno()
+        raise _Note(f"the icon is on, but recording it failed: {os.strerror(code)}")
+
+
+def _icon_key(app: Path) -> tuple:
+    try:
+        stamp = os.stat(app / "Contents" / "Info.plist").st_mtime_ns
+    except OSError:
+        stamp = 0
+    return (str(app), stamp, _icon_digest())
+
+
+def _has_icon(app: Path) -> bool:
+    return _resource_fork_size(app / ICON_FILE) > 0
+
+
+def _resource_fork_size(path: Path) -> int:
+    """A custom icon lives in the resource fork of `Icon\\r`; the file's data fork is empty."""
+    try:
+        return os.stat(str(path) + "/..namedfork/rsrc").st_size
+    except OSError:
+        return 0
+
+
+@functools.lru_cache(maxsize=1)
+def _icon_digest() -> str:
+    try:
+        return hashlib.sha256(ICON_PATH.read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
+def _bundle_version(app: Path) -> Optional[tuple]:
+    try:
+        with open(app / "Contents" / "Info.plist", "rb") as handle:
+            info = plistlib.load(handle)
+        short = info["CFBundleShortVersionString"]
+    except Exception:
+        return None
+    return (str(short), str(info.get("CFBundleVersion", "")))
+
+
+def _set_icon(app: Path, icon: Path) -> None:
+    """NSWorkspace.setIcon, in another process so AppKit stays out of the server. About 0.3 s."""
+    tried = []
+    try:
+        done = subprocess.run([sys.executable, "-c", _SET_ICON_PY, str(icon), str(app)],
+                              capture_output=True, text=True, timeout=_ICON_TIMEOUT)
+        if done.returncode == 0:
+            return
+        tried.append("AppKit is not installed" if "No module named" in (done.stderr or "")
+                     else f"AppKit refused (exit {done.returncode})")
+    except Exception as exc:
+        tried.append(f"python: {type(exc).__name__}")
+    try:
+        done = subprocess.run(["/usr/bin/osascript", "-l", "JavaScript", "-e", _SET_ICON_JXA,
+                               str(icon), str(app)], capture_output=True, text=True,
+                              timeout=_ICON_TIMEOUT)
+        if done.returncode == 0 and done.stdout.strip() == "ok":
+            return
+        tried.append(f"osascript answered {(done.stdout or done.stderr or '').strip()[:120]!r}")
+    except Exception as exc:
+        tried.append(f"osascript: {type(exc).__name__}")
+    raise _Note("the icon could not be set: " + "; ".join(tried))
+
+
+# ── the Chrome copy from 0.13.0: removal only ────────────────────────────────
 
 def discard_copy(root: Optional[Path] = None) -> str:
     """Remove the copy and what this module made beside it, when nothing runs from it.
@@ -228,201 +468,6 @@ def discard_copy(root: Optional[Path] = None) -> str:
     return "removed"
 
 
-def status(chrome_binary: Optional[str], root: Optional[Path] = None) -> dict:
-    """Where the copy stands, for server_status. Reads only: no build, no wait, no folder made."""
-    report = _status(chrome_binary, root)
-    with contextlib.suppress(Exception):
-        disk = _disk_use(Path(os.path.abspath(root or app_dir())) / APP_NAME)
-        if disk is not None:
-            report["disk"] = disk
-    return report
-
-
-def _status(chrome_binary: Optional[str], root: Optional[Path]) -> dict:
-    try:
-        if WITHDRAWN and asked_for():
-            return {"state": "withdrawn", "detail": f"{ENV_SWITCH}=1 is ignored, {WITHDRAWN_NOTE}"}
-        if not enabled():
-            return {"state": "off", "detail": f"set {ENV_SWITCH}=1 to turn it on (macOS)"}
-        if sys.platform != "darwin":
-            return {"state": "unavailable", "detail": "only on macOS"}
-        if not chrome_binary:
-            return {"state": "unavailable", "detail": "Chrome was not found"}
-        plan = _plan(Path(str(chrome_binary)), root or app_dir())
-        if plan.key in _failed:
-            return {"state": "unavailable", "detail": _failed[plan.key]}
-        state, detail = _peek(plan)
-        if state == "ready":
-            detail = f"{plan.target} (Chrome {plan.version[0]})"
-        elif state == "stale" and _last_note:
-            detail = f"{detail}; the last build did not finish: {_last_note}"
-        return {"state": state, "detail": detail}
-    except _Unusable as why:
-        return {"state": "unavailable", "detail": str(why)}
-    except Exception as exc:
-        return {"state": "unavailable", "detail": f"{type(exc).__name__}: {exc}"}
-
-
-class _AttrList(ctypes.Structure):
-    _fields_ = [("bitmapcount", ctypes.c_ushort), ("reserved", ctypes.c_ushort),
-                ("commonattr", ctypes.c_uint32), ("volattr", ctypes.c_uint32),
-                ("dirattr", ctypes.c_uint32), ("fileattr", ctypes.c_uint32),
-                ("forkattr", ctypes.c_uint32)]
-
-
-def _disk_use(app: Path) -> Optional[dict]:
-    """What the copy really takes, which `du` cannot say for a clone.
-
-    `own_mb` is what removing it would free: APFS's private size, the blocks it shares with
-    nothing. `shown_mb` is what `du` and Finder show. A fresh copy owns next to nothing; one
-    left behind by a Chrome update owns all of it. About 30 ms for Chrome's 700 files. None
-    when there is no copy or the sizes cannot be read.
-    """
-    if sys.platform != "darwin" or app.is_symlink() or not app.is_dir():
-        return None
-    libc = ctypes.CDLL(None, use_errno=True)
-    # ATTR_CMN_RETURNED_ATTRS, then ATTR_CMNEXT_PRIVATESIZE in the fork attributes.
-    wanted = _AttrList(5, 0, 0x80000000, 0, 0, 0, 0x00000008)
-    buffer = ctypes.create_string_buffer(64)
-    own = shown = 0
-    for base, _dirs, names in os.walk(app):
-        for name in names:
-            path = os.path.join(base, name)
-            if os.path.islink(path):
-                continue
-            # FSOPT_NOFOLLOW | FSOPT_ATTR_CMN_EXTENDED
-            if libc.getattrlist(os.fsencode(path), ctypes.byref(wanted), buffer, 64, 0x1 | 0x20) != 0:
-                return None
-            if not struct.unpack_from("5I", buffer, 4)[4] & 0x00000008:
-                return None
-            own += struct.unpack_from("q", buffer, 24)[0]
-            shown += os.lstat(path).st_blocks * 512
-    return {"own_mb": round(own / 1e6, 1), "shown_mb": round(shown / 1e6, 1)}
-
-
-def building() -> bool:
-    """Whether this process has a build thread running."""
-    return _builder is not None and _builder.is_alive()
-
-
-def wait(timeout: Optional[float] = None) -> bool:
-    """Wait for this process's build thread. For tests and tools; a launch never calls it."""
-    thread = _builder
-    if thread is not None:
-        thread.join(timeout)
-    return not building()
-
-
-def _start(job: Callable[[], object]) -> bool:
-    """Run a build, or a removal, on the one background thread. False when it is busy."""
-    global _builder
-    with _guard:
-        if building():
-            return False
-        _builder = threading.Thread(target=_run, args=(job,), name="dock-icon-copy", daemon=True)
-        _builder.start()
-        return True
-
-
-def _run(job: Callable[[], object]) -> None:
-    """The background thread. Whatever happens stays here: the reason is kept for the next
-    launch (`_failed`) or for server_status (`_last_note`)."""
-    global _last_note
-    try:
-        job()
-        _last_note = ""
-    except _Unusable as why:
-        _last_note = str(why)
-    except BaseException as exc:
-        _last_note = f"{type(exc).__name__}: {exc}"
-
-
-def _plan(binary: Path, root: Path) -> _Plan:
-    source = next((p for p in (binary, *binary.parents) if p.suffix == ".app"), None)
-    if source is None or not binary.is_file():
-        raise _Unusable(f"{binary} is not inside an app bundle")
-    root = Path(os.path.abspath(root))
-    source_real, root_real = source.resolve(), root.resolve()
-    if root_real == source_real or source_real in root_real.parents or root_real in source_real.parents:
-        # Either the copy would land inside Chrome, or Chrome is the copy itself.
-        raise _Unusable(f"{root} and {source} overlap")
-    version = _bundle_version(source)
-    if version is None:
-        raise _Unusable(f"could not read the version of {source}")
-    target = root / APP_NAME
-    return _Plan(binary=binary, source=source, source_real=source_real, root=root, version=version,
-                 target=target, copy_binary=target / binary.relative_to(source),
-                 key=(str(source_real), version, str(root_real), _icon_digest()))
-
-
-def _stale(plan: _Plan) -> str:
-    return _stale_reason(plan.target, plan.copy_binary, plan.root / MARKER_NAME,
-                         plan.source_real, plan.version)
-
-
-def _peek(plan: _Plan) -> tuple[str, str]:
-    """("ready" | "building" | "stale", detail) without waiting, building or creating anything.
-
-    A builder holds the lock exclusively for the whole build, here or in another server. A
-    reader asks for it shared and without blocking, so readers never hold each other up and a
-    refusal means exactly that someone is building.
-    """
-    if building():
-        return "building", "this server is preparing the copy"
-    try:
-        handle = open(plan.root / ".lock", "r")
-    except OSError:
-        handle = None  # no folder or no lock file yet: nobody has ever built here
-    try:
-        if handle is not None:
-            try:
-                fcntl.flock(handle, fcntl.LOCK_SH | fcntl.LOCK_NB)
-            except OSError:
-                return "building", "another server is preparing the copy"
-        stale = _stale(plan)
-        return ("stale", stale) if stale else ("ready", "")
-    finally:
-        if handle is not None:
-            handle.close()
-
-
-def _in_use_note(stale: str) -> str:
-    return (f"the copy is out of date ({stale}) and a browser is still running from it; "
-            "it is rebuilt on the first headed launch after that browser closes")
-
-
-def _ensure_copy(plan: _Plan) -> Path:
-    """Build or refresh the copy, waiting for the lock. Only ever runs on the build thread."""
-    if plan.key in _failed:
-        raise _Unusable(_failed[plan.key])
-    if not _leftovers(plan.root) and not _stale(plan):
-        # Nothing to do, so the lock is left alone: taking it, even briefly, makes a launch
-        # in another server read "being prepared" and fall back to Chrome itself.
-        return plan.copy_binary
-    if not plan.root.exists():
-        plan.root.mkdir(parents=True, mode=0o700)
-    with _locked(plan.root):
-        # Whoever builds holds the lock, so a build folder found here was abandoned: a server
-        # that died mid-build. It can hold a whole previous copy, which after a Chrome update
-        # shares no blocks with anything, so it goes even when the copy itself is fine.
-        for leftover in _leftovers(plan.root):
-            shutil.rmtree(leftover, ignore_errors=True)
-        stale = _stale(plan)
-        if not stale:
-            return plan.copy_binary
-        if plan.target.exists() and _running_from(plan.target):
-            # Replacing the bundle under a running Chrome breaks it: new renderers start from
-            # that path. Not remembered in _failed, because it clears when that browser closes.
-            raise _Unusable(_in_use_note(stale))
-        try:
-            _build(plan.source, plan.target, plan.root, plan.version, plan.source_real,
-                   plan.binary.relative_to(plan.source))
-        except _Unusable as why:
-            _failed[plan.key] = str(why)
-            raise
-    return plan.copy_binary
-
-
 def _leftovers(root: Path) -> list[Path]:
     try:
         return list(root.glob(f"{_BUILD_PREFIX}*"))
@@ -430,111 +475,11 @@ def _leftovers(root: Path) -> list[Path]:
         return []
 
 
-def forget_when_idle(executable: Optional[str]) -> None:
-    """Take the copy out of LaunchServices once nothing runs from it. Call after a browser
-    started from it has ended. Best effort, never raises; may take a moment, so off the loop.
-
-    Running the copy registers it: from then on it is listed beside the person's Chrome for
-    Chrome's bundle id, in Open With and as a handler for links. The bundle id still resolves
-    to the installed Chrome, but there is no reason to stay listed. The next run registers it
-    again, which is why this is repeated after every run and not done once.
-    """
-    with contextlib.suppress(Exception):
-        if sys.platform != "darwin" or not executable:
-            return
-        binary = Path(str(executable))
-        app = next((p for p in binary.parents if p.suffix == ".app"), None)
-        if app is None or app.name != APP_NAME or not (app.parent / MARKER_NAME).is_file():
-            return  # not a copy made here: the person's own apps are never unregistered
-        if _running_from(app):
-            return
-        _unregister(app)
-        _refresh_idle_copy(app, binary)
-
-
-def _refresh_idle_copy(app: Path, binary: Path) -> None:
-    """The last browser running from the copy has gone. If Chrome was updated meanwhile, the
-    copy could not be replaced under it and now holds its 1.5 GB alone, so it is rebuilt now
-    and not at whatever launch comes next. With the feature off it is simply removed."""
-    if not enabled():
-        _start(lambda: discard_copy(app.parent))
-        return
-    recorded = json.loads((app.parent / MARKER_NAME).read_text(encoding="utf-8"))
-    plan = _plan(Path(recorded["source"]) / binary.relative_to(app), app.parent)
-    if plan.key not in _failed and _stale(plan):
-        _start(lambda: _ensure_copy(plan))
-
-
 def _unregister(app: Path) -> None:
+    """Take the copy out of LaunchServices before it is deleted, so it is not left listed
+    for Chrome's bundle id."""
     with contextlib.suppress(Exception):
         subprocess.run([_LSREGISTER, "-u", str(app)], capture_output=True, timeout=20)
-
-
-def _exclude_from_backups(app: Path) -> None:
-    """Mark the copy as not worth backing up, the way `tmutil addexclusion` does.
-
-    It can be rebuilt in seconds, and a backup does not know it is a clone. The mark is an
-    extended attribute that stays with the bundle; tmutil writes the same one, but takes
-    11 seconds over it. Best effort: an unmarked copy is still a good copy.
-    """
-    with contextlib.suppress(Exception):
-        value = plistlib.dumps("com.apple.backupd", fmt=plistlib.FMT_BINARY).hex()
-        subprocess.run(["/usr/bin/xattr", "-wx", _BACKUP_EXCLUDE, value, str(app)],
-                       capture_output=True, timeout=10)
-
-
-def _bundle_version(app: Path) -> Optional[tuple]:
-    try:
-        with open(app / "Contents" / "Info.plist", "rb") as handle:
-            info = plistlib.load(handle)
-        short = info["CFBundleShortVersionString"]
-    except Exception:
-        return None
-    return (str(short), str(info.get("CFBundleVersion", "")))
-
-
-@functools.lru_cache(maxsize=1)
-def _icon_digest() -> str:
-    try:
-        return hashlib.sha256(ICON_PATH.read_bytes()).hexdigest()
-    except OSError:
-        return ""
-
-
-def _has_icon(app: Path) -> bool:
-    return _resource_fork_size(app / ICON_FILE) > 0
-
-
-def _resource_fork_size(path: Path) -> int:
-    """A custom icon lives in the resource fork of `Icon\\r`; the file's data fork is empty."""
-    try:
-        return os.stat(str(path) + "/..namedfork/rsrc").st_size
-    except OSError:
-        return 0
-
-
-def _stale_reason(target: Path, copy_binary: Path, marker: Path, source: Path, version: tuple) -> str:
-    """Why the copy has to be rebuilt, or "" when it can be used as it is."""
-    if not copy_binary.is_file():
-        return "there is no copy yet"
-    have = _bundle_version(target)
-    if have != version:
-        return f"it is Chrome {have[0] if have else 'of an unknown version'}, installed is {version[0]}"
-    if not _has_icon(target):
-        return "its icon is missing"
-    try:
-        recorded = json.loads(marker.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return "it was never finished"
-    # The marker is written last, after the signature check passed, so its presence is what
-    # says the build completed. It also catches a new icon and a different source browser.
-    if not isinstance(recorded, dict) or recorded.get("verified") is not True:
-        return "it was never finished"
-    if recorded.get("source") != str(source):
-        return "it was made from another browser"
-    if recorded.get("icon") != _icon_digest():
-        return "the icon changed"
-    return ""
 
 
 def _running_from(app: Path) -> bool:
@@ -546,138 +491,3 @@ def _running_from(app: Path) -> bool:
     except Exception:
         return True  # unknown is not "nobody": leave the bundle alone
     return any(line.strip().startswith(prefixes) for line in listing.splitlines())
-
-
-@contextlib.contextmanager
-def _locked(root: Path):
-    """One builder at a time across server processes."""
-    handle = open(root / ".lock", "a+")
-    try:
-        deadline = time.monotonic() + _LOCK_WAIT
-        while True:
-            try:
-                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except OSError:
-                if time.monotonic() >= deadline:
-                    raise _Unusable("another process has been preparing the copy for too long")
-                time.sleep(0.2)
-        yield
-    finally:
-        with contextlib.suppress(OSError):
-            fcntl.flock(handle, fcntl.LOCK_UN)
-        handle.close()
-
-
-def _build(source: Path, target: Path, root: Path, version: tuple, source_real: Path,
-           relative: Path) -> None:
-    """Clone, set the icon, check the signature, run it once, and only then move it into place."""
-    if not ICON_PATH.is_file():
-        raise _Unusable("the icon file is missing from this install")
-    work = root / f"{_BUILD_PREFIX}{os.getpid()}-{uuid.uuid4().hex[:8]}"
-    work.mkdir()
-    try:
-        _require_clone_support(source / "Contents" / "Info.plist", work / "probe")
-        fresh = work / APP_NAME
-        _clone(source, fresh)
-        if _bundle_version(fresh) != version:
-            raise _Unusable("Chrome changed while it was being copied")
-        _set_icon(fresh, ICON_PATH)
-        if not _has_icon(fresh):
-            raise _Unusable("the icon did not take on the copy")
-        _exclude_from_backups(fresh)
-        _verify_signature(fresh)
-        _warm_up(fresh / relative)
-        # Running it registered this build folder with LaunchServices, a path about to vanish.
-        _unregister(fresh)
-        marker = root / MARKER_NAME
-        with contextlib.suppress(FileNotFoundError):
-            marker.unlink()
-        if target.exists() or target.is_symlink():
-            os.rename(target, work / "previous")
-        os.rename(fresh, target)
-        pending = work / MARKER_NAME
-        pending.write_text(json.dumps({
-            "source": str(source_real), "version": list(version),
-            "icon": _icon_digest(), "verified": True,
-        }), encoding="utf-8")
-        os.replace(pending, marker)
-    except _Unusable:
-        raise
-    except Exception as exc:
-        raise _Unusable(f"{type(exc).__name__}: {exc}") from exc
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
-
-
-def _require_clone_support(sample: Path, probe: Path) -> None:
-    """`cp -c` quietly falls back to a full copy where it cannot clone, which here would be
-    most of a gigabyte. So one small file is cloned first, with the call that cannot fall back."""
-    try:
-        libc = ctypes.CDLL(None, use_errno=True)
-        result = libc.clonefile(os.fsencode(sample), os.fsencode(probe), 0)
-    except Exception as exc:
-        raise _Unusable(f"cloning is not available here ({type(exc).__name__})") from exc
-    if result != 0:
-        code = ctypes.get_errno()
-        raise _Unusable(
-            f"{probe.parent.parent} cannot hold a clone of Chrome "
-            f"({errno.errorcode.get(code, code)}: it has to be on the same APFS volume)")
-
-
-def _clone(source: Path, destination: Path) -> None:
-    try:
-        done = subprocess.run(["/bin/cp", "-c", "-R", str(source), str(destination)],
-                              capture_output=True, text=True, timeout=180)
-    except Exception as exc:
-        raise _Unusable(f"cp -c failed: {type(exc).__name__}") from exc
-    if done.returncode != 0:
-        raise _Unusable(f"cp -c failed: {(done.stderr or '').strip()[:200] or done.returncode}")
-
-
-def _set_icon(app: Path, icon: Path) -> None:
-    """NSWorkspace.setIcon, in another process so AppKit stays out of the server."""
-    tried = []
-    try:
-        done = subprocess.run([sys.executable, "-c", _SET_ICON_PY, str(icon), str(app)],
-                              capture_output=True, text=True, timeout=60)
-        if done.returncode == 0:
-            return
-        tried.append("AppKit is not installed" if "No module named" in (done.stderr or "")
-                     else f"AppKit refused (exit {done.returncode})")
-    except Exception as exc:
-        tried.append(f"python: {type(exc).__name__}")
-    try:
-        done = subprocess.run(["/usr/bin/osascript", "-l", "JavaScript", "-e", _SET_ICON_JXA,
-                               str(icon), str(app)], capture_output=True, text=True, timeout=60)
-        if done.returncode == 0 and done.stdout.strip() == "ok":
-            return
-        tried.append(f"osascript answered {(done.stdout or done.stderr or '').strip()[:120]!r}")
-    except Exception as exc:
-        tried.append(f"osascript: {type(exc).__name__}")
-    raise _Unusable("the icon could not be set: " + "; ".join(tried))
-
-
-def _warm_up(binary: Path) -> None:
-    """Run the new copy once, so its slow first start is paid here and not by the launch.
-
-    macOS takes about 11 seconds over the first start of a freshly cloned Chrome, and under a
-    second after that. Left to the launch, that sits at the edge of what `_start_chrome` waits
-    for. `--version` is enough, and it carries over the rename into place. Best effort: a copy
-    that was not warmed is still a good copy, only slow once.
-    """
-    with contextlib.suppress(Exception):
-        subprocess.run([str(binary), "--version"], capture_output=True, timeout=_WARM_UP_TIMEOUT)
-
-
-def _verify_signature(app: Path) -> None:
-    """A copy whose signature no longer verifies is never used: Keychain access hangs on it."""
-    try:
-        done = subprocess.run(["/usr/bin/codesign", "--verify", "--deep", str(app)],
-                              capture_output=True, text=True, timeout=180)
-    except Exception as exc:
-        raise _Unusable(f"codesign could not run: {type(exc).__name__}") from exc
-    if done.returncode != 0:
-        raise _Unusable(
-            "the copy's signature did not verify: "
-            + ((done.stderr or '').strip().splitlines() or ["no detail"])[-1][:200])

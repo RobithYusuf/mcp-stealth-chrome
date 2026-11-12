@@ -25,7 +25,9 @@ import httpx
 
 from .. import os_input
 from .._app import mcp
+from .. import profile_version
 from ..helpers import err, get_url, mask_url, ok
+from ..identity import chrome_version
 from ..state import BrowserState, find_chrome_binary
 
 
@@ -260,6 +262,15 @@ async def _attempt(url: Optional[str], timeout_s: float, report: dict, resources
     main_ua = await server._eval_checked(tab, "navigator.userAgent")
     if not isinstance(main_ua, str) or not main_ua:
         raise _Failure("main browser user agent could not be measured")
+    # The sidecar is Google Chrome. A main browser on Chrome Beta (MCP_STEALTH_DOCK_ICON=1) is a
+    # version ahead, and the clearance is bound to the user agent, so it could never be handed
+    # over: say so now rather than after the whole attempt.
+    sidecar_version = profile_version.binary_version(binary)
+    main_major = (chrome_version(main_ua) or "").split(".")[0]
+    if sidecar_version and main_major and str(sidecar_version[0]) != main_major:
+        raise _Failure(f"main browser is Chrome {main_major} and the sidecar would be Chrome "
+                       f"{sidecar_version[0]}; a clearance bound to the user agent could not be "
+                       "transferred, so nothing was attempted")
     root = Path(tempfile.mkdtemp(prefix="mcp-stealth-oscursor-"))
     resources["root"] = root
     root.chmod(0o700)

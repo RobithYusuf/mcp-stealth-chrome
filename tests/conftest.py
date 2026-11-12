@@ -1,10 +1,10 @@
-"""Keeps the suite away from the person's real ~/.mcp-stealth/app.
+"""Keeps the suite away from the person's real ~/.mcp-stealth.
 
-A headed launch runs Chrome from a copy carrying the project's Dock icon, which a server
-builds in the background as it starts. Servers the tests start have that turned off, and
-would build in a folder made for this run if a test turned it on. Launches made inside the
-pytest process are fakes or in-process E2E and skip the copy. `test_dock_icon.py` tests the
-real functions and opts out of that.
+MCP_STEALTH_DOCK_ICON=1 makes headed launches run from Chrome Beta. Servers the tests start
+have it off, and launches inside the pytest process skip it, unless the run sets
+MCP_TEST_DOCK_ICON=1: then every server and in-process launch has it on, which is how the
+suites are run against Chrome Beta. `test_dock_icon.py` tests the real functions either way.
+The folder for an old Chrome copy is a temp folder, so no server removes anything real.
 """
 import os
 import shutil
@@ -14,16 +14,17 @@ import pytest
 
 from mcp_stealth_chrome import dock_icon
 
+_BETA_RUN = os.environ.get("MCP_TEST_DOCK_ICON") == "1"
+
 
 @pytest.fixture(scope="session", autouse=True)
-def _dock_icon_copy_in_a_temp_folder():
+def _dock_icon_switch_and_app_folder():
     previous = os.environ.get(dock_icon.ENV_APP_DIR)
     folder = tempfile.mkdtemp(prefix="mcp-stealth-app-")
     os.environ[dock_icon.ENV_APP_DIR] = folder
-    # A server builds the copy on a thread as it starts. Servers the tests start inherit this
-    # and build nothing; a test that is about the copy turns it on for its own server.
+    # Servers the tests start inherit this: off, unless the run asks for Chrome Beta.
     switch = os.environ.get(dock_icon.ENV_SWITCH)
-    os.environ[dock_icon.ENV_SWITCH] = "0"
+    os.environ[dock_icon.ENV_SWITCH] = "1" if _BETA_RUN else "0"
     try:
         yield folder
     finally:
@@ -56,6 +57,6 @@ def _no_profile_cleanup_on_real_data():
 
 
 @pytest.fixture(autouse=True)
-def _no_dock_icon_copy_in_process(request, monkeypatch):
-    if request.module.__name__ != "test_dock_icon":
+def _no_dock_icon_in_process(request, monkeypatch):
+    if request.module.__name__ != "test_dock_icon" and not _BETA_RUN:
         monkeypatch.setattr(dock_icon, "prepare", lambda *_a, **_kw: dock_icon.DockChrome())

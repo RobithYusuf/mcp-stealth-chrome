@@ -19,7 +19,7 @@ pytestmark = pytest.mark.skipif(
 def _test_chrome_pids() -> set:
     listing = subprocess.run(["ps", "axo", "pid,args"], capture_output=True, text=True).stdout
     return {int(line.split()[0]) for line in listing.splitlines()
-            if "/Google Chrome " in line and "--type=" not in line
+            if ("/Google Chrome " in line or "/Google Chrome Beta " in line) and "--type=" not in line
             and "EXCLUDE 127.0.0.1" in line and "--headless" not in line}
 
 

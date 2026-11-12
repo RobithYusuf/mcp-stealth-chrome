@@ -99,20 +99,6 @@ class Client:
         self._thread.join(15)
 
 
-DOCK_COPY_ON = {"MCP_STEALTH_DOCK_ICON": "1"}
-
-
-def wait_for_dock_copy(client: "Client", timeout: float = 120) -> dict:
-    """Wait until the server's background build of the Dock-icon copy has settled.
-
-    The suite turns the copy off for the servers it starts; a headed test that should run from
-    it passes DOCK_COPY_ON and calls this before launching, since a launch never waits for it.
-    """
-    import time
-
-    deadline = time.monotonic() + timeout
-    while True:
-        state = client.call("server_status").json()["dock_icon"]
-        if state["state"] != "building" or time.monotonic() >= deadline:
-            return state
-        time.sleep(0.5)
+# Headed launches run from Chrome Beta with the project icon (macOS). The suite turns it off for
+# the servers it starts; a test about it passes this.
+DOCK_ICON_ON = {"MCP_STEALTH_DOCK_ICON": "1"}

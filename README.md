@@ -410,7 +410,19 @@ To use logins from your own browser, `list_chrome_profiles` shows every Chromium
 
 A browser started with `browser_launch` over stdio stays open until you close it. Instances from `spawn_browser` and browsers in HTTP mode close after `BROWSER_IDLE_TIMEOUT`.
 
-Runtime data lives in `~/.mcp-stealth/`: `profile/`, `profiles/<id>/`, `screenshots/`, `exports/`, `storage-states/`, `app/` (the Chrome copy with the Dock icon, macOS).
+Runtime data lives in `~/.mcp-stealth/`: `profile/`, `profiles/<id>/`, `screenshots/`, `exports/`, `storage-states/`. An `app/` folder left by 0.13.0 is removed.
+
+### Chrome 158 and saved logins (macOS)
+
+Chrome 158 on macOS encrypts with a new key in any profile outside its own default folder, which is every profile this server uses. It does not read the cookies Chrome 157 stored there, and deletes them. The server moves them first, once per profile, the first time Chrome 158 or newer opens it:
+
+1. It copies the profile's cookie databases aside, then opens the profile headless with `--disable-features=KeychainKeyProviderUserDataDirProtection`, which keeps the old cookies readable, and reads every cookie.
+2. It writes them to `~/.mcp-stealth/storage-states/pre-v11-migration-<profile>-<time>.json`, readable by you only. `storage_state_load` accepts that file.
+3. It closes that Chrome, starts the launch you asked for normally, sets the cookies again, and reads them back.
+
+The launch result says `migrated N cookies to Chrome 158 encryption; backup at <path>`. If fewer come back, the launch result is an error that names the missing cookies and the backup, and the next launch tries again. If anything fails before the backup is complete, that launch keeps the protection turned off so nothing is lost, and the next launch tries again. If Chrome reads fewer cookies than the profile holds, the copied databases are put back. Measured with Chrome Beta 158 standing in for Chrome 158, on profiles made by Chrome 157.
+
+Only cookies move. Saved passwords, card and address data and other values Chrome 157 encrypted in that profile stay unreadable to Chrome 158 there. Only the profile folder being launched is moved (`Default`, or the one `--profile-directory` names). A profile in Chrome's own default folder keeps the old key and is left alone. A profile Chrome 158 has opened is refused to Chrome 157.
 
 Two kinds of profile get left behind: `privacy-profiles/<name>`, when a server stops before it could delete one, and `profile-pid<N>`, which a server uses when another one holds `profile/`. A few seconds after it starts, the server checks both on a background thread and removes a folder only when all of these hold:
 
@@ -433,13 +445,14 @@ Results describe what was observed. A tool that reports success when nothing hap
 - ✅ `browser_snapshot` writes nothing to the page. Refs live on the server and reach into iframes, cross-origin ones included, and open shadow roots. A field shows its label as `label="..."`, taken from `<label for>`, a label around it or `aria-labelledby`, and `name_contains` finds it by that. The label's own row is left out when its field is listed, and the count of those rows is reported.
 - ✅ `navigate` reports the final URL, redirects, status and ready state, and waits for the load event up to 15 seconds. `expect_url` and `expect_status` turn a redirect into a failure. A page that did not load is an error, and `batch_actions` and `workflow_run` count it as failed. It no longer raises the window unless you pass `focus=True`.
 - ✅ A visible browser stays behind the app you are using. `browser_launch`, `spawn_browser`, `tab_new`, `tab_select` and page actions do not take the keyboard, measured with `lsappinfo` on macOS. `tab_new` opens its own background window, or with `new_window=False` a tab behind the one its window shows, which pages still read as visible (Chrome picks the window and the result names it). `tab_select` only changes which tab tools act on unless you pass `focus=True`, and says when the page it selected reads as hidden. A click that calls `window.open` still brings Chrome forward for about 130 ms before focus returns, so keys typed in that moment reach Chrome. `tab_focus` raises the window on request. Quitting it with Cmd+Q, or closing all its windows, ends it within a few seconds, and the next tool call says so.
-- Own Dock icon (macOS): withdrawn in 0.13.1. Running the copy registered it with Google's updater, which then updated the copy instead of your installed Chrome. `MCP_STEALTH_DOCK_ICON=1` is now ignored, `server_status` reports `dock_icon: withdrawn`, and a copy left in `~/.mcp-stealth/app` is removed once no browser runs from it. If your Chrome stayed on an old version, open Chrome > About Google Chrome after the copy is gone. The notes below describe how it worked:
-  - The browser runs from a copy of your installed Chrome in `~/.mcp-stealth/app/`. Your installed Chrome is never changed, and the Dock tooltip still says Google Chrome.
-  - The copy is an APFS clone. `du` shows about 1.5 GB for the folder, but it shares its blocks with the original: the free space measured before and after making it did not change beyond normal drift. After Chrome updates, the old copy holds that space by itself until it is rebuilt, which happens when the server next starts, at the next visible launch, or when the last browser running from it closes. `server_status` reports both numbers under `dock_icon.disk`: `own_mb` is what removing the copy would free, `shown_mb` is what `du` shows.
-  - Turning it off again removes the copy: a server started without `MCP_STEALTH_DOCK_ICON=1` deletes `Stealth Chrome.app` and its own files from that folder in the background, unless a browser is still running from it. If you run one server with it on and another with it off, the second removes the copy the first one made.
-  - It is built in the background when the server starts, about 20 seconds, once per Chrome update. A launch never waits for it: until the copy is ready a visible browser runs from Chrome itself and the result says so. `server_status` shows the state under `dock_icon`.
-  - The copy is marked to stay out of Time Machine backups. Running it lists it next to Chrome in Open With menus, so it is taken off that list again when no browser runs from it. macOS still picks your own Chrome when something asks for Chrome.
-  - Memory use measured the same as running from Chrome itself.
+- Own Dock icon (macOS, opt-in): with `MCP_STEALTH_DOCK_ICON=1`, a visible browser on a new profile runs from Google Chrome Beta (`/Applications/Google Chrome Beta.app`) with the project icon, so it is not mistaken for your own Chrome. It needs Chrome Beta installed. Measured on Chrome Beta 158:
+  - Only a profile nothing has written to goes to Beta: `persistent=False`, `privacy=True`, or a profile folder that does not exist yet or is empty. A profile that already holds data stays on Google Chrome and the result says why. Chrome 158 does not read the `v10` cookies Chrome 157 stores in a profile outside its default folder, and deletes them: a copy of a profile with 1172 cookies had none left after Beta opened it. When in doubt, Google Chrome is used.
+  - A profile Beta made stays on Beta, and the result says so. Google Chrome 157 is refused it, headless too, until Google Chrome reaches the version that last opened it.
+  - The icon is a custom Finder icon at the top of the Beta app (`Icon\r` and a Finder flag). Nothing inside `Contents/` changes, and `codesign --verify --deep` still passes. An update of Beta removes the icon. The next visible launch puts it back in the background, about 0.3 seconds, and does not wait for it. `/Applications/Google Chrome.app` is never changed.
+  - Beta registers with Google's updater under its own entry, `com.google.chrome.beta`. The `com.google.chrome` entry is not changed. Headless browsers, `attach_to_chrome` and the `solve_turnstile_oscursor` helper keep Google Chrome. The helper stops at once when the main browser runs a different Chrome version, because a clearance bound to the user agent could not be moved over.
+  - `server_status` reports `dock_icon`: `off`, `beta-ready`, `beta-missing`, `icon-missing` or `unavailable`, with the reason.
+  - The Chrome copy used by 0.13.0 is gone. A copy left in `~/.mcp-stealth/app` is removed when a server starts and no browser runs from it.
+- ✅ A profile last opened by a newer Chrome is never opened by an older one. The launch is refused with both versions named, nothing starts, and the profile is not changed. The version is read from `Last Version` and `Local State` in the profile. An older Chrome can damage a profile a newer one has upgraded.
   - It needs macOS with the copy on the same APFS volume as Chrome. If the copy cannot be made, launches use Chrome itself and the result says why. Headless launches and `attach_to_chrome` are not affected.
 - ✅ `evaluate`, `frame_evaluate` and `wait_for_function` report a JavaScript exception as an error, and promises are awaited. Objects and arrays come back as JSON.
 - ✅ `type_text`, `humanize_type` and `fill` send a keydown and keyup per character. `type_text` refuses when no field has focus, and refuses a newline in a single-line field.
@@ -653,7 +666,7 @@ These run without a browser and without a search API key, and use the stealth br
 | `browser_launch(profile_mode="light")` | No images, background Chrome services or Chrome's built-in component extensions, for ordinary pages. It also drops the "Google" speech voices, which pages can see. Keep the default on protected sites |
 | Every launch | Chrome's default apps (Google Docs Offline, Web Store Payments) are not installed. On a fresh profile, one page took 10 processes and about 0.9 GB instead of 12 and 1.1 GB, measured on one machine. Pages cannot tell the difference: `fingerprint_audit` reads the same |
 | `navigate` | Looks for a Cloudflare challenge once after load and waits only when something points at one. Opening a local page went from 669 ms to 63 ms |
-| `browser_close` | Returns when the browser's processes are seen gone, 0.11 s instead of 1.6 to 2.6 s. Programs Chrome starts that are not part of the browser, such as the system updater, are left alone |
+| `browser_close` | Asks Chrome to quit over CDP and returns when its processes are seen gone, about 0.75 s. Chrome writes its cookies on the way out, so a login made just before the close is kept; ended with a signal, as before, it lost cookies set in the last 30 seconds. A Chrome that does not exit within 5 seconds is still ended with a signal. Programs Chrome starts that are not part of the browser, such as the system updater, are left alone |
 | Headless | The reported screen is your display's size, or 1920x1080 when it cannot be read, so the window fits its screen. Headless Chrome otherwise reports 800x600 with a 1280x800 window. `fingerprint_audit` warns when a window is larger than its screen |
 | `browser_launch(testing_mode=True)` | Faster regression runs, with less stealth |
 | `profile_report`, `profile_cleanup` | Size and use of every profile, and cleanup of caches. Cleanup previews unless `confirm=True`, and refuses main and named profiles and anything in use |
@@ -720,8 +733,9 @@ Things to know:
 | `BROWSER_LAUNCH_TIMEOUT`, `BROWSER_NAV_TIMEOUT`, `TOOL_ACTION_TIMEOUT` | Time limits for launching, navigating, and single actions |
 | `CAPTURE_MAX_EVENTS`, `CAPTURE_MAX_INDEXED` | Size of the capture buffers |
 | `MCP_STEALTH_TOKEN` | Token for HTTP mode |
-| `MCP_STEALTH_DOCK_ICON` | Ignored since 0.13.1, when the Dock icon was withdrawn. See "Own Dock icon" under What tool results tell you for what it costs |
-| `MCP_STEALTH_APP_DIR` | Folder for the Chrome copy that carries the Dock icon. Default `~/.mcp-stealth/app`. It must be on the same APFS volume as Chrome |
+| `MCP_STEALTH_DOCK_ICON` | Set to `1` to run visible browsers on new profiles from Google Chrome Beta with the project icon (macOS). See "Own Dock icon" under What tool results tell you |
+| `MCP_STEALTH_APP_DIR` | Folder of the Chrome copy left by 0.13.0, which is removed. Default `~/.mcp-stealth/app` |
+| `MCP_STEALTH_CLOSE_WAIT` | Seconds a browser asked to quit is given to write its state and exit before it is ended with a signal. Default 5 |
 | `MCP_STEALTH_DATA_DIR` | Folder used instead of `~/.mcp-stealth` for profiles, screenshots, exports and the rest. Chrome keeps your real home folder. The HTTP token stays in `~/.mcp-stealth` |
 | `MCP_STEALTH_PROFILE_GC` | Set to `0` to turn off the cleanup of leftover profiles when the server starts |
 | `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL` | Vision model through any OpenAI-compatible API |

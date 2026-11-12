@@ -21,6 +21,7 @@ import sys
 import tempfile
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Optional
 
@@ -76,6 +77,8 @@ from .refs import (
 )
 from . import dock_icon
 from . import profile_gc
+from . import profile_version
+from . import cookie_migration
 from .state import data_root as state_data_root
 from .workflow import WorkflowError, run_workflow
 from .humanize import humanized_click, humanized_move, humanized_mouse_press, humanized_scroll, move_pointer
@@ -88,6 +91,7 @@ from .state import (
     PROFILE_DIR,
     PROFILES_ROOT,
     PRIVACY_PROFILE_ROOT,
+    STORAGE_STATE_DIR,
     BrowserState,
     InstanceSnapshot,
     chrome_install_hint,
@@ -352,6 +356,32 @@ async def _all_gone(pids: list[int], within: float) -> bool:
     return not any(_process_exists(target) for target in pids)
 
 
+# How long a Chrome asked to close is given to write its state and exit before it is signalled.
+# Measured exits are well under a second; the wait ends as soon as the process is gone.
+_CLOSE_WAIT = float(os.environ.get("MCP_STEALTH_CLOSE_WAIT", "5"))
+
+
+async def _request_browser_close(browser: Any) -> bool:
+    """Send Browser.close over CDP. True when Chrome acknowledged it; never raises."""
+    from nodriver.cdp import browser as cdp_browser
+    connection = getattr(browser, "connection", None)
+    if connection is None or getattr(connection, "closed", False):
+        return False
+    try:
+        await asyncio.wait_for(connection.send(cdp_browser.close()), timeout=2)
+        return True
+    except Exception:
+        # The reply can be lost as Chrome closes the socket on its way out; whether it is
+        # really going is decided by watching the process, not by this answer.
+        return True if _socket_dropped(connection) else False
+
+
+def _socket_dropped(connection: Any) -> bool:
+    with contextlib.suppress(Exception):
+        return bool(getattr(connection, "closed", False))
+    return False
+
+
 async def _ensure_browser_dead(browser, profile_dir=None, grace: float = 1.5) -> dict:
     """Stop a browser and VERIFY the OS process actually died.
 
@@ -393,6 +423,15 @@ async def _ensure_browser_dead(browser, profile_dir=None, grace: float = 1.5) ->
                 (getattr(browser, "connection", None) or browser).send(cdp_browser.close()),
                 timeout=3,
             )
+    elif isinstance(pid, int) and pid > 0 and not recycled:
+        # A browser this server started. nodriver's stop() disconnects and sends SIGTERM, and
+        # Chrome then exits without writing what it holds in memory: its cookie store is
+        # written about every 30 s, so a login made just before the close was lost. Asked
+        # with Browser.close, Chrome shuts down as on Quit and writes it first. The signals
+        # below stay the fallback for a Chrome that does not answer or does not exit.
+        report["close_requested"] = await _request_browser_close(browser)
+        if report["close_requested"]:
+            report["closed_itself"] = await _all_gone([pid, *family], _CLOSE_WAIT)
     try:
         if browser:
             browser.stop()
@@ -473,18 +512,7 @@ async def _ensure_browser_dead(browser, profile_dir=None, grace: float = 1.5) ->
     report["verified"] = not report["still_alive"]
     if report["verified"]:
         await _discard_temp_profile(browser)
-        _forget_dock_copy(browser)
     return report
-
-
-def _forget_dock_copy(browser: Any) -> None:
-    """A browser run from the Dock-icon copy has ended: stop listing the copy beside the
-    person's Chrome, unless another browser still runs from it. On a thread, never awaited."""
-    with contextlib.suppress(Exception):
-        executable = getattr(getattr(browser, "config", None), "browser_executable_path", None)
-        if executable:
-            threading.Thread(target=dock_icon.forget_when_idle, args=(str(executable),),
-                             name="dock-icon-forget", daemon=True).start()
 
 
 def _kill_note(report: dict) -> str:
@@ -1748,39 +1776,219 @@ async def _give_focus_back(app: Optional[str]) -> None:
         pass
 
 
-async def _use_dock_icon_copy(config: Config, headless: bool) -> str:
-    """Point a headed launch at the Chrome copy that carries the project's Dock icon.
+@dataclass(frozen=True)
+class _LaunchChoice:
+    """Which Chrome a launch runs, decided before anything writes to its profile.
 
-    Returns what to add to the launch result: nothing when the copy is in use or does not
-    apply, and the reason when it was wanted and Chrome's own app had to be used instead.
-    The copy is the same build with the same signature, so the identity does not change.
-    This never waits for the copy: one that is not ready means Chrome's own app this time,
-    while the build goes on in the background.
-    """
+    `beta` means Chrome Beta for the Dock icon. `note` is the profile's part of the launch
+    result: why it stays on Google Chrome, or why it stays on Beta."""
+    executable: Optional[str]
+    beta: bool = False
+    note: str = ""
+
+
+def _launch_choice(profile_path: Optional[Path], headless: bool,
+                   extra_args: Optional[list] = None) -> _LaunchChoice:
+    """Chrome Beta only for a profile it cannot damage: see profile_version.beta_verdict.
+    Must run before clean_profile_state or the window-state wipe, which write to the profile
+    and would make a new one look used."""
+    chrome = _default_chrome()
+    beta = dock_icon.chosen(headless=headless)
+    if not beta:
+        return _LaunchChoice(chrome)
     try:
-        choice = await asyncio.to_thread(
-            dock_icon.prepare, str(config.browser_executable_path or ""), headless=headless)
+        allowed, note = profile_version.beta_verdict(profile_path, chrome=chrome, beta=beta,
+                                                     extra_args=extra_args)
     except Exception as exc:
-        return f" [Dock icon: Chrome's own, because {_exc_text(exc)}]"
-    if choice.executable:
-        config.browser_executable_path = choice.executable
-    if choice.pending:
-        return f" [Dock icon: Chrome's own this time, {choice.note}]"
-    return f" [Dock icon: Chrome's own, because {choice.note}]" if choice.note else ""
+        allowed, note = False, f"the profile could not be checked ({_exc_text(exc)})"
+    return _LaunchChoice(beta if allowed else chrome, beta=allowed, note=note)
 
 
-def _chrome_for_dock_icon() -> Optional[str]:
-    """The Chrome a launch would run: nodriver's own choice, as Config makes it."""
+async def _use_dock_icon_browser(config: Config, headless: bool, choice: _LaunchChoice) -> str:
+    """Point a headed launch at Chrome Beta, which carries the project's Dock icon, when
+    MCP_STEALTH_DOCK_ICON=1 asks for it (macOS) and the profile allows it.
+
+    Returns what to add to the launch result: nothing when the switch is off or the launch is
+    headless, otherwise which browser it is and why. Never waits: an icon an update removed
+    goes back on in the background while Beta starts.
+    """
+    refusal = "" if choice.beta else choice.note
+    try:
+        picked = await asyncio.to_thread(
+            dock_icon.prepare, str(config.browser_executable_path or ""), headless=headless,
+            profile_refusal=refusal)
+    except Exception as exc:
+        return f" [Dock icon: Google Chrome, because {_exc_text(exc)}]"
+    if picked.executable:
+        config.browser_executable_path = picked.executable
+        version = f" {picked.version}" if picked.version else ""
+        tails = [t for t in (picked.note, choice.note) if t]
+        tail = "".join(f"; {t}" for t in tails)
+        return f" [Dock icon: Chrome Beta{version}{tail}]"
+    return f" [Dock icon: {picked.note}]" if picked.note else ""
+
+
+def _profile_version_refusal(profile_path: Optional[Path], executable: Optional[str]) -> str:
+    """Why `executable` must not open this profile, or "": see profile_version. A profile last
+    opened by Chrome Beta is refused to an older Google Chrome rather than damaged by it."""
+    try:
+        executable = str(executable or "")
+        return profile_version.refusal(profile_path, executable,
+                                       beta=executable.startswith(str(dock_icon.BETA_APP) + "/"))
+    except Exception:
+        return ""
+
+
+def _default_chrome() -> Optional[str]:
+    """The Chrome a launch runs without the Dock icon: nodriver's own choice, as Config makes it."""
     with contextlib.suppress(Exception):
         from nodriver.core.config import find_chrome_executable
         return str(find_chrome_executable())
     return find_chrome_binary()
 
 
+def _cdp_call(method: str, params: Optional[dict] = None):
+    """A raw CDP command for nodriver's connection.send, answering Chrome's result as sent.
+    Used where nodriver's typed objects lag Chrome's fields, as cookies do."""
+    result = yield {"method": method, "params": params or {}}
+    return result
+
+
+@dataclass
+class _CookieMove:
+    """A profile's cookies on their way to Chrome 158's encryption; see cookie_migration.
+
+    `flag`: launch with the protection turned off. `backup`: after the launch, set the
+    cookies in this file again and check them. `note` goes into the launch result."""
+    plan: Any
+    flag: bool = False
+    backup: Optional[Path] = None
+    note: str = ""
+
+
+def _cookie_flag_arg(config: Config) -> str:
+    return _disable_features_arg(config, (cookie_migration.FEATURE,))
+
+
+async def _prepare_cookie_move(profile_path: Optional[Path], config: Config) -> _CookieMove:
+    """Before Chrome 158 opens a profile holding v10 cookies: read them with the protection
+    off, keep them in a backup, and only then let the launch go without it. Never raises;
+    whatever goes wrong before the backup is complete means the flag for this launch."""
+    executable = str(config.browser_executable_path or "")
+    plan = await asyncio.to_thread(cookie_migration.plan, profile_path, list(config.browser_args or []),
+                                   executable)
+    if plan.kind == "none":
+        return _CookieMove(plan)
+    if plan.kind == "flag":
+        return _CookieMove(plan, flag=True, note=f" [cookies: {plan.reason}]")
+    if plan.kind == "resume":
+        return _CookieMove(plan, backup=Path(str(plan.marker["backup"])))
+    try:
+        return await _move_cookies_out(Path(profile_path), config, plan, executable)
+    except Exception as exc:
+        return _CookieMove(plan, flag=True, note=_cookie_move_failed(_exc_text(exc)))
+
+
+def _cookie_move_failed(why: str) -> str:
+    return (f" [cookies NOT moved to Chrome 158 encryption: {why}. This launch opens the profile with "
+            f"the protection turned off, so nothing is lost, and the next launch tries again]")
+
+
+async def _move_cookies_out(profile: Path, config: Config, plan: Any, executable: str) -> _CookieMove:
+    """Steps 1 to 4 of cookie_migration: copy the databases, read every cookie with the flag,
+    write the backup, close that Chrome, and mark the move pending."""
+    ensure_dirs()
+    name = f"{cookie_migration.BACKUP_PREFIX}-{cookie_migration.label(profile)}-{time.strftime('%Y%m%d-%H%M%S')}"
+    db_copy = STORAGE_STATE_DIR / f"{name}-db"
+    databases = cookie_migration.cookie_databases(profile, plan.subprofile)
+    copied = await asyncio.to_thread(cookie_migration.backup_databases, databases, profile, db_copy)
+    reader_config = Config(
+        user_data_dir=str(profile), headless=True,
+        browser_args=[f"--profile-directory={plan.subprofile}", "--no-default-browser-check",
+                      "--disable-restore-session-state", "--hide-crash-restore-bubble", *_LEAN_FLAGS],
+    )
+    reader_config.browser_executable_path = executable
+    reader_config.add_argument(_cookie_flag_arg(reader_config))
+    reader = None
+    cookies: list = []
+    problem = ""
+    try:
+        reader = await _start_chrome(reader_config)
+        answer = await asyncio.wait_for(
+            (getattr(reader, "connection", None) or reader).send(_cdp_call("Storage.getCookies")),
+            timeout=30)
+        cookies = list((answer or {}).get("cookies") or [])
+    except Exception as exc:
+        problem = f"reading them with the protection turned off failed ({_exc_text(exc)})"
+    closed = await _ensure_browser_dead(reader, profile) if reader is not None else {"verified": True}
+    if not closed.get("verified"):
+        return _CookieMove(plan, flag=True, note=_cookie_move_failed(
+            f"the Chrome that read them did not end ({_kill_note(closed) or 'not verified'})"))
+    if not problem and len(cookies) < plan.rows:
+        problem = (f"Chrome read {len(cookies)} of the {plan.rows} cookies in the profile with the "
+                   "protection turned off")
+    if problem:
+        # The flag may have stopped working, in which case Chrome deleted what it could not
+        # read: the databases go back as they were.
+        await asyncio.to_thread(cookie_migration.restore_databases, db_copy, profile, copied)
+        return _CookieMove(plan, flag=True, note=_cookie_move_failed(
+            f"{problem}; the cookie databases were put back from {db_copy}"))
+    backup = STORAGE_STATE_DIR / f"{name}.json"
+    document = cookie_migration.backup_document(cookies, profile, executable)
+    await asyncio.to_thread(cookie_migration.write_private, backup, json.dumps(document))
+    # Only now may this Chrome open the profile without the flag: every cookie is in the backup.
+    cookie_migration.write_marker(profile, {
+        "state": "pending", "backup": str(backup), "database_copy": str(db_copy),
+        "count": len(cookies), "major": profile_version.binary_version(executable)[0],
+        "started_at": time.time()})
+    return _CookieMove(plan, backup=backup)
+
+
+async def _finish_cookie_move(browser: Any, profile: Path, move: _CookieMove) -> tuple[bool, str]:
+    """Steps 5 and 6: set the backed-up cookies in the Chrome just started without the flag,
+    read them back and compare. (True, note) once all are there and the move is done;
+    (False, text) otherwise, with the marker left pending so the next launch sets them again."""
+    if move.backup is None:
+        return True, move.note
+    connection = getattr(browser, "connection", None) or browser
+    try:
+        document = json.loads(move.backup.read_text(encoding="utf-8"))
+        cookies = list(document.get("cdp_cookies") or [])
+        params = [cookie_migration.cookie_params(c) for c in cookies]
+        refused = []
+        for start in range(0, len(params), 200):
+            chunk = params[start:start + 200]
+            try:
+                await connection.send(_cdp_call("Storage.setCookies", {"cookies": chunk}))
+            except Exception:
+                for one in chunk:  # one bad cookie fails the whole call; find which
+                    try:
+                        await connection.send(_cdp_call("Storage.setCookies", {"cookies": [one]}))
+                    except Exception as exc:
+                        refused.append(f"{one.get('name')}@{one.get('domain')}: {_exc_text(exc)}")
+        answer = await connection.send(_cdp_call("Storage.getCookies"))
+        back = {cookie_migration.key(c) for c in (answer or {}).get("cookies") or []}
+    except Exception as exc:
+        return False, (f"the cookies could not be set again ({_exc_text(exc)}); every one of them is in "
+                       f"{move.backup}, storage_state_load({str(move.backup)!r}) sets them, and the "
+                       "next launch of this profile tries again")
+    missing = [k for k in (cookie_migration.key(c) for c in cookies) if k not in back]
+    if missing:
+        sample = ", ".join(f"{n}@{d}" for n, d, *_ in missing[:5])
+        return False, (f"{len(cookies) - len(missing)} of {len(cookies)} cookies came back after the move to "
+                       f"Chrome 158 encryption; missing {sample}{' and more' if len(missing) > 5 else ''}"
+                       f"{'; refused: ' + refused[0] if refused else ''}. All {len(cookies)} are in "
+                       f"{move.backup}: storage_state_load({str(move.backup)!r}) sets them, and the next "
+                       "launch of this profile tries again")
+    marker = cookie_migration.read_marker(profile)
+    cookie_migration.write_marker(profile, {**marker, "state": "done", "finished_at": time.time()})
+    return True, (f" [cookies: migrated {len(cookies)} cookies to Chrome 158 encryption; "
+                  f"backup at {move.backup}]")
+
+
 async def _dock_icon_status() -> dict:
     try:
-        return await asyncio.wait_for(asyncio.to_thread(
-            lambda: dock_icon.status(_chrome_for_dock_icon())), timeout=3)
+        return await asyncio.wait_for(asyncio.to_thread(dock_icon.status), timeout=3)
     except Exception as exc:
         return {"state": "unavailable", "detail": _exc_text(exc)}
 
@@ -2012,6 +2220,8 @@ async def browser_launch(
         # If the user passed user_data_dir explicitly, that takes precedence over
         # both `persistent` and any --user-data-dir already in extra_args.
         explicit_udd: Optional[Path] = None
+        # Decided before anything writes to the profile; see _launch_choice.
+        launch_choice: Optional[_LaunchChoice] = None
         if user_data_dir:
             explicit_udd = Path(user_data_dir).expanduser()
             if not explicit_udd.exists():
@@ -2050,6 +2260,10 @@ async def browser_launch(
                 merged_extra_args.append(f"--profile-directory={profile_directory}")
             else:
                 merged_extra_args.extend(_profile_directory_args(explicit_udd, merged_extra_args))
+            launch_choice = _launch_choice(explicit_udd, headless, merged_extra_args)
+            refused = _profile_version_refusal(explicit_udd, launch_choice.executable)
+            if refused:
+                return err(refused)
             persistent = False  # we're managing user_data_dir ourselves; skip default profile flow
             profile_path = explicit_udd
             used_fallback = False
@@ -2107,6 +2321,11 @@ async def browser_launch(
                         f"Run `pkill -f mcp-stealth-chrome` then retry, or use persistent=False "
                         f"for an ephemeral throwaway profile."
                     )
+                # Before the window-state wipe below writes to it: a refused profile stays as it was.
+                launch_choice = _launch_choice(profile_path, headless, merged_extra_args)
+                refused = _profile_version_refusal(profile_path, launch_choice.executable)
+                if refused:
+                    return err(refused)
                 clean_profile_state(profile_path)  # only clears stale locks
                 # Selectively wipe corrupt window-placement / session-restore
                 # state. Idempotent + cheap (a few file writes), preserves
@@ -2184,7 +2403,20 @@ async def browser_launch(
                 config.add_argument(_flag)
 
         browser: Optional[Browser] = None
-        dock_note = await _use_dock_icon_copy(config, headless)
+        if launch_choice is None:
+            launch_choice = _launch_choice(profile_path, headless, merged_extra_args)
+        dock_note = await _use_dock_icon_browser(config, headless, launch_choice)
+        refused = _profile_version_refusal(profile_path, config.browser_executable_path)
+        if refused:
+            await _remove_privacy_profile(privacy_profile)
+            return err(refused)
+        with contextlib.suppress(Exception):
+            dock_note += profile_version.upgrade_note(profile_path, config.browser_executable_path)
+        cookie_move = await _prepare_cookie_move(profile_path, config)
+        if cookie_move.flag:
+            config.add_argument(_cookie_flag_arg(config))
+        if not cookie_move.backup:
+            dock_note += cookie_move.note
         # Read before Chrome starts, while the person's app is still the frontmost one.
         previous_app = None if headless else await asyncio.to_thread(_frontmost_app)
         if not headless:
@@ -2244,6 +2476,12 @@ async def browser_launch(
             return err(hint or f"launch failed: {e}")
 
         BrowserState.browser = browser
+
+        if cookie_move.backup is not None:
+            moved, moved_text = await _finish_cookie_move(browser, Path(str(profile_path)), cookie_move)
+            if not moved:
+                return err(f"the browser is running, but its cookies were not all moved: {moved_text}")
+            dock_note += moved_text
 
         if storage_state_path:
             try:
@@ -5015,10 +5253,9 @@ async def server_status() -> str:
     it makes the CDP event listener die on the first mismatched payload, so
     console/network capture returns nothing and looks like a quiet page.
 
-    `dock_icon` says where the macOS Chrome copy with its own Dock icon stands: ready,
-    building, stale, off or unavailable, with the reason. Reading it starts no build.
-    Its `disk` gives `own_mb`, what removing the copy would free, and `shown_mb`, what
-    du shows for it: the copy is a clone, so the first is near zero until Chrome updates.
+    `dock_icon` says whether visible browsers get their own Dock icon (macOS): off,
+    beta-ready (they run from Chrome Beta with the project icon), beta-missing,
+    icon-missing or unavailable, with the reason. Reading it changes nothing.
 
     `profile_gc` is the startup pass over leftover privacy-profiles/* and profile-pid<N>
     folders: what it removed, what it kept because it holds data, what was in use, and
@@ -5856,6 +6093,7 @@ async def _launch_browser_instance(
         profile_dir_override=profile_dir_override,
     )
     privacy_profile = profile_path if privacy else None
+    launch_choice: Optional[_LaunchChoice] = None
     if profile_path is not None:
         if profile_path.exists():
             holder = chrome_lock_holder_pid(profile_path)
@@ -5864,6 +6102,13 @@ async def _launch_browser_instance(
                     f"profile {profile_path} is locked by Chrome PID {holder}; "
                     "close that browser or clone the profile first"
                 )
+        # Before mkdir and clean_profile_state write to it: whether the profile is new decides
+        # whether Chrome Beta may open it, and a refused profile stays as it was.
+        launch_choice = _launch_choice(profile_path, headless, extra_args)
+        refused = _profile_version_refusal(profile_path, launch_choice.executable)
+        if refused:
+            await _remove_privacy_profile(privacy_profile)
+            return False, refused
         profile_path.mkdir(parents=True, exist_ok=True)
         if persistent or profile_dir_override:
             clean_profile_state(profile_path)
@@ -5893,7 +6138,20 @@ async def _launch_browser_instance(
             config.add_argument(_screen_arg)
 
     browser: Optional[Browser] = None
-    dock_note = await _use_dock_icon_copy(config, headless)
+    if launch_choice is None:
+        launch_choice = _launch_choice(profile_path, headless, extra_args)
+    dock_note = await _use_dock_icon_browser(config, headless, launch_choice)
+    refused = _profile_version_refusal(profile_path, config.browser_executable_path)
+    if refused:
+        await _remove_privacy_profile(privacy_profile)
+        return False, refused
+    with contextlib.suppress(Exception):
+        dock_note += profile_version.upgrade_note(profile_path, config.browser_executable_path)
+    cookie_move = await _prepare_cookie_move(profile_path, config)
+    if cookie_move.flag:
+        config.add_argument(_cookie_flag_arg(config))
+    if not cookie_move.backup:
+        dock_note += cookie_move.note
     previous_app = None if headless else await asyncio.to_thread(_frontmost_app)
     if not headless:
         for _flag in _BACKGROUND_WINDOW_FLAGS:
@@ -5917,6 +6175,14 @@ async def _launch_browser_instance(
         await _safe_stop_browser(browser)
         await _remove_privacy_profile(privacy_profile)
         return False, f"launch failed: {_exc_text(e)}"
+
+    cookie_error = ""
+    if cookie_move.backup is not None:
+        moved, moved_text = await _finish_cookie_move(browser, Path(str(profile_path)), cookie_move)
+        if moved:
+            dock_note += moved_text
+        else:
+            cookie_error = moved_text
 
     if storage_state_path:
         try:
@@ -5993,6 +6259,10 @@ async def _launch_browser_instance(
     if not headless:
         _watch_windows(browser)
     await _give_focus_back(previous_app)
+    if cookie_error:
+        # The instance is registered and running; the text must still read as a failure.
+        return True, (f"Error: instance {instance_id!r} is running, but its cookies were not all "
+                      f"moved: {cookie_error}")
     return True, (
         f"instance {instance_id!r} launched (headless={headless}, "
         f"privacy={privacy}, identity={identity_source}, "
@@ -9085,7 +9355,7 @@ def main() -> None:
     cli = _parse_cli(sys.argv[1:])
     # A thread, so neither the start nor any tool waits on it; a failure stays in there.
     with contextlib.suppress(Exception):
-        dock_icon.start_in_background(_chrome_for_dock_icon)
+        dock_icon.start_in_background()
     # Leftover privacy and fallback profiles: one pass on its own thread, see profile_gc.
     with contextlib.suppress(Exception):
         profile_gc.start_in_background(state_data_root())
