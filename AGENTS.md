@@ -168,6 +168,13 @@ conclusions. Each rule below replaced a real lie.
   hung forever. `_dispatch_input` stops waiting once `_watch_dialogs` sees one open and the result names it. Pointer moves go
   through it too, because `onmousemove` can open a dialog before any press. `Page.enable` needs the renderer as well, so the
   watch is armed before input, and `dialog_handle` answers a dialog already open.
+- Giving up the wait leaves the gesture's task running (a press blocked on mousedown still has to release), but marks it
+  stopped (`humanize.CURRENT_GESTURE`, bound in that task only): `move_pointer` and `check_gesture` then send nothing more.
+  Before, the step that opened the dialog finished once it was answered and the rest of the path went out after the tool
+  had returned, into whatever page was open: 7 to 11 moves reached the next page, opened its alert while another tool ran,
+  and the guard in `_app` cut that tool off ("<tool> stopped"), on the macOS and Windows runners now and then. A path and
+  its press are separate pieces of input, so a dialog from the path means `NOT clicked`: `humanize_click` answered
+  "clicked" with its press still queued behind the dialog. Input sent while a dialog is open is dropped by Chrome.
 - Anything else needing the renderer also waits for ever while a dialog is open, timeout or not. `_app._run_unless_a_dialog_blocks`
   refuses or stops such a tool and names the dialog. A new tool that does not touch the page belongs in `_RUNS_DESPITE_DIALOG`.
   A dialog only counts once `_watch_dialogs` has armed that tab, so one on a tab no tool has touched yet is not seen.
@@ -249,6 +256,18 @@ conclusions. Each rule below replaced a real lie.
   for the processes to end is a poll (`_all_gone`), not a sleep: the fixed 1.5 s made every close take 1.6 s. `verified` still means every one of them was seen gone.
   It skips a PID whose command line no longer names the profile: that number was recycled. Once death is verified it removes nodriver's `uc_*` temp profile, which nodriver otherwise
   leaves for an exit hook, one per launch, that at exit on 0.48.1 stops after the first (it prints to the closed stdout).
+- Windows has no `ps`, so the descendants and command lines come from `state.process_table` there (a Toolhelp snapshot and
+  `NtQueryInformationProcess(ProcessCommandLineInformation)`); parent numbers are reused there, so the walk keeps a seen
+  set. Before, the family was empty on Windows. Measured on the runner: a Chrome ended with TerminateProcess leaves its
+  8 to 9 helpers running for 0.2 to 2 s, holding the profile's files (`WinError 32` on `Default\Extension Rules\000003.log`
+  in 8 of 8 rounds); a Chrome that quits on `Browser.close` took up to 4 s. A close that had to signal Chrome then
+  deleted a privacy profile under them, gave up after about a second, and the next launch refused.
+- `_remove_privacy_profile` deletes nothing while a process names the profile on its command line (`state.processes_naming`:
+  Chrome hands `--user-data-dir` to every helper, and crashpad gets `--database=<profile>\Crashpad`); it waits for them.
+  Then it retries for `MCP_STEALTH_PROFILE_REMOVE_WAIT` (15 s on Windows, where an open handle blocks a delete and a
+  deleted file stays until its last handle closes; elsewhere the three tries it always made). A folder that still cannot
+  be removed is an error naming why and who holds it: Restart Manager on Windows (`state._win_file_holders`, the API behind
+  Explorer's "the file is open in"), with the process table's command line when it gives no name (an exiting process).
 - A browser this server started is asked to quit with `Browser.close` (`_request_browser_close`) and given
   `_CLOSE_WAIT` (5 s, `MCP_STEALTH_CLOSE_WAIT`) to exit, polled with `_all_gone`, before `stop()` and the signals.
   nodriver's `stop()` disconnects and sends SIGTERM, and Chrome then exits without writing its cookie store, which it

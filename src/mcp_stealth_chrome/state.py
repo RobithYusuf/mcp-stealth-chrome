@@ -257,6 +257,186 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
+def _win_process_table() -> Optional[list[tuple[int, int, str]]]:
+    """Windows: (pid, parent pid, command line) of every process, from a Toolhelp snapshot.
+
+    `ps` does not exist there, so the browser's helpers (renderers, GPU, network, crashpad)
+    went unseen and a privacy profile was deleted while they still held its files. The
+    command line comes from NtQueryInformationProcess(ProcessCommandLineInformation),
+    Windows 8.1 and later; "" where it cannot be read. None when the snapshot fails.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        ntdll = ctypes.WinDLL("ntdll")
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                        ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_size_t),
+                        ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                        ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", wintypes.LONG),
+                        ("dwFlags", wintypes.DWORD), ("szExeFile", wintypes.WCHAR * 260)]
+
+        class UNICODE_STRING(ctypes.Structure):
+            _fields_ = [("Length", wintypes.USHORT), ("MaximumLength", wintypes.USHORT),
+                        ("Buffer", ctypes.c_void_p)]
+
+        kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        kernel32.CreateToolhelp32Snapshot.argtypes = (wintypes.DWORD, wintypes.DWORD)
+        kernel32.Process32FirstW.argtypes = (wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W))
+        kernel32.Process32NextW.argtypes = (wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W))
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        ntdll.NtQueryInformationProcess.restype = ctypes.c_long
+        ntdll.NtQueryInformationProcess.argtypes = (
+            wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.ULONG,
+            ctypes.POINTER(wintypes.ULONG))
+
+        def command_line(pid: int) -> str:
+            handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+            if not handle:
+                return ""
+            try:
+                size = wintypes.ULONG(4096)
+                for _ in range(3):
+                    buf = ctypes.create_string_buffer(size.value)
+                    status = ntdll.NtQueryInformationProcess(
+                        handle, 60, buf, size.value, ctypes.byref(size)) & 0xFFFFFFFF
+                    if status == 0:
+                        text = UNICODE_STRING.from_buffer(buf)
+                        return ctypes.wstring_at(text.Buffer, text.Length // 2) if text.Buffer else ""
+                    if status not in (0xC0000004, 0x80000005, 0xC0000023):  # too small
+                        return ""
+                return ""
+            finally:
+                kernel32.CloseHandle(handle)
+
+        snapshot = kernel32.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
+        if not snapshot or snapshot == ctypes.c_void_p(-1).value:
+            return None
+        rows: list[tuple[int, int, str]] = []
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            more = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+            while more:
+                rows.append((int(entry.th32ProcessID), int(entry.th32ParentProcessID),
+                             entry.szExeFile))
+                more = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+        finally:
+            kernel32.CloseHandle(snapshot)
+        return [(pid, ppid, command_line(pid) if pid else "") for pid, ppid, _exe in rows]
+    except Exception:
+        return None
+
+
+def process_table() -> Optional[list[tuple[int, int, str]]]:
+    """(pid, parent pid, command line) of every process; None when it cannot be read."""
+    import sys
+    if sys.platform == "win32":
+        return _win_process_table()
+    try:
+        import subprocess
+        r = subprocess.run(["ps", "-ax", "-ww", "-o", "pid=,ppid=,command="],
+                           capture_output=True, text=True, timeout=3)
+    except Exception:
+        return None
+    rows: list[tuple[int, int, str]] = []
+    for line in (r.stdout or "").splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
+            continue
+        rows.append((int(parts[0]), int(parts[1]), parts[2] if len(parts) > 2 else ""))
+    return rows if r.returncode == 0 or rows else None
+
+
+def processes_naming(path: Path, table: Optional[list[tuple[int, int, str]]] = None
+                     ) -> Optional[list[tuple[int, str]]]:
+    """Live processes whose command line names `path` or something inside it, as (pid, command).
+
+    Chrome hands --user-data-dir to every helper it starts, and its crash handler also gets
+    --database=<profile>/Crashpad, so this finds the whole browser of a profile. The path must
+    end where a separator, quote or space follows, so profile-x does not claim profile-xy.
+    None when the process list cannot be read, which is not the same as none running.
+    """
+    rows = process_table() if table is None else table
+    if rows is None:
+        return None
+    spellings = {str(path)}
+    try:
+        spellings.add(str(Path(path).resolve()))
+    except OSError:
+        pass
+    flags = re.IGNORECASE if os.name == "nt" else 0  # Windows paths ignore case
+    needle = re.compile("|".join(re.escape(s) for s in sorted(spellings)) + r"""(?=[\\/"'\s]|$)""",
+                        flags)
+    own = os.getpid()
+    return [(pid, command) for pid, _ppid, command in rows
+            if pid != own and command and needle.search(command)]
+
+
+def _win_file_holders(paths: list[str]) -> Optional[list[tuple[int, str]]]:
+    """Windows: the processes holding any of these files open, as (pid, app name).
+
+    Restart Manager is the API Windows Explorer uses for "the file is open in ...". None when
+    it cannot answer; an empty list when nothing holds them.
+    """
+    if not paths:
+        return []
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class RM_UNIQUE_PROCESS(ctypes.Structure):
+            _fields_ = [("dwProcessId", wintypes.DWORD), ("ProcessStartTime", wintypes.FILETIME)]
+
+        class RM_PROCESS_INFO(ctypes.Structure):
+            _fields_ = [("Process", RM_UNIQUE_PROCESS),
+                        ("strAppName", wintypes.WCHAR * 256),
+                        ("strServiceShortName", wintypes.WCHAR * 64),
+                        ("ApplicationType", ctypes.c_int), ("AppStatus", wintypes.ULONG),
+                        ("TSSessionId", wintypes.DWORD), ("bRestartable", wintypes.BOOL)]
+
+        rm = ctypes.WinDLL("rstrtmgr")
+        rm.RmStartSession.argtypes = (ctypes.POINTER(wintypes.DWORD), wintypes.DWORD,
+                                      ctypes.c_wchar_p)
+        rm.RmRegisterResources.argtypes = (
+            wintypes.DWORD, wintypes.UINT, ctypes.POINTER(ctypes.c_wchar_p), wintypes.UINT,
+            ctypes.c_void_p, wintypes.UINT, ctypes.c_void_p)
+        rm.RmGetList.argtypes = (
+            wintypes.DWORD, ctypes.POINTER(wintypes.UINT), ctypes.POINTER(wintypes.UINT),
+            ctypes.POINTER(RM_PROCESS_INFO), ctypes.POINTER(wintypes.DWORD))
+        rm.RmEndSession.argtypes = (wintypes.DWORD,)
+
+        session = wintypes.DWORD()
+        key = ctypes.create_unicode_buffer(33)  # CCH_RM_SESSION_KEY + 1
+        if rm.RmStartSession(ctypes.byref(session), 0, key) != 0:
+            return None
+        try:
+            names = (ctypes.c_wchar_p * len(paths))(*paths)
+            if rm.RmRegisterResources(session, len(paths), names, 0, None, 0, None) != 0:
+                return None
+            needed, count, reasons = wintypes.UINT(0), wintypes.UINT(0), wintypes.DWORD()
+            for _ in range(3):
+                infos = (RM_PROCESS_INFO * max(1, needed.value))()
+                count.value = needed.value
+                rc = rm.RmGetList(session, ctypes.byref(needed), ctypes.byref(count),
+                                  infos, ctypes.byref(reasons))
+                if rc == 0:
+                    return [(int(infos[i].Process.dwProcessId), infos[i].strAppName)
+                            for i in range(count.value)]
+                if rc != 234:  # ERROR_MORE_DATA: the list grew between the two calls
+                    return None
+            return None
+        finally:
+            rm.RmEndSession(session)
+    except Exception:
+        return None
+
+
 def is_chrome_profile_locked(profile_path: Path) -> bool:
     """True only if SingletonLock exists AND points to a live PID.
     Stale locks (Chrome crashed / orphaned) return False so we treat the

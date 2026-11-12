@@ -111,7 +111,8 @@ def test_chrome_158_moves_the_cookies_and_loses_none(world):
     client, launched = _launch_as_158(world)
     try:
         assert not launched.failed, launched.text
-        assert "Chrome/158." in client.evaluate("navigator.userAgent")
+        ua = client.evaluate("navigator.userAgent")
+        assert int(ua.split("Chrome/")[1].split(".")[0]) >= 158, ua  # Beta moves on: 158, then 159
         assert "migrated 5 cookies to Chrome 158 encryption; backup at " in launched.text, launched.text
         backup = pathlib.Path(launched.text.split("backup at ", 1)[1].split("]", 1)[0])
         assert backup.parent == world["data"] / "storage-states"

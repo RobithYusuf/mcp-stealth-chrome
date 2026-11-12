@@ -19,7 +19,7 @@ from typing import Any, Optional
 from .. import server as _srv
 from .._app import mcp
 from ..helpers import err, get_url, ok
-from ..humanize import humanized_move, move_pointer
+from ..humanize import check_gesture, humanized_move, move_pointer
 from ..identity import key_event_params
 from ..refs import active_element, outer_blocker, resolve_ref
 from ..state import BrowserState
@@ -449,9 +449,14 @@ async def drag_and_drop(start_x: int, start_y: int, end_x: int, end_y: int) -> s
         from nodriver.cdp import input_ as cdp_input
         left = cdp_input.MouseButton.LEFT
         before = await _srv._page_sig(tab)
+        pressed = False
 
         async def gesture():
+            nonlocal pressed
             await move_pointer(tab, start_x, start_y)
+            # The move opened a dialog and the wait for it was given up: no drag started.
+            check_gesture()
+            pressed = True
             await tab.send(cdp_input.dispatch_mouse_event(
                 type_="mousePressed", x=start_x, y=start_y, button=left, buttons=1, click_count=1,
             ))
@@ -476,6 +481,9 @@ async def drag_and_drop(start_x: int, start_y: int, end_x: int, end_y: int) -> s
 
         await _srv._dispatch_input(tab, gesture())
         if _srv._dialog_note(tab):
+            if not pressed:
+                return err(f"drag_and_drop: NOT dragged — moving the pointer to ({start_x},{start_y}) "
+                           f"opened a dialog{_srv._dialog_note(tab)}. Nothing was pressed.")
             return ok(f"drag from ({start_x},{start_y}) interrupted{_srv._dialog_note(tab)}. "
                       f"It finishes once the dialog is answered.")
         return _srv._click_outcome(

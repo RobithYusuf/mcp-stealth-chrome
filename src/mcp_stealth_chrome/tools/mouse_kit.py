@@ -131,6 +131,9 @@ async def click_turnstile(
             start_x = target_x + 180
             start_y = target_y - 80
             await _srv._dispatch_input(tab, humanized_move(tab, start_x, start_y, target_x, target_y))
+            if _srv._dialog_note(tab):
+                return err(f"click_turnstile: NOT clicked — moving the pointer there opened a "
+                           f"dialog{_srv._dialog_note(tab)}")
             await asyncio.sleep(0.15)
             await _srv._dispatch_input(tab, tab.mouse_click(target_x, target_y))
             if _srv._dialog_note(tab):

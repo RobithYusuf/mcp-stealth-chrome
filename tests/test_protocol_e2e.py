@@ -31,6 +31,10 @@ PAGES = {
     "/loadalert.html": "<!doctype html><title>Boot</title><script>alert('boot')</script><p id=p>after</p>",
     "/movealert.html": ('<!doctype html><title>Move</title><button id="b" style="width:200px;height:60px" '
                         'onmousemove="if(!window.done){window.done=1;alert(\'move\')}">Hot</button>'),
+    "/movecount.html": ('<!doctype html><title>Count</title><button id="b" style="width:200px;height:60px" '
+                        'onmousemove="window.moves=(window.moves||0)+1;'
+                        'if(!window.done){window.done=1;alert(\'move\')}" '
+                        'onmousedown="window.downs=(window.downs||0)+1">Hot</button>'),
     "/moment.html": ('<!doctype html><title>Just a moment...</title>'
                      '<div class="cf-turnstile" data-sitekey="x" style="width:300px;height:65px"></div>'),
     "/widget.html": ('<!doctype html><title>Login</title>'
@@ -245,12 +249,13 @@ def test_a_click_that_opens_an_alert_returns_and_can_be_answered(page):
     ("drag_and_drop", {"start_x": 50, "start_y": 30, "end_x": 60, "end_y": 40}),
     ("mouse_replay", {"path_json": '[{"t":0,"x":50,"y":30}]'}),
 ])
-@pytest.mark.skipif(sys.platform == "darwin" and os.environ.get("GITHUB_ACTIONS") == "true", reason=(
-    "Race on the slower macOS runner (2 of 2 runs, a different tool each time): the dialog guard "
-    "in _app stops the tool before the tool's own input wait sees the dialog. The reply still names "
-    "the dialog and dialog_handle; the 'tool sees it itself' assertion is what fails. Open."))
 def test_a_dialog_opened_by_the_pointer_moving_is_reported(mcp, base, tool, kw):
-    """The move comes before the press, so the dialog can open before the click is even sent."""
+    """The move comes before the press, so the dialog can open before the click is even sent.
+
+    It failed now and then on the macOS and Windows runners, with "<tool> stopped" from the guard in
+    _app: the previous tool's path went on after dialog_handle, into this test's page, and opened
+    its alert before this tool moved the pointer at all.
+    """
     mcp.call("navigate", url=f"{base}/movealert.html")
     reply = mcp.call(tool, _timeout=25, **kw)
     # Answered before any assertion: a dialog left open fails every test after this one.
@@ -260,6 +265,28 @@ def test_a_dialog_opened_by_the_pointer_moving_is_reported(mcp, base, tool, kw):
     assert f"{tool} stopped" not in reply.text, "the tool should see this itself, not be cut off"
     assert "answered" in answered.text, answered.text
     assert mcp.evaluate("1+1", timeout_ms=5000) == "2"
+
+
+@pytest.mark.parametrize("tool,kw", [
+    ("humanize_click", {"selector": "#b"}),
+    ("humanize_click", {"x": 50, "y": 30}),
+    ("click_element_offset", {"selector": "#b"}),
+    ("mouse_move", {"x": 50, "y": 30, "humanize": True}),
+])
+def test_a_path_cut_short_by_a_dialog_sends_nothing_after_the_tool_returns(mcp, base, tool, kw):
+    """The move that opened the dialog was answered by dialog_handle, and the rest of the path,
+    with humanize_click's press after it, then went out into whatever page was open."""
+    mcp.call("navigate", url=f"{base}/movecount.html")
+    reply = mcp.call(tool, _timeout=25, **kw)
+    answered = mcp.call("dialog_handle", action="accept", _timeout=10)
+    assert "answered" in answered.text, answered.text
+    time.sleep(1.5)  # a humanized path takes well under a second
+    seen = json.loads(mcp.evaluate(
+        "JSON.stringify({moves: window.moves || 0, downs: window.downs || 0})"))
+    assert "dialog_handle" in reply.text and f"{tool} stopped" not in reply.text, reply.text
+    if tool != "mouse_move":
+        assert "NOT clicked" in reply.text, reply.text
+    assert seen == {"moves": 1, "downs": 0}, f"input reached the page after {tool} returned: {seen}"
 
 
 def test_a_tool_called_while_a_dialog_is_open_says_so_at_once(page):

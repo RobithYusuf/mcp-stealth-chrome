@@ -740,6 +740,7 @@ Things to know:
 | `MCP_WINDOWLESS_CLOSE_SECONDS` | Seconds a visible browser may have no window before it is ended as quit. Default 3 |
 | `MCP_STEALTH_QUIT_WATCHER` | Set to `0` to leave quitting to the server alone, without the per-browser watcher process |
 | `MCP_STEALTH_CLOSE_WAIT` | Seconds a browser asked to quit is given to write its state and exit before it is ended with a signal. Default 5 |
+| `MCP_STEALTH_PROFILE_REMOVE_WAIT` | Seconds a privacy profile's removal keeps trying after its browser has gone, while Windows still holds its files open. Default 15 on Windows, 0 elsewhere (three quick tries) |
 | `MCP_STEALTH_DATA_DIR` | Folder used instead of `~/.mcp-stealth` for profiles, screenshots, exports and the rest. Chrome keeps your real home folder. The HTTP token stays in `~/.mcp-stealth` |
 | `MCP_STEALTH_PROFILE_GC` | Set to `0` to turn off the cleanup of leftover profiles when the server starts |
 | `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL` | Vision model through any OpenAI-compatible API |

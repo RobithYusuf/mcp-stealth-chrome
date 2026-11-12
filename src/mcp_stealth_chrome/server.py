@@ -82,7 +82,10 @@ from . import cookie_migration
 from . import quit_watch
 from .state import data_root as state_data_root
 from .workflow import WorkflowError, run_workflow
-from .humanize import humanized_click, humanized_move, humanized_mouse_press, humanized_scroll, move_pointer
+from .humanize import (
+    CURRENT_GESTURE, Gesture, humanized_approach, humanized_move, humanized_mouse_press,
+    humanized_scroll, move_pointer,
+)
 from .state import (
     PRIMARY_SESSION,
     SESSION_GONE_HOOKS,
@@ -318,7 +321,8 @@ def _pid_recycled(pid: int, browser: Any) -> bool:
     return command is not None and f"--user-data-dir={data_dir}" not in command
 
 
-def _descendant_pids(pid: int, data_dir: Optional[str] = None) -> list[int]:
+def _descendant_pids(pid: int, data_dir: Optional[str] = None,
+                     table: Optional[list[tuple[int, int, str]]] = None) -> list[int]:
     """Everything this browser started under a PID, found while the parent links still exist.
 
     A launcher script that does not exec is the recorded PID, with Chrome as its child.
@@ -328,25 +332,31 @@ def _descendant_pids(pid: int, data_dir: Optional[str] = None) -> list[int]:
     starts programs that are not part of the browser: on macOS it wakes GoogleUpdater, the
     machine-wide updater, which outlives the browser by a few seconds. Counted as family, it
     made a clean close read as "did not end the process" and was sent SIGTERM mid-update.
+
+    Windows has no ps; the table comes from a Toolhelp snapshot there. Without it the helpers
+    were never waited for, and a privacy profile was deleted while they still held its files.
+    `table` is a process_table() the caller already read, to compare against the same moment.
     """
-    try:
-        r = subprocess.run(["ps", "-ax", "-ww", "-o", "pid=,ppid=,command="],
-                           capture_output=True, text=True, timeout=3)
-        children: dict[int, list[int]] = {}
-        commands: dict[int, str] = {}
-        for line in (r.stdout or "").splitlines():
-            parts = line.split(None, 2)
-            if len(parts) < 2:
-                continue
-            child, parent = int(parts[0]), int(parts[1])
-            children.setdefault(parent, []).append(child)
-            commands[child] = parts[2] if len(parts) > 2 else ""
-    except Exception:
+    from .state import process_table
+    rows = process_table() if table is None else table
+    if rows is None:
         return []
+    children: dict[int, list[int]] = {}
+    commands: dict[int, str] = {}
+    for child, parent, command in rows:
+        if child != parent:
+            children.setdefault(parent, []).append(child)
+        commands[child] = command
     found: list[int] = []
+    # Windows keeps a parent's number after it exits and hands the number out again, so the
+    # links can form a cycle there.
+    seen = {pid}
     pending = [pid]
     while pending:
         for child in children.get(pending.pop(), []):
+            if child in seen:
+                continue
+            seen.add(child)
             pending.append(child)
             if not data_dir or str(data_dir) in commands.get(child, ""):
                 found.append(child)
@@ -855,8 +865,63 @@ def _new_privacy_profile(instance_id: str) -> Path:
     return Path(tempfile.mkdtemp(prefix=f"{safe}-", dir=PRIVACY_PROFILE_ROOT))
 
 
+# How long removing a privacy profile keeps trying once its browser is verified gone. Windows
+# refuses to delete a file while any handle to it is open, and a deleted file stays in its
+# folder until the last one closes. On a CI runner, a profile whose Chrome had just been
+# ended still could not be removed a second later and could be some seconds after that.
+# POSIX deletes open files, so there the three tries made before are kept.
+_PRIVACY_REMOVE_WAIT = float(os.environ.get(
+    "MCP_STEALTH_PROFILE_REMOVE_WAIT", "15" if sys.platform == "win32" else "0"))
+_PRIVACY_REMOVE_DELAYS = (0.1, 0.25, 0.5)
+# Why the last removal of a privacy profile failed, by the path the caller passed.
+_PRIVACY_REMOVE_FAILURES: dict[str, str] = {}
+
+
+def _removal_failure(profile_dir: Optional[Path]) -> str:
+    """'; <why>' for an error about a privacy profile that could not be removed, else ''."""
+    reason = _PRIVACY_REMOVE_FAILURES.get(str(profile_dir)) if profile_dir is not None else None
+    return f"; {reason}" if reason else ""
+
+
+def _short_command(command: str, limit: int = 120) -> str:
+    return command if len(command) <= limit else command[:limit - 3] + "..."
+
+
+def _profile_holders(profile_dir: Path, remaining: list[str], already: set[int]) -> str:
+    """Who holds a profile that could not be removed, in words, leaving out PIDs `already` named."""
+    from .state import _win_file_holders, process_table, processes_naming
+    users = [(pid, command) for pid, command in processes_naming(profile_dir) or []
+             if pid not in already]
+    named = [f"PID {pid} ({_short_command(command)})" for pid, command in users]
+    # Restart Manager exists only on Windows, the one system where an open file blocks this;
+    # elsewhere it answers None. It gives no name for a process that is exiting.
+    holders = _win_file_holders(remaining[:300]) or []
+    commands = {pid: command for pid, _ppid, command in (process_table() or [])} if holders else {}
+    for pid, app in holders:
+        if pid not in already and not any(n.startswith(f"PID {pid} ") for n in named):
+            label = app or _short_command(commands.get(pid, "")) or "a program whose name could not be read"
+            named.append(f"PID {pid} ({label})")
+    if named:
+        return "held open by " + ", ".join(named)
+    return "" if already else "no process holding it could be named"
+
+
+def _left_in(target: Path) -> list[str]:
+    left: list[str] = []
+    with contextlib.suppress(OSError):
+        for folder, _dirs, files in os.walk(target):
+            left.extend(os.path.join(folder, name) for name in files)
+    return left
+
+
 async def _remove_privacy_profile(profile_dir: Optional[Path]) -> bool:
-    """Remove a privacy profile after Chrome releases it, with bounded retries."""
+    """Remove a privacy profile once its browser is gone, with bounded retries.
+
+    Called after _ensure_browser_dead verified the browser and its helpers ended. Nothing is
+    deleted while a process still names the profile on its command line: Chrome writes back
+    what is deleted under it. When the folder cannot be removed in time, the reason and any
+    holder are kept for the error (_removal_failure).
+    """
     if profile_dir is None:
         return True
     root = PRIVACY_PROFILE_ROOT.resolve()
@@ -866,22 +931,47 @@ async def _remove_privacy_profile(profile_dir: Optional[Path]) -> bool:
             return False
     except Exception:
         return False
+    from .state import processes_naming
+    _PRIVACY_REMOVE_FAILURES.pop(str(profile_dir), None)
     # Browser.stop() terminates the parent synchronously, but Chrome helpers can
     # write their final Preferences files a beat later. Deleting immediately can
     # therefore appear successful and then be recreated behind us.
     await asyncio.sleep(0.15)
-    for delay in (0.1, 0.25, 0.5):
-        try:
-            shutil.rmtree(target)
-        except FileNotFoundError:
-            pass
-        except Exception:
+    deadline = time.monotonic() + _PRIVACY_REMOVE_WAIT
+    reason = ""
+    users: list[tuple[int, str]] = []
+    attempt = 0
+    while True:
+        delay = _PRIVACY_REMOVE_DELAYS[min(attempt, len(_PRIVACY_REMOVE_DELAYS) - 1)]
+        attempt += 1
+        # The path as Chrome was given it: resolving can change its spelling (a Windows 8.3
+        # short name becomes the long one), and processes_naming tries both.
+        users = await asyncio.to_thread(processes_naming, profile_dir) or []
+        if users:
+            reason = "a process still runs with it: " + ", ".join(
+                f"PID {pid} ({_short_command(command)})" for pid, command in users)
             await asyncio.sleep(delay)
-            continue
-        await asyncio.sleep(delay)
+        else:
+            try:
+                await asyncio.to_thread(shutil.rmtree, target)
+            except FileNotFoundError:
+                pass
+            except Exception as exc:
+                reason = f"{type(exc).__name__}: {exc}"
+                await asyncio.sleep(delay)
+            else:
+                await asyncio.sleep(delay)
+                if not target.exists():
+                    return True
+                reason = "it was written again after being removed"
         if not target.exists():
             return True
-    return not target.exists()
+        if attempt >= len(_PRIVACY_REMOVE_DELAYS) and time.monotonic() >= deadline:
+            break
+    holders = await asyncio.to_thread(
+        _profile_holders, profile_dir, _left_in(target), {pid for pid, _command in users})
+    _PRIVACY_REMOVE_FAILURES[str(profile_dir)] = "; ".join(p for p in (reason, holders) if p)
+    return False
 
 
 async def _safe_stop_browser(browser: Optional[Browser]) -> None:
@@ -2121,7 +2211,8 @@ async def browser_launch(
     if not BrowserState.is_up() and BrowserState.current_privacy and BrowserState.current_profile_dir:
         stale_profile = BrowserState.current_profile_dir
         if not await _remove_privacy_profile(stale_profile):
-            return err(f"could not remove stale privacy profile before relaunch: {stale_profile}")
+            return err(f"could not remove stale privacy profile before relaunch: {stale_profile}"
+                       f"{_removal_failure(stale_profile)}")
         BrowserState.current_privacy = False
         BrowserState.current_headless = False
         BrowserState.current_fingerprint = {}
@@ -2196,7 +2287,8 @@ async def browser_launch(
                 BrowserState.reset()
                 if _stale_privacy is not None and not await _remove_privacy_profile(_stale_privacy):
                     BrowserState.current_profile_dir, BrowserState.current_privacy = _stale_privacy, True
-                    return err(f"could not remove stale privacy profile before relaunch: {_stale_privacy}")
+                    return err(f"could not remove stale privacy profile before relaunch: {_stale_privacy}"
+                               f"{_removal_failure(_stale_privacy)}")
 
         ensure_dirs()
 
@@ -2644,7 +2736,7 @@ async def browser_close() -> str:
             if not removed:
                 return err(
                     "Browser was not running and stale privacy profile cleanup failed: "
-                    f"{stale_privacy_profile}"
+                    f"{stale_privacy_profile}{_removal_failure(stale_privacy_profile)}"
                 )
         BrowserState.current_headless = False
         BrowserState.current_privacy = False
@@ -2690,6 +2782,7 @@ async def browser_close() -> str:
             BrowserState.current_privacy = True
             return err(
                 f"Browser closed, but privacy profile cleanup failed: {privacy_profile}"
+                f"{_removal_failure(privacy_profile)}"
             )
     elif closed_profile is not None:
         clean_profile_state(closed_profile)
@@ -3738,7 +3831,13 @@ async def _dispatch_input(tab, press) -> None:
         app = await asyncio.to_thread(_frontmost_app) if pid else None
         if app and await asyncio.to_thread(_frontmost_pid) != pid:
             _spawn_background(_win_focus_back_from_popup(pid, app))
-    task = asyncio.ensure_future(press)
+    # The task copies the context here, so the gesture it runs sees this flag and no other.
+    gesture = Gesture()
+    bound = CURRENT_GESTURE.set(gesture)
+    try:
+        task = asyncio.ensure_future(press)
+    finally:
+        CURRENT_GESTURE.reset(bound)
     deadline = time.monotonic() + TOOL_ACTION_TIMEOUT
     while not task.done():
         await asyncio.wait({task}, timeout=0.05)
@@ -3749,9 +3848,13 @@ async def _dispatch_input(tab, press) -> None:
             if key in _OPEN_DIALOGS and not task.done():
                 # Left running, not cancelled: it finishes once the dialog is answered, and
                 # cancelling a press blocked on mousedown would never send its mouseReleased.
+                # Stopped, though: the rest of a path would reach the page after this tool
+                # returned, and open the next page's dialog under another tool.
+                gesture.stopped = True
                 task.add_done_callback(_ignore_task_result)
                 return
         elif time.monotonic() > deadline:
+            gesture.stopped = True
             task.add_done_callback(_ignore_task_result)
             raise TimeoutError(f"input was not acknowledged within {TOOL_ACTION_TIMEOUT}s")
     task.result()
@@ -3876,8 +3979,15 @@ async def _click_and_report(
     x, y = pos.left + pos.width / 2, pos.top + pos.height / 2
     if humanize:
         hx, hy = await _humanized_point(el, pos, x, y)
-        await _dispatch_input(tab, humanized_click(
-            tab, el, last_pos_ref=BrowserState.last_mouse_xy, point=(hx, hy)))
+        # The path and the press are two pieces of input, as in the plain click below: a path
+        # that opens a dialog must not be followed by a press, and the result has to say so.
+        await _dispatch_input(tab, humanized_approach(
+            tab, hx, hy, last_pos_ref=BrowserState.last_mouse_xy))
+        if _dialog_note(tab):
+            return err(f"{label}: NOT clicked — moving the pointer there opened a dialog"
+                       f"{_dialog_note(tab)}")
+        await asyncio.sleep(random.uniform(0.05, 0.18))  # dwell before pressing, as a hand does
+        await _dispatch_input(tab, tab.mouse_click(int(hx), int(hy)))
         where = f"humanized point ({int(hx)},{int(hy)}) inside the element"
     else:
         await _dispatch_input(tab, move_pointer(tab, x, y))
@@ -6818,7 +6928,8 @@ async def close_instance(instance_id: str) -> str:
                 if not await _remove_privacy_profile(_profile):
                     BrowserState.current_profile_dir = _profile
                     BrowserState.current_privacy = True
-                    return err(f"closed browser but failed to remove privacy profile {_profile}")
+                    return err(f"closed browser but failed to remove privacy profile {_profile}"
+                               f"{_removal_failure(_profile)}")
             elif _profile:
                 clean_profile_state(_profile)
             _ATTACHED_BROWSERS.discard(_iid)
@@ -6826,7 +6937,7 @@ async def close_instance(instance_id: str) -> str:
         if BrowserState.current_privacy:
             _profile = BrowserState.current_profile_dir
             if not await _remove_privacy_profile(_profile):
-                return err(f"failed to remove stale privacy profile {_profile}")
+                return err(f"failed to remove stale privacy profile {_profile}{_removal_failure(_profile)}")
             BrowserState.current_privacy = False
             BrowserState.current_headless = False
             BrowserState.current_fingerprint = {}
@@ -6859,7 +6970,8 @@ async def close_instance(instance_id: str) -> str:
     elif snap.profile_dir:
         clean_profile_state(snap.profile_dir)
     if not cleanup_ok:
-        return err(f"closed browser but failed to remove privacy profile {snap.profile_dir}")
+        return err(f"closed browser but failed to remove privacy profile {snap.profile_dir}"
+                   f"{_removal_failure(snap.profile_dir)}")
     BrowserState.instances.pop(instance_id, None)
     _ATTACHED_BROWSERS.discard(instance_id)
     return ok(f"closed instance {instance_id!r}" + _kill_note(_kill))
@@ -6883,7 +6995,8 @@ async def close_all_instances() -> str:
         _clear_tab_scoped_state(_tabs)
         if snap.privacy:
             if not await _remove_privacy_profile(snap.profile_dir):
-                failures.append(f"{iid}: privacy cleanup failed ({snap.profile_dir})")
+                failures.append(f"{iid}: privacy cleanup failed ({snap.profile_dir}"
+                                f"{_removal_failure(snap.profile_dir)})")
                 continue
         elif snap.profile_dir:
             clean_profile_state(snap.profile_dir)
@@ -6920,7 +7033,7 @@ async def close_all_instances() -> str:
                 BrowserState.current_privacy = True
                 failures.append(
                     f"{BrowserState.current_instance_id}: privacy cleanup failed "
-                    f"({_current_profile})"
+                    f"({_current_profile}{_removal_failure(_current_profile)})"
                 )
     elif BrowserState.current_privacy:
         if await _remove_privacy_profile(BrowserState.current_profile_dir):
@@ -6931,7 +7044,8 @@ async def close_all_instances() -> str:
         else:
             failures.append(
                 f"{BrowserState.current_instance_id}: stale privacy cleanup failed "
-                f"({BrowserState.current_profile_dir})"
+                f"({BrowserState.current_profile_dir}"
+                f"{_removal_failure(BrowserState.current_profile_dir)})"
             )
     for _iid in closed:
         _ATTACHED_BROWSERS.discard(_iid)

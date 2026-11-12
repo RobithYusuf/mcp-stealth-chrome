@@ -578,6 +578,50 @@ def test_privacy_changes_the_profile_and_not_the_identity(loop, browser, base_ur
 
 
 @E2E
+def test_a_privacy_browser_that_had_to_be_ended_goes_with_its_helpers(loop, base_url, monkeypatch,
+                                                                       tmp_path):
+    """Windows CI: a Chrome that did not quit on Browser.close was ended. Only the PID nodriver
+    recorded was waited for (ps does not exist there), its helpers still held the profile's
+    files, the removal failed with WinError 32, and the next launch refused to start."""
+    from mcp_stealth_chrome import server, state
+
+    monkeypatch.setattr(server, "PRIVACY_PROFILE_ROOT", tmp_path / "privacy-profiles")
+    monkeypatch.setattr(server, "_CLOSE_WAIT", 0.0)
+
+    async def unanswered(_browser):
+        return False  # a Chrome that does not quit when asked
+
+    monkeypatch.setattr(server, "_request_browser_close", unanswered)
+    real = server._ensure_browser_dead
+    alive = []
+
+    async def checked(browser, profile_dir=None, grace=1.5):
+        report = await real(browser, profile_dir, grace)
+        alive.append(state.processes_naming(profile_dir) if profile_dir else None)
+        return report
+
+    monkeypatch.setattr(server, "_ensure_browser_dead", checked)
+    for _ in range(3):
+        out = run(loop, "browser_launch", headless=True, privacy=True, url=f"{base_url}/keys.html")
+        assert not out.startswith("Error:"), out
+        profile = server.BrowserState.current_profile_dir
+        pid = server._browser_process_pid(server.BrowserState.browser)
+        # Every process running with the profile is the browser or a helper the close follows.
+        # The helpers usually exit within the close's own pauses, so this is what tells.
+        table = state.process_table()  # one moment for both: a helper can exit in between
+        named = {p for p, _command in state.processes_naming(profile, table) or []}
+        family = set(server._descendant_pids(pid, str(profile), table))
+        try:
+            assert len(named) > 1 and named - {pid} <= family, (pid, named, family)
+        finally:
+            # Never leave a Chrome behind: on Windows it keeps the job's output pipe open.
+            closed = run(loop, "browser_close")
+        assert alive[-1] == [], f"declared ended while these still ran: {alive[-1]}"
+        assert "privacy profile removed" in closed, closed
+        assert not profile.exists()
+
+
+@E2E
 def test_spawn_works_on_a_copied_multi_profile_browser(loop, tmp_path):
     """The known failure: spawn_browser on a clone stopped at Chrome's profile picker."""
     data = tmp_path / "clone"

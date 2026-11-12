@@ -14,11 +14,40 @@ from __future__ import annotations
 import asyncio
 import math
 import random
+from contextvars import ContextVar
 from typing import Optional, Tuple
 
 from nodriver import Element, Tab, cdp
 
 from .helpers import parse_json
+
+
+class Gesture:
+    """One piece of input run by server._dispatch_input, which may stop waiting for it."""
+    __slots__ = ("stopped",)
+
+    def __init__(self) -> None:
+        self.stopped = False
+
+
+class GestureStopped(Exception):
+    """The caller gave up waiting for this gesture, so it must send no more input."""
+
+
+# _dispatch_input stops waiting once a native dialog blocks a gesture, and returns while the
+# gesture's task still runs: the step that opened the dialog only finishes once it is answered.
+# Every later step then went out into whatever page was open by then. A humanize_click whose
+# path opened an alert sent the rest of its path and its click after dialog_handle, into the
+# next page, and opened that page's alert while another tool was running. Bound in the task
+# _dispatch_input starts, so it reaches that gesture and no other.
+CURRENT_GESTURE: ContextVar[Optional[Gesture]] = ContextVar("current_gesture", default=None)
+
+
+def check_gesture() -> None:
+    """Raise GestureStopped when the gesture running this code was given up on."""
+    gesture = CURRENT_GESTURE.get()
+    if gesture is not None and gesture.stopped:
+        raise GestureStopped("a dialog stopped this gesture; no more input is sent")
 
 
 def _bezier_point(t: float, p0: Tuple[float, float], p1: Tuple[float, float],
@@ -90,30 +119,22 @@ async def move_pointer(tab: Tab, x: float, y: float) -> None:
     Tab.mouse_move interpolates from (0,0) rather than the cursor, sweeping a diagonal
     across the page and firing hover handlers along it, and then sends a mouseReleased
     the page sees as a stray mouseup.
+
+    Nothing is sent once the gesture this move belongs to was given up on (check_gesture).
     """
+    check_gesture()
     await tab.send(cdp.input_.dispatch_mouse_event("mouseMoved", x=x, y=y))
 
 
-async def humanized_click(
-    tab: Tab, element: Element,
+async def humanized_approach(
+    tab: Tab, target_x: float, target_y: float,
     last_pos_ref: Optional[dict] = None,
-    point: Optional[Tuple[float, float]] = None,
 ) -> None:
-    """Click element with Bezier approach from last-known cursor position.
+    """A Bezier path to (target_x, target_y) from the last known cursor position, no press.
 
-    point: where to press, when the caller has already hit-tested a spot. A freshly
-    sampled one has passed no test and can land on an overlay covering part of the element.
+    The press is a separate piece of input: a path that opens a dialog must not be followed
+    by one, and the caller has to be able to say which of the two the dialog came from.
     """
-    if point is not None:
-        target_x, target_y = point
-    else:
-        pos = await element.get_position()
-        if pos is None:
-            raise RuntimeError("element has no on-screen position to move the mouse to")
-        # Random spot inside element (not dead center — that's a bot tell)
-        target_x = pos.left + pos.width * random.uniform(0.3, 0.7)
-        target_y = pos.top + pos.height * random.uniform(0.3, 0.7)
-
     # Start from last-known cursor position if available, else random nearby
     if last_pos_ref and last_pos_ref.get("x") is not None:
         start_x = last_pos_ref["x"]
@@ -124,9 +145,6 @@ async def humanized_click(
 
     await humanized_move(tab, start_x, start_y, target_x, target_y,
                           last_pos_ref=last_pos_ref)
-    # Dwell before click (human hesitation)
-    await asyncio.sleep(random.uniform(0.05, 0.18))
-    await tab.mouse_click(int(target_x), int(target_y))
 
 
 async def humanized_mouse_press(

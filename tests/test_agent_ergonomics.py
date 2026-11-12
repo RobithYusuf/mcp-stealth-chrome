@@ -1972,6 +1972,99 @@ def test_humanized_click_falls_back_to_the_tested_centre(monkeypatch):
     assert tab.clicks == [(150, 120)]
 
 
+class _DialogTab(_MouseTab):
+    """A page whose n-th pointer move opens a native dialog.
+
+    That move is acknowledged only once the dialog is answered, as Chrome's renderer is held
+    inside the handler; every input sent afterwards is recorded with the time it was sent.
+    """
+
+    def __init__(self, target_id, opens_on=3):
+        from types import SimpleNamespace
+
+        super().__init__()
+        self.target = SimpleNamespace(target_id=target_id)
+        self.moves = []
+        self.opens_on = opens_on
+        self.answered = None
+
+    def add_handler(self, *_args):
+        return None
+
+    def answer(self):
+        from mcp_stealth_chrome.helpers import OPEN_DIALOGS
+
+        OPEN_DIALOGS.pop(self.target.target_id, None)
+        self.answered.set()
+
+    async def send(self, command):
+        import asyncio
+        import time
+
+        from mcp_stealth_chrome.helpers import OPEN_DIALOGS
+
+        request = next(command)
+        if self.answered is None:
+            self.answered = asyncio.Event()
+        await asyncio.sleep(0)
+        params = request.get("params", {})
+        if request["method"] == "Input.dispatchMouseEvent" and params.get("type") == "mouseMoved":
+            self.moves.append((params["x"], params["y"]))
+            if len(self.moves) == self.opens_on:
+                OPEN_DIALOGS[self.target.target_id] = {
+                    "type": "alert", "message": "move", "since": time.monotonic()}
+                await self.answered.wait()
+        return None
+
+
+def test_a_path_cut_short_by_a_dialog_sends_nothing_after_the_tool_returns():
+    """The step that opened the dialog finished once it was answered, and every later step went
+    out then, into whatever page was open: a CI run's next tool found an alert it never opened."""
+    import asyncio
+
+    from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.humanize import humanized_move
+
+    async def scenario():
+        tab = _DialogTab("PATH-CUT")
+        await server._dispatch_input(tab, humanized_move(tab, 0, 0, 300, 300, steps=20))
+        at_return = len(tab.moves)
+        tab.answer()  # dialog_handle
+        await asyncio.sleep(0.6)  # 17 more steps of 10-30 ms each would all have gone by now
+        return at_return, len(tab.moves)
+
+    at_return, later = asyncio.run(scenario())
+    assert at_return == 3, at_return
+    assert later == 3, f"{later - at_return} pointer moves were sent after the tool had returned"
+
+
+def test_a_humanized_click_whose_path_opens_a_dialog_is_not_clicked(monkeypatch):
+    """It answered 'clicked' with the press still waiting behind the dialog, and the press then
+    landed after dialog_handle, wherever the page was by then."""
+    import asyncio
+
+    from mcp_stealth_chrome import server
+
+    async def settled(el):
+        return await el.get_position()
+
+    monkeypatch.setattr(server, "_settled_position", settled)
+
+    async def scenario():
+        tab = _DialogTab("CLICK-CUT")
+        out = await server._click_and_report(tab, _ClickEl(), "c", False, humanize=True)
+        at_return = len(tab.moves)
+        tab.answer()
+        await asyncio.sleep(0.6)
+        return out, tab, at_return
+
+    out, tab, at_return = asyncio.run(scenario())
+    assert out.startswith("Error:") and "NOT clicked" in out, out
+    assert "moving the pointer there opened a dialog" in out and "dialog_handle" in out, out
+    assert tab.clicks == [], f"pressed after the dialog was answered: {tab.clicks}"
+    assert len(tab.moves) == at_return, "the path went on after the tool returned"
+
+
 @pytest.mark.parametrize("probes", [
     [RuntimeError("context lost")] * 3,
     # The first passes, then the page moves and the check that counts cannot run.
