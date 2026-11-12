@@ -52,6 +52,7 @@ def mac(monkeypatch, tmp_path):
 
     monkeypatch.setattr(dock_icon.sys, "platform", "darwin")
     monkeypatch.setenv(dock_icon.ENV_SWITCH, "1")  # it is opt-in
+    monkeypatch.setattr(dock_icon, "WITHDRAWN", False)  # the build code itself still works
     monkeypatch.setattr(dock_icon, "_failed", {})
     monkeypatch.setattr(dock_icon, "_builder", None)
     monkeypatch.setattr(dock_icon, "_last_note", "")
@@ -1082,3 +1083,16 @@ def test_status_adds_the_disk_use_and_survives_it_failing(mac, monkeypatch):
     assert "disk" not in dock_icon.status(str(mac.binary), root=mac.root)
     monkeypatch.setattr(dock_icon, "_disk_use", lambda _app: None)
     assert "disk" not in dock_icon.status(str(mac.binary), root=mac.root)
+
+
+def test_withdrawn_ignores_the_switch_and_removes_an_old_copy(mac, monkeypatch):
+    """0.13.1: the copy got Google's updater to update it instead of the installed Chrome. With
+    the switch on, a launch runs Chrome itself, nothing is built, and a copy from before goes."""
+    assert _prepare(mac).executable  # a copy built while it was allowed
+    assert dock_icon.wait(30)
+    monkeypatch.setattr(dock_icon, "WITHDRAWN", True)
+    clones = mac.clone
+    assert dock_icon.prepare(str(mac.binary), headless=False, root=mac.root) == dock_icon.DockChrome()
+    assert dock_icon.status(str(mac.binary), root=mac.root)["state"] == "withdrawn"
+    assert dock_icon.discard_copy(mac.root) == "removed"
+    assert mac.clone == clones and not mac.root.exists()

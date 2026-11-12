@@ -10,7 +10,7 @@ import time
 
 import pytest
 
-from _protocol import DOCK_COPY_ON, SAFE_ARGS, Client, wait_for_dock_copy
+from _protocol import SAFE_ARGS, Client
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("MCP_HEADED") or sys.platform != "darwin", reason="opens a visible window")
@@ -32,9 +32,8 @@ def _alive(pid: int) -> bool:
 def test_quit_ends_the_browser_and_the_next_call_says_why(instance):
     AppKit = pytest.importorskip("AppKit")
     before = _test_chrome_pids()
-    client = Client(env=DOCK_COPY_ON)
+    client = Client()
     try:
-        assert wait_for_dock_copy(client)["state"] == "ready"  # so it runs from the copy
         if instance == "main":
             launched = client.call("browser_launch", _timeout=60, url="about:blank", headless=False,
                                    persistent=False, extra_args=SAFE_ARGS)

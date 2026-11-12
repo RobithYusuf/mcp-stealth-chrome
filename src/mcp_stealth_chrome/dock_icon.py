@@ -106,10 +106,24 @@ class _Unusable(Exception):
     """The copy cannot be made or used; the message is the note the caller reports."""
 
 
+# Withdrawn in 0.13.1. Running the copy registered it with Google's updater, which then
+# updated the copy instead of /Applications/Google Chrome.app: the copy lost its icon and the
+# person's own Chrome stayed on the old version. Until a launch is proved not to register
+# with the updater, the switch is ignored and a copy left from before is removed when
+# nothing runs from it. Tests of the build code set this to False.
+WITHDRAWN = True
+WITHDRAWN_NOTE = ("withdrawn in 0.13.1: running the copy registered it with Google's updater, "
+                  "which updated the copy instead of your installed Chrome")
+
+
+def asked_for() -> bool:
+    return os.environ.get(ENV_SWITCH, "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def enabled() -> bool:
     """Opt-in. It puts a second Chrome bundle on the person's disk and in LaunchServices, so
-    it happens only when they ask: unset, or any other value, is off."""
-    return os.environ.get(ENV_SWITCH, "").strip().lower() in ("1", "true", "yes", "on")
+    it happens only when they ask: unset, or any other value, is off. Withdrawn wins."""
+    return not WITHDRAWN and asked_for()
 
 
 def app_dir() -> Path:
@@ -226,6 +240,8 @@ def status(chrome_binary: Optional[str], root: Optional[Path] = None) -> dict:
 
 def _status(chrome_binary: Optional[str], root: Optional[Path]) -> dict:
     try:
+        if WITHDRAWN and asked_for():
+            return {"state": "withdrawn", "detail": f"{ENV_SWITCH}=1 is ignored, {WITHDRAWN_NOTE}"}
         if not enabled():
             return {"state": "off", "detail": f"set {ENV_SWITCH}=1 to turn it on (macOS)"}
         if sys.platform != "darwin":

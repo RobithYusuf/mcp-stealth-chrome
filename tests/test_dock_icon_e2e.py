@@ -18,8 +18,11 @@ import pytest
 from _protocol import DOCK_COPY_ON, SAFE_ARGS, Client, wait_for_dock_copy
 from mcp_stealth_chrome import dock_icon
 
-pytestmark = pytest.mark.skipif(
-    not os.environ.get("MCP_HEADED") or sys.platform != "darwin", reason="opens visible windows")
+pytestmark = [
+    pytest.mark.skipif(not os.environ.get("MCP_HEADED") or sys.platform != "darwin",
+                       reason="opens visible windows"),
+    pytest.mark.skipif(dock_icon.WITHDRAWN, reason=dock_icon.WITHDRAWN_NOTE),
+]
 
 FIXTURES = str(pathlib.Path(__file__).parent / "fixtures")
 INSTALLED = pathlib.Path("/Applications/Google Chrome.app")

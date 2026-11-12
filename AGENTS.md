@@ -241,6 +241,11 @@ conclusions. Each rule below replaced a real lie.
   this browser's PID is frontmost, about 130 ms measured, so keys typed in that moment still reach Chrome. It compares the
   PID, because a person's own Chrome has the same bundle path. `tests/test_headed_focus.py` measures all this, with
   `MCP_HEADED=1`, and counts this browser's PID so the person's other apps cannot skew it.
+- The Dock icon is withdrawn since 0.13.1 (`dock_icon.WITHDRAWN`): the switch is ignored and an old copy is removed
+  once nothing runs from it. Running the copy registered it with Google's updater (`ap_path` in GoogleUpdater's prefs
+  pointed at the copy's `Info.plist`), which then updated the copy, removing its `Icon\r`, and left
+  `/Applications/Google Chrome.app` on the old version. Do not lift it until a launch from a copy is shown to leave the
+  updater's registration on the installed Chrome. The rules below describe the code as it stays for that day.
 - The Dock icon is opt-in: only `MCP_STEALTH_DOCK_ICON=1` (or true, yes, on) turns it on. Off means no build thread, no
   `~/.mcp-stealth/app` (one left from before is removed), nothing in the launch result, and `dock_icon: off` in
   `server_status`. It stays off by default
