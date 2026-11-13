@@ -3522,7 +3522,7 @@ def _window_watch_setup(monkeypatch, pages):
     async def count(_browser):
         return pages[0]
 
-    async def end_current():
+    async def end_current(record_reason=None):
         ended.append("current")
         server.BrowserState.browser = None
         return True
@@ -3608,7 +3608,7 @@ def _sweep_with(monkeypatch, browser):
         asked.append(1)
         return 0
 
-    async def end_current():
+    async def end_current(record_reason=None):
         ended.append("current")
         server.BrowserState.browser = None
         return True

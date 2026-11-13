@@ -30,6 +30,9 @@ _RUNS_DESPITE_DIALOG = frozenset({
     "get_page_errors", "network_get", "intercept_log", "intercept_stop", "export_har", "export_curl",
     "request_human_help", "wait_for_human", "web_search", "deep_research", "github_read", "youtube_read",
 })
+# Called with the tool's name after every tool call, inside the caller's session. server.py adds
+# the saved-tabs writer here. Each must be cheap and must not await; one that raises is ignored.
+AFTER_TOOL_HOOKS: list = []
 # Long enough for a dialog_handle armed in advance to answer, and for an input tool to return
 # its own better message. A dialog still open after this is blocking the tool.
 _DIALOG_GRACE_SECONDS = 1.5
@@ -89,6 +92,11 @@ class StealthMCP(FastMCP):
         try:
             return await self._call_bound(name, arguments, context, tool)
         finally:
+            for hook in AFTER_TOOL_HOOKS:
+                try:
+                    hook(name)
+                except Exception:
+                    pass
             if token is not None:
                 BrowserState.unbind_session(token)
 

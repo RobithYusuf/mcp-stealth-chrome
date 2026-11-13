@@ -400,7 +400,7 @@ Average: 113 s
 
 | You want to | Use | Profile | Kept after closing |
 |-------------|-----|---------|--------------------|
-| Work with a logged-in account | `browser_launch()` | `~/.mcp-stealth/profile` | Logins, cookies, history |
+| Work with a logged-in account | `browser_launch()` | `~/.mcp-stealth/profile` | Logins, cookies, history, the list of open tabs |
 | Try something without saving a login | `browser_launch(persistent=False)` | Temporary | Nothing |
 | Start with no trace of this browser's past use | `browser_launch(privacy=True)` | Empty, under `privacy-profiles/` | Nothing, and the removal is checked |
 
@@ -412,7 +412,18 @@ To use logins from your own browser, `list_chrome_profiles` shows every Chromium
 
 A browser started with `browser_launch` over stdio stays open until you close it. Instances from `spawn_browser` and browsers in HTTP mode close after `BROWSER_IDLE_TIMEOUT`.
 
-Runtime data lives in `~/.mcp-stealth/`: `profile/`, `profiles/<id>/`, `screenshots/`, `exports/`, `storage-states/`. An `app/` folder left by 0.13.0 is removed.
+Runtime data lives in `~/.mcp-stealth/`: `profile/`, `profiles/<id>/`, `screenshots/`, `exports/`, `storage-states/`, `window-state/`. An `app/` folder left by 0.13.0 is removed.
+
+### Reopening the last tabs
+
+`browser_launch(restore_tabs=True)` reopens the tabs this instance had on this profile when the server last closed it: `browser_close`, `close_instance`, `close_all_instances`, the idle timeout, a Quit, or the server exiting because its client went away, which is what happens when an agent session is put to sleep. `spawn_browser(restore_tabs=True)` does the same for a named instance. Chrome's own session restore stays off, because restored window placement opened windows that could not be seen.
+
+- ✅ Pages open behind the app you are using, the way `tab_new` opens them, in the order `tab_list` showed, and the tab that was selected is selected again. Measured on macOS: 0 ms frontmost for the restored browser.
+- Without a `url`, the first saved page loads in the first tab. With a `url`, that page stays first and selected, the saved pages follow, and a saved page with exactly that URL is not opened twice.
+- ✅ The result lists each page as reopened (final URL, status) or failed (why), with secret URL parameters masked. It says plainly when there is no saved list, when the list cannot be read, and when it is older than 30 days (`MCP_STEALTH_RESTORE_TABS_MAX_DAYS`), and it never fails the launch.
+- The list is saved when the server closes the browser, about 2 seconds after tool calls, and every 30 seconds while the browser runs, so a server that was killed still leaves the last list it saw. Saving takes about 1 ms. A Quit closes every window before anything can read them, so the list saved before the Quit stays: a browser with no pages never replaces a saved list. Only `http`, `https` and `file` pages are kept, up to 30.
+- `persistent=False` and `privacy=True` keep no tabs.
+- The list is in `~/.mcp-stealth/window-state/<instance>-tabs.json`, one entry per profile, readable by you only. Page URLs can carry tokens. `browser_close(forget_tabs=True)` and `close_instance(instance_id, forget_tabs=True)` close without saving and remove the list. `profile_cleanup(action="remove_fallback", ...)` removes the list of the profile it deletes. Deleting the file removes all of them.
 
 ### Chrome 158 and saved logins (macOS)
 
@@ -743,6 +754,11 @@ Things to know:
 | `MCP_STEALTH_PROFILE_REMOVE_WAIT` | Seconds a privacy profile's removal keeps trying after its browser has gone, while Windows still holds its files open. Default 15 on Windows, 0 elsewhere (three quick tries) |
 | `MCP_STEALTH_DATA_DIR` | Folder used instead of `~/.mcp-stealth` for profiles, screenshots, exports and the rest. Chrome keeps your real home folder. The HTTP token stays in `~/.mcp-stealth` |
 | `MCP_STEALTH_PROFILE_GC` | Set to `0` to turn off the cleanup of leftover profiles when the server starts |
+| `MCP_STEALTH_TABS_DIR` | Folder for the saved tab lists of `restore_tabs`. Default `~/.mcp-stealth/window-state` |
+| `MCP_STEALTH_TAB_RECORD_DEBOUNCE` | Seconds after a tool call before the open tabs are saved. Default 2, 0 turns it off |
+| `MCP_STEALTH_TAB_RECORD_PERIOD` | Seconds between saves of the open tabs while a browser runs. Default 30, 0 turns it off |
+| `MCP_STEALTH_RESTORE_TABS_MAX_DAYS` | A saved tab list older than this is not reopened. Default 30, 0 means no limit |
+| `MCP_STEALTH_RESTORE_TABS_MAX` | Tabs kept in a saved list. Default 30 |
 | `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL` | Vision model through any OpenAI-compatible API |
 | `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL` | Vision model through Anthropic |
 | `CAPSOLVER_KEY` | Enables `solve_captcha` |

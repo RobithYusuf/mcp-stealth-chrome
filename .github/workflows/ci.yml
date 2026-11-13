@@ -139,4 +139,5 @@ jobs:
           tests/test_refs_frames_e2e.py
           tests/test_slow_start_e2e.py
           tests/test_profile_gc_e2e.py
+          tests/test_restore_tabs_e2e.py
           tests/test_sessions_http.py

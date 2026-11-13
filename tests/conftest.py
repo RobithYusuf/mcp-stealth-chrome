@@ -72,6 +72,24 @@ def _quit_watch_files_in_a_temp_folder():
         shutil.rmtree(folder, ignore_errors=True)
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _saved_tab_lists_in_a_temp_folder():
+    """Tab lists (restore_tabs) for every server the suite starts and every in-process launch.
+    A test launching a temporary user_data_dir would otherwise write its fixture URLs into the
+    person's ~/.mcp-stealth/window-state."""
+    previous = os.environ.get("MCP_STEALTH_TABS_DIR")
+    folder = tempfile.mkdtemp(prefix="mcp-stealth-tabs-")
+    os.environ["MCP_STEALTH_TABS_DIR"] = folder
+    try:
+        yield folder
+    finally:
+        if previous is None:
+            os.environ.pop("MCP_STEALTH_TABS_DIR", None)
+        else:
+            os.environ["MCP_STEALTH_TABS_DIR"] = previous
+        shutil.rmtree(folder, ignore_errors=True)
+
+
 @pytest.fixture(autouse=True)
 def _no_dock_icon_in_process(request, monkeypatch):
     if request.module.__name__ != "test_dock_icon" and not _BETA_RUN:

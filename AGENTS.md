@@ -31,6 +31,7 @@ uvx mcp-stealth-chrome → Python 3.11+ → FastMCP → nodriver → Chrome/Chro
 - `src/mcp_stealth_chrome/profile_version.py` — which Chrome may open a profile: the version guard and `beta_verdict`.
 - `src/mcp_stealth_chrome/quit_watch.py` — starts the per-browser quit watcher and keeps its state files; `_quit_watcher.py` is that watcher, a standalone script.
 - `src/mcp_stealth_chrome/cookie_migration.py` — moving a profile's `v10` cookies to Chrome 158's `v11` before it loses them.
+- `src/mcp_stealth_chrome/tab_record.py`: the saved tab list behind `restore_tabs`: the file, its order, masking, `/json/list` at exit.
 - `src/mcp_stealth_chrome/_app.py` — `StealthMCP`, the FastMCP boundary. `captcha.py`, `image_output.py`, `result_types.py` — their named helpers.
 - `src/mcp_stealth_chrome/tools/` — `research.py`, `devtools.py`, `vision.py`, `network_http.py`, `profiles.py`,
   `storage.py` (cookies, web storage, IndexedDB, cache), `capture.py` (request interception, HAR, dry_run),
@@ -385,6 +386,40 @@ conclusions. Each rule below replaced a real lie.
   the shared default and the next launch silently moves to a different cookie jar, so every login
   looks wiped while the data sits untouched in the old directory.
 
+### Saved tabs (restore_tabs)
+
+- Chrome's own session restore stays off (`wipe_window_state`, `--disable-restore-session-state`); restored window
+  placement is what opened invisible windows. The server keeps its own list instead: `tab_record`, one
+  `<instance>-tabs.json` per instance in the window-state folder (`MCP_STEALTH_TABS_DIR`), one entry per resolved
+  profile path, so a fallback profile never replaces the list of the real one. Written 0600 through a temporary file,
+  `fsync` and `os.replace`. `tests/conftest.py` points `MCP_STEALTH_TABS_DIR` at a temporary folder for every server and
+  in-process launch: a test with a temporary `user_data_dir` would otherwise write fixture URLs into the real folder.
+- Only a profile that outlives the close is recorded (`_tab_record_scope`): never `persistent=False` (no profile path),
+  `privacy=True` or an attached browser.
+- An empty list never replaces a record. A Quit closes every window before anything can read them, a failed read says
+  nothing, and a browser holding only about:blank or chrome:// pages has nothing worth reopening. `forget_tabs=True` on
+  `browser_close` and `close_instance`, and `profile_cleanup(remove_fallback)`, are the ways to clear one.
+- Written at four moments. (1) Every close this server makes of a browser it started (`browser_close`, `close_instance`,
+  `close_all_instances`, `_end_current_instance`/`_end_stored_instance` for the idle reaper and the window sweep), before
+  `_ensure_browser_dead`, with a 1 s cap on the read. The sweep's branch for a browser the quit watcher already ended
+  passes no reason: Chrome is gone. (2) The background writer, about 2 s after any tool call (`_app.AFTER_TOOL_HOOKS`, a
+  dict write measured at 2 µs) and every 30 s for every recordable instance, since a person can navigate a visible
+  window with no tool call. It reads twice 0.3 s apart and writes only when both agree, and leaves a browser alone for
+  30 s once a close has started (`_CLOSING_ATTR`): windows closing one by one must not be written over the close's
+  list. An unchanged list is not rewritten. (3) stdin EOF, `_stop_all_browsers`: the event loop has closed by then, so
+  the list comes from `/json/list` over plain HTTP with the quit watcher's reader (to Content-Length). (4) Nothing else:
+  a killed server leaves what (2) last wrote.
+- Order is the server's tab list (`BrowserState.tabs`, what `tab_list` shows), not Chrome's: see the target-order fact
+  below. Active is the server's selected tab, not whichever tab a window happens to show.
+- Restore (`_reopen_saved_tabs`) re-filters every URL (http, https, file only) because the file can be edited, opens
+  each extra page as `tab_new` does (its own background window headed, a tab headless) with the instance fingerprint,
+  loads them concurrently, and reports each one through `tab_record.shown_url` (`mask_url` plus the fragment, where
+  OAuth puts `access_token`). It never fails the launch. A record older than `MCP_STEALTH_RESTORE_TABS_MAX_DAYS` (30)
+  is named and not opened. The reuse path of `browser_launch` says restore was not applied.
+- `tests/test_restore_tabs_e2e.py` closes through each path on real Chrome (the EOF case with the background writer
+  off, so only the exit path can write) and, with `MCP_HEADED=1` (needs `--extra os-cursor` for AppKit), quits a
+  visible browser and checks the restored windows took 0 ms of frontmost time.
+
 ### Refs, snapshots and paths
 
 - Nothing is written to the page. The snapshot runs in an isolated world and returns element handles,
@@ -470,6 +505,11 @@ Platform truths, not preferences. Each one cost a release.
   Unreadable means the flag. Beta never opens a profile with data (`beta_verdict`), so it never migrates; tests use
   Beta 158 as Chrome 158 through a `chrome` script on the server's PATH, shorter than Google Chrome's path because
   nodriver takes the shortest candidate.
+- Chrome lists page targets in neither tab nor creation order. Measured on Chrome 157, four tabs opened A, B, C, D (C
+  then activated): `Target.getTargets` gave C, B, D, A and `/json/list` C, D, B, A (it sorts by last activity), while
+  nodriver's `browser.tabs` kept A, B, C, D. Anything that must keep tab order orders by the server's own list.
+  A page that failed to load reads `chrome-error://chromewebdata/` as `location.href`, but its `TargetInfo.url` keeps
+  the URL that failed, so a saved tab list keeps it.
 - `Network.setUserAgentOverride` needs `user_agent_metadata`, or `navigator.userAgentData.brands` comes back
   EMPTY, which no real Chrome reports. It also requires a UA even to change only the language. Identity
   defaults to the real browser and machine in every mode, and `_apply_fingerprint_to_tab` derives the hints

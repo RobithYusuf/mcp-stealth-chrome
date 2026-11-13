@@ -80,6 +80,7 @@ from . import profile_gc
 from . import profile_version
 from . import cookie_migration
 from . import quit_watch
+from . import tab_record
 from .state import data_root as state_data_root
 from .workflow import WorkflowError, run_workflow
 from .humanize import (
@@ -2085,6 +2086,341 @@ async def _dock_icon_status() -> dict:
         return {"state": "unavailable", "detail": _exc_text(exc)}
 
 
+# ── Saved tabs (restore_tabs) ─────────────────────────────────────────────
+# Chrome's own session restore stays off (wipe_window_state, --disable-restore-session-state):
+# restored window placement is what opened windows invisible. So the server keeps the list
+# itself (tab_record). It is written when this server closes a browser it started, by a
+# background writer a moment after tool calls and every _TAB_RECORD_PERIOD seconds, so a killed
+# server still leaves the last list it saw, and at stdin EOF, which is what an agent session
+# going to sleep looks like, from the DevTools HTTP endpoint since the event loop has closed by
+# then. Only for a profile that outlives the close: never persistent=False, privacy or attached.
+_TAB_RECORD_READ_TIMEOUT = 1.0
+_TAB_RECORD_DEBOUNCE = tab_record.env_number("MCP_STEALTH_TAB_RECORD_DEBOUNCE", 2)
+_TAB_RECORD_PERIOD = tab_record.env_number("MCP_STEALTH_TAB_RECORD_PERIOD", 30)
+_RESTORE_TABS_MAX_DAYS = tab_record.env_number("MCP_STEALTH_RESTORE_TABS_MAX_DAYS", 30)
+# A browser being closed: the background writer leaves it alone for this long, so the windows
+# closing one by one are never written over the list the close just recorded.
+_TAB_RECORD_CLOSING_SECONDS = 30.0
+_CLOSING_ATTR = "_mcp_stealth_closing_at"
+_TAB_RECORD_DIRTY: dict[tuple[str, str], float] = {}  # (session, instance) -> last tool call
+_tab_record_task: Optional[asyncio.Task] = None
+
+
+def _tab_record_scope(instance_id: str, profile: Any, privacy: bool) -> Optional[Path]:
+    """The profile whose tabs are kept, or None.
+
+    persistent=False has no profile of its own here and privacy promises that nothing is kept.
+    An attached browser was not started by this server.
+    """
+    if privacy or profile is None or instance_id in _ATTACHED_BROWSERS:
+        return None
+    return Path(str(profile))
+
+
+def _instance_view(instance_id: str) -> Optional[tuple]:
+    """(browser, tab keys in tab order, active key, profile, privacy) in the bound session."""
+    if instance_id == BrowserState.current_instance_id:
+        browser, tabs, index = (BrowserState.browser, list(BrowserState.tabs),
+                                BrowserState.active_tab_index)
+        profile, privacy = BrowserState.current_profile_dir, BrowserState.current_privacy
+    else:
+        snap = BrowserState.instances.get(instance_id)
+        if snap is None:
+            return None
+        browser, tabs, index = snap.browser, list(snap.tabs), snap.active_tab_index
+        profile, privacy = snap.profile_dir, snap.privacy
+    if browser is None:
+        return None
+    keys = [_target_key(t) for t in tabs]
+    return browser, keys, (keys[index] if 0 <= index < len(keys) else None), profile, privacy
+
+
+def _mark_closing(browser: Any) -> None:
+    """From here on the background writer leaves this browser to the close."""
+    with contextlib.suppress(Exception):
+        setattr(browser, _CLOSING_ATTR, time.monotonic())
+
+
+def _closing(browser: Any) -> bool:
+    since = getattr(browser, _CLOSING_ATTR, None)
+    return since is not None and time.monotonic() - since < _TAB_RECORD_CLOSING_SECONDS
+
+
+async def _page_targets(browser: Any) -> list[tuple[str, str]]:
+    """(target id, url) of every page, in the order Chrome lists them."""
+    from nodriver.cdp import target as cdp_target
+    infos = await (getattr(browser, "connection", None) or browser).send(cdp_target.get_targets())
+    return [(str(info.target_id), info.url or "") for info in infos
+            if getattr(info, "type_", "") == "page"]
+
+
+async def _record_tabs_before_close(instance_id: str, browser: Any, tabs: list, active_index: int,
+                                    profile: Any, privacy: bool, reason: str) -> str:
+    """Write what a browser this server is closing has open. Never raises; a read that does not
+    answer within _TAB_RECORD_READ_TIMEOUT leaves the earlier record as it was."""
+    scope = _tab_record_scope(instance_id, profile, privacy)
+    if scope is None or browser is None:
+        return "not recorded: this profile keeps no tabs"
+    _mark_closing(browser)
+    keys = [_target_key(t) for t in tabs]
+    active = keys[active_index] if 0 <= active_index < len(keys) else None
+    try:
+        pages = await asyncio.wait_for(_page_targets(browser), timeout=_TAB_RECORD_READ_TIMEOUT)
+    except Exception:
+        pages = None
+    return tab_record.save(instance_id, scope, pages, keys, active, reason, force=True)
+
+
+def _record_tabs_at_exit(instance_id: str, browser: Any, tabs: list, active_index: int,
+                         profile: Any, privacy: bool) -> str:
+    """The stdin-EOF form of _record_tabs_before_close: no event loop, so /json/list over HTTP."""
+    scope = _tab_record_scope(instance_id, profile, privacy)
+    if scope is None or browser is None or getattr(browser, "stopped", False) is True:
+        return "not recorded"
+    config = getattr(browser, "config", None)
+    pages = tab_record.pages_over_http(getattr(config, "host", None), getattr(config, "port", None),
+                                       timeout=_TAB_RECORD_READ_TIMEOUT)
+    keys = [_target_key(t) for t in tabs]
+    active = keys[active_index] if 0 <= active_index < len(keys) else None
+    return tab_record.save(instance_id, scope, pages, keys, active, "server exit", force=True)
+
+
+def _mark_tabs_changed(_tool: str) -> None:
+    """After every tool call, in the caller's session: record this instance's tabs a moment later.
+
+    Only a dictionary write here; the read and the write happen in the background writer.
+    """
+    if _TAB_RECORD_DEBOUNCE <= 0 or BrowserState.browser is None:
+        return
+    iid = BrowserState.current_instance_id
+    if _tab_record_scope(iid, BrowserState.current_profile_dir, BrowserState.current_privacy) is None:
+        return
+    _TAB_RECORD_DIRTY[(BrowserState.session_key(), iid)] = time.monotonic()
+    _ensure_tab_recorder_running()
+
+
+def _ensure_tab_recorder_running() -> None:
+    global _tab_record_task
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    task = _tab_record_task
+    if task is not None and not task.done() and task.get_loop() is loop:
+        return
+    _tab_record_task = loop.create_task(_tab_record_loop())
+
+
+async def _record_tabs_in_background(key: str, instance_id: str) -> str:
+    token = BrowserState.in_session(key)
+    try:
+        view = _instance_view(instance_id)
+    finally:
+        BrowserState.unbind_session(token)
+    if view is None:
+        return "gone"
+    browser, keys, active, profile, privacy = view
+    scope = _tab_record_scope(instance_id, profile, privacy)
+    if scope is None or _closing(browser):
+        return "skipped"
+    try:
+        first = await asyncio.wait_for(_page_targets(browser), timeout=_TAB_RECORD_READ_TIMEOUT)
+        await asyncio.sleep(0.3)
+        second = await asyncio.wait_for(_page_targets(browser), timeout=_TAB_RECORD_READ_TIMEOUT)
+    except Exception:
+        return "unread"
+    if _closing(browser):
+        return "skipped"
+    if sorted(first) != sorted(second):
+        # Pages going or arriving between two reads 0.3 s apart: a Quit closing its windows, or
+        # a navigation under way. A half-closed list must not replace the record; look again.
+        _TAB_RECORD_DIRTY.setdefault((key, instance_id), time.monotonic())
+        return "changing"
+    return tab_record.save(instance_id, scope, second, keys, active, "while running", force=False)
+
+
+def _recordable_instances() -> list[tuple[str, str]]:
+    found = []
+    for key in BrowserState.session_keys():
+        token = BrowserState.in_session(key)
+        try:
+            for iid in [BrowserState.current_instance_id, *BrowserState.instances]:
+                view = _instance_view(iid)
+                if view is not None and _tab_record_scope(iid, view[3], view[4]) is not None:
+                    found.append((key, iid))
+        finally:
+            BrowserState.unbind_session(token)
+    return found
+
+
+async def _tab_record_loop() -> None:
+    last_sweep = time.monotonic()
+    while True:
+        try:
+            await asyncio.sleep(0.5)
+        except asyncio.CancelledError:
+            return
+        now = time.monotonic()
+        due = [k for k, at in list(_TAB_RECORD_DIRTY.items()) if now - at >= _TAB_RECORD_DEBOUNCE]
+        for k in due:
+            _TAB_RECORD_DIRTY.pop(k, None)
+        if _TAB_RECORD_PERIOD > 0 and now - last_sweep >= _TAB_RECORD_PERIOD:
+            # Pages change without a tool call too: a person navigating a visible window, or a
+            # page redirecting itself.
+            last_sweep = now
+            with contextlib.suppress(Exception):
+                due += [k for k in _recordable_instances() if k not in due]
+        for key, iid in due:
+            try:
+                await _record_tabs_in_background(key, iid)
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                continue
+
+
+from . import _app as _app_module  # noqa: E402
+
+_app_module.AFTER_TOOL_HOOKS[:] = [
+    hook for hook in _app_module.AFTER_TOOL_HOOKS
+    if getattr(hook, "__name__", "") != "_mark_tabs_changed"] + [_mark_tabs_changed]
+
+
+async def _load_saved_tab(tab: Any, url: str) -> dict:
+    doc_state, disarm = await _arm_document_watch(tab)
+    try:
+        await asyncio.wait_for(tab.get(url), timeout=BROWSER_NAV_TIMEOUT)
+        await _wait_load_complete(tab, 10)
+        return await _observe_navigation(tab, url, disarm())
+    finally:
+        disarm()
+
+
+async def _reopen_saved_tabs(
+    instance_id: str, browser: Any, main_tab: Any, profile: Any, privacy: bool, headless: bool,
+    fingerprint: dict, launch_url: Optional[str], window_width: Optional[int] = None,
+    window_height: Optional[int] = None,
+) -> tuple[list, int, dict, str]:
+    """Reopen the tabs saved for this instance and profile. Never raises.
+
+    Returns every page in tab order (main_tab first), the index to select, the report and a
+    one-line summary. With no launch url (about:blank) the first saved page loads in main_tab and
+    the saved selection is selected again. With a launch url, that page stays first and
+    selected, the saved pages follow in their order, and one equal to it is not opened twice.
+    Each further page opens as tab_new opens one: its own background window when headed, a tab
+    when headless, so no window takes the keyboard.
+    """
+    report: dict[str, Any] = {"reopened": [], "failed": []}
+    tabs, select = [main_tab], 0
+
+    def done(summary: str) -> tuple[list, int, dict, str]:
+        report["summary"] = summary
+        return tabs, select, report, f" [restore_tabs: {summary}]"
+
+    scope = _tab_record_scope(instance_id, profile, privacy)
+    if scope is None:
+        kind = ("a privacy profile" if privacy else "an attached browser"
+                if instance_id in _ATTACHED_BROWSERS else "a persistent=False launch")
+        return done(f"nothing to reopen: {kind} keeps no tabs")
+    entry, why = await asyncio.to_thread(tab_record.load, instance_id, scope)
+    if entry is None:
+        return done(f"nothing to reopen: {why}")
+    age = tab_record.age_text(entry.get("saved_at"))
+    report["saved"] = f"{age}, at {entry.get('reason') or 'an unknown moment'}"
+    try:
+        days = (time.time() - float(entry.get("saved_at"))) / 86400
+    except (TypeError, ValueError):
+        days = None
+    if days is None or (_RESTORE_TABS_MAX_DAYS > 0 and days > _RESTORE_TABS_MAX_DAYS):
+        return done(f"nothing reopened: the saved list is {age}, older than "
+                    f"{_RESTORE_TABS_MAX_DAYS:g} days (MCP_STEALTH_RESTORE_TABS_MAX_DAYS)")
+    saved = [t.get("url") if isinstance(t, dict) else None for t in entry["tabs"]]
+    active = entry.get("active") if isinstance(entry.get("active"), int) else None
+    use_main = not launch_url or launch_url == "about:blank"
+    todo: list[tuple[int, str]] = []
+    for position, url in enumerate(saved):
+        if not tab_record.keep_url(url):
+            report["failed"].append({"saved_index": position, "url": tab_record.shown_url(url),
+                                     "error": "not reopened: only http, https and file pages are"})
+        elif not use_main and url == launch_url:
+            report.setdefault("skipped", []).append(
+                {"saved_index": position, "url": tab_record.shown_url(url),
+                 "note": "already open as the launch url"})
+        else:
+            todo.append((position, url))
+    slots: list[dict] = []
+    for n, (position, url) in enumerate(todo):
+        slot = {"saved_index": position, "url": url, "tab": None, "error": None}
+        slots.append(slot)
+        if use_main and n == 0:
+            slot["tab"] = main_tab
+            continue
+        try:
+            opened = (await _wait(browser.get("about:blank", new_tab=True), timeout=10,
+                                  what="open a tab") if headless
+                      else await _wait(_open_background_window(browser, window_width, window_height),
+                                       timeout=10, what="open a window"))
+            await _apply_fingerprint_to_tab(opened, fingerprint)
+            slot["tab"] = opened
+        except Exception as exc:
+            slot["error"] = f"could not open a tab: {_exc_text(exc)}"
+    loads = [s for s in slots if s["tab"] is not None]
+    results = await asyncio.gather(*(_load_saved_tab(s["tab"], s["url"]) for s in loads),
+                                   return_exceptions=True)
+    for slot, result in zip(loads, results):
+        slot["observed"] = result
+    # The order tab_list will show: the browser's own list, as _refresh_tabs reads it.
+    with contextlib.suppress(Exception):
+        await asyncio.wait_for(browser.update_targets(), timeout=5)
+    tabs = list(browser.tabs)
+    listed = {_target_key(t) for t in tabs}
+    for tab in [main_tab, *(s["tab"] for s in slots if s["tab"] is not None)]:
+        if _target_key(tab) not in listed:
+            listed.add(_target_key(tab))
+            tabs.append(tab)
+    position_of = {_target_key(t): i for i, t in enumerate(tabs)}
+    for slot in slots:
+        row: dict[str, Any] = {"saved_index": slot["saved_index"],
+                               "url": tab_record.shown_url(slot["url"])}
+        observed = slot.get("observed")
+        if slot["tab"] is not None:
+            row["tab"] = position_of.get(_target_key(slot["tab"]))
+        if slot["error"]:
+            row["error"] = slot["error"]
+        elif isinstance(observed, BaseException):
+            row["error"] = f"the page did not load: {_exc_text(observed)}"
+        elif observed.get("load_failure"):
+            row["error"] = f"the page did not load ({observed['load_failure']})"
+            row["final_url"] = tab_record.shown_url(observed.get("final_url"))
+        else:
+            row.update(final_url=tab_record.shown_url(observed.get("final_url")),
+                       status=observed.get("status"), ready_state=observed.get("ready_state"))
+        report["failed" if "error" in row else "reopened"].append(row)
+    report["reopened"].sort(key=lambda r: r["saved_index"])
+    report["failed"].sort(key=lambda r: r["saved_index"])
+    note = ""
+    if use_main and active is not None:
+        chosen = next((s for s in slots if s["saved_index"] == active), None)
+        if chosen is not None and chosen["tab"] is not None:
+            select = position_of.get(_target_key(chosen["tab"]), 0)
+        else:
+            note = "; the tab that was selected could not be reopened, so tab 0 is"
+    if headless and select:
+        with contextlib.suppress(Exception):
+            await _wait(tabs[select].activate(), timeout=5, what="select the saved tab")
+    report["selected"] = select
+    if entry.get("not_kept"):
+        report["not_kept"] = entry["not_kept"]
+    total = len(saved)
+    summary = f"reopened {len(report['reopened'])} of {total} saved tab(s)"
+    if report["failed"]:
+        summary += f", {len(report['failed'])} failed"
+    if report.get("skipped"):
+        summary += f", {len(report['skipped'])} already open as the launch url"
+    summary += f" (saved {report['saved']}); tab {select} is selected{note}"
+    return done(summary)
+
+
 @mcp.tool()
 async def browser_launch(
     url: str = "about:blank",
@@ -2107,6 +2443,7 @@ async def browser_launch(
     expect_url: Optional[str] = None,
     expect_status: Optional[int] = None,
     profile_mode: Literal["default", "light"] = "default",
+    restore_tabs: bool = False,
 ) -> str:
     """Launch stealth Chrome via nodriver. Creates persistent profile by default.
 
@@ -2177,6 +2514,17 @@ async def browser_launch(
             it. Nothing on disk is ever deleted or overwritten either way.
         expect_url, expect_status: validate the initial load — see navigate().
             An unmeasured value fails the check rather than passing it.
+        restore_tabs: reopen the tabs this instance had open on this profile when this server
+            last closed it (browser_close, close_instance, the idle timeout, Quit, or the
+            server's own exit when its client goes away). Pages open behind the app in use, as
+            tab_new opens them, and the tab that was selected is selected again. Without a url
+            the first saved page loads in the first tab; with a url, that page stays first and
+            selected and the saved pages follow. The result lists each page as reopened (final
+            URL, status) or failed (why), with secret URL parameters masked, and says plainly
+            when there is no saved list. It never fails the launch. Persistent profiles only:
+            persistent=False and privacy=True keep no tabs. The list is kept in
+            ~/.mcp-stealth/window-state/<instance>-tabs.json, readable by you only;
+            browser_close(forget_tabs=True) removes it.
     """
     # Local testing wants a clean room by default: a testing_mode run that
     # silently accumulated state in the real login profile was both a surprise
@@ -2236,6 +2584,9 @@ async def browser_launch(
                             timeout=5, what="reuse probe")
                 _answered = True
                 reuse_head = f"reusing the running browser ({len(BrowserState.tabs)} tab(s))"
+                if restore_tabs:
+                    reuse_head += ("; restore_tabs NOT applied, the running browser keeps its own "
+                                   "tabs and nothing was reopened")
                 if profile_mode != "default":
                     reuse_head += (f"; profile_mode={profile_mode!r} NOT applied, it only "
                                    f"takes effect on a new launch")
@@ -2712,19 +3063,45 @@ async def browser_launch(
             except Exception:
                 pass  # placement is a convenience; never fail a launch over it
 
+        restore_suffix = ""
+        if restore_tabs:
+            try:
+                _all_tabs, _select, _report, restore_suffix = await _reopen_saved_tabs(
+                    BrowserState.current_instance_id, browser, main, profile_path, privacy,
+                    headless, effective_fingerprint, url, window_width, window_height)
+                BrowserState.tabs = _all_tabs
+                BrowserState.active_tab_index = _select
+                _launch_observed = {**_launch_observed, "restore_tabs": _report}
+            except Exception as e:
+                restore_suffix = f" [restore_tabs: failed: {_exc_text(e)}]"
+
         await _give_focus_back(previous_app)
         return _nav_result(
             f"Browser launched (headless={headless}, persistent={persistent}, "
             f"privacy={privacy}, identity={identity_source}). Loaded",
             _launch_observed,
             expect_url=expect_url, expect_status=expect_status,
-            suffix=f"{suffix}{verify_suffix}{health_suffix}{place_suffix}{dock_note}",
+            suffix=f"{suffix}{verify_suffix}{health_suffix}{place_suffix}{restore_suffix}{dock_note}",
         )
 
 
+def _forget_tabs_note(instance_id: str, profile: Any, privacy: bool) -> str:
+    """Remove the saved tab list of an instance and profile, for forget_tabs=True."""
+    scope = _tab_record_scope(instance_id, profile, privacy)
+    if scope is None:
+        return " No tab list is kept for this profile."
+    if tab_record.forget(instance_id, scope):
+        return " Its saved tab list was removed."
+    return " It had no saved tab list."
+
+
 @mcp.tool()
-async def browser_close() -> str:
-    """Close the browser and free the profile lock."""
+async def browser_close(forget_tabs: bool = False) -> str:
+    """Close the browser and free the profile lock.
+
+    The open tabs are saved first (persistent profiles only), so browser_launch(restore_tabs=True)
+    can reopen them. forget_tabs=True closes without saving and removes the saved list.
+    """
     # The handle, not is_up(): closing the last tab makes is_up() false while Chrome
     # still runs and holds the profile, and that is not "not running".
     if BrowserState.browser is None:
@@ -2742,9 +3119,14 @@ async def browser_close() -> str:
         BrowserState.current_privacy = False
         BrowserState.current_fingerprint = {}
         BrowserState.current_proxy = None
+        forgot = ""
+        if forget_tabs:
+            gone = tab_record.forget_instance(BrowserState.current_instance_id)
+            forgot = (f" Removed the saved tab list of instance {BrowserState.current_instance_id!r}."
+                      if gone else " There was no saved tab list.")
         if stale_privacy_profile is not None:
-            return ok("Browser was not running; stale privacy profile removed.")
-        return ok("Browser was not running.")
+            return ok(f"Browser was not running; stale privacy profile removed.{forgot}")
+        return ok(f"Browser was not running.{forgot}")
     was_up = BrowserState.is_up()
     privacy_profile = (
         BrowserState.current_profile_dir if BrowserState.current_privacy else None
@@ -2758,9 +3140,22 @@ async def browser_close() -> str:
             await _save_window_bounds(BrowserState.current_instance_id, closed_tabs[0])
         except Exception:
             pass
+    tabs_note = ""
+    if forget_tabs:
+        _mark_closing(BrowserState.browser)
+    else:
+        saved = await _record_tabs_before_close(
+            BrowserState.current_instance_id, BrowserState.browser, closed_tabs,
+            BrowserState.active_tab_index, closed_profile, BrowserState.current_privacy,
+            "browser_close")
+        if saved.startswith("recorded"):
+            tabs_note = f" {saved[0].upper()}{saved[1:]} for browser_launch(restore_tabs=True)."
     _kill = await _ensure_browser_dead(BrowserState.browser, closed_profile)
     if _close_incomplete(_kill):
         return err(f"close failed: {_close_failure(_kill)}; handle kept so a retry can reach it")
+    if forget_tabs:
+        tabs_note = _forget_tabs_note(BrowserState.current_instance_id, closed_profile,
+                                      BrowserState.current_privacy)
     # Capture the id BEFORE reset() (which may change current_instance_id) so
     # we can drop any attached-browser bookkeeping for it.
     _closed_iid = BrowserState.current_instance_id
@@ -2788,7 +3183,7 @@ async def browser_close() -> str:
         clean_profile_state(closed_profile)
     head = "Browser closed" if was_up else "Browser had no live tabs or had already exited; ended it"
     return ok(f"{head}; privacy profile removed.{_kill_note(_kill)}" if privacy_profile
-              else f"{head}.{_kill_note(_kill)}")
+              else f"{head}.{_kill_note(_kill)}{tabs_note}")
 
 
 @mcp.tool()
@@ -6213,6 +6608,7 @@ async def _launch_browser_instance(
     fingerprint: Optional[dict] = None,
     privacy: bool = False,
     desc: str = "",
+    restore_tabs: bool = False,
 ) -> tuple[bool, str]:
     """Shared launcher for browser_launch + spawn_browser.
 
@@ -6386,11 +6782,21 @@ async def _launch_browser_instance(
         await _remove_privacy_profile(privacy_profile)
         return False, f"initial nav failed: {_exc_text(e)}"
 
+    slot_tabs, slot_active, restore_text = [main_tab], 0, ""
+    if restore_tabs:
+        try:
+            slot_tabs, slot_active, _report, _summary = await _reopen_saved_tabs(
+                instance_id, browser, main_tab, profile_path, privacy, headless,
+                effective_fingerprint, url, window_width, window_height)
+            restore_text = f"{_summary}\n{json.dumps({'restore_tabs': _report}, indent=2, default=str)}"
+        except Exception as e:
+            restore_text = f" [restore_tabs: failed: {_exc_text(e)}]"
+
     # Write into the target instance slot
     if instance_id == BrowserState.current_instance_id:
         BrowserState.browser = browser
-        BrowserState.tabs = [main_tab]
-        BrowserState.active_tab_index = 0
+        BrowserState.tabs = slot_tabs
+        BrowserState.active_tab_index = slot_active
         BrowserState.current_profile_dir = profile_path
         BrowserState.current_desc = desc
         BrowserState.current_headless = headless
@@ -6405,8 +6811,8 @@ async def _launch_browser_instance(
         snap = InstanceSnapshot(
             instance_id=instance_id,
             browser=browser,
-            tabs=[main_tab],
-            active_tab_index=0,
+            tabs=slot_tabs,
+            active_tab_index=slot_active,
             profile_dir=profile_path,
             desc=desc,
             headless=headless,
@@ -6433,17 +6839,23 @@ async def _launch_browser_instance(
         f"instance {instance_id!r} launched (headless={headless}, "
         f"privacy={privacy}, identity={identity_source}, "
         f"profile={profile_path.name if profile_path else '(ephemeral Chrome temp)'})"
-        f"{dock_note}"
+        f"{dock_note}{restore_text}"
     )
 
 
-async def _end_stored_instance(iid: str, snap: InstanceSnapshot) -> bool:
-    """Close a stored instance like close_instance does. True once its Chrome is verified gone."""
+async def _end_stored_instance(iid: str, snap: InstanceSnapshot,
+                               record_reason: Optional[str] = None) -> bool:
+    """Close a stored instance like close_instance does. True once its Chrome is verified gone.
+
+    record_reason: save its tabs first, under that reason. None when Chrome is already gone."""
     _tabs = list(snap.tabs)
     # stop() can return without raising when the socket is gone. Keep the instance
     # reachable and retry later unless the process is really gone; dropping it
     # would leak a live Chrome with no remaining handle.
     if snap.browser:
+        if record_reason:
+            await _record_tabs_before_close(iid, snap.browser, _tabs, snap.active_tab_index,
+                                            snap.profile_dir, snap.privacy, record_reason)
         _dead = await _ensure_browser_dead(snap.browser, snap.profile_dir)
         if _close_incomplete(_dead):
             return False
@@ -6462,12 +6874,18 @@ async def _end_stored_instance(iid: str, snap: InstanceSnapshot) -> bool:
     return True
 
 
-async def _end_current_instance() -> bool:
-    """Close the calling session's current instance. True once its Chrome is verified gone."""
+async def _end_current_instance(record_reason: Optional[str] = None) -> bool:
+    """Close the calling session's current instance. True once its Chrome is verified gone.
+
+    record_reason: save its tabs first, under that reason. None when Chrome is already gone."""
     _cur_profile = BrowserState.current_profile_dir
     _cur_privacy = BrowserState.current_privacy
     _cur_tabs = list(BrowserState.tabs)
     if BrowserState.browser:
+        if record_reason:
+            await _record_tabs_before_close(
+                BrowserState.current_instance_id, BrowserState.browser, _cur_tabs,
+                BrowserState.active_tab_index, _cur_profile, _cur_privacy, record_reason)
         _dead = await _ensure_browser_dead(BrowserState.browser, _cur_profile)
         if _close_incomplete(_dead):
             # State must remain reachable so the next sweep can retry.
@@ -6489,11 +6907,11 @@ async def _sweep_idle_instances() -> None:
     """Close the calling session's instances that are past their idle timeout."""
     for iid, snap in list(BrowserState.instances.items()):
         if snap.is_running() and snap.is_idle_expired():
-            await _end_stored_instance(iid, snap)
+            await _end_stored_instance(iid, snap, "idle timeout")
     if (BrowserState.is_up()
         and BrowserState.current_idle_timeout > 0
         and (time.time() - BrowserState.current_last_active) > BrowserState.current_idle_timeout):
-        await _end_current_instance()
+        await _end_current_instance("idle timeout")
 
 
 async def _idle_reaper_loop() -> None:
@@ -6622,7 +7040,8 @@ async def _sweep_windowless() -> set[int]:
         BrowserState.window_closed[iid] = (
             f"instance {iid!r} was closed at {time.strftime('%H:%M:%S')} because its last window "
             f"was closed (Quit, or closing every window).")
-        ended = await (_end_current_instance() if snap is None else _end_stored_instance(iid, snap))
+        ended = await (_end_current_instance("last window closed") if snap is None
+                       else _end_stored_instance(iid, snap, "last window closed"))
         if not ended:
             BrowserState.window_closed.pop(iid, None)
             entry["zero_since"] = time.monotonic()  # Chrome did not die: retry after another grace
@@ -6684,6 +7103,7 @@ async def spawn_browser(
     desc: str = "",
     fingerprint: Optional[dict] = None,
     privacy: bool = False,
+    restore_tabs: bool = False,
 ) -> str:
     """Create a new named browser instance running in parallel with main.
     Each instance has its own profile, cookies, tabs, logs. Use for multi-account
@@ -6699,6 +7119,8 @@ async def spawn_browser(
         privacy: empty profile deleted when closed. The identity stays the real browser
             and machine unless fingerprint overrides it. To use a logged-in account,
             leave this off
+        restore_tabs: reopen the tabs this instance had when it was last closed, as
+            browser_launch(restore_tabs=True) does
         other args: same as browser_launch
 
     Use switch_instance(id) to route subsequent tool calls to this instance.
@@ -6760,6 +7182,7 @@ async def spawn_browser(
                 fingerprint=fingerprint,
                 privacy=privacy,
                 desc=desc,
+                restore_tabs=restore_tabs,
             )
     finally:
         _SPAWNING.pop(instance_id, None)
@@ -6890,8 +7313,12 @@ async def instance_release(instance_id: str) -> str:
 
 
 @mcp.tool()
-async def close_instance(instance_id: str) -> str:
-    """Close a specific browser instance (frees profile + memory)."""
+async def close_instance(instance_id: str, forget_tabs: bool = False) -> str:
+    """Close a specific browser instance (frees profile + memory).
+
+    Its open tabs are saved first (persistent profiles only) for restore_tabs=True on the next
+    launch of that instance. forget_tabs=True closes without saving and removes the saved list.
+    """
     try:
         _validate_instance_id(instance_id)
     except ValueError as e:
@@ -6914,9 +7341,16 @@ async def close_instance(instance_id: str) -> str:
                                           BrowserState.tabs[0] if BrowserState.tabs else None)
             except Exception:
                 pass
+            if forget_tabs:
+                _mark_closing(BrowserState.browser)
+            else:
+                await _record_tabs_before_close(
+                    instance_id, BrowserState.browser, _tabs, BrowserState.active_tab_index,
+                    _profile, _privacy, "close_instance")
             _kill = await _ensure_browser_dead(BrowserState.browser, _profile)
             if _close_incomplete(_kill):
                 return err(f"close failed: {_close_failure(_kill)} — instance retained")
+            _forgot = _forget_tabs_note(instance_id, _profile, _privacy) if forget_tabs else ""
             _iid = BrowserState.current_instance_id
             BrowserState.reset()
             _clear_tab_scoped_state(_tabs)
@@ -6933,7 +7367,7 @@ async def close_instance(instance_id: str) -> str:
             elif _profile:
                 clean_profile_state(_profile)
             _ATTACHED_BROWSERS.discard(_iid)
-            return ok(f"closed current instance {instance_id!r}" + _kill_note(_kill))
+            return ok(f"closed current instance {instance_id!r}" + _kill_note(_kill) + _forgot)
         if BrowserState.current_privacy:
             _profile = BrowserState.current_profile_dir
             if not await _remove_privacy_profile(_profile):
@@ -6943,6 +7377,10 @@ async def close_instance(instance_id: str) -> str:
             BrowserState.current_fingerprint = {}
             BrowserState.current_proxy = None
             return ok(f"current instance {instance_id!r} was not running; privacy profile removed")
+        if forget_tabs:
+            gone = tab_record.forget_instance(instance_id)
+            return ok(f"current instance {instance_id!r} was not running."
+                      + (" Removed its saved tab list." if gone else " It had no saved tab list."))
         return ok(f"current instance {instance_id!r} was not running")
     # Close stored
     snap = BrowserState.instances.get(instance_id)
@@ -6953,12 +7391,18 @@ async def close_instance(instance_id: str) -> str:
         await _save_window_bounds(instance_id, snap.tabs[0] if snap.tabs else None)
     except Exception:
         pass
+    if forget_tabs:
+        _mark_closing(snap.browser)
+    else:
+        await _record_tabs_before_close(instance_id, snap.browser, _tabs, snap.active_tab_index,
+                                        snap.profile_dir, snap.privacy, "close_instance")
     _kill = await _ensure_browser_dead(snap.browser, snap.profile_dir)
     if _close_incomplete(_kill):
         return err(
             f"close failed for instance {instance_id!r}: {_close_failure(_kill)}"
             f" — instance retained for retry"
         )
+    _forgot = _forget_tabs_note(instance_id, snap.profile_dir, snap.privacy) if forget_tabs else ""
     # Chrome is stopped even if residue cleanup below fails. Retain a minimal
     # snapshot in that case so a second close_instance call can retry cleanup.
     snap.browser = None
@@ -6974,7 +7418,7 @@ async def close_instance(instance_id: str) -> str:
                    f"{_removal_failure(snap.profile_dir)}")
     BrowserState.instances.pop(instance_id, None)
     _ATTACHED_BROWSERS.discard(instance_id)
-    return ok(f"closed instance {instance_id!r}" + _kill_note(_kill))
+    return ok(f"closed instance {instance_id!r}" + _kill_note(_kill) + _forgot)
 
 
 @mcp.tool()
@@ -6986,6 +7430,8 @@ async def close_all_instances() -> str:
     for iid, snap in list(BrowserState.instances.items()):
         _tabs = list(snap.tabs)
         if snap.browser:
+            await _record_tabs_before_close(iid, snap.browser, _tabs, snap.active_tab_index,
+                                            snap.profile_dir, snap.privacy, "close_all_instances")
             _kill = await _ensure_browser_dead(snap.browser, snap.profile_dir)
             if _close_incomplete(_kill):
                 failures.append(f"{iid}: {_close_failure(_kill)}; instance retained")
@@ -7007,6 +7453,10 @@ async def close_all_instances() -> str:
         _current_profile = BrowserState.current_profile_dir
         _current_privacy = BrowserState.current_privacy
         _current_tabs = list(BrowserState.tabs)
+        await _record_tabs_before_close(
+            BrowserState.current_instance_id, BrowserState.browser, _current_tabs,
+            BrowserState.active_tab_index, _current_profile, _current_privacy,
+            "close_all_instances")
         _kill = await _ensure_browser_dead(BrowserState.browser, _current_profile)
         if _close_incomplete(_kill):
             failures.append(
@@ -9498,6 +9948,16 @@ def _stop_all_browsers() -> None:
     for key in BrowserState.session_keys():
         token = BrowserState.in_session(key)
         try:
+            # What an agent session going to sleep looks like: stdin closes and these browsers
+            # end. Their tabs are saved first, from /json/list, as the event loop is gone.
+            views = [(BrowserState.current_instance_id, BrowserState.browser, list(BrowserState.tabs),
+                      BrowserState.active_tab_index, BrowserState.current_profile_dir,
+                      BrowserState.current_privacy)]
+            views += [(iid, s.browser, list(s.tabs), s.active_tab_index, s.profile_dir, s.privacy)
+                      for iid, s in BrowserState.instances.items()]
+            for view in views:
+                with contextlib.suppress(Exception):
+                    _record_tabs_at_exit(*view)
             handles = [BrowserState.browser]
             handles.extend(s.browser for s in BrowserState.instances.values())
             for browser in handles:

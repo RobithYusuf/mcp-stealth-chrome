@@ -19,6 +19,7 @@ from typing import Literal
 
 from .. import profile_gc as _gc
 from .. import state as _state
+from .. import tab_record as _tabs
 from .._app import mcp
 from ..helpers import err, ok
 
@@ -264,11 +265,12 @@ def _remove_fallback(name: str, confirm: bool) -> dict:
     if not confirm:
         found = _gc.contents(profile)
         return {"name": name, "ok": True, "would_free": _human(size),
-                "would_lose": {k: found[k] for k in ("cookies", "cookie_domains", "logins",
-                                                    "history", "autofill", "top_sites",
-                                                    "sessions", "local_storage",
-                                                    "indexeddb", "extensions", "bookmarks",
-                                                    "readable")}}
+                "would_lose": {**{k: found[k] for k in ("cookies", "cookie_domains", "logins",
+                                                       "history", "autofill", "top_sites",
+                                                       "sessions", "local_storage",
+                                                       "indexeddb", "extensions", "bookmarks",
+                                                       "readable")},
+                               "saved_tabs": _tabs.saved_for_profile(profile)}}
     # Asked again immediately before deleting: the report may be minutes old.
     refusal = _removal_refusal(name, profile)
     if refusal:
@@ -278,7 +280,9 @@ def _remove_fallback(name: str, confirm: bool) -> dict:
     except OSError as exc:
         return {"name": name, "ok": False, "error": str(exc),
                 "still_exists": profile.exists()}
-    return {"name": name, "ok": True, "removed": True, "freed": _human(size)}
+    # Its saved tab list goes with it: the URLs belong to that profile's sessions.
+    return {"name": name, "ok": True, "removed": True, "freed": _human(size),
+            "saved_tab_lists_removed": _tabs.forget_profile(profile)}
 
 
 @mcp.tool()
@@ -295,7 +299,8 @@ async def profile_cleanup(
                 use. Cookies, logins, local storage and preferences stay.
             remove_fallback: delete a whole profile-pid<N> directory. Refused for
                 main or named profiles, or while the directory or its owner is live.
-                Any login made inside that profile goes with it.
+                Any login made inside that profile goes with it, and so does the tab
+                list saved for it (restore_tabs).
         names: exact names from profile_report. There is no "all", so nothing gets
             deleted that was not named.
         confirm: False (default) reports what would happen and deletes nothing.
