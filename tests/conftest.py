@@ -90,6 +90,24 @@ def _saved_tab_lists_in_a_temp_folder():
         shutil.rmtree(folder, ignore_errors=True)
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _keep_alive_records_in_a_temp_folder():
+    """keep_alive records for every server the suite starts and every in-process launch, so no
+    test reads or writes the person's ~/.mcp-stealth/keep-alive, and none reattaches to a
+    browser the person kept."""
+    previous = os.environ.get("MCP_STEALTH_KEEP_ALIVE_DIR")
+    folder = tempfile.mkdtemp(prefix="mcp-stealth-keep-alive-")
+    os.environ["MCP_STEALTH_KEEP_ALIVE_DIR"] = folder
+    try:
+        yield folder
+    finally:
+        if previous is None:
+            os.environ.pop("MCP_STEALTH_KEEP_ALIVE_DIR", None)
+        else:
+            os.environ["MCP_STEALTH_KEEP_ALIVE_DIR"] = previous
+        shutil.rmtree(folder, ignore_errors=True)
+
+
 @pytest.fixture(autouse=True)
 def _cookie_backups_in_a_temp_folder(monkeypatch, tmp_path_factory):
     """An in-process launch that moves cookies to Chrome 158's encryption writes its backup and

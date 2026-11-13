@@ -1066,8 +1066,12 @@ def test_close_kills_the_process_when_cdp_cannot(monkeypatch):
 
     import mcp_stealth_chrome.server as srv
 
+    from types import SimpleNamespace
+
     class _Browser:
         _process_pid = 424242
+        _mcp_pid_start = "Fri Nov 13 10:00:00 2026"
+        config = SimpleNamespace(host="127.0.0.1", port=1, user_data_dir="/p")
         def stop(self):
             return None            # the silent-failure case: no exception
 
@@ -1083,6 +1087,15 @@ def test_close_kills_the_process_when_cdp_cannot(monkeypatch):
         alive.discard(pid)         # the signal is what actually ends it
 
     monkeypatch.setattr(os, "kill", fake_kill)
+    monkeypatch.delattr(os, "pidfd_open", raising=False)
+    # Identified, as a real browser of this server is: its profile and its start time.
+    monkeypatch.setattr(srv, "_process_command",
+                        lambda pid: "chrome --user-data-dir=/p" if pid in alive else None)
+    monkeypatch.setattr(srv._keep_alive._watcher, "process_command",
+                        lambda pid: "chrome --user-data-dir=/p" if pid in alive else None)
+    monkeypatch.setattr(srv._keep_alive._watcher, "process_start",
+                        lambda pid, like=None: _Browser._mcp_pid_start if pid in alive else None)
+    monkeypatch.setattr(srv, "_descendant_pids", lambda _pid, _data_dir=None: [])
     report = asyncio.run(srv._ensure_browser_dead(_Browser(), None, grace=0))
 
     assert report["pid"] == 424242
@@ -2759,6 +2772,11 @@ def test_a_process_that_takes_a_moment_to_die_after_sigkill_counts_as_dead(monke
                 raise ProcessLookupError(pid)
 
     monkeypatch.setattr(os, "kill", fake_kill)
+    # A stand-in PID running nothing: identity is not what this test is about.
+    monkeypatch.setattr(server, "_identify", lambda _pid, _browser: "same")
+    monkeypatch.setattr(server, "_signal_verified",
+                        lambda pid, sig, _start, _matches: os.kill(pid, sig) or True)
+    monkeypatch.setattr(server, "_descendant_pids", lambda _pid, _data_dir=None: [])
     report = asyncio.run(server._ensure_browser_dead(_Browser(), None, grace=0))
     assert report["still_alive"] == [] and report["verified"] is True
 
@@ -3268,7 +3286,10 @@ def _nodriver_start(monkeypatch, tmp_path, outcomes):
     monkeypatch.setattr(server.os, "kill", fake_kill)
     monkeypatch.setattr(server.asyncio, "sleep", _no_sleep)
     monkeypatch.setattr(state, "find_chrome_pids_by_profile", lambda _p: [7777])
-    monkeypatch.setattr(server, "_pid_recycled", lambda _pid, _browser: False)
+    # The stand-in PIDs run nothing; identity is what these tests are not about.
+    monkeypatch.setattr(server, "_identify", lambda _pid, _browser: "same")
+    monkeypatch.setattr(server, "_signal_verified",
+                        lambda pid, sig, _start, _matches: server.os.kill(pid, sig) or True)
     monkeypatch.setattr(server, "_descendant_pids", lambda _pid, _data_dir=None: [])
     return spawned, signalled
 
@@ -3589,12 +3610,14 @@ def _watched_browser(tmp_path, monkeypatch, watcher_running, verdict):
     from mcp_stealth_chrome import quit_watch
 
     monkeypatch.setenv("MCP_STEALTH_QUIT_WATCH_DIR", str(tmp_path))
-    browser = SimpleNamespace(_process=None, _process_pid=4242, stopped=True,
+    start = "Fri Nov 13 10:00:00 2026"
+    browser = SimpleNamespace(_process=None, _process_pid=4242, stopped=True, _mcp_pid_start=start,
                               config=SimpleNamespace(host="127.0.0.1", port=9, user_data_dir="/p"),
                               _quit_watcher=_FakeWatcher(watcher_running))
     if verdict:
-        (tmp_path / "chrome-4242-9.quit").write_text(
-            json.dumps({"pid": 4242, "port": 9, "user_data_dir": "/p", "at": time.time()}))
+        quit_watch._browser_paths(browser)[1].write_text(
+            json.dumps({"pid": 4242, "port": 9, "user_data_dir": "/p", "pid_start": start,
+                        "at": time.time()}))
     return browser, quit_watch
 
 

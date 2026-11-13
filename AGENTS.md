@@ -34,6 +34,7 @@ uvx mcp-stealth-chrome → Python 3.11+ → FastMCP → nodriver → Chrome/Chro
 - `src/mcp_stealth_chrome/cookie_migration.py` — moving a profile's `v10` cookies to Chrome 158's `v11` before it loses them.
   `cookie_db.py` reads a cookie database for such a decision: a private copy with its journal rolled back.
 - `src/mcp_stealth_chrome/tab_record.py`: the saved tab list behind `restore_tabs`: the file, its order, masking, `/json/list` at exit.
+- `src/mcp_stealth_chrome/keep_alive.py`: browsers left running at exit (`keep_alive=True`): the record, the "is it ours" check, leaving one running at exit.
 - `src/mcp_stealth_chrome/_app.py` — `StealthMCP`, the FastMCP boundary. `captcha.py`, `image_output.py`, `result_types.py` — their named helpers.
 - `src/mcp_stealth_chrome/tools/` — `research.py`, `devtools.py`, `vision.py`, `network_http.py`, `profiles.py`,
   `storage.py` (cookies, web storage, IndexedDB, cache), `capture.py` (request interception, HAR, dry_run),
@@ -473,6 +474,87 @@ conclusions. Each rule below replaced a real lie.
 - `tests/test_restore_tabs_e2e.py` closes through each path on real Chrome (the EOF case with the background writer
   off, so only the exit path can write) and, with `MCP_HEADED=1` (needs `--extra os-cursor` for AppKit), quits a
   visible browser and checks the restored windows took 0 ms of frontmost time.
+
+### Kept browsers (keep_alive)
+
+- Per launch, never a setting: many agents share the machine. `keep_alive=True` on `browser_launch` or `spawn_browser`
+  leaves that browser running at stdin EOF; every other one still closes there. Left unset on a reattach it stays as it
+  was (whoever kept it wanted it kept); `False` then means it closes with this server.
+- Only a profile a later server can find: `persistent=False`, `privacy=True`, Windows and `MCP_STEALTH_QUIT_WATCHER=0`
+  ignore it and say so. A kept browser always has a watcher that outlives the server, or nothing would end it: no
+  watcher, no keep.
+- The record (`keep_alive.py`, `<data>/keep-alive/<sha of real path>.json`, `MCP_STEALTH_KEEP_ALIVE_DIR`, 0600) is written
+  when the browser starts (`held`), so a killed server still leaves it findable, and at exit (`kept`, with the server's tab
+  order). It stores `--user-data-dir` exactly as Chrome got it: on macOS `/var/folders` and `/private/var/folders` are one
+  folder, and only one is on the command line, which the watcher and the check compare. `tests/conftest.py` points the folder
+  at a temporary one for every server.
+- Reattach (`keep_alive.check`) needs positive evidence on every point, or the launch goes on as before and the result names
+  why: the record's PID holds SingletonLock; its command line is a browser main process naming exactly that `--user-data-dir`,
+  the recorded `--remote-debugging-port` and `OUR_FLAGS` (`_quit_watcher.has_flag`: a value ends at the end of the line or
+  where the next flag or URL starts, since ps drops quoting); the process start time equals the recorded `pid_start`;
+  `/json/version` there gives the recorded Chrome version, which the record must have; and `SystemInfo.getProcessInfo` there
+  names the same PID as its `browser` process (the port could be another Chrome's). The server that wrote the record must be
+  gone (`is_server_command`; unreadable counts as alive); this server's own is refused. Chrome does not write
+  `DevToolsActivePort` when the port is given on the command line (measured, Chrome 157), so that file proves nothing here.
+- Checking and connecting are not atomic. `check(hold=True)` takes an flock on `<hash>.lock` (released by the kernel when its
+  holder dies) and `_reattach_kept` keeps it until the record names this server or is gone, so two servers that both found
+  the browser free never both connect. After connecting, `_verify_connected` asks over that very connection for the browser
+  PID and version and repeats the lock, command line and start-time check; any change drops the connection
+  (`_NotTheKeptBrowser`) and touches nothing. Then, before any watcher is touched, the record is claimed (`server_pid`
+  = this server): if that write fails, or the previous watcher cannot be ended or proved to be it, the reattach stops
+  (`_ReattachAborted`) and the claim is given back. A record still naming the dead server after the lock went let a third
+  server take the same browser, and a second watcher beside a live one made two closers.
+- The record never holds the proxy (a proxy URL can carry a password); `write` drops the key even from an old record, and a
+  reattach reads `--proxy-server` from the running Chrome's command line (`proxy_from_command`).
+- `profile_gc` asks `still_running`, not "is the PID alive": a PID is handed out again. A record whose Chrome is positively gone
+  (no process, a process not naming the profile, another lock holder, another start time) is removed; unreadable keeps it.
+- A reattach starts nothing, so the version guard, `beta_verdict` and the cookie move do not run; the result says so and
+  names a pending cookie move. It reorders `browser.targets` in place by the saved tab order (Chrome lists targets in no
+  useful order, and `_refresh_tabs` copies `browser.tabs`), reapplies the recorded fingerprint to every tab (CDP overrides
+  died with the old connection) and opens a `url` in a new tab, so a kept page is never navigated away from.
+- At exit (`_leave_or_end_at_exit`, no event loop) a kept browser is released, not stopped: nodriver's atexit hook stops
+  every registered browser and asyncio's subprocess transport kills a running child when it is closed or collected
+  (`BaseSubprocessTransport.close`), so `keep_alive.release` drops it from the registry and clears `transport._proc`. A
+  reattached browser has no `_process`, so nodriver's `stopped` reads True and `stop()` does nothing: one that is not kept is
+  ended with `Browser.close` over a stdlib websocket and SIGTERM to its one PID (`close_at_exit`). Check `_browser_exited`,
+  never `stopped`, for such a browser.
+- The stdio server ignores SIGTERM and every child inherits that, Chrome and the quit watcher included. `quit_watch.stop`'s
+  `terminate()` did nothing until the watcher reset SIGTERM to default. A watcher started by an older server still ignores
+  it, so `end_old_watcher` follows with SIGKILL, only for a process whose command line is the watcher of that Chrome PID
+  and port.
+- Every signal, server or watcher, goes through an identity check right before it (`_quit_watcher.signal_if_same`,
+  `server._signal_verified`): exact profile, browser main process where it applies, and the start time recorded for that
+  process (`quit_watch.START_ATTR`, read at launch in `_start_chrome`, else at the start of the close). `identity` is
+  same, different, gone or unknown, and unknown is never signalled: `_ensure_browser_dead` then reports the PID in
+  `still_alive`, unverified, and keeps the handle. On Linux the check runs on a pidfd opened first, so the signal cannot
+  reach a process that took the PID after it. Windows has no start time here; the exact command line is the identity.
+  The quit watcher's state files carry the generation (`chrome-<pid>-<port>-<hash of start>`) and its verdict the start
+  time, so a later Chrome on the same PID, port and profile never shares an earlier one's files or verdict, and a watcher
+  that sees another start time stops ("pid reused"). Descendants count only when they name the profile with a path
+  boundary (`processes_naming`), and each is checked against its own start time before a signal. A PID found only by
+  the profile scan (no PID recorded) goes by the start time read at the scan, and is not signalled without one.
+- Start times: Linux reads clock ticks from `/proc/<pid>/stat`; macOS has `ps lstart`, whole seconds, so a PID reused
+  within the same second by a process with the same command line would pass, and its check and `kill` are a few system
+  calls apart (no pidfd). Windows has no start time here and goes by the exact command line. These are known residuals,
+  not guarantees; keep_alive itself is POSIX only.
+- A watcher that cannot identify the browser after its last window went (command line or start time unreadable) tries
+  `UNIDENTIFIED_TRIES` (3) times, then stops and leaves `not_ended` in its verdict file, which outlives it. `quit_time`
+  does not read that as a Quit; `BrowserState.active_tab` reports it ("the quit watcher stopped without ending Chrome
+  PID N"). Before, it retried after every grace for ever and nothing said so.
+- An unreadable process list is unknown, never empty. `_win_process_table` returns None when `Process32FirstW` fails or
+  `Process32NextW` stops on anything but `ERROR_NO_MORE_FILES`; `_remove_privacy_profile` waits and then refuses on
+  None rather than deleting under a helper it could not see.
+- `MCP_STEALTH_KEEP_ALIVE_MAX_HOURS` is positive and finite, at most a year (`MAX_HOURS_LIMIT`); anything else falls back or is
+  cut and `max_hours_problem` names it in the launch result. "inf" would have quietly withdrawn the cap.
+- `keep_alive` left unset reads False on a new browser and the result says so; on the browser already running,
+  `browser_launch(keep_alive=...)` applies the change (`_keep_alive_on_reuse`).
+- The watcher ends a kept browser on Quit (headed) and once it has had no server for `MCP_STEALTH_KEEP_ALIVE_MAX_HOURS`,
+  counted from when `getppid()` stopped being its server. Headless (`pages_matter=False`) skips the window logic: nobody can
+  quit it, and an empty headless browser may still be reattached. It removes the record once Chrome is gone, only if the
+  record names that PID. `profile_gc` refuses a profile whose record names a live PID.
+- `tests/test_keep_alive_e2e.py` proves it on real Chrome with a temporary data folder: EOF, reattach with the typed value,
+  the tab list at exit, `spawn_browser`, the time cap, a forged record over a foreign Chrome, a browser a live server holds,
+  and (`MCP_HEADED=1`) reattach without taking focus, then Quit with no server.
 
 ### Refs, snapshots and paths
 

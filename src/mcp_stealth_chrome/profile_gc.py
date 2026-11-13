@@ -150,6 +150,16 @@ def _recorded_profiles() -> set[str]:
     return held
 
 
+def _kept_alive() -> set[str]:
+    """Profiles of browsers kept alive whose Chrome still runs. Unreadable reads as none, and
+    the lock and process checks that follow still stand."""
+    try:
+        from . import keep_alive
+        return {os.path.realpath(p) for p in keep_alive.live_profiles()}
+    except Exception:
+        return set()
+
+
 def _owner_gone(pid: int, processes: Optional[list[tuple[int, str]]]) -> Optional[bool]:
     """True when the server that made profile-pid<pid> has ended, None when it cannot be told.
 
@@ -350,6 +360,9 @@ def _common_refusal(path: Path, root: Path, processes, held: set[str], now: floa
         return "not a real folder directly in its root"
     if os.path.realpath(path) in held:
         return "held by this server"
+    if os.path.realpath(path) in _kept_alive():
+        # A browser left running with keep_alive: a later server reattaches to it.
+        return "held by a browser kept alive (keep_alive)"
     if _state.is_chrome_profile_locked(path) or _state.chrome_lock_holder_pid(path) is not None:
         return "locked by a running Chrome"
     if processes is None:

@@ -783,11 +783,16 @@ def _start_external_chrome(tmp_path):
         str(find_chrome_binary()), f"--remote-debugging-port={port}", "--headless=new",
         f"--user-data-dir={tmp_path}", "--use-mock-keychain", "--no-first-run", "about:blank",
     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    import urllib.request
+
+    # Until DevTools answers over HTTP: on the Ubuntu runner the port accepted a connection
+    # before /json/version did, and attach_to_chrome's probe then read an empty reply.
     deadline = time.time() + 20
     while time.time() < deadline:
         try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.3):
-                return proc, port
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=1) as reply:
+                if reply.status == 200:
+                    return proc, port
         except OSError:
             time.sleep(0.2)
     proc.kill()

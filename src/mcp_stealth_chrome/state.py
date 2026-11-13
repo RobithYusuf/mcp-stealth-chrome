@@ -407,7 +407,9 @@ def processes_naming(path: Path, table: Optional[list[tuple[int, int, str]]] = N
     except OSError:
         pass
     flags = re.IGNORECASE if os.name == "nt" else 0  # Windows paths ignore case
-    needle = re.compile("|".join(re.escape(s) for s in sorted(spellings)) + r"""(?=[\\/"'\s]|$)""",
+    # Grouped: an alternation binds looser than the lookahead, which then held only for the
+    # last spelling, and the first matched as a bare prefix (profile-x claimed profile-xy).
+    needle = re.compile("(?:" + "|".join(re.escape(s) for s in sorted(spellings)) + r""")(?=[\\/"'\s]|$)""",
                         flags)
     own = os.getpid()
     return [(pid, command) for pid, _ppid, command in rows
@@ -1143,6 +1145,14 @@ class BrowserState(metaclass=_SessionRouted):
         if not cls.is_up():
             if closed and cls.browser is None:
                 raise RuntimeError(f"Browser not running: {closed} Call browser_launch to start it again.")
+            if cls.browser is not None:
+                try:
+                    from . import quit_watch
+                    stuck = quit_watch.not_ended_note(cls.browser)
+                except Exception:
+                    stuck = None
+                if stuck:
+                    raise RuntimeError(f"Browser has no window: {stuck}")
             raise RuntimeError("Browser not running. Call browser_launch first.")
         cls.current_last_active = time.time()
         if cls.active_tab_index >= len(cls.tabs):

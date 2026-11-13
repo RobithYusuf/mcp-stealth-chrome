@@ -128,7 +128,7 @@ def _cfg(tmp_path, pid, port, profile, **over):
     cfg = {"pid": pid, "host": "127.0.0.1", "port": port, "user_data_dir": profile,
            "grace": 0.3, "close_wait": 1.0, "interval": 0.05,
            "tool_closed_file": str(tmp_path / "w.tool-closed"), "quit_file": str(tmp_path / "w.quit"),
-           "server_pid": os.getppid()}
+           "server_pid": os.getppid(), "pid_start": qw.process_start(pid)}  # as quit_watch.start does
     cfg.update(over)
     return cfg
 
@@ -256,7 +256,9 @@ def test_end_browser_rechecks_the_command_line_before_each_signal(tmp_path, devt
     profile = str(tmp_path / "profile")
     monkeypatch.setattr(qw, "wait_gone", lambda *_a: False)  # Browser.close "did not work"
     sent = []
-    monkeypatch.setattr(qw, "send_signal", lambda pid, sig: sent.append((pid, sig)))
+    monkeypatch.setattr(qw.os, "kill", lambda pid, sig: sent.append((pid, sig)))
+    if hasattr(qw.signal, "pidfd_send_signal"):
+        monkeypatch.setattr(qw.signal, "pidfd_send_signal", lambda fd, sig: sent.append((fd, sig)))
     assert qw.end_browser(_cfg(tmp_path, other.pid, tools.port, profile)) == "closed"
     assert sent == [] and other.poll() is None
 
@@ -292,7 +294,7 @@ def test_the_detached_watcher_runs_from_stdin_and_ends_a_windowless_browser(tmp_
     time.sleep(1.0)
     assert proc.poll() is None and chrome.poll() is None  # a page is open
     quit_watch.mark_tool_closed(browser)
-    marker = tmp_path / "watch" / f"chrome-{chrome.pid}-{tools.port}.tool-closed"
+    marker = quit_watch._browser_paths(browser)[0]
     assert marker.stat().st_mode & 0o777 == 0o600
     tools.pages = 0
     time.sleep(1.5)
@@ -326,12 +328,45 @@ def test_stopping_the_watcher_before_a_tool_close(tmp_path, devtools, procs, mon
 
 def test_a_verdict_for_another_profile_is_not_read(tmp_path, monkeypatch):
     monkeypatch.setenv("MCP_STEALTH_QUIT_WATCH_DIR", str(tmp_path))
-    browser = SimpleNamespace(_process=None, _process_pid=4242,
+    start = "Fri Nov 13 10:00:00 2026"
+    browser = SimpleNamespace(_process=None, _process_pid=4242, _mcp_pid_start=start,
                               config=SimpleNamespace(host="127.0.0.1", port=9, user_data_dir="/a"))
-    (tmp_path / "chrome-4242-9.quit").write_text(json.dumps({"pid": 4242, "user_data_dir": "/b", "at": 1}))
+    quit_file = quit_watch._browser_paths(browser)[1]
+    quit_file.write_text(json.dumps({"pid": 4242, "user_data_dir": "/b", "pid_start": start, "at": 1}))
     assert quit_watch.quit_time(browser) is None
-    (tmp_path / "chrome-4242-9.quit").write_text(json.dumps({"pid": 4242, "user_data_dir": "/a", "at": 1}))
+    quit_file.write_text(json.dumps({"pid": 4242, "user_data_dir": "/a", "pid_start": start, "at": 1}))
     assert quit_watch.quit_time(browser) == 1.0
+    # Another Chrome generation on the same PID, port and profile: never its verdict.
+    quit_file.write_text(json.dumps({"pid": 4242, "user_data_dir": "/a",
+                                     "pid_start": "Fri Nov 13 09:00:00 2026", "at": 1}))
+    assert quit_watch.quit_time(browser) is None
+    later = SimpleNamespace(**{**vars(browser), "_mcp_pid_start": "Fri Nov 13 11:00:00 2026"})
+    assert quit_watch._browser_paths(later) != quit_watch._browser_paths(browser), \
+        "two generations of one PID and port share state files"
+
+
+def test_a3_the_profile_must_match_exactly(tmp_path):
+    """Review finding 3: /tmp/profile must not claim /tmp/profile-evil, nor a sibling with a space."""
+    assert qw.names_profile("chrome --user-data-dir=/tmp/profile --no-first-run", "/tmp/profile")
+    assert qw.names_profile("chrome --user-data-dir=/tmp/profile about:blank", "/tmp/profile")
+    assert qw.names_profile("chrome --user-data-dir=/tmp/profile", "/tmp/profile")
+    assert qw.names_profile("chrome --user-data-dir=/Users/x/Application Support/G --type=gpu",
+                            "/Users/x/Application Support/G")
+    assert not qw.names_profile("chrome --user-data-dir=/tmp/profile-evil", "/tmp/profile")
+    assert not qw.names_profile("chrome --user-data-dir=/tmp/profile/sub --x", "/tmp/profile")
+    assert not qw.names_profile("chrome --user-data-dir=/tmp/profile evil --x", "/tmp/profile")
+    assert not qw.has_flag("chrome --remote-debugging-port=50123", "--remote-debugging-port", "5012")
+
+
+def test_a4_the_watcher_leaves_a_later_chrome_on_the_same_pid_alone(tmp_path, devtools, procs):
+    """Review finding 4: same PID, profile and port, started later: not the browser watched."""
+    profile = str(tmp_path / "profile")
+    chrome = _fake_chrome(profile)
+    procs.append(chrome)
+    tools = devtools(0)
+    cfg = _cfg(tmp_path, chrome.pid, tools.port, profile, pid_start="Mon Jan  1 00:00:00 2001")
+    assert qw.watch(cfg, sleep=_bounded(5)) == "pid reused"
+    assert tools.closes == 0 and chrome.poll() is None
 
 
 def test_the_watcher_imports_nothing_from_the_package():

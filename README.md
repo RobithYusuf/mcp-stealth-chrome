@@ -410,9 +410,9 @@ You can override identity for one launch: `fingerprint={"user_agent": ..., "acce
 
 To use logins from your own browser, `list_chrome_profiles` shows every Chromium-family browser on the machine and `clone_chrome_profile` copies one into an isolated profile. The source is only ever opened read-only.
 
-A browser started with `browser_launch` over stdio stays open until you close it. Instances from `spawn_browser` and browsers in HTTP mode close after `BROWSER_IDLE_TIMEOUT`.
+A browser started with `browser_launch` over stdio stays open until you close it, or until the server exits when its client goes away. `keep_alive=True` keeps it past that (see below). Instances from `spawn_browser` and browsers in HTTP mode close after `BROWSER_IDLE_TIMEOUT`.
 
-Runtime data lives in `~/.mcp-stealth/`: `profile/`, `profiles/<id>/`, `screenshots/`, `exports/`, `storage-states/`, `window-state/`. An `app/` folder left by 0.13.0 is removed.
+Runtime data lives in `~/.mcp-stealth/`: `profile/`, `profiles/<id>/`, `screenshots/`, `exports/`, `storage-states/`, `window-state/`, `keep-alive/`. An `app/` folder left by 0.13.0 is removed.
 
 ### Reopening the last tabs
 
@@ -424,6 +424,30 @@ Runtime data lives in `~/.mcp-stealth/`: `profile/`, `profiles/<id>/`, `screensh
 - The list is saved when the server closes the browser, about 2 seconds after tool calls, and every 30 seconds while the browser runs, so a server that was killed still leaves the last list it saw. Saving takes about 1 ms. A Quit closes every window before anything can read them, so the list saved before the Quit stays: a browser with no pages never replaces a saved list. Only `http`, `https` and `file` pages are kept, up to 30.
 - `persistent=False` and `privacy=True` keep no tabs.
 - The list is in `~/.mcp-stealth/window-state/<instance>-tabs.json`, one entry per profile, readable by you only. Page URLs can carry tokens. `browser_close(forget_tabs=True)` and `close_instance(instance_id, forget_tabs=True)` close without saving and remove the list. `profile_cleanup(action="remove_fallback", ...)` removes the list of the profile it deletes. Deleting the file removes all of them.
+
+### Keeping a browser open when the agent goes away
+
+When an agent session sleeps, reconnects (`/mcp`) or ends, its client closes the server's stdin and the server closes every browser it started. `browser_launch(keep_alive=True)` and `spawn_browser(instance_id, keep_alive=True)` leave that one browser running instead, with its tabs and page state, and the next launch on the same profile picks it up:
+
+```
+browser_launch(url="https://app.example.com", keep_alive=True)
+# ... the agent sleeps; the browser stays open ...
+browser_launch()   # a new agent, same profile
+# Reattached to the running browser (pid 4242, 3 tab(s)). Selected tab shows: ...
+```
+
+- It is per launch, not a setting: other agents on the machine keep the default, which closes their browsers with their server.
+- ✅ Reattaching opens no new Chrome. Tabs keep their order, the selected tab stays selected, and a half-filled form keeps what was typed, measured with a value typed before the server exited. With a `url`, that page opens in a new tab so no kept page is navigated away from; a tab already showing exactly that URL is selected instead. The result lists the tabs, with secret URL parameters masked.
+- A launch on a profile held by a kept browser reattaches whatever `keep_alive` says. Left unset on a reattach, `keep_alive` stays as it was; `keep_alive=False` means it now closes with this server. Every result says which holds, a new browser included ("keep_alive=False: this browser closes when this server exits"). `browser_launch(keep_alive=...)` on the browser already running applies the change. Launch options that only shape a new Chrome (headless, proxy, fingerprint, profile_mode, restore_tabs and so on) are named in the result as not applied.
+- ✅ It only takes a browser a previous server of this project started and no live server holds. Every one of these must hold, or the launch goes on as before (a `profile-pid<N>` fallback, or `profile_conflict` as you set it) and the result says why it did not reattach: the record's PID holds the profile lock, its command line names that `--user-data-dir`, the recorded DevTools port and flags only this server passes (exactly: `/tmp/profile` never matches `/tmp/profile-evil`), the process started at the recorded time (so a PID handed to another program is told apart), DevTools answers there with the recorded Chrome version and names that same PID as its browser process, and the server that wrote the record has exited. Only one server reattaches at a time (a lock on the profile, released by the system if that server dies), and after connecting it asks the browser once more for its PID and version and checks the process again, dropping the connection if anything changed. Your own Chrome on that profile, or a browser another running server drives, is never attached.
+- Nothing starts on a reattach, so the profile version check, the Chrome Beta choice and the Chrome 158 cookie move do not run; the result says so, and says when a cookie move is still pending for the next real launch.
+- How a kept browser ends: Quit (Cmd+Q, the Dock) still ends a visible one after its server has gone, through its watcher process. `browser_close` or `close_instance` from an agent that reattached ends it. Once it has had no server for `MCP_STEALTH_KEEP_ALIVE_MAX_HOURS` (24 by default), its watcher ends it; the time counts from when the last server let go, not from the launch.
+- Headless works too, as an invisible Chrome that keeps holding memory until one of those ends it. The launch result says so.
+- `persistent=False` and `privacy=True` ignore `keep_alive` and say so: there is no profile for a later server to find. It is not available on Windows, or with `MCP_STEALTH_QUIT_WATCHER=0`, because nothing would end the browser on Quit or at the time cap there; the result says so and the browser closes with its server.
+- The record is one small file per profile in `~/.mcp-stealth/keep-alive/` (PID and its start time, port, profile, instance, Chrome version), readable by you only, and removed when the browser ends. It never holds the proxy: a proxy URL can carry a password, so a reattach reads it from the running Chrome's own command line. The tab list for `restore_tabs` is still saved when the server exits. The leftover-profile cleanup leaves the profile of a running kept browser alone; a record whose Chrome is gone, or whose PID now runs something else, is removed rather than trusted.
+- A signal from the watcher or the server only goes to a process proved to be the one meant, checked right before it: exact profile, and the start time recorded for it. A process whose command line or start time cannot be read is not signalled, and the close says it is not verified. On Linux the signal goes through a pidfd, so it cannot reach a process that took the PID after the check. On macOS the start time has one-second resolution and the check and the signal are separate calls, and Windows goes by the exact command line: small residual risks, not guarantees.
+- If the watcher cannot identify the browser after its last window was closed, it stops after three tries and leaves the reason behind; the next tool call says the browser may still be running and was not ended.
+- `MCP_STEALTH_KEEP_ALIVE_MAX_HOURS` must be a positive finite number. `inf`, `nan`, 0 or a negative value fall back to 24 and a value over a year is cut to a year; the launch result names either.
 
 ### Chrome 158 and saved logins (macOS)
 
@@ -765,6 +789,8 @@ Things to know:
 | `MCP_STEALTH_TAB_RECORD_PERIOD` | Seconds between saves of the open tabs while a browser runs. Default 30, 0 turns it off |
 | `MCP_STEALTH_RESTORE_TABS_MAX_DAYS` | A saved tab list older than this is not reopened. Default 30, 0 means no limit |
 | `MCP_STEALTH_RESTORE_TABS_MAX` | Tabs kept in a saved list. Default 30 |
+| `MCP_STEALTH_KEEP_ALIVE_MAX_HOURS` | Hours a browser kept with `keep_alive=True` may run with no server before its watcher ends it. Default 24, at most a year; anything not a positive finite number means 24 |
+| `MCP_STEALTH_KEEP_ALIVE_DIR` | Folder for the records of kept browsers. Default `~/.mcp-stealth/keep-alive` |
 | `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL` | Vision model through any OpenAI-compatible API |
 | `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL` | Vision model through Anthropic |
 | `CAPSOLVER_KEY` | Enables `solve_captcha` |

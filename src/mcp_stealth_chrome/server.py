@@ -82,6 +82,7 @@ from . import profile_gc
 from . import profile_version
 from . import cookie_migration
 from . import quit_watch
+from . import keep_alive as _keep_alive
 from . import tab_record
 from .state import data_root as state_data_root
 from .workflow import WorkflowError, run_workflow
@@ -318,22 +319,54 @@ def _process_command(pid: int) -> Optional[str]:
     return (r.stdout or "").strip() or None
 
 
-def _pid_recycled(pid: int, browser: Any) -> bool:
-    """Whether a recorded PID now belongs to another program.
+def _identify(pid: int, browser: Any) -> str:
+    """What a recorded PID runs now: "same" (this browser), "different" (another program, or a
+    later process on the reused number), "gone", or "unknown" when that cannot be told.
 
     A handle can outlive its Chrome after a crash, and the OS hands the number out again.
-    Signalling it then kills something innocent. True only on positive evidence: a live
-    process whose command line does not name this browser's profile.
+    Signalling it then kills something innocent, so only "same" may be signalled, and
+    "unknown" is never read as "same". The profile must be named exactly (/tmp/profile is not
+    /tmp/profile-evil), and on POSIX the process must have the start time recorded for this
+    browser (quit_watch.pid_start).
     """
     data_dir = getattr(getattr(browser, "config", None), "user_data_dir", None)
-    if not data_dir:
-        return False
     command = _process_command(pid)
-    return command is not None and f"--user-data-dir={data_dir}" not in command
+    if command is None:
+        return "gone" if not _process_exists(pid) else "unknown"
+    if not data_dir:
+        return "unknown"
+    if not _keep_alive._watcher.names_profile(command, str(data_dir)):
+        return "different"
+    if sys.platform == "win32":
+        return "same"  # no start time there; the exact command line is the identity
+    recorded = getattr(browser, quit_watch.START_ATTR, None)
+    now = _keep_alive._watcher.process_start(pid, recorded)
+    if not recorded or now is None:
+        return "unknown"
+    return "same" if now == recorded else "different"
+
+
+def _pid_recycled(pid: int, browser: Any) -> bool:
+    """Whether a recorded PID now belongs to another program, on positive evidence."""
+    return _identify(pid, browser) == "different"
+
+
+def _signal_verified(pid: int, sig: int, start: Optional[str], matches: Any) -> bool:
+    """Signal a PID only while it is provably the process meant, checked right before."""
+    if sys.platform == "win32":
+        command = _process_command(pid)
+        if not command or not matches(command):
+            return False
+        try:
+            os.kill(pid, sig)
+            return True
+        except OSError:
+            return False
+    return _keep_alive._watcher.signal_if_same(pid, sig, start, matches)
 
 
 def _descendant_pids(pid: int, data_dir: Optional[str] = None,
-                     table: Optional[list[tuple[int, int, str]]] = None) -> list[int]:
+                     table: Optional[list[tuple[int, int, str]]] = None) -> Optional[list[int]]:
     """Everything this browser started under a PID, found while the parent links still exist.
 
     A launcher script that does not exec is the recorded PID, with Chrome as its child.
@@ -348,10 +381,15 @@ def _descendant_pids(pid: int, data_dir: Optional[str] = None,
     were never waited for, and a privacy profile was deleted while they still held its files.
     `table` is a process_table() the caller already read, to compare against the same moment.
     """
-    from .state import process_table
+    from .state import process_table, processes_naming
     rows = process_table() if table is None else table
     if rows is None:
-        return []
+        return None  # the process list could not be read: unknown, never "no helpers"
+    # A path boundary, as processes_naming has it: /tmp/profile names /tmp/profile/Crashpad
+    # (the crash handler's --database) but never /tmp/profile-evil.
+    # The folder as given, not through Path: on Windows Path("/tmp/p") reads back as \\tmp\\p.
+    named = ({p for p, _c in processes_naming(str(data_dir), table=rows) or []}  # type: ignore[arg-type]
+             if data_dir else None)
     children: dict[int, list[int]] = {}
     commands: dict[int, str] = {}
     for child, parent, command in rows:
@@ -369,7 +407,7 @@ def _descendant_pids(pid: int, data_dir: Optional[str] = None,
                 continue
             seen.add(child)
             pending.append(child)
-            if not data_dir or str(data_dir) in commands.get(child, ""):
+            if named is None or child in named:
                 found.append(child)
     return found
 
@@ -437,10 +475,18 @@ async def _ensure_browser_dead(browser, profile_dir=None, grace: float = 1.5) ->
         await asyncio.to_thread(quit_watch.stop, browser)
     pid = getattr(browser, "_process_pid", None) if browser else None
     report["pid"] = pid
-    recycled = isinstance(pid, int) and pid > 0 and _pid_recycled(pid, browser)
+    if isinstance(pid, int) and pid > 0 and browser is not None:
+        # Recorded at launch; read now for a browser that has none, so a PID handed out again
+        # during this close still reads as another process.
+        quit_watch.pid_start(browser, pid)
+    identity = _identify(pid, browser) if isinstance(pid, int) and pid > 0 else "gone"
+    recycled = identity == "different"
     data_dir = getattr(getattr(browser, "config", None), "user_data_dir", None)
     family = (_descendant_pids(pid, str(data_dir) if data_dir else None)
-              if isinstance(pid, int) and pid > 0 and not recycled else [])
+              if isinstance(pid, int) and pid > 0 and identity == "same" else [])
+    helpers_unknown = family is None
+    family = family or []
+    family_starts = _keep_alive._watcher.process_starts(family) or {} if family else {}
     # Attached: this server did not start that Chrome and has no process to signal, and
     # from nodriver 0.50 stop() only closes the socket. Ask it to quit, then look for
     # evidence, or an attached browser reads as closed while it keeps running.
@@ -486,17 +532,31 @@ async def _ensure_browser_dead(browser, profile_dir=None, grace: float = 1.5) ->
         report["detail"] = f"PID {pid} now belongs to another program, so it was not signalled"
         await _discard_temp_profile(browser)
         return report
-    # Collect every PID that could still be ours.
+    # Collect every PID that could still be ours. One whose identity cannot be told is never
+    # signalled; if it still runs, the close is not verified and the handle is kept.
+    if identity == "unknown" and isinstance(pid, int) and pid > 0:
+        await _all_gone([pid], grace)
+        if _process_exists(pid):
+            report["still_alive"].append(pid)
+            report["detail"] = (f"PID {pid} could not be identified (its command line or start time "
+                                f"could not be read), so it was not signalled")
+        report["verified"] = not report["still_alive"]
+        return report
     candidates: list[int] = [pid] if isinstance(pid, int) and pid > 0 else []
     candidates += [child for child in family if child not in candidates]
     # The profile scan is only a fallback for when no PID was captured. With a PID the
     # target is known, and a scan can only add processes that are not ours to signal.
+    scanned: dict[int, Optional[str]] = {}
     if profile_dir is not None and not candidates:
         try:
             from .state import find_chrome_pids_by_profile
             for extra in find_chrome_pids_by_profile(profile_dir):
                 if extra not in candidates:
                     candidates.append(extra)
+            # Their identity: the start time each had at the scan (none on Windows, where the
+            # exact command line stands in for it).
+            starts = _keep_alive._watcher.process_starts(candidates) or {}
+            scanned = {extra: starts.get(extra) for extra in candidates}
         except Exception:
             pass
     if not candidates:
@@ -506,23 +566,43 @@ async def _ensure_browser_dead(browser, profile_dir=None, grace: float = 1.5) ->
     # Let a graceful stop finish before escalating. Chrome is gone about 0.1 s after stop(),
     # so this returns then instead of sitting out the whole grace on every close.
     await _all_gone(candidates, grace)
+    from .state import processes_naming as _naming
+
+    def _verified(target: int, sig: int) -> bool:
+        # Each signal only to the process meant, checked right before it: the browser by its
+        # exact profile and start time, a helper by naming the profile and the start time it
+        # had when the close began. A PID found by the profile scan (no PID was recorded) has
+        # no recorded start and goes by its command line alone, as before.
+        if target == pid:
+            return _signal_verified(target, sig, getattr(browser, quit_watch.START_ATTR, None),
+                                    lambda c: _keep_alive._watcher.names_profile(c, str(data_dir)))
+        if target in scanned:
+            # Found by the profile scan, with no PID recorded: its start time read at the scan
+            # is its identity, and without one it is not signalled.
+            return _signal_verified(target, sig, scanned[target],
+                                    lambda c: bool(_naming(str(profile_dir), table=[(target, 0, c)])))
+        if target in family and data_dir:
+            names = lambda c: bool(_naming(str(data_dir), table=[(target, 0, c)]))  # type: ignore[arg-type]  # noqa: E731
+            if sys.platform == "win32" or target not in family_starts:
+                return _signal_verified(target, sig, None, names) if sys.platform == "win32" else False
+            return _signal_verified(target, sig, family_starts[target], names)
+        return False  # nothing identifies it: not signalled, and reported
+
+    unidentified: list[int] = []
     for target in candidates:
         if not _process_exists(target):
             continue                    # already gone, or not ours to signal
-        try:
-            os.kill(target, _signal.SIGTERM)
+        if _verified(target, _signal.SIGTERM):
             report["killed"].append(target)
-        except Exception:
-            continue
+        else:
+            unidentified.append(target)
     if report["killed"]:
         await _all_gone(report["killed"], 1.0)
         for target in list(report["killed"]):
             if not _process_exists(target):
                 continue
-            try:
-                # Windows has no SIGKILL; os.kill with any other signal is TerminateProcess there.
-                os.kill(target, getattr(_signal, "SIGKILL", _signal.SIGTERM))
-            except Exception:
+            # Windows has no SIGKILL; os.kill with any other signal is TerminateProcess there.
+            if not _verified(target, getattr(_signal, "SIGKILL", _signal.SIGTERM)):
                 report["still_alive"].append(target)
         # SIGKILL takes a moment, and the verdict below decides whether the handle is kept.
         for _ in range(20):
@@ -531,10 +611,29 @@ async def _ensure_browser_dead(browser, profile_dir=None, grace: float = 1.5) ->
             await asyncio.sleep(0.1)
     for target in candidates:
         if _process_exists(target) and target not in report["still_alive"]:
+            if target in unidentified and _identify(target, browser) == "different" and target == pid:
+                continue  # it ended and its number went to another program meanwhile
             report["still_alive"].append(target)
+    if unidentified:
+        left = [t for t in unidentified if t in report["still_alive"]]
+        if left:
+            report["detail"] = (report.get("detail") or "") + (
+                f"PID(s) {left} could not be proved to be this browser's (command line or start "
+                f"time unreadable, or changed), so they were not signalled")
     report["verified"] = not report["still_alive"]
+    if helpers_unknown and report["verified"]:
+        # The browser's helpers could not be listed, so none could be waited for: they may
+        # still hold the profile. Not verified, and the handle stays.
+        report["verified"] = False
+        report["helpers_unknown"] = True
+        report["detail"] = ((report.get("detail") or "") + "the process list could not be read, so "
+                            "whether the browser's helper processes ended is unknown")
     if report["verified"]:
         await _discard_temp_profile(browser)
+        if isinstance(pid, int) and pid > 0 and data_dir:
+            # Gone, so a later launch has nothing to reattach to.
+            with contextlib.suppress(Exception):
+                _keep_alive.remove(data_dir, pid)
     return report
 
 
@@ -562,7 +661,8 @@ def _close_incomplete(report: dict) -> bool:
     dropping the handle then leaves a live Chrome nothing can reach, and a privacy profile
     would be deleted from under it.
     """
-    return bool(report.get("still_alive")) or not (report.get("stopped") or report.get("verified"))
+    return (bool(report.get("still_alive")) or bool(report.get("helpers_unknown"))
+            or not (report.get("stopped") or report.get("verified")))
 
 
 def _close_failure(report: dict) -> str:
@@ -2321,6 +2421,435 @@ def _tab_record_scope(instance_id: str, profile: Any, privacy: bool) -> Optional
     return Path(str(profile))
 
 
+# ── keep_alive: a browser left running when this server exits, and reattaching to it ──────
+
+def _keep_alive_decision(keep_alive: Optional[bool], profile: Any, privacy: bool,
+                         headless: bool) -> tuple[bool, str]:
+    """(keep this browser at exit, note for the result). Only a persistent profile can be
+    kept: there is nothing for a later server to find otherwise."""
+    if not keep_alive:
+        # Said even when left unset: on a reattach unset means "as it was", so a new browser's
+        # result must not leave the caller to guess.
+        return False, " [keep_alive=False: this browser closes when this server exits]"
+    if privacy:
+        return False, (" [keep_alive ignored: a privacy profile is deleted when the browser "
+                       "closes, so it closes with this server]")
+    if profile is None:
+        return False, (" [keep_alive ignored: persistent=False has no profile a later server "
+                       "could find, so it closes with this server]")
+    why = _keep_alive.supported()
+    if why:
+        return False, f" [keep_alive ignored: {why}]"
+    cap_note = f"; {_keep_alive.max_hours_problem()}" if _keep_alive.max_hours_problem() else ""
+    if headless:
+        return True, (f" [keep_alive{cap_note}: this headless browser keeps running after this server "
+                      f"exits, an invisible Chrome holding memory, until a later launch on "
+                      f"this profile reattaches and closes it, or it has had no server for "
+                      f"{_keep_alive.max_hours():g} h (MCP_STEALTH_KEEP_ALIVE_MAX_HOURS)]")
+    return True, (f" [keep_alive{cap_note}: stays open when this server exits; Quit still ends it, and "
+                  f"it ends once it has had no server for {_keep_alive.max_hours():g} h "
+                  f"(MCP_STEALTH_KEEP_ALIVE_MAX_HOURS). A later browser_launch on this "
+                  f"profile reattaches to it]")
+
+
+def _keep_alive_on_reuse(keep_alive: Optional[bool]) -> str:
+    """browser_launch on the browser already running here: apply an explicit keep_alive, and say
+    what holds either way."""
+    browser = BrowserState.browser
+    headless = BrowserState.current_headless
+    privacy = BrowserState.current_privacy
+    attached = BrowserState.current_instance_id in _ATTACHED_BROWSERS
+    profile = None if attached else BrowserState.current_profile_dir
+    kept = bool(getattr(browser, _keep_alive.ATTR, False))
+    if keep_alive and not kept:
+        keep, note = _keep_alive_decision(True, profile, privacy, headless)
+        if keep:
+            note = _arm_keep_alive(browser, profile, BrowserState.current_instance_id, headless,
+                                   BrowserState.current_fingerprint) or note
+        return note
+    if keep_alive is False and kept:
+        _disarm_keep_alive(browser, profile, headless)
+        return " [keep_alive=False: this browser now closes when this server exits]"
+    if kept:
+        return " [keep_alive: on, it stays open when this server exits]"
+    return " [keep_alive=False: this browser closes when this server exits]"
+
+
+def _chrome_version_of(browser: Any) -> Optional[str]:
+    info = getattr(browser, "info", None)
+    with contextlib.suppress(Exception):
+        value = info.get("Browser") if hasattr(info, "get") else getattr(info, "Browser", None)
+        if value:
+            return str(value)
+    return None
+
+
+def _arm_keep_alive(browser: Any, profile: Any, instance_id: str, headless: bool,
+                    fingerprint: dict, *, previous: Optional[dict] = None) -> str:
+    """Mark a running browser to stay at exit: a watcher that outlives this server (Quit, time
+    cap) and the record a later server finds it by. '' when armed, else why it was not, and
+    the browser then closes with this server like any other."""
+    pid = _browser_process_pid(browser)
+    config = getattr(browser, "config", None)
+    host, port = getattr(config, "host", None), getattr(config, "port", None)
+    if not (isinstance(pid, int) and pid > 0 and host and port):
+        return " [keep_alive not armed: the browser's PID or port is unknown, so it closes with this server]"
+    version = (_chrome_version_of(browser) or (previous or {}).get("chrome_version")
+               or (_keep_alive._json_version(str(host), int(port)) or {}).get("Browser"))
+    if not version:
+        # A later server matches the browser on the port to the record by this; without it
+        # anything answering there would do.
+        return (" [keep_alive not armed: the browser's Chrome version could not be read, so it "
+                "closes with this server]")
+    started = quit_watch.pid_start(browser, pid)
+    if not started:
+        # Without it a PID handed to another program later could not be told from this Chrome.
+        return (" [keep_alive not armed: the start time of the browser's process could not be "
+                "read, so it closes with this server]")
+    path = str(_keep_alive.record_path(profile))
+    cap = _keep_alive.max_hours() * 3600
+    if headless:
+        proc = quit_watch.start(browser, _WINDOWLESS_GRACE, _CLOSE_WAIT, max_orphan_seconds=cap,
+                                pages_matter=False, keep_alive_record=path)
+    else:
+        _WINDOW_WATCH[id(browser)] = {"browser": browser, "zero_since": None, "tool_closed": False}
+        proc = quit_watch.start(browser, _WINDOWLESS_GRACE, _CLOSE_WAIT, max_orphan_seconds=cap,
+                                keep_alive_record=path)
+        _ensure_window_watcher_running()
+    if proc is None:
+        return (" [keep_alive not armed: its watcher could not start, and nothing could end the "
+                "browser on Quit or at the time cap, so it closes with this server]")
+    now = time.time()
+    failed = _keep_alive.write(
+        profile, pid=pid, host=str(host), port=int(port), instance_id=instance_id,
+        chrome_version=version,
+        headless=bool(headless), fingerprint=dict(fingerprint or {}), server_pid=os.getpid(),
+        user_data_dir=str(getattr(config, "user_data_dir", "") or profile),
+        pid_start=started, watcher_pid=proc.pid,
+        watcher_start=_keep_alive._watcher.process_start(proc.pid), state="held", launched_at=(previous or {}).get("launched_at", now),
+        attached_at=now if previous else None, kept_at=None, max_hours=_keep_alive.max_hours())
+    if failed:
+        # A plain watcher, as any headed browser has; none for headless.
+        if headless:
+            quit_watch.stop(browser)
+        else:
+            quit_watch.start(browser, _WINDOWLESS_GRACE, _CLOSE_WAIT)
+        return f" [keep_alive not armed: its record could not be written ({failed}), so it closes with this server]"
+    with contextlib.suppress(Exception):
+        setattr(browser, _keep_alive.ATTR, True)
+    return ""
+
+
+def _disarm_keep_alive(browser: Any, profile: Any, headless: bool) -> None:
+    """keep_alive off for a browser that had it: plain watcher, no record."""
+    with contextlib.suppress(Exception):
+        setattr(browser, _keep_alive.ATTR, False)
+    if headless:
+        quit_watch.stop(browser)
+    else:
+        quit_watch.start(browser, _WINDOWLESS_GRACE, _CLOSE_WAIT)
+    if profile is not None:
+        _keep_alive.remove(profile, _browser_process_pid(browser))
+
+
+def _kept_candidates(instance_id: str) -> list[Path]:
+    """The profiles a persistent launch of this instance would ask for, in that order."""
+    from .state import get_profile_affinity
+    found: list[Path] = []
+    pinned = get_profile_affinity() if instance_id == "main" else None
+    if pinned is not None:
+        found.append(Path(pinned))
+    desired = PROFILE_DIR if instance_id == "main" else PROFILES_ROOT / instance_id
+    if all(_keep_alive.profile_key(p) != _keep_alive.profile_key(desired) for p in found):
+        found.append(desired)
+    return found
+
+
+def _kept_verdict(profile: Path) -> Optional[dict]:
+    """keep_alive.check for a profile some Chrome holds, or None when nothing was kept there.
+
+    An ok verdict holds the profile's reattach lock: the caller reattaches at once, and
+    _reattach_kept lets it go when done."""
+    if not profile.exists() or chrome_lock_holder_pid(profile) is None:
+        return None
+    if _keep_alive.read(profile) is None:
+        return None
+    return _keep_alive.check(profile, hold=True)
+
+
+class _ReattachAborted(RuntimeError):
+    """A reattach stopped before taking the browser over; nothing of the browser was changed."""
+
+
+class _NotTheKeptBrowser(_ReattachAborted):
+    """The browser connected to is not the one the checks found: it changed in between."""
+
+
+async def _verify_connected(browser: Any, record: dict) -> None:
+    """After connecting, the browser at the other end must still be the one checked before.
+
+    Between keep_alive.check and the connection the Chrome can end and its PID or port go to
+    another one. Asked over the very connection: its browser process PID and version; then the
+    lock, the command line and the start time once more."""
+    from nodriver.cdp import browser as cdp_browser, system_info as cdp_system_info
+    connection = getattr(browser, "connection", None) or browser
+    pid = int(record["pid"])
+    infos = await _wait(connection.send(cdp_system_info.get_process_info()), timeout=5,
+                        what="SystemInfo.getProcessInfo")
+    found = [int(getattr(i, "id_", 0)) for i in infos or [] if getattr(i, "type_", "") == "browser"]
+    if found != [pid]:
+        raise _NotTheKeptBrowser(f"the browser on port {record['port']} is PID "
+                                 f"{found[0] if found else 'unknown'}, not the kept PID {pid}")
+    version = await _wait(connection.send(cdp_browser.get_version()), timeout=5,
+                          what="Browser.getVersion")
+    product = version[1] if isinstance(version, (tuple, list)) and len(version) > 1 else None
+    if product != record.get("chrome_version"):
+        raise _NotTheKeptBrowser(f"the browser on port {record['port']} is {product}, not the "
+                                 f"recorded {record.get('chrome_version')}")
+    problem = await asyncio.to_thread(_keep_alive.identity_problem, record)
+    if problem:
+        raise _NotTheKeptBrowser(problem)
+
+
+def _not_reattached_note(profile: Path, verdict: Optional[dict]) -> str:
+    if not verdict or verdict.get("ok"):
+        return ""
+    return (f" [a browser kept alive on {profile} was not reattached: {verdict.get('reason')}]")
+
+
+async def _reattach_kept(instance_id: str, profile: Path, verdict: dict, *, url: str,
+                         keep_alive: Optional[bool], ignored: list[str]) -> tuple[Any, list, int, dict, str, str]:
+    """Connect to a browser a previous server of ours left running on `profile`.
+
+    Opens nothing on the profile: no Chrome starts, so the profile version guard, the Chrome
+    Beta choice and the cookie move have nothing to act on. Returns (browser, tabs, selected
+    index, observed, summary, keep_alive note). Raises when Chrome does not take the connection.
+    """
+    try:
+        return await _reattach_locked(instance_id, profile, verdict, url=url,
+                                      keep_alive=keep_alive, ignored=ignored)
+    finally:
+        # Held from the check until the record names this server (or is gone).
+        _keep_alive.release_lock(verdict)
+
+
+async def _reattach_locked(instance_id: str, profile: Path, verdict: dict, *, url: str,
+                           keep_alive: Optional[bool], ignored: list[str]
+                           ) -> tuple[Any, list, int, dict, str, str]:
+    record = verdict["record"]
+    pid, port = int(record["pid"]), int(record["port"])
+    host = str(record.get("host") or "127.0.0.1")
+    headless = bool(record.get("headless"))
+    fingerprint = dict(record.get("fingerprint") or {})
+    # The folder exactly as Chrome was given it, which is what the watcher and a close compare.
+    config = Config(user_data_dir=str(record["user_data_dir"]), headless=headless, host=host, port=port)
+    browser = await asyncio.wait_for(nodriver.start(config=config), timeout=BROWSER_LAUNCH_TIMEOUT)
+    # Not spawned here, but ours: the PID and its start time are what closing it and the
+    # watcher go by.
+    browser._process_pid = pid
+    setattr(browser, quit_watch.START_ATTR, record.get("pid_start"))
+    try:
+        await _verify_connected(browser, record)
+        # Proved with the record's own format; from here on the current one, which the record
+        # is rewritten in when this reattach arms it.
+        fresh = await asyncio.to_thread(_keep_alive._watcher.process_start, pid)
+        if fresh:
+            setattr(browser, quit_watch.START_ATTR, fresh)
+        return await _reattach_connected(browser, instance_id, profile, record, url=url,
+                                         keep_alive=keep_alive, ignored=ignored)
+    except BaseException:
+        # Drop only the connection: Chrome and its tabs stay as they were.
+        with contextlib.suppress(Exception):
+            await close_connection(getattr(browser, "connection", None) or browser)
+        raise
+
+
+async def _reattach_connected(browser: Any, instance_id: str, profile: Path, record: dict, *,
+                              url: str, keep_alive: Optional[bool], ignored: list[str]
+                              ) -> tuple[Any, list, int, dict, str, str]:
+    pid, port = int(record["pid"]), int(record["port"])
+    headless = bool(record.get("headless"))
+    fingerprint = dict(record.get("fingerprint") or {})
+    # Claimed before anything else changes: once the lock goes, the record must name this
+    # server, or another one reads the old server as gone and takes the browser too.
+    failed = _keep_alive.write(profile, server_pid=os.getpid(), state="attaching")
+    if failed or (_keep_alive.read(profile) or {}).get("server_pid") != os.getpid():
+        raise _ReattachAborted(f"its record could not be made to name this server ({failed or 'not written'})")
+    watcher_note = ""
+    try:
+        watcher_note = await asyncio.to_thread(_keep_alive.end_old_watcher, record)
+        if watcher_note not in ("ended", "none running") and "is not its watcher" not in watcher_note:
+            # A watcher still running, or one that could not be proved to be it: a second one
+            # beside it would make two closers for one browser.
+            raise _ReattachAborted(f"the previous quit watcher could not be ended ({watcher_note})")
+        return await _reattach_claimed(browser, instance_id, profile, record, watcher_note,
+                                       url=url, keep_alive=keep_alive, ignored=ignored)
+    except BaseException as exc:
+        # Given back, so the browser can be taken by a later launch, as it could before. If the
+        # old watcher was already ended, a new one takes its place first: the browser is never
+        # left with nothing to end it on Quit or at the time cap.
+        fields: dict[str, Any] = {"server_pid": record.get("server_pid"), "state": record.get("state")}
+        if watcher_note == "ended" and not quit_watch.running(browser):
+            proc = quit_watch.start(
+                browser, _WINDOWLESS_GRACE, _CLOSE_WAIT,
+                max_orphan_seconds=_keep_alive.max_hours() * 3600,
+                pages_matter=not headless, keep_alive_record=str(_keep_alive.record_path(profile)))
+            if proc is not None:
+                fields.update(watcher_pid=proc.pid,
+                              watcher_start=_keep_alive._watcher.process_start(proc.pid))
+        failed = _keep_alive.write(profile, **fields)
+        if failed and isinstance(exc, Exception):
+            # The record still names this server, so others refuse the browser until it exits.
+            raise _ReattachAborted(f"{exc}; and the record could not be given back ({failed})") from exc
+        raise
+
+
+async def _reattach_claimed(browser: Any, instance_id: str, profile: Path, record: dict,
+                            watcher_note: str, *, url: str, keep_alive: Optional[bool],
+                            ignored: list[str]) -> tuple[Any, list, int, dict, str, str]:
+    pid, port = int(record["pid"]), int(record["port"])
+    headless = bool(record.get("headless"))
+    fingerprint = dict(record.get("fingerprint") or {})
+    with contextlib.suppress(Exception):
+        await asyncio.wait_for(browser.update_targets(), timeout=5)
+    order = [str(k) for k in (record.get("tab_order") or [])]
+    rank = {key: i for i, key in enumerate(order)}
+    with contextlib.suppress(Exception):
+        # In place, so the order survives every later update_targets and _refresh_tabs.
+        browser.targets.sort(key=lambda t: rank.get(str(t.target.target_id), len(rank)))
+    tabs = list(browser.tabs)
+    opened_note = ""
+    if not tabs:
+        tabs = [await (_open_background_window(browser) if not headless
+                       else browser.get("about:blank", new_tab=True))]
+        opened_note = "; it had no page, so one was opened"
+    for tab in tabs:
+        with contextlib.suppress(Exception):
+            await _wait(_apply_fingerprint_to_tab(tab, fingerprint), timeout=5, what="identity")
+    active_key = record.get("active")
+    select = next((i for i, t in enumerate(tabs) if _target_key(t) == active_key), 0)
+    observed: dict[str, Any] = {}
+    if url and url != "about:blank":
+        match = next((i for i, t in enumerate(tabs)
+                      if str(getattr(t.target, "url", "") or "") == url), None)
+        if match is not None:
+            select = match
+            observed = await _observe_navigation(tabs[match], url, {"armed": False})
+            observed["note"] = "already open in a tab of the reattached browser; selected, not reloaded"
+        else:
+            # A new tab, so no page the kept browser holds (a half-filled form) is navigated away.
+            tab = await (_open_background_window(browser) if not headless
+                         else browser.get("about:blank", new_tab=True))
+            with contextlib.suppress(Exception):
+                await _wait(_apply_fingerprint_to_tab(tab, fingerprint), timeout=5, what="identity")
+            doc_state, disarm = await _arm_document_watch(tab)
+            try:
+                await asyncio.wait_for(tab.get(url), timeout=BROWSER_NAV_TIMEOUT)
+                await _wait_load_complete(tab, 3)
+                observed = await _observe_navigation(tab, url, disarm())
+            finally:
+                disarm()
+            tabs.append(tab)
+            select = len(tabs) - 1
+            observed["note"] = "opened in a new tab; the kept tabs were left as they were"
+    else:
+        # Nothing navigated: read back the page the selected tab shows.
+        observed = await _observe_navigation(tabs[select], None, {"armed": False})
+    if not headless:
+        _watch_windows(browser)  # replaced below when keep_alive stays on
+    # Left unset, a reattach keeps what the browser had: whoever kept it wanted it kept.
+    if keep_alive is None or keep_alive:
+        failed = _arm_keep_alive(browser, profile, instance_id, headless, fingerprint,
+                                 previous=record)
+        keep_text = failed or " [keep_alive: still on, so it stays open when this server exits too]"
+    else:
+        _disarm_keep_alive(browser, profile, headless)
+        keep_text = " [keep_alive=False: it now closes when this server exits]"
+    pages = [{"index": i, "url": tab_record.shown_url(str(getattr(t.target, "url", "") or "")),
+              "title": str(getattr(t.target, "title", "") or "")[:120]} for i, t in enumerate(tabs)]
+    details = {
+        "reattached": {"pid": pid, "port": port, "chrome": record.get("chrome_version"),
+                       "headless": headless, "left_running": _keep_alive.describe(record),
+                       "previous_watcher": watcher_note, "tabs": pages, "selected": select},
+    }
+    notes = [f"no Chrome was started, so the profile version guard, the Chrome Beta choice and "
+             f"the cookie move did not run"]
+    marker = cookie_migration.read_marker(Path(_keep_alive.profile_key(profile)))
+    if marker.get("state") == "pending":
+        notes.append("a cookie move to v11 is still pending for this profile; it runs on the next "
+                     "launch that starts Chrome, not on a reattach")
+    if ignored:
+        notes.append("not applied, the running browser keeps its own: " + ", ".join(ignored))
+    details["reattached"]["notes"] = notes
+    summary = f"reattached to the running browser (pid {pid}, {len(tabs)} tab(s){opened_note})"
+    return browser, tabs, select, {**observed, **details}, summary, keep_text
+
+
+async def _launch_by_reattach(profile: Path, verdict: dict, *, url: str, keep_alive: Optional[bool],
+                             ignored: list[str], expect_url: Optional[str],
+                             expect_status: Optional[int]) -> str:
+    """browser_launch's reattach: the kept browser becomes the calling session's current one."""
+    iid = BrowserState.current_instance_id
+    record = verdict["record"]
+    ignored = [item for item in ignored if item != f"headless={bool(record.get('headless'))!r}"]
+    try:
+        browser, tabs, select, observed, summary, keep_text = await _reattach_kept(
+            iid, profile, verdict, url=url, keep_alive=keep_alive, ignored=ignored)
+    except _NotTheKeptBrowser as e:
+        return err(f"the browser kept alive on {profile} ({_keep_alive.describe(record)}) changed "
+                   f"between the check and the connection: {e}. Nothing was changed and the "
+                   f"connection was dropped; browser_launch again to look afresh")
+    except _ReattachAborted as e:
+        return err(f"the browser kept alive on {profile} ({_keep_alive.describe(record)}) could not "
+                   f"be taken over safely: {e}. Nothing was changed and the connection was dropped")
+    except Exception as e:
+        return err(f"a browser kept alive on {profile} ({_keep_alive.describe(record)}) is ours and "
+                   f"free, but connecting to it failed: {_exc_text(e)}. It was left running as it "
+                   f"was; browser_launch again to retry, or end it with Quit")
+    BrowserState.browser = browser
+    BrowserState.tabs = tabs
+    BrowserState.active_tab_index = select
+    BrowserState.current_profile_dir = Path(_keep_alive.profile_key(profile))
+    BrowserState.current_headless = bool(record.get("headless"))
+    BrowserState.current_privacy = False
+    BrowserState.current_fingerprint = dict(record.get("fingerprint") or {})
+    BrowserState.current_proxy = verdict.get("proxy")
+    BrowserState.current_idle_timeout = DEFAULT_IDLE_TIMEOUT if BrowserState.http_mode() else 0
+    BrowserState.current_last_active = time.time()
+    BrowserState.current_created_at = time.time()
+    if BrowserState.http_mode():
+        _ensure_idle_reaper_running()
+    _ATTACHED_BROWSERS.discard(iid)
+    BrowserState.window_closed.pop(iid, None)
+    if iid == "main":
+        from .state import set_profile_affinity
+        set_profile_affinity(BrowserState.current_profile_dir)
+    observed["profile"] = {"actual_profile": str(BrowserState.current_profile_dir),
+                           "session_state_source": "reattached to the browser kept alive on it"}
+    action = "Loaded" if url and url != "about:blank" else "Selected tab shows"
+    return _nav_result(f"{summary[0].upper()}{summary[1:]}. {action}", observed,
+                       expect_url=expect_url, expect_status=expect_status, suffix=keep_text)
+
+
+# browser_launch / spawn_browser parameters that only shape a new Chrome, with the value that
+# means "not asked for". A reattach starts none, so any other value is named as not applied.
+_NEW_CHROME_ONLY = {
+    "headless": False, "proxy": None, "user_agent": None, "fingerprint": None,
+    "storage_state_path": None, "testing_mode": False, "profile_mode": "default",
+    "restore_tabs": False, "extra_args": None, "lang": "en-US", "profile_directory": None,
+}
+
+
+def _reattach_ignored(given: dict) -> list[str]:
+    """Launch parameters a reattach cannot apply, named for the result."""
+    out = []
+    for name, default in _NEW_CHROME_ONLY.items():
+        if name in given and given[name] not in (default, [], {}):
+            out.append(f"{name}={given[name]!r}" if name not in ("proxy", "fingerprint", "user_agent")
+                       else name)
+    return out
+
+
 def _instance_view(instance_id: str) -> Optional[tuple]:
     """(browser, tab keys in tab order, active key, profile, privacy) in the bound session."""
     if instance_id == BrowserState.current_instance_id:
@@ -2380,7 +2909,7 @@ def _record_tabs_at_exit(instance_id: str, browser: Any, tabs: list, active_inde
                          profile: Any, privacy: bool) -> str:
     """The stdin-EOF form of _record_tabs_before_close: no event loop, so /json/list over HTTP."""
     scope = _tab_record_scope(instance_id, profile, privacy)
-    if scope is None or browser is None or getattr(browser, "stopped", False) is True:
+    if scope is None or browser is None or _browser_exited(browser):
         return "not recorded"
     config = getattr(browser, "config", None)
     pages = tab_record.pages_over_http(getattr(config, "host", None), getattr(config, "port", None),
@@ -2407,6 +2936,16 @@ async def _record_tabs_at_launch(instance_id: str) -> str:
         return tab_record.save(instance_id, scope, pages, keys, active, "at launch", force=False)
     except Exception as exc:
         return f"not recorded: {_exc_text(exc)}"
+
+
+def _browser_exited(browser: Any) -> bool:
+    """Whether a browser this server drives is known to have ended. A reattached one was not
+    spawned here, so nodriver's `stopped` (no subprocess means stopped) says nothing about it."""
+    if getattr(browser, "_process", None) is None:
+        pid = getattr(browser, "_process_pid", None)
+        if isinstance(pid, int) and pid > 0:
+            return not _process_exists(pid)
+    return getattr(browser, "stopped", False) is True
 
 
 def _mark_tabs_changed(_tool: str) -> None:
@@ -2668,6 +3207,7 @@ async def browser_launch(
     expect_status: Optional[int] = None,
     profile_mode: Literal["default", "light"] = "default",
     restore_tabs: bool = False,
+    keep_alive: Optional[bool] = None,
 ) -> str:
     """Launch stealth Chrome via nodriver. Creates persistent profile by default.
 
@@ -2749,6 +3289,17 @@ async def browser_launch(
             persistent=False and privacy=True keep no tabs. The list is kept in
             ~/.mcp-stealth/window-state/<instance>-tabs.json, readable by you only;
             browser_close(forget_tabs=True) removes it.
+        keep_alive: True leaves this browser running when this server exits (the client went
+            to sleep, reconnected or closed), with its tabs and page state, and the next
+            browser_launch on the same profile reattaches to it instead of starting another
+            Chrome: "reattached to the running browser (pid N, K tabs)". It still ends on Quit,
+            on browser_close after a reattach, and once it has had no server for
+            MCP_STEALTH_KEEP_ALIVE_MAX_HOURS (24). Persistent profiles only: persistent=False
+            and privacy=True ignore it and say so. Headless works too, as an invisible Chrome
+            holding memory until one of those ends it. Not on Windows. Left unset it is False
+            for a new browser and stays as it was on a reattach. A reattach happens whenever
+            a profile is held by a browser a previous server of ours kept, whatever this
+            value; it never attaches to the person's own Chrome or one a live server drives.
     """
     # Local testing wants a clean room by default: a testing_mode run that
     # silently accumulated state in the real login profile was both a surprise
@@ -2814,6 +3365,7 @@ async def browser_launch(
                 if profile_mode != "default":
                     reuse_head += (f"; profile_mode={profile_mode!r} NOT applied, it only "
                                    f"takes effect on a new launch")
+                _reuse_keep_note = _keep_alive_on_reuse(keep_alive)
                 _doc_state, _disarm = await _arm_document_watch(_tab)
                 try:
                     if url and url != "about:blank":
@@ -2837,7 +3389,7 @@ async def browser_launch(
                 }
                 return _nav_result(
                     reuse_head, _observed,
-                    expect_url=expect_url, expect_status=expect_status,
+                    expect_url=expect_url, expect_status=expect_status, suffix=_reuse_keep_note,
                 )
             except Exception as e:
                 # The browser answered, so what failed was the navigation: a bad or slow
@@ -2886,6 +3438,8 @@ async def browser_launch(
         except Exception as e:
             return err(f"identity setup failed: {e}")
 
+        # Why a browser kept alive on the profile asked for was not taken over, for the result.
+        kept_note = ""
         # If the user passed user_data_dir explicitly, that takes precedence over
         # both `persistent` and any --user-data-dir already in extra_args.
         explicit_udd: Optional[Path] = None
@@ -2905,12 +3459,19 @@ async def browser_launch(
                 )
             holder_pid = chrome_lock_holder_pid(explicit_udd)
             if holder_pid is not None:
+                kept = _kept_verdict(explicit_udd)
+                if kept and kept.get("ok"):
+                    return await _launch_by_reattach(
+                        explicit_udd, kept, url=url, keep_alive=keep_alive,
+                        ignored=_reattach_ignored(locals()), expect_url=expect_url,
+                        expect_status=expect_status)
                 return err(
                     f"user_data_dir {explicit_udd} is currently in use by Chrome PID {holder_pid}. "
                     "Close that Chrome window first (a single Chrome process locks the whole "
                     "user-data-dir, regardless of profile_directory). "
                     "Or use clone_chrome_profile to take a snapshot copy of the profile, "
                     "or attach_to_chrome(port=...) if Chrome was started with --remote-debugging-port."
+                    + _not_reattached_note(explicit_udd, kept)
                 )
             # Validate sub-profile if specified
             if profile_directory:
@@ -2949,6 +3510,12 @@ async def browser_launch(
             if custom_udd is not None:
                 holder_pid = chrome_lock_holder_pid(custom_udd) if custom_udd.exists() else None
                 if holder_pid is not None:
+                    kept = _kept_verdict(custom_udd)
+                    if kept and kept.get("ok"):
+                        return await _launch_by_reattach(
+                            custom_udd, kept, url=url, keep_alive=keep_alive,
+                            ignored=_reattach_ignored(locals()), expect_url=expect_url,
+                            expect_status=expect_status)
                     return err(
                         f"Profile directory is locked by another Chrome process: "
                         f"{custom_udd} (PID {holder_pid}). Close that Chrome window first, "
@@ -2956,8 +3523,20 @@ async def browser_launch(
                         f"OR use the user_data_dir parameter (with same fail-fast lock check), "
                         f"OR omit --user-data-dir to use the default MCP profile, "
                         f"OR use attach_to_chrome(port=...) if Chrome was started with debug port."
+                        + _not_reattached_note(custom_udd, kept)
                     )
 
+            # A browser a previous server of ours kept alive on the profile this launch asks
+            # for is taken over, not raced: falling back would hide its tabs and logins.
+            if persistent and custom_udd is None:
+                for _candidate in _kept_candidates(BrowserState.current_instance_id):
+                    _kept = _kept_verdict(_candidate)
+                    if _kept and _kept.get("ok"):
+                        return await _launch_by_reattach(
+                            _candidate, _kept, url=url, keep_alive=keep_alive,
+                            ignored=_reattach_ignored(locals()), expect_url=expect_url,
+                            expect_status=expect_status)
+                    kept_note += _not_reattached_note(_candidate, _kept)
             # Each instance has one deterministic profile, and a conflict over it is
             # settled by the caller's profile_conflict. Only "main" takes part in
             # process affinity: a second HTTP session must not repoint it, or the
@@ -3241,6 +3820,16 @@ async def browser_launch(
             f" [{profile_info.get('session_state_source')}]"
             if used_fallback else ""
         )
+        suffix += kept_note
+        _keep, _keep_note = _keep_alive_decision(keep_alive, final_udd, privacy, headless)
+        if _keep:
+            _failed = _arm_keep_alive(browser, final_udd, BrowserState.current_instance_id,
+                                      headless, effective_fingerprint)
+            _keep_note = _failed or _keep_note
+            if not _failed and used_fallback:
+                _keep_note += (f" [it runs on the fallback profile {final_udd}, which no later default "
+                               f"launch asks for: reattach with user_data_dir={final_udd!r}]")
+        suffix += _keep_note
 
         # Post-launch health check — degenerate window detection.
         # After a macOS sleep/wake cycle (or some persistent-profile state
@@ -6753,9 +7342,11 @@ async def _start_chrome(config: Config) -> Browser:
     host, port = config.host, config.port
     for attempt in (1, 2):
         try:
-            return await asyncio.wait_for(
+            browser = await asyncio.wait_for(
                 nodriver.start(config=config), timeout=BROWSER_LAUNCH_TIMEOUT,
             )
+            _record_pid_start(browser)
+            return browser
         except asyncio.CancelledError:
             await _reap_failed_start(config)
             raise
@@ -6763,6 +7354,7 @@ async def _start_chrome(config: Config) -> Browser:
             slow = "Failed to connect" in str(exc)
             adopted = await _adopt_slow_chrome(config) if slow else None
             if adopted is not None:
+                _record_pid_start(adopted)
                 return adopted
             reap = await _reap_failed_start(config)
             if attempt == 2 or not slow:
@@ -6772,6 +7364,15 @@ async def _start_chrome(config: Config) -> Browser:
             config.host, config.port = host, port
             await asyncio.sleep(1.0)
     raise AssertionError("unreachable")
+
+
+def _record_pid_start(browser: Any) -> None:
+    """When this browser's process started, read once at launch: a close later signals only a
+    process with that start time, so a PID handed to another program meanwhile is left alone."""
+    pid = _browser_process_pid(browser)
+    if isinstance(pid, int) and pid > 0:
+        with contextlib.suppress(Exception):
+            quit_watch.pid_start(browser, pid)
 
 
 async def _adopt_slow_chrome(config: Config) -> Optional[Browser]:
@@ -6890,6 +7491,8 @@ async def _launch_browser_instance(
     privacy: bool = False,
     desc: str = "",
     restore_tabs: bool = False,
+    keep_alive: Optional[bool] = None,
+    ignored: Optional[list[str]] = None,
 ) -> tuple[bool, str]:
     """Shared launcher for browser_launch + spawn_browser.
 
@@ -6941,9 +7544,15 @@ async def _launch_browser_instance(
         if profile_path.exists():
             holder = chrome_lock_holder_pid(profile_path)
             if holder is not None:
+                kept = None if privacy else _kept_verdict(profile_path)
+                if kept and kept.get("ok"):
+                    return await _spawn_by_reattach(instance_id, profile_path, kept, url=url,
+                                                    keep_alive=keep_alive, ignored=ignored or [],
+                                                    idle_timeout=idle_timeout, desc=desc)
                 return False, (
                     f"profile {profile_path} is locked by Chrome PID {holder}; "
                     "close that browser or clone the profile first"
+                    + _not_reattached_note(profile_path, kept)
                 )
         # Before anything writes to it (mkdir and clean_profile_state wait for the cookie checks
         # below): whether the profile is new decides
@@ -7127,6 +7736,11 @@ async def _launch_browser_instance(
     if not headless:
         _watch_windows(browser)
     await _record_tabs_at_launch(instance_id)
+    _keep, _keep_note = _keep_alive_decision(keep_alive, profile_path, privacy, headless)
+    if _keep:
+        _keep_note = _arm_keep_alive(browser, profile_path, instance_id, headless,
+                                     effective_fingerprint) or _keep_note
+    dock_note += _keep_note
     await _give_focus_back(previous_app)
     return True, (
         f"instance {instance_id!r} launched (headless={headless}, "
@@ -7139,6 +7753,46 @@ async def _launch_browser_instance(
 def _being_closed(instance_id: str) -> bool:
     """Another close of this instance is under way; a sweep leaves it to that one."""
     return (BrowserState.session_key(), instance_id) in _app_module.INSTANCE_CLOSING
+
+
+async def _spawn_by_reattach(instance_id: str, profile: Path, verdict: dict, *, url: str,
+                            keep_alive: Optional[bool], ignored: list[str], idle_timeout: int,
+                            desc: str) -> tuple[bool, str]:
+    """spawn_browser's reattach: the kept browser fills the instance slot, current or stored."""
+    record = verdict["record"]
+    ignored = [item for item in ignored if item != f"headless={bool(record.get('headless'))!r}"]
+    try:
+        browser, tabs, select, observed, summary, keep_text = await _reattach_kept(
+            instance_id, profile, verdict, url=url, keep_alive=keep_alive, ignored=ignored)
+    except Exception as e:
+        return False, (f"a browser kept alive on {profile} ({_keep_alive.describe(record)}) is "
+                       f"ours and free, but connecting to it failed: {_exc_text(e)}. It was left "
+                       f"running as it was")
+    fields = dict(browser=browser, tabs=tabs, active_tab_index=select,
+                  profile_dir=Path(_keep_alive.profile_key(profile)), desc=desc,
+                  headless=bool(record.get("headless")), privacy=False,
+                  fingerprint=dict(record.get("fingerprint") or {}), proxy=verdict.get("proxy"),
+                  idle_timeout=idle_timeout, last_active=time.time(), created_at=time.time())
+    if instance_id == BrowserState.current_instance_id:
+        BrowserState.browser = browser
+        BrowserState.tabs = tabs
+        BrowserState.active_tab_index = select
+        BrowserState.current_profile_dir = fields["profile_dir"]
+        BrowserState.current_desc = desc
+        BrowserState.current_headless = fields["headless"]
+        BrowserState.current_privacy = False
+        BrowserState.current_fingerprint = fields["fingerprint"]
+        BrowserState.current_proxy = fields["proxy"]
+        BrowserState.current_idle_timeout = idle_timeout
+        BrowserState.current_last_active = time.time()
+        BrowserState.current_created_at = time.time()
+    else:
+        BrowserState.instances[instance_id] = InstanceSnapshot(instance_id=instance_id, **fields)
+    _ensure_idle_reaper_running()
+    BrowserState.window_closed.pop(instance_id, None)
+    _ATTACHED_BROWSERS.discard(instance_id)
+    return True, (f"instance {instance_id!r} {summary}{keep_text}\n"
+                  f"{json.dumps(observed, indent=2, default=str)}")
 
 
 @contextlib.contextmanager
@@ -7466,6 +8120,7 @@ async def spawn_browser(
     fingerprint: Optional[dict] = None,
     privacy: bool = False,
     restore_tabs: bool = False,
+    keep_alive: Optional[bool] = None,
 ) -> str:
     """Create a new named browser instance running in parallel with main.
     Each instance has its own profile, cookies, tabs, logs. Use for multi-account
@@ -7483,6 +8138,10 @@ async def spawn_browser(
             leave this off
         restore_tabs: reopen the tabs this instance had when it was last closed, as
             browser_launch(restore_tabs=True) does
+        keep_alive: leave this browser running when this server exits, as
+            browser_launch(keep_alive=True) does; a later spawn_browser or browser_launch on
+            the same profile reattaches to it. The idle timeout still applies while a server
+            holds it
         other args: same as browser_launch
 
     Use switch_instance(id) to route subsequent tool calls to this instance.
@@ -7545,6 +8204,8 @@ async def spawn_browser(
                 privacy=privacy,
                 desc=desc,
                 restore_tabs=restore_tabs,
+                keep_alive=keep_alive,
+                ignored=_reattach_ignored(locals()),
             )
     finally:
         _SPAWNING.pop(instance_id, None)
@@ -10351,14 +11012,39 @@ def _stop_all_browsers() -> None:
             for view in views:
                 with contextlib.suppress(Exception):
                     _record_tabs_at_exit(*view)
-            handles = [BrowserState.browser]
-            handles.extend(s.browser for s in BrowserState.instances.values())
-            for browser in handles:
+            for iid, browser, tabs, active_index, profile, privacy in views:
                 with contextlib.suppress(Exception):
-                    if browser and not getattr(browser, "stopped", False):
-                        browser.stop()
+                    _leave_or_end_at_exit(browser, tabs, active_index, profile, privacy)
         finally:
             BrowserState.unbind_session(token)
+
+
+def _leave_or_end_at_exit(browser: Any, tabs: list, active_index: int, profile: Any,
+                          privacy: bool) -> str:
+    """At exit, with no event loop: leave a browser kept alive running, end every other one."""
+    if browser is None:
+        return "none"
+    pid = _browser_process_pid(browser)
+    if (getattr(browser, _keep_alive.ATTR, False) and not privacy and profile is not None
+            and isinstance(pid, int) and _process_exists(pid)):
+        keys = [_target_key(t) for t in tabs]
+        active = keys[active_index] if 0 <= active_index < len(keys) else None
+        if _keep_alive.mark_kept(profile, pid, keys, active) is None:
+            _keep_alive.release(browser)
+            return "kept"
+    config = getattr(browser, "config", None)
+    if getattr(browser, "_process", None) is None and isinstance(pid, int) and pid > 0:
+        # Reattached: nodriver's stop() has no process to end, so it would stay running.
+        outcome = _keep_alive.close_at_exit(str(getattr(config, "host", "127.0.0.1")),
+                                            int(getattr(config, "port", 0) or 0), pid,
+                                            str(getattr(config, "user_data_dir", "") or ""),
+                                            getattr(browser, quit_watch.START_ATTR, None))
+        if outcome != "still running" and profile is not None:
+            _keep_alive.remove(profile, pid)
+        return outcome
+    if not getattr(browser, "stopped", False):
+        browser.stop()
+    return "stopped"
 
 
 def _parse_cli(argv: list[str]) -> Any:
