@@ -61,8 +61,10 @@ class _Frontmost:
         self._thread.join(2)
 
 
-@pytest.mark.parametrize("browser", ["chrome", "brave"])
-def test_headed_browser_stays_behind_the_app_in_use(browser):
+@pytest.mark.parametrize("browser, block_ads", [("chrome", False), ("brave", False), ("chrome", True)],
+                         ids=["chrome", "brave", "chrome-block_ads"])
+def test_headed_browser_stays_behind_the_app_in_use(browser, block_ads):
+    """block_ads holds every new target until its Fetch domain is on; that must not raise it."""
     if browser == "brave" and brave.find_brave() is None:
         pytest.skip("Brave is not installed")
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(_Quiet, directory=FIXTURES))
@@ -73,7 +75,7 @@ def test_headed_browser_stays_behind_the_app_in_use(browser):
     client = Client()
     try:
         client.call("browser_launch", _timeout=60, url=f"{base}/protocol.html", headless=False,
-                    persistent=False, extra_args=SAFE_ARGS, browser=browser)
+                    persistent=False, extra_args=SAFE_ARGS, browser=browser, block_ads=block_ads)
         ours = _main_chrome_pids() - before
         assert ours
         assert front.ms_of(ours, 0) == 0

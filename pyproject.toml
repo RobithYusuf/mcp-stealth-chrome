@@ -1,6 +1,6 @@
 [project]
 name = "mcp-stealth-chrome"
-version = "0.18.0"
+version = "0.19.0"
 description = "MCP server with 173 tools: a real Chrome browser over CDP with nodriver, HTTP with Chrome's TLS fingerprint, Cloudflare Turnstile handling, session reuse, and web research without API keys"
 readme = "README.md"
 license = { text = "MIT" }
@@ -52,6 +52,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# block_ads: Brave's adblock-rust (MPL-2.0) through its MIT/Apache bindings. An extra, not a
+# dependency: 0.6.0 has no musllinux or Windows ARM64 wheel, and building it needs Rust, so as a
+# dependency it made the whole package fail to install there. Capped because the stored engine
+# (engine.dat) is its format.
+adblock = [
+    "adblock>=0.6,<0.7",
+]
 os-cursor = [
     "pyobjc-framework-Quartz>=10; sys_platform == 'darwin'",
     "pyobjc-framework-Cocoa>=10; sys_platform == 'darwin'",

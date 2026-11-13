@@ -38,6 +38,7 @@ _patches.apply_all()
 from .key_outcome import element_unread
 from .helpers import (
     OPEN_DIALOGS,
+    adblock_package_note,
     dialog_note,
     err,
     get_title,
@@ -2969,9 +2970,23 @@ async def _reattach_claimed(browser: Any, instance_id: str, profile: Path, recor
     return browser, tabs, select, {**observed, **details}, summary, keep_text
 
 
+async def _block_ads_on_reattach(block_ads: bool, browser: Any, instance_id: str) -> str:
+    """block_ads on a reattached browser: a blocker of its own, as on a new one. The blocker of
+    the server that kept it ended at that server's exit, so nothing blocks until a launch asks."""
+    if not block_ads:
+        return ""
+    module = _adblock_module()
+    # A reattached Brave's Config names nodriver's Chrome; its mark says what it is. Shields
+    # blocks there, so block_ads stays a no-op that says so, as on a new Brave launch.
+    executable = ("Brave Browser" if brave_mode.product_of(browser) == brave_mode.BRAVE
+                  else getattr(getattr(browser, "config", None), "browser_executable_path", None))
+    return await module.attach(module.begin(True, executable), browser, instance_id,
+                               BrowserState.session_key())
+
+
 async def _launch_by_reattach(profile: Path, verdict: dict, *, url: str, keep_alive: Optional[bool],
                              ignored: list[str], expect_url: Optional[str],
-                             expect_status: Optional[int]) -> str:
+                             expect_status: Optional[int], block_ads: bool = False) -> str:
     """browser_launch's reattach: the kept browser becomes the calling session's current one."""
     iid = BrowserState.current_instance_id
     record = verdict["record"]
@@ -3010,9 +3025,11 @@ async def _launch_by_reattach(profile: Path, verdict: dict, *, url: str, keep_al
         set_profile_affinity(BrowserState.current_profile_dir)
     observed["profile"] = {"actual_profile": str(BrowserState.current_profile_dir),
                            "session_state_source": "reattached to the browser kept alive on it"}
+    ads_note = await _block_ads_on_reattach(block_ads, browser, iid)
     action = "Loaded" if url and url != "about:blank" else "Selected tab shows"
     return _nav_result(f"{summary[0].upper()}{summary[1:]}. {action}", observed,
-                       expect_url=expect_url, expect_status=expect_status, suffix=keep_text)
+                       expect_url=expect_url, expect_status=expect_status,
+                       suffix=keep_text + ads_note)
 
 
 # browser_launch / spawn_browser parameters that only shape a new Chrome, with the value that
@@ -3234,6 +3251,29 @@ _app_module.AFTER_TOOL_HOOKS[:] = [
     if getattr(hook, "__name__", "") != "_mark_tabs_changed"] + [_mark_tabs_changed]
 
 
+def _adblock_module() -> Any:
+    """block_ads's module, imported on first use: a launch without it never loads it, nor the
+    adblock package it uses."""
+    from . import adblock
+    return adblock
+
+
+def _adblock_if_loaded() -> Any:
+    """block_ads's module when some launch has loaded it, else None. Nothing is imported."""
+    return sys.modules.get(f"{__package__}.adblock")
+
+
+def _adblock_notice(session_key: str, result: str) -> str:
+    """The notice of a block_ads that stopped, for the next tool result. Only once block_ads
+    was used: before that there is nothing to tell, and nothing is imported."""
+    module = _adblock_if_loaded()
+    return result if module is None else module.result_notice(session_key, result)
+
+
+if _adblock_notice not in _app_module.RESULT_FILTERS:
+    _app_module.RESULT_FILTERS.append(_adblock_notice)
+
+
 async def _load_saved_tab(tab: Any, url: str) -> dict:
     doc_state, disarm = await _arm_document_watch(tab)
     try:
@@ -3395,6 +3435,7 @@ async def browser_launch(
     keep_alive: Optional[bool] = None,
     browser: Literal["chrome", "brave"] = "chrome",
     vertical_tabs: Optional[str] = None,
+    block_ads: bool = False,
 ) -> str:
     """Launch stealth Chrome via nodriver. Creates persistent profile by default.
 
@@ -3497,6 +3538,15 @@ async def browser_launch(
         vertical_tabs: "left", "right" or "off" writes the tab-strip setting into the profile
             before the browser starts; None (default) leaves the profile's own setting.
             Brave has both sides; Chrome only "left", and "right" there is refused.
+        block_ads: block ad and tracker requests in every tab, popup, frame and worker of this
+            browser, with EasyList and EasyPrivacy (Brave's adblock-rust engine). Requests
+            only: nothing is hidden or written in the page, so a blocked ad can leave an empty
+            box. The lists are downloaded on first use into ~/.mcp-stealth/adblock, checked
+            again at most once a day, and used offline from the last copy. Without a list the
+            launch says ad blocking is off and why; it never fails over it. The result says
+            whether it is on; server_status shows what was blocked. Blocked requests fail
+            with net::ERR_BLOCKED_BY_CLIENT, as with any ad blocker, which a page can notice.
+            Brave blocks ads itself with Shields, so there it does nothing.
     """
     product, brave_executable, problem = brave_mode.check_request(browser, vertical_tabs)
     if problem:
@@ -3579,6 +3629,8 @@ async def browser_launch(
                 if vertical_tabs is not None:
                     reuse_head += (f"; vertical_tabs={vertical_tabs!r} NOT applied, it only "
                                    f"takes effect on a new launch")
+                if block_ads:
+                    reuse_head += _adblock_module().reuse_note(block_ads, BrowserState.browser)
                 _doc_state, _disarm = await _arm_document_watch(_tab)
                 try:
                     if url and url != "about:blank":
@@ -3677,7 +3729,8 @@ async def browser_launch(
                     return await _launch_by_reattach(
                         explicit_udd, kept, url=url, keep_alive=keep_alive,
                         ignored=_reattach_ignored(locals()), expect_url=expect_url,
-                        expect_status=expect_status)
+                        expect_status=expect_status,
+                        block_ads=block_ads)
                 return err(
                     f"user_data_dir {explicit_udd} is currently in use by Chrome PID {holder_pid}. "
                     "Close that Chrome window first (a single Chrome process locks the whole "
@@ -3728,7 +3781,8 @@ async def browser_launch(
                         return await _launch_by_reattach(
                             custom_udd, kept, url=url, keep_alive=keep_alive,
                             ignored=_reattach_ignored(locals()), expect_url=expect_url,
-                            expect_status=expect_status)
+                            expect_status=expect_status,
+                            block_ads=block_ads)
                     return err(
                         f"Profile directory is locked by another Chrome process: "
                         f"{custom_udd} (PID {holder_pid}). Close that Chrome window first, "
@@ -3748,7 +3802,8 @@ async def browser_launch(
                         return await _launch_by_reattach(
                             _candidate, _kept, url=url, keep_alive=keep_alive,
                             ignored=_reattach_ignored(locals()), expect_url=expect_url,
-                            expect_status=expect_status)
+                            expect_status=expect_status,
+                            block_ads=block_ads)
                     kept_note += _not_reattached_note(_candidate, _kept)
             # Each instance has one deterministic profile, and a conflict over it is
             # settled by the caller's profile_conflict. Only "main" takes part in
@@ -3908,6 +3963,7 @@ async def browser_launch(
         refused = await _cookie_preflight(profile_path, cookie_move)
         if refused:
             return err(refused)
+        ads_pending = _adblock_module().begin(block_ads, config.browser_executable_path) if block_ads else None
         try:
             browser = await _start_chrome(config)
             brave_mode.mark(browser, product)
@@ -3963,6 +4019,10 @@ async def browser_launch(
             return err(hint or f"launch failed: {e}")
 
         BrowserState.browser = browser
+        # Before the first navigation, so its own requests are already looked at.
+        if ads_pending is not None:
+            dock_note += await _adblock_module().attach(
+                ads_pending, browser, BrowserState.current_instance_id, BrowserState.session_key())
 
         if cookie_move.backup is not None:
             moved, moved_text = await _finish_cookie_move(browser, Path(str(profile_path)), cookie_move)
@@ -6369,10 +6429,13 @@ def _clear_tab_scoped_state(tabs: list[Any]) -> None:
         watchdog = _capture._INTERCEPT.get("watchdog")
         if watchdog is not None and not watchdog.done():
             watchdog.cancel()
-        _capture._INTERCEPT.update({
-            "active": False, "tab": None, "handler": None, "handler_tab": None,
-            "watchdog": None, "stop_reason": "target closed", "disable_error": None,
-        })
+        # A rule riding on block_ads stops at once: it answers only while active and current.
+        with _capture._INTERCEPT_LOCK:
+            _capture._INTERCEPT.update({
+                "active": False, "tab": None, "handler": None, "handler_tab": None,
+                "watchdog": None, "stop_reason": "target closed", "disable_error": None,
+                "broker": None, "broker_token": None,
+            })
     try:
         from .tools import devtools as _dt
         if _dt._TRACE_ACTIVE.get("tab_id") in keys:
@@ -6871,6 +6934,10 @@ async def server_status() -> str:
     beta-ready (they run from Chrome Beta with the project icon), beta-missing,
     icon-missing or unavailable, with the reason. Reading it changes nothing.
 
+    `block_ads` lists, per browser launched with block_ads=True, the requests looked at,
+    blocked and allowed, by type and host, the targets covered and any that could not be,
+    and the age of the filter lists.
+
     `profile_gc` is the startup pass over leftover privacy-profiles/* and profile-pid<N>
     folders: what it removed, what it kept because it holds data, what was in use, and
     errors. A fallback with cookies, logins, storage, extensions or bookmarks is never
@@ -6902,6 +6969,10 @@ async def server_status() -> str:
         "dock_icon": await _dock_icon_status(),
         "brave": await asyncio.to_thread(_brave_status),
         "profile_gc": profile_gc.status(),
+        "block_ads": (_adblock_if_loaded().status([BrowserState.browser] + [
+            snap.browser for snap in BrowserState.instances.values()]) if _adblock_if_loaded()
+            else {"browsers": [], "package": adblock_package_note(),
+                  "note": "no launch in this process asked for block_ads"}),
     }
     return ok(json.dumps(status, indent=2, default=str))
 
@@ -7737,6 +7808,7 @@ async def _launch_browser_instance(
     ignored: Optional[list[str]] = None,
     browser: str = "chrome",
     vertical_tabs: Optional[str] = None,
+    block_ads: bool = False,
 ) -> tuple[bool, str]:
     """Shared launcher for browser_launch + spawn_browser.
 
@@ -7800,7 +7872,8 @@ async def _launch_browser_instance(
                 if kept and kept.get("ok"):
                     return await _spawn_by_reattach(instance_id, profile_path, kept, url=url,
                                                     keep_alive=keep_alive, ignored=ignored or [],
-                                                    idle_timeout=idle_timeout, desc=desc)
+                                                    idle_timeout=idle_timeout, desc=desc,
+                                                    block_ads=block_ads)
                 return False, (
                     f"profile {profile_path} is locked by Chrome PID {holder}; "
                     "close that browser or clone the profile first"
@@ -7882,6 +7955,7 @@ async def _launch_browser_instance(
     if refused:
         await _remove_privacy_profile(privacy_profile)
         return False, refused
+    ads_pending = _adblock_module().begin(block_ads, config.browser_executable_path) if block_ads else None
     try:
         browser = await _start_chrome(config)
         brave_mode.mark(browser, product)
@@ -7902,6 +7976,9 @@ async def _launch_browser_instance(
         await _safe_stop_browser(browser)
         await _remove_privacy_profile(privacy_profile)
         return False, f"launch failed: {_exc_text(e)}"
+    if ads_pending is not None:
+        dock_note += await _adblock_module().attach(ads_pending, browser, instance_id,
+                                                    BrowserState.session_key())
 
     if cookie_move.backup is not None:
         moved, moved_text = await _finish_cookie_move(browser, Path(str(profile_path)), cookie_move)
@@ -8017,7 +8094,7 @@ def _being_closed(instance_id: str) -> bool:
 
 async def _spawn_by_reattach(instance_id: str, profile: Path, verdict: dict, *, url: str,
                             keep_alive: Optional[bool], ignored: list[str], idle_timeout: int,
-                            desc: str) -> tuple[bool, str]:
+                            desc: str, block_ads: bool = False) -> tuple[bool, str]:
     """spawn_browser's reattach: the kept browser fills the instance slot, current or stored."""
     record = verdict["record"]
     ignored = [item for item in ignored if item != f"headless={bool(record.get('headless'))!r}"]
@@ -8051,6 +8128,7 @@ async def _spawn_by_reattach(instance_id: str, profile: Path, verdict: dict, *, 
     _ensure_idle_reaper_running()
     BrowserState.window_closed.pop(instance_id, None)
     _ATTACHED_BROWSERS.discard(instance_id)
+    keep_text += await _block_ads_on_reattach(block_ads, browser, instance_id)
     return True, (f"instance {instance_id!r} {summary}{keep_text}\n"
                   f"{json.dumps(observed, indent=2, default=str)}")
 
@@ -8383,6 +8461,7 @@ async def spawn_browser(
     keep_alive: Optional[bool] = None,
     browser: Literal["chrome", "brave"] = "chrome",
     vertical_tabs: Optional[str] = None,
+    block_ads: bool = False,
 ) -> str:
     """Create a new named browser instance running in parallel with main.
     Each instance has its own profile, cookies, tabs, logs. Use for multi-account
@@ -8407,6 +8486,8 @@ async def spawn_browser(
         browser: "chrome" (default) or "brave", as in browser_launch. A Brave instance's
             profile defaults to ~/.mcp-stealth/brave-profiles/<id>/
         vertical_tabs: "left", "right" (Brave only) or "off", as in browser_launch
+        block_ads: block ad and tracker requests in this instance, as
+            browser_launch(block_ads=True) does
         other args: same as browser_launch
 
     Use switch_instance(id) to route subsequent tool calls to this instance.
@@ -8473,6 +8554,7 @@ async def spawn_browser(
                 ignored=_reattach_ignored(locals()),
                 browser=browser,
                 vertical_tabs=vertical_tabs,
+                block_ads=block_ads,
             )
     finally:
         _SPAWNING.pop(instance_id, None)
@@ -11281,6 +11363,10 @@ def _stop_all_browsers() -> None:
     Stopping only the current one left stored instances running after the server
     exited, with nothing remaining that knew about them.
     """
+    # block_ads first: its connections go, and every target they may hold is started, once.
+    with contextlib.suppress(Exception):
+        if _adblock_if_loaded() is not None:
+            _adblock_if_loaded().shutdown()
     for key in BrowserState.session_keys():
         token = BrowserState.in_session(key)
         try:

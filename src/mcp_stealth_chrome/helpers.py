@@ -131,6 +131,22 @@ def mask_body(body: Any) -> Any:
     return body
 
 
+# block_ads needs the adblock package, an optional extra: say how to get it wherever it is missing.
+ADBLOCK_MISSING = ("the adblock package is not installed (block_ads needs the adblock extra): "
+                   "uv tool install 'mcp-stealth-chrome[adblock]' or "
+                   "pip install 'mcp-stealth-chrome[adblock]', then restart the server")
+
+
+def adblock_package_note() -> str:
+    """Whether block_ads's engine package is there, found without importing it."""
+    import importlib.util
+    try:
+        found = importlib.util.find_spec("adblock") is not None
+    except (ImportError, ValueError):
+        found = False
+    return "installed" if found else ADBLOCK_MISSING
+
+
 def mask_url(url: Any) -> Any:
     """Hide what in a URL is a credential: userinfo, and secret query or fragment pairs.
 

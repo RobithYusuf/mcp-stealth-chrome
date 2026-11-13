@@ -124,3 +124,20 @@ def _cookie_backups_in_a_temp_folder(monkeypatch, tmp_path_factory):
 def _no_dock_icon_in_process(request, monkeypatch):
     if request.module.__name__ != "test_dock_icon" and not _BETA_RUN:
         monkeypatch.setattr(dock_icon, "prepare", lambda *_a, **_kw: dock_icon.DockChrome())
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _adblock_lists_in_a_temp_folder():
+    """block_ads keeps its filter lists and engine here for every server the suite starts and
+    every in-process launch, so no test writes into the person's ~/.mcp-stealth/adblock."""
+    previous = os.environ.get("MCP_STEALTH_ADBLOCK_DIR")
+    folder = tempfile.mkdtemp(prefix="mcp-stealth-adblock-")
+    os.environ["MCP_STEALTH_ADBLOCK_DIR"] = folder
+    try:
+        yield folder
+    finally:
+        if previous is None:
+            os.environ.pop("MCP_STEALTH_ADBLOCK_DIR", None)
+        else:
+            os.environ["MCP_STEALTH_ADBLOCK_DIR"] = previous
+        shutil.rmtree(folder, ignore_errors=True)

@@ -3,6 +3,21 @@ revision = 3
 requires-python = ">=3.11"
 
 [[package]]
+name = "adblock"
+version = "0.6.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/f2/62/f77f4ef114a74e15104675a1e0f77302aad72bcc0bfcdda867e4c24f7ffe/adblock-0.6.0.tar.gz", hash = "sha256:11651e956c69b3ee571404754df665854717255b80f437e9dc323ee82b564e72", size = 21617, upload-time = "2022-07-17T23:08:35.152Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/23/db/9dd1e59fb4229904a60db01f7aa84e34577d938f996dc394eb35c83ebe34/adblock-0.6.0-cp37-abi3-macosx_10_7_x86_64.whl", hash = "sha256:4d0493e410298ef3d7bc60b303ba87a03dd09623b950b50a39351c7810678906", size = 1699701, upload-time = "2022-07-17T23:08:22.593Z" },
+    { url = "https://files.pythonhosted.org/packages/82/51/fef5e4c2c184e35d6dd47eecf2068fb9509f1447965813ff489bac7ab3f6/adblock-0.6.0-cp37-abi3-macosx_10_9_x86_64.macosx_11_0_arm64.macosx_10_9_universal2.whl", hash = "sha256:a3d42afa8f4bb46376bbd2e12b670b1fdf4e13b1842b1e262b40fa2c786e18fa", size = 3303478, upload-time = "2022-07-17T23:08:24.571Z" },
+    { url = "https://files.pythonhosted.org/packages/06/26/39fad77ba6fe8bd5b1c5ebe411ea84a768075f40caa5400e889678de39b3/adblock-0.6.0-cp37-abi3-manylinux_2_12_x86_64.manylinux2010_x86_64.whl", hash = "sha256:d008b53101d3e10148b66039b5df9e1ff821b8e3803480148542d614b7783abf", size = 10302925, upload-time = "2022-07-17T23:08:26.334Z" },
+    { url = "https://files.pythonhosted.org/packages/cb/3f/2eed1a5a7ef27d745b97f0f2d3c7544f4e37fdef8bc198f1b91cf3268ba9/adblock-0.6.0-cp37-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:93b40157aeab45364df39b55d947c542a803942650c43a3830799b1e89bd3215", size = 9705499, upload-time = "2022-07-17T23:08:28.138Z" },
+    { url = "https://files.pythonhosted.org/packages/bd/af/b43dd38bf8c2fae093b621069394cc098e01e853bd8142b434e5955c3442/adblock-0.6.0-cp37-abi3-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:f54ee39fa20bb529dc10cbd7eef4b0046eb684c2b7bc7dd6398814892e581c82", size = 9288951, upload-time = "2022-07-17T23:08:30.288Z" },
+    { url = "https://files.pythonhosted.org/packages/99/6e/8d172b16147a58f5c0c4b60efb9e8b3333628a10df3fc4c0c1fbc7ea0934/adblock-0.6.0-cp37-abi3-win32.whl", hash = "sha256:4f750dede164f19a0915b45c1238bc7f56ce388f1b1b1bd2ad01779720000565", size = 1272957, upload-time = "2022-07-17T23:08:33.075Z" },
+    { url = "https://files.pythonhosted.org/packages/5d/b5/f769cd99493602ef7514cd0acc3e221702aaa90577410633533acd7d757c/adblock-0.6.0-cp37-abi3-win_amd64.whl", hash = "sha256:58074d280edeb2fe53228befff42152e8f71fd7a6b7d6ff048788bba93b88729", size = 1326809, upload-time = "2022-07-17T23:08:34.201Z" },
+]
+
+[[package]]
 name = "annotated-types"
 version = "0.7.0"
 source = { registry = "https://pypi.org/simple" }
@@ -367,7 +382,7 @@ wheels = [
 
 [[package]]
 name = "mcp-stealth-chrome"
-version = "0.18.0"
+version = "0.19.0"
 source = { editable = "." }
 dependencies = [
     { name = "curl-cffi" },
@@ -379,6 +394,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+adblock = [
+    { name = "adblock" },
+]
 os-cursor = [
     { name = "mss", marker = "sys_platform != 'darwin'" },
     { name = "pyobjc-framework-cocoa", marker = "sys_platform == 'darwin'" },
@@ -394,6 +412,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "adblock", marker = "extra == 'adblock'", specifier = ">=0.6,<0.7" },
     { name = "curl-cffi", specifier = ">=0.7" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "mcp", specifier = ">=1.2.0,<2" },
@@ -405,7 +424,7 @@ requires-dist = [
     { name = "pyobjc-framework-quartz", marker = "sys_platform == 'darwin' and extra == 'os-cursor'", specifier = ">=10" },
     { name = "python-xlib", marker = "sys_platform == 'linux' and extra == 'os-cursor'", specifier = ">=0.33" },
 ]
-provides-extras = ["os-cursor"]
+provides-extras = ["adblock", "os-cursor"]
 
 [package.metadata.requires-dev]
 dev = [

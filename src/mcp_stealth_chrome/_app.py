@@ -33,6 +33,9 @@ _RUNS_DESPITE_DIALOG = frozenset({
 # Called with the tool's name after every tool call, inside the caller's session. server.py adds
 # the saved-tabs writer here. Each must be cheap and must not await; one that raises is ignored.
 AFTER_TOOL_HOOKS: list = []
+# Called with (session key, result) on every text result, returning the text to give. block_ads
+# adds one that says, once, that it stopped and why. Each must be cheap; one that raises is skipped.
+RESULT_FILTERS: list = []
 # Tool calls running, per session. Every call is use of the session's current instance, so the
 # idle reaper never closes that instance while one runs: tab_new, tab_select and switch_instance
 # never touched last_active, and an instance spawned with idle_timeout_seconds=2 was closed between
@@ -169,6 +172,12 @@ class StealthMCP(FastMCP):
         try:
             result = await _run_unless_a_dialog_blocks(
                 name, lambda: tool.run(arguments, context=context, convert_result=False))
+            if isinstance(result, str):
+                for result_filter in RESULT_FILTERS:
+                    try:
+                        result = result_filter(BrowserState.session_key(), result)
+                    except Exception:
+                        pass
             if isinstance(result, StructuredResult):
                 return result.to_call_tool_result()
             from .image_output import ImageResult

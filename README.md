@@ -231,6 +231,8 @@ See [docs/INSTALL.md](docs/INSTALL.md) for verification and troubleshooting.
 
 `solve_turnstile_oscursor` needs the optional `os-cursor` extra. On macOS, use `uvx 'mcp-stealth-chrome[os-cursor]'` in your client config (`"args": ["mcp-stealth-chrome[os-cursor]@latest"]`), or install it with `uv tool install 'mcp-stealth-chrome[os-cursor]'`. Then give the app or terminal that runs your client **Accessibility** and **Screen Recording** permission in System Settings > Privacy & Security. `server_status` shows under `os_cursor` whether this is ready. Windows and Linux backends exist but have not been field-tested.
 
+`block_ads` needs the optional `adblock` extra, which installs Brave's adblock-rust engine: `uvx 'mcp-stealth-chrome[adblock]'` in your client config (`"args": ["mcp-stealth-chrome[adblock]@latest"]`), `uv tool install 'mcp-stealth-chrome[adblock]'`, or `pip install 'mcp-stealth-chrome[adblock]'`. It is not installed by default because the engine has no prebuilt package for Alpine and other musl Linux or for Windows on ARM, where installing it would need Rust. Without it, `block_ads=True` still launches, and the result and `server_status` say ad blocking is off and how to install the extra. Extras combine: `mcp-stealth-chrome[adblock,os-cursor]`.
+
 ## Usage examples
 
 An agent usually reads the page, then acts on the refs it got back:
@@ -413,7 +415,7 @@ To use logins from your own browser, `list_chrome_profiles` shows every Chromium
 
 A browser started with `browser_launch` over stdio stays open until you close it, or until the server exits when its client goes away. `keep_alive=True` keeps it past that (see below). Instances from `spawn_browser` and browsers in HTTP mode close after `BROWSER_IDLE_TIMEOUT`.
 
-Runtime data lives in `~/.mcp-stealth/`: `profile/`, `profiles/<id>/`, `brave-profile/`, `brave-profiles/<id>/`, `screenshots/`, `exports/`, `storage-states/`, `window-state/`, `keep-alive/`. An `app/` folder left by 0.13.0 is removed.
+Runtime data lives in `~/.mcp-stealth/`: `profile/`, `profiles/<id>/`, `brave-profile/`, `brave-profiles/<id>/`, `screenshots/`, `exports/`, `storage-states/`, `window-state/`, `keep-alive/`, `adblock/`. An `app/` folder left by 0.13.0 is removed.
 
 ### Brave
 
@@ -480,6 +482,19 @@ browser_launch()   # a new agent, same profile
 - A signal from the watcher or the server only goes to a process proved to be the one meant, checked right before it: exact profile, and the start time recorded for it. A process whose command line or start time cannot be read is not signalled, and the close says it is not verified. On Linux the signal goes through a pidfd, so it cannot reach a process that took the PID after the check. On macOS the start time has one-second resolution and the check and the signal are separate calls, and Windows goes by the exact command line: small residual risks, not guarantees.
 - If the watcher cannot identify the browser after its last window was closed, it stops after three tries and leaves the reason behind; the next tool call says the browser may still be running and was not ended.
 - `MCP_STEALTH_KEEP_ALIVE_MAX_HOURS` must be a positive finite number. `inf`, `nan`, 0 or a negative value fall back to 24 and a value over a year is cut to a year; the launch result names either.
+### Blocking ads
+
+`browser_launch(block_ads=True)` and `spawn_browser(block_ads=True)` block ad and tracker requests with EasyList and EasyPrivacy, using [adblock-rust](https://github.com/brave/adblock-rust), the engine inside Brave. Off by default, and it needs the `adblock` extra (see Install).
+
+- ✅ Every tab, popup, frame (including frames from other sites, which run as their own process) and worker of that browser is covered from its first request: a new one waits up to 2 seconds while blocking is set up for it. The page you navigate to is never blocked, even on an ad domain.
+- ✅ Requests only. Nothing is hidden or written in the page, so a blocked ad can leave an empty box. Blocked requests fail with `net::ERR_BLOCKED_BY_CLIENT`, as with any ad blocker, and a page can notice that.
+- The lists are downloaded the first time from easylist.to into `~/.mcp-stealth/adblock`, readable by you only, checked again at most once a day in the background, and used offline from the last copy. They are not included in the package: they are published under GPLv3 and CC BY-SA. A download is limited to 16 MB and 20 seconds. Without a list the launch says `block_ads: OFF` and why, and runs without blocking. With one of the two lists missing it says `block_ads: PARTIAL` and which one.
+- ✅ Blocking does not freeze the browser when it fails. If the part of the server that answers Chrome stops answering for 3 seconds, or its connection to Chrome ends while the browser is open, ad blocking turns itself off for that browser, the requests and new tabs it was holding go through, and the next tool result says so and why. Measured on real Chrome by stopping, hanging and disconnecting it in the middle of a page load, and by killing the whole server with SIGKILL: the page, a popup opened meanwhile and the page that opened it all finished loading.
+- The launch result says whether it is on and how many rules it uses. `server_status` shows, per browser, the requests seen, blocked and allowed, by type and host, and the last blocked URLs with secret parameters masked.
+- `intercept_start` works alongside it on the same connection to Chrome, so each request gets one answer: an ad request is logged with the outcome `blocked by block_ads`, and `intercept_stop` leaves ad blocking on.
+- Brave blocks ads itself with Shields, so `block_ads` does nothing there and says so.
+- With `keep_alive=True`, ad blocking ends when the server exits and the browser stays open: the browser goes on unblocked. A later launch that reattaches to it with `block_ads=True` blocks again; one without it does not. A kept Brave is left to Shields on a reattach too.
+- Measured on three Indonesian news home pages, 5 runs each, headless, with and without `block_ads`: frames went from 33 to 16 (detik.com), 30 to 5 (kompas.com) and 12 to 1 (cnnindonesia.com), and requests from 225 to 118, at least 250 to 145, and at least 250 to 118. The page's load event came within 60 s in 15 of 15 runs with blocking and 9 of 15 without, where ad auctions kept loading frames. The article text stayed the same apart from sponsored items. On a local page of 200 requests the load event took 178 ms instead of 138 ms (median of 24 loads), about 0.2 ms per request. A page can also wait longer for a widget it starts from a blocked tag manager: on cnnindonesia.com, its article recommendations started about 2 s later.
 
 ### Chrome 158 and saved logins (macOS)
 
@@ -824,6 +839,10 @@ Things to know:
 | `MCP_STEALTH_RESTORE_TABS_MAX` | Tabs kept in a saved list. Default 30 |
 | `MCP_STEALTH_KEEP_ALIVE_MAX_HOURS` | Hours a browser kept with `keep_alive=True` may run with no server before its watcher ends it. Default 24, at most a year; anything not a positive finite number means 24 |
 | `MCP_STEALTH_KEEP_ALIVE_DIR` | Folder for the records of kept browsers. Default `~/.mcp-stealth/keep-alive` |
+| `MCP_STEALTH_ADBLOCK_DIR` | Folder for the filter lists and engine of `block_ads`. Default `~/.mcp-stealth/adblock` |
+| `MCP_STEALTH_ADBLOCK_DOWNLOAD_TIMEOUT` | Seconds a list download may take in all. Default 20 |
+| `MCP_STEALTH_ADBLOCK_MAX_BYTES` | Largest list accepted, in bytes. Default 16 MB |
+| `MCP_STEALTH_ADBLOCK_STALL` | Seconds ad blocking may go unanswered before it turns itself off for that browser. Default 3 |
 | `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL` | Vision model through any OpenAI-compatible API |
 | `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL` | Vision model through Anthropic |
 | `CAPSOLVER_KEY` | Enables `solve_captcha` |
@@ -850,7 +869,7 @@ CI runs the fast tests on macOS, Ubuntu and Windows with Python 3.11 and 3.13, i
 
 [mcp-camoufox](https://github.com/RobithYusuf/mcp-camoufox) offers the same tool names and snapshot format on Firefox, for sites where Chromium is harder to get through.
 
-Built with [nodriver](https://github.com/ultrafunkamsterdam/nodriver), [curl_cffi](https://github.com/lexiforest/curl_cffi), [FastMCP](https://github.com/modelcontextprotocol/python-sdk) and [OpenCV](https://opencv.org). [stealth-browser-mcp](https://github.com/vibheksoni/stealth-browser-mcp) covers UI cloning and network hooks.
+Built with [nodriver](https://github.com/ultrafunkamsterdam/nodriver), [curl_cffi](https://github.com/lexiforest/curl_cffi), [FastMCP](https://github.com/modelcontextprotocol/python-sdk), [OpenCV](https://opencv.org) and [adblock-rust](https://github.com/brave/adblock-rust) (MPL-2.0, through the [python-adblock](https://github.com/ArniDagur/python-adblock) bindings). The EasyList and EasyPrivacy lists are by the EasyList authors (https://easylist.to) and are downloaded at run time. [stealth-browser-mcp](https://github.com/vibheksoni/stealth-browser-mcp) covers UI cloning and network hooks.
 
 ## License
 

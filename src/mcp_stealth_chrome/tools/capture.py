@@ -11,6 +11,9 @@ import base64
 import fnmatch
 import json
 import os
+import re
+import sys
+import threading
 import time
 from typing import Any, Literal, Optional
 
@@ -49,6 +52,74 @@ _INTERCEPT: dict[str, Any] = {
 }
 
 _MUTATING_METHODS = ("POST", "PUT", "PATCH", "DELETE")
+# With block_ads on, intercept_start does not enable a Fetch domain of its own: the blocker owns
+# the browser's only one, asks this module's rule (_broker_rule, on the adblock thread) and gives
+# each request one answer. The log and counts are then written from that thread, so every read
+# and write of them goes through this lock.
+_INTERCEPT_LOCK = threading.Lock()
+_ADS_NOTE = (" block_ads is on in this browser, so its Fetch session answers for both: a request "
+             "it blocks is logged here as 'blocked by block_ads', and stopping interception "
+             "leaves ad blocking on.")
+
+
+def _cdp_glob(pattern: str) -> "re.Pattern[str]":
+    """Fetch.RequestPattern.urlPattern as a regex: * any run, ? one character, \\ escapes."""
+    out, i = [], 0
+    while i < len(pattern):
+        ch = pattern[i]
+        if ch == "\\" and i + 1 < len(pattern):
+            out.append(re.escape(pattern[i + 1]))
+            i += 2
+            continue
+        out.append(".*" if ch == "*" else "." if ch == "?" else re.escape(ch))
+        i += 1
+    return re.compile("^" + "".join(out) + "$", re.DOTALL)
+
+
+def _broker_rule(state: dict, token: object):
+    """intercept_start's decision for the blocker to call, on the adblock thread, for each
+    request of the intercepted tab. Returns the answer to give instead of letting it through,
+    or None; a request block_ads fails is logged as blocked by block_ads and left to it."""
+    pattern = _cdp_glob(state.get("url_pattern") or "*")
+
+    def rule(request: dict, ads_kind: Optional[str]):
+        with _INTERCEPT_LOCK:
+            if not state.get("active") or state.get("broker_token") is not token:
+                return None
+            url, method = request.get("url") or "", (request.get("method") or "").upper()
+            if not pattern.match(url):
+                return None
+            state["counts"]["seen"] += 1
+            targeted = state["methods"] is None or method in state["methods"]
+            chosen = state["action"] if targeted else "observe"
+            answer = None
+            if ads_kind is not None:
+                state["counts"]["blocked_by_block_ads"] = state["counts"].get("blocked_by_block_ads", 0) + 1
+                outcome = "blocked by block_ads"
+            elif chosen == "cancel":
+                state["counts"]["blocked"] += 1
+                outcome, answer = "blocked", ("Fetch.failRequest", {"errorReason": "Aborted"})
+            elif chosen == "mock":
+                mock = state["mock"] or {}
+                state["counts"]["mocked"] += 1
+                outcome = "mocked"
+                answer = ("Fetch.fulfillRequest", {
+                    "responseCode": int(mock.get("status", 200)),
+                    "responseHeaders": [{"name": "Content-Type",
+                                         "value": mock.get("content_type", "application/json")}],
+                    "body": base64.b64encode((mock.get("body") or "").encode("utf-8")).decode()})
+            else:
+                state["counts"]["passed"] += 1
+                outcome = "passed"
+            log = state["log"]
+            log.append({"method": method, "url": url, "outcome": outcome, "targeted": targeted,
+                        "headers": dict(request.get("headers") or {}),
+                        "body": request.get("post_data")})
+            if len(log) > state["max_events"]:
+                del log[:-state["max_events"]]
+            return answer
+
+    return rule
 
 
 def _intercept_drop_handler() -> None:
@@ -84,7 +155,12 @@ async def _intercept_disable(reason: str = "stopped") -> Optional[str]:
         watchdog.cancel()
     state["watchdog"] = None
     tab = state.get("tab")
-    if tab is not None:
+    broker = state.get("broker")
+    if broker is not None:
+        # Interception rode on block_ads's Fetch session: taking the rule off is all there is.
+        state["broker"] = None
+        await broker.set_interceptor(None, None)
+    elif tab is not None:
         from nodriver.cdp import fetch as cdp_fetch
         try:
             await tab.send(cdp_fetch.disable())
@@ -97,10 +173,11 @@ async def _intercept_disable(reason: str = "stopped") -> Optional[str]:
                                     "pause, and the handler now lets every one through")
             return problem
         _intercept_drop_handler()
-    state["active"] = False
-    state["tab"] = None
-    state["disable_error"] = None
-    state["stop_reason"] = reason
+    with _INTERCEPT_LOCK:
+        state["active"] = False
+        state["tab"] = None
+        state["disable_error"] = None
+        state["stop_reason"] = reason
     return None
 
 
@@ -179,7 +256,12 @@ async def intercept_start(
                 wanted = None
 
         state = _INTERCEPT
-        state.update({
+        # Only a browser launched with block_ads has a blocker, and then the module is loaded;
+        # without one, interception never imports it.
+        adblock_module = sys.modules.get(f"{__package__.rsplit('.', 1)[0]}.adblock")
+        ads = adblock_module.blocker_for(BrowserState.browser) if adblock_module else None
+        token = object()
+        fresh = {
             "active": True,
             "session": BrowserState.session_key(),
             "action": action,
@@ -196,7 +278,11 @@ async def intercept_start(
             },
             "stop_reason": None,
             "disable_error": None,
-        })
+            "broker": None,
+            "broker_token": token,
+        }
+        with _INTERCEPT_LOCK:
+            state.update(fresh)
 
         async def on_paused(event):
             request_id = getattr(event, "request_id", None)
@@ -259,12 +345,20 @@ async def intercept_start(
                         pass
 
         _intercept_drop_handler()
-        tab.add_handler(cdp_fetch.RequestPaused, on_paused)
-        state["handler"] = on_paused
-        state["handler_tab"] = tab
-        await tab.send(cdp_fetch.enable(patterns=[
-            cdp_fetch.RequestPattern(url_pattern=url_pattern or "*")
-        ]))
+        if ads is not None:
+            # One Fetch owner per request: block_ads already pauses every request of this
+            # browser, so this rule rides on its session instead of enabling a second one.
+            if not await ads.set_interceptor(target_key(tab), _broker_rule(state, token)):
+                raise RuntimeError("block_ads is on in this browser and did not take the rule; "
+                                   "server_status says why")
+            state["broker"] = ads
+        else:
+            tab.add_handler(cdp_fetch.RequestPaused, on_paused)
+            state["handler"] = on_paused
+            state["handler_tab"] = tab
+            await tab.send(cdp_fetch.enable(patterns=[
+                cdp_fetch.RequestPattern(url_pattern=url_pattern or "*")
+            ]))
 
         if auto_disable_after and auto_disable_after > 0:
             state["expires_at"] = time.time() + float(auto_disable_after)
@@ -302,7 +396,7 @@ async def intercept_start(
                 "Every matching request is paused until this handler answers it. "
                 "Call intercept_stop() when done; it also disables itself after "
                 "the deadline so a forgotten intercept cannot wedge the page."
-            ),
+            ) + (_ADS_NOTE if ads is not None else ""),
         }, indent=2))
     except Exception as e:
         try:
@@ -332,27 +426,34 @@ async def intercept_log(limit: int = 50, clear: bool = False, reveal_values: boo
     if holder not in (None, BrowserState.session_key()):
         # The log holds another session's request headers and bodies.
         return err(f"request interception belongs to another MCP session ({holder}).")
-    entries = state["log"][-max(1, int(limit)):]
-    payload = {
-        "active": state["active"],
-        "action": state["action"],
-        "url_pattern": state["url_pattern"],
-        "methods": list(state["methods"]) if state["methods"] else "all",
-        "counts": dict(state["counts"]),
-        "expires_in_s": (round(state["expires_at"] - time.time(), 1)
-                         if state["active"] and state["expires_at"] else None),
-        "stop_reason": state.get("stop_reason"),
-        "disable_error": state.get("disable_error"),
-        "returned": len(entries),
-        "requests": entries if reveal_values else [mask_request_entry(e) for e in entries],
-    }
+    broker = state.get("broker")
+    if state["active"] and broker is not None and broker.ended():
+        # It rode on block_ads's Fetch session, and that session is gone: nothing is intercepted.
+        await _intercept_disable(f"the block_ads session it rode on ended ({broker.end_reason})")
+    with _INTERCEPT_LOCK:
+        entries = list(state["log"][-max(1, int(limit)):])
+        payload = {
+            "active": state["active"],
+            "action": state["action"],
+            "url_pattern": state["url_pattern"],
+            "methods": list(state["methods"]) if state["methods"] else "all",
+            "counts": dict(state["counts"]),
+            "expires_in_s": (round(state["expires_at"] - time.time(), 1)
+                             if state["active"] and state["expires_at"] else None),
+            "stop_reason": state.get("stop_reason"),
+            "disable_error": state.get("disable_error"),
+            "returned": len(entries),
+        }
+        if clear:
+            state["log"] = []
+    payload["requests"] = entries if reveal_values else [mask_request_entry(e) for e in entries]
+    if state.get("broker") is not None:
+        payload["block_ads"] = _ADS_NOTE.strip()
     if not state["active"]:
         payload["note"] = (
             "NOT intercepting — an empty list here means nothing was watched, "
             "not that the page sent nothing. Call intercept_start() or dry_run()."
         )
-    if clear:
-        state["log"] = []
     return ok(json.dumps(payload, indent=2, default=str))
 
 

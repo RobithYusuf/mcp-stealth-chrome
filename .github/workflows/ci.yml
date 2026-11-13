@@ -45,7 +45,7 @@ jobs:
     # dependency that breaks at import; this resolves the newest versions the caps allow.
     name: install (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -58,6 +58,21 @@ jobs:
         with:
           python-version: "3.13"
           enable-cache: true
+      # The plain install launches a browser (see installed_smoke.py): on Linux the same Chrome
+      # as the e2e job, for the same reasons; Windows and macOS use the runner's own.
+      - uses: browser-actions/setup-chrome@48ad923757ca74d66703209fe939badbdf80f2f4 # v2.2.0
+        if: runner.os == 'Linux'
+        id: chrome
+        with:
+          chrome-version: stable
+          install-dependencies: true
+      - name: Make the stable Chrome the one the server launches
+        if: runner.os == 'Linux'
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+        run: |
+          sudo ln -sf "$CHROME_PATH" /usr/bin/chrome
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - run: uv build
       - name: Install the wheel into a fresh venv without uv.lock
         shell: bash
@@ -74,6 +89,16 @@ jobs:
         run: |
           wheel=$(ls "$GITHUB_WORKSPACE"/dist/*.whl)
           "$VENV_PY" -I "$GITHUB_WORKSPACE/.github/scripts/installed_smoke.py" "$wheel"
+      - name: Install the wheel with the adblock extra and check the engine
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        run: |
+          wheel=$(ls "$GITHUB_WORKSPACE"/dist/*.whl)
+          venv="$RUNNER_TEMP/wheel-venv-adblock"
+          uv venv --python 3.13 "$venv"
+          VIRTUAL_ENV="$venv" uv pip install --no-cache "${wheel}[adblock]"
+          if [ "$RUNNER_OS" = "Windows" ]; then py="$venv/Scripts/python.exe"; else py="$venv/bin/python"; fi
+          "$py" -I "$GITHUB_WORKSPACE/.github/scripts/installed_smoke.py" "$wheel" --with-adblock
 
   e2e:
     # Real Chrome, headless, local fixtures only. Suites that open visible windows
@@ -136,7 +161,8 @@ jobs:
       - name: Install Brave (Windows)
         if: runner.os == 'Windows'
         run: choco install brave --no-progress -y
-      - run: uv sync --locked
+      # block_ads is an optional extra; its suites need the engine.
+      - run: uv sync --locked --extra adblock
       - name: Show the Chrome the server will launch
         shell: bash
         run: |
@@ -166,3 +192,5 @@ jobs:
           tests/test_restore_tabs_e2e.py
           tests/test_keep_alive_e2e.py
           tests/test_sessions_http.py
+          tests/test_block_ads.py
+          tests/test_block_ads_e2e.py
