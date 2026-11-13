@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Any, Literal, Optional
 
 from ._app import mcp
-from .helpers import confined_output_path, err, ok, select_tab, ts_filename
+from .helpers import confined_output_path, err, ok, select_tab, ts_filename, write_private
 from .state import SCREENSHOT_DIR, ensure_dirs
 
 # Native assets fetched by inspect_image live beside the screenshots, under the
@@ -814,7 +814,7 @@ async def screenshot_element(
                                   scale=scale, timeout=TOOL_ACTION_TIMEOUT)
         dpr = float(box.get("dpr") or 1)
         width, height, complaint = verify_capture(data, clip, dpr, float(scale), box)
-        path.write_bytes(data)
+        write_private(path, data)
         if complaint:
             return err(f"{complaint}. The partial capture is saved at {path} so you "
                        f"can look at it, but do NOT treat it as "
@@ -907,7 +907,7 @@ async def inspect_image(
 
         stem = _asset_filename(source, mime)
         path = confined_output_path(ASSET_DIR, filename or stem)
-        path.write_bytes(data)
+        write_private(path, data)
 
         facts: dict[str, Any] = {
             "source": source,

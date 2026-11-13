@@ -63,8 +63,19 @@ uvx mcp-stealth-chrome → Python 3.11+ → FastMCP → nodriver → Chrome/Chro
   `export_curl` and `http_request` responses (headers, JSON body, final URL, pending and status payloads) go
   through `helpers.mask_*`, with `reveal_values=True` as the way out where a caller needs the value. Everything
   under a secret key is hidden, except that a `session` object keeps its non-secret fields, and `mask_url` works
-  on the raw pairs so an ordinary parameter stays byte for byte. `export_curl` stays useful because its `http_request` form takes cookies
+  on the raw text so an ordinary parameter stays byte for byte. It also hides userinfo (`***@host`, since a token
+  can be the user name; also with no scheme, `user:pass@host/path`, but not `mailto:`) and secret pairs in the
+  fragment, where OAuth puts `access_token`, also after a hash route. `mask_headers` passes `Location`,
+  `Content-Location` and `Referer` through it. `http_session_cookies`, `session_warmup` and `http_request` (its
+  errors, the redirect chain and the hop that failed) print URLs through it. `export_curl` stays useful because its `http_request` form takes cookies
   from the browser. Bodies other than JSON or forms cannot be read field by field and pass through.
+- Where URLs are masked, settled by the developer: masking applies to the HTTP client's output (`http_request`
+  and its status, retry and errors, `http_session_cookies`, `session_warmup`, the `Location`, `Content-Location` and
+  `Referer` of a response) and to captured traffic (`network_get`, `intercept_log`, `wait_for_request`,
+  `auth_capture`, `export_curl`, HAR). Navigation tools return the page's URL as it is: `get_url`, `navigate` and
+  every navigation result, `tab_list`, URL waits and asserts, click and key outcomes, `expect_url`, workflow
+  variables and the research envelopes. Agents work with that URL (a `${u}` saved from `get_url` is opened again),
+  and masking it broke that. Mask only at the output boundary: a record keeps the real value (`_Tracked.hops`).
 - `nodriver` stays capped at the newest version the E2E suites have passed on (`<0.51`): `uv.lock` hides
   breakage just as it does for `mcp`, and a fresh install gets the newest allowed. 0.50 rebuilt `Connection`
   and `Tab` around sessions, so code touching them must work on both designs (`_connect_to_target`).
@@ -94,7 +105,13 @@ uvx mcp-stealth-chrome → Python 3.11+ → FastMCP → nodriver → Chrome/Chro
 - Do not add a tool that can fail silently. If an action may not have taken effect, the response says
   so — see the honest-reporting invariants below.
 - Do not weaken a security property to make a test pass: managed paths never escape their root,
-  identity files are written `0600`, and a profile clone only ever opens the source read-only.
+  identity files are written `0600`, and a profile clone only ever opens the source read-only. So is every file
+  taken from a page (screenshots, `save_pdf`, `screenshot_element`, `inspect_image`, traces, heap snapshots), through
+  `helpers.write_private`: a fresh sibling opened `O_EXCL|O_NOFOLLOW` at 0600, then `os.replace`. A reader sees the
+  old file or the whole new one, and a symlink at the target is replaced, not written through (opening the path
+  itself followed a planted link out of the folder). A writer that opens the file itself, nodriver's
+  `save_screenshot`, gets a path from `private_staging(path)`, which publishes it only when it holds something;
+  `cv2.imwrite` is replaced by `cv2.imencode` plus `write_private`. Not fsynced: these are artifacts.
 - Anything that deletes a profile (`clone_chrome_profile(overwrite=True)`, `profile_cleanup(confirm=True)`,
   privacy cleanup, `browser_recover`) needs an explicit request. The shared profile holds the developer's real logins.
   The one exception is `profile_gc`, the pass at server start, and it is narrow on purpose. It removes only
@@ -194,7 +211,10 @@ conclusions. Each rule below replaced a real lie.
 - A click that opens a tab changes nothing on its own page, so `_page_sig(pages=True)` lists the browser's tabs and
   `_click_outcome` names a new one. Without it a working popup button read as dead, and an agent clicks it again.
 - `fill_form` fails when a field fails and does not click submit. `batch_actions` counts failures by the `Error:`
-  prefix, so a tool that reports a failure through `ok()` is counted as a success.
+  prefix, so a tool that reports a failure through `ok()` is counted as a success. Input that is not a list, or an
+  empty list, is an error rather than `0 actions OK`, and an item that is not an object is a counted failure.
+- `_click_outcome` is only reached with `verify=True`, so an empty fingerprint before or after (`_page_sig` answers
+  `{}` when the page cannot be read) says `the outcome could NOT be verified`, never a bare `clicked`.
 - An empty result must be distinguishable from "not measured". `console_get` returns
   `{attached, capturing, since, total, messages}`; `intercept_log` reports `active` and `stop_reason`;
   `storage_snapshot` marks each area `measured` and collects failures in `errors`, because a snapshot
@@ -432,8 +452,8 @@ conclusions. Each rule below replaced a real lie.
   below. Active is the server's selected tab, not whichever tab a window happens to show.
 - Restore (`_reopen_saved_tabs`) re-filters every URL (http, https, file only) because the file can be edited, opens
   each extra page as `tab_new` does (its own background window headed, a tab headless) with the instance fingerprint,
-  loads them concurrently, and reports each one through `tab_record.shown_url` (`mask_url` plus the fragment, where
-  OAuth puts `access_token`). It never fails the launch. A record older than `MCP_STEALTH_RESTORE_TABS_MAX_DAYS` (30)
+  loads them concurrently, and reports each one through `tab_record.shown_url` (`mask_url`, which covers the fragment,
+  where OAuth puts `access_token`). It never fails the launch. A record older than `MCP_STEALTH_RESTORE_TABS_MAX_DAYS` (30)
   is named and not opened. The reuse path of `browser_launch` says restore was not applied.
 - `tests/test_restore_tabs_e2e.py` closes through each path on real Chrome (the EOF case with the background writer
   off, so only the exit path can write) and, with `MCP_HEADED=1` (needs `--extra os-cursor` for AppKit), quits a
@@ -480,6 +500,14 @@ conclusions. Each rule below replaced a real lie.
   explains.
 - Volatile headers (`Content-Length`, `Host`, `:authority`) are dropped rather than replayed stale;
   a mismatched Content-Length is itself a bot signal.
+- `http_request` follows redirects itself (`allow_redirects=False` per hop, 30 at most, then curl's error 47 as
+  before). curl carried every caller header to whatever host a redirect named: `X-Api-Key` reached a third party,
+  and only Cookie and Authorization were dropped, by curl's own rule. Caller headers now go only to the first
+  origin (scheme, host, effective port); `headers_not_forwarded` names what stayed behind and `redirects` lists
+  the hops. Browser cookies are passed on the first hop only and the session's jar carries them, host-only, which
+  is what curl did: sent to the same host on another port, never to another host. 303 (not HEAD) and 301/302 after
+  a POST continue as a GET without the body; only http and https Locations are followed. A failure on a later hop
+  reports the chain and `failed_at` (masked), and is never `not_executed`: the first server got the request.
 
 ### Request interception
 
@@ -492,6 +520,13 @@ conclusions. Each rule below replaced a real lie.
   the next await raises and `active` stays true forever. Disabling removes the `RequestPaused` handler, or a
   restart answers each pause twice, except after a failed `Fetch.disable`: requests may still be pausing and
   nothing else would answer them, so `intercept_start` removes it instead.
+- A failed `Fetch.disable` is not a stop. `_intercept_disable` returns the failure and keeps `active`, `tab` and the
+  handler, which switches to letting every request through. `intercept_stop` is then an error and retries on the
+  next call, `intercept_log` shows `disable_error`, and the deadline retries (`_DISABLE_RETRY_DELAYS`). Before, it
+  answered `stopped`, and every later stop said "not active" with the handler and Fetch still live.
+- `intercept_start` on another tab after such a failure is refused and keeps the old state: dropping the old
+  handler left Fetch on there with nothing to answer its pauses. On the same tab the restart goes ahead, which is
+  safe because nothing awaits between removing the old handler and adding the new one.
 
 ## Chrome, CDP and nodriver facts
 

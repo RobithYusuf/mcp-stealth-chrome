@@ -16,7 +16,7 @@ from typing import Any, Literal, Optional
 
 from .. import __version__
 from .._app import mcp
-from ..helpers import confined_output_path, err, mask_request_entry, ok, ts_filename
+from ..helpers import confined_output_path, err, mask_request_entry, ok, target_key, ts_filename
 from ..server import _drop_handlers
 from ..state import EXPORT_DIR, BrowserState, ensure_dirs
 
@@ -62,8 +62,19 @@ def _intercept_drop_handler() -> None:
     _INTERCEPT["handler"] = None
 
 
-async def _intercept_disable(reason: str = "stopped") -> None:
-    """Turn interception off and release the page. Safe to call twice."""
+# Waits between retries when Fetch.disable failed on the deadline. Nothing else would try again.
+_DISABLE_RETRY_DELAYS = (1.0, 2.0, 5.0, 10.0, 30.0)
+
+
+async def _intercept_disable(reason: str = "stopped") -> Optional[str]:
+    """Turn interception off and release the page. Safe to call twice.
+
+    Returns None once it is off, or why Fetch.disable failed. Then Fetch may still be
+    pausing requests and only this handler answers them, so the tab and the handler stay
+    recorded, `active` stays true, and the handler lets every request through until a
+    retry (intercept_stop again, the deadline's retries, or a restart) gets it off.
+    Reporting it stopped there left a stop that could never be retried.
+    """
     state = _INTERCEPT
     watchdog = state.get("watchdog")
     # On the deadline path this runs INSIDE the watchdog. Cancelling the current task makes
@@ -73,21 +84,24 @@ async def _intercept_disable(reason: str = "stopped") -> None:
         watchdog.cancel()
     state["watchdog"] = None
     tab = state.get("tab")
-    try:
-        if tab is not None:
-            from nodriver.cdp import fetch as cdp_fetch
-            try:
-                await tab.send(cdp_fetch.disable())
-            except Exception:
-                # Fetch may still be pausing requests, and only this handler answers them.
-                # intercept_start removes it before installing the next one.
-                pass
-            else:
-                _intercept_drop_handler()
-    finally:
-        state["active"] = False
-        state["tab"] = None
-        state["stop_reason"] = reason
+    if tab is not None:
+        from nodriver.cdp import fetch as cdp_fetch
+        try:
+            await tab.send(cdp_fetch.disable())
+        except Exception as e:
+            problem = f"Fetch.disable failed ({type(e).__name__}: {e})"
+            state["action"] = "observe"
+            state["methods"] = None
+            state["disable_error"] = problem
+            state["stop_reason"] = (f"{reason} requested, but {problem}: requests may still "
+                                    "pause, and the handler now lets every one through")
+            return problem
+        _intercept_drop_handler()
+    state["active"] = False
+    state["tab"] = None
+    state["disable_error"] = None
+    state["stop_reason"] = reason
+    return None
 
 
 def _intercept_matches(url: str, pattern: str) -> bool:
@@ -142,7 +156,19 @@ async def intercept_start(
                     f"request interception is in use by another MCP session ({holder}). "
                     "This server runs one interception at a time; wait for it to end."
                 )
-            await _intercept_disable("restarted")
+            old_tab = _INTERCEPT.get("tab")
+            problem = await _intercept_disable("restarted")
+            # On another tab the old handler is the only thing answering that tab's paused
+            # requests: dropping it below left Fetch enabled there with nobody to answer, and
+            # the next stop disabled only the new tab and said "stopped". On the same tab the
+            # swap is safe: no await separates removing the old handler from adding the new
+            # one, so every later pause reaches exactly one of them.
+            if problem is not None and old_tab is not None and target_key(old_tab) != target_key(tab):
+                return err(
+                    f"interception NOT started: the previous one, on another tab, could not be "
+                    f"stopped ({problem}). Its handler stays and lets every request there through. "
+                    "Call intercept_stop() to retry, or select that tab and start again."
+                )
 
         from nodriver.cdp import fetch as cdp_fetch, network as cdp_network
 
@@ -169,6 +195,7 @@ async def intercept_start(
                 "content_type": mock_content_type,
             },
             "stop_reason": None,
+            "disable_error": None,
         })
 
         async def on_paused(event):
@@ -245,8 +272,17 @@ async def intercept_start(
             async def watchdog():
                 try:
                     await asyncio.sleep(float(auto_disable_after))
-                    if _INTERCEPT["active"]:
-                        await _intercept_disable("auto-disabled on deadline")
+                    for delay in (*_DISABLE_RETRY_DELAYS, None):
+                        if not _INTERCEPT["active"] or _INTERCEPT.get("tab") is not tab:
+                            return
+                        if await _intercept_disable("auto-disabled on deadline") is None:
+                            return
+                        if delay is None:
+                            return
+                        # _intercept_disable cleared the slot; keep this task findable so
+                        # intercept_stop or a restart cancels the retries.
+                        _INTERCEPT["watchdog"] = asyncio.current_task()
+                        await asyncio.sleep(delay)
                 except asyncio.CancelledError:
                     pass
                 except Exception:
@@ -306,6 +342,7 @@ async def intercept_log(limit: int = 50, clear: bool = False, reveal_values: boo
         "expires_in_s": (round(state["expires_at"] - time.time(), 1)
                          if state["active"] and state["expires_at"] else None),
         "stop_reason": state.get("stop_reason"),
+        "disable_error": state.get("disable_error"),
         "returned": len(entries),
         "requests": entries if reveal_values else [mask_request_entry(e) for e in entries],
     }
@@ -327,7 +364,13 @@ async def intercept_stop() -> str:
         return err(f"request interception belongs to another MCP session ({holder}).")
     was_active = _INTERCEPT["active"]
     counts = dict(_INTERCEPT["counts"])
-    await _intercept_disable("stopped by caller")
+    problem = await _intercept_disable("stopped by caller")
+    if problem is not None:
+        return err(
+            f"interception NOT stopped: {problem}. Fetch may still pause requests on that tab; "
+            "the handler stays installed and now lets every request through. Call "
+            "intercept_stop() again to retry; intercept_log() shows it as still active."
+        )
     if not was_active:
         return ok("interception was not active")
     return ok(json.dumps({"stopped": True, "counts": counts}, indent=2))

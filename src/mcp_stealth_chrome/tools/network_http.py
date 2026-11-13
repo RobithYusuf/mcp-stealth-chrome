@@ -43,7 +43,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Literal, Optional
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 from .._app import mcp
 from urllib.parse import urlsplit
@@ -255,6 +255,40 @@ def _classify_http_error(exc: BaseException, may_have_redirected: bool = False) 
     }
 
 
+# ── Redirects ──────────────────────────────────────────────────────────────
+
+_REDIRECT_CODES = {301, 302, 303, 307, 308}
+# curl_cffi's default for the single transfer this loop replaced: 30 followed, the 31st an error.
+_MAX_REDIRECTS = 30
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _mask_urls_in(text: str, *urls: str) -> str:
+    """`text` with each of these URLs, and its origin, replaced by mask_url's form of it.
+
+    An exception message can quote the URL it failed on, userinfo included.
+    """
+    for url in urls:
+        if not isinstance(url, str) or not url:
+            continue
+        text = text.replace(url, mask_url(url))
+        parts = urlsplit(url)
+        if "@" in parts.netloc:
+            text = text.replace(parts.netloc, mask_url(f"//{parts.netloc}")[2:])
+    return text
+
+
+def _origin(url: str) -> tuple:
+    """(scheme, host, effective port): what has to match for a header to follow a redirect."""
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    try:
+        port = parts.port or _DEFAULT_PORTS.get(scheme)
+    except ValueError:
+        port = parts.netloc.rpartition(":")[2]
+    return scheme, (parts.hostname or "").lower(), port
+
+
 # ── Tracked request lifecycle ──────────────────────────────────────────────
 
 
@@ -275,11 +309,31 @@ class _Tracked:
     detail: dict = field(default_factory=dict)
     task: Optional[asyncio.Task] = None
     sent: bool = False                 # request handed to curl at least once
+    hops: list = field(default_factory=list)   # redirects followed so far, real URLs
+    hop_url: str = ""                  # the URL of the request in flight, the last hop's
     finished_at: Optional[float] = None
 
     def shown_url(self) -> str:
         """The URL for tool output, which lands in the transcript."""
         return self.url if self.spec.get("reveal_values") else mask_url(self.url)
+
+    def shown_hops(self) -> list:
+        """The redirect chain for tool output: masked here, at the boundary, not in the record."""
+        if self.spec.get("reveal_values"):
+            return [dict(hop) for hop in self.hops]
+        return [{**hop, "from": mask_url(hop["from"]), "to": mask_url(hop["to"])} for hop in self.hops]
+
+    def redirect_report(self) -> tuple[dict, str]:
+        """(fields, words) naming the chain and the hop that failed; empty with no redirect.
+
+        Every failure path uses it, a deadline or a cancel included: without it a failure after
+        a redirect read like one on the first request, which the first server did receive.
+        """
+        if not self.hops:
+            return {}, ""
+        at = self.hop_url if self.spec.get("reveal_values") else mask_url(self.hop_url)
+        return ({"redirects": self.shown_hops(), "failed_at": at},
+                f" after {len(self.hops)} redirect(s), at {at}")
 
     def public(self) -> dict:
         return {
@@ -357,36 +411,84 @@ async def _perform(rec: _Tracked) -> str:
         session_kwargs["proxies"] = {"all": ""}
 
     started = time.monotonic()
+    reveal = bool(spec.get("reveal_values"))
+    shown_url = (lambda u: u) if reveal else mask_url
     async with AsyncSession(**session_kwargs) as session:
-        kwargs = {
-            "timeout": (connect_timeout, read_budget),
-            "allow_redirects": spec["follow_redirects"],
-        }
-        if spec.get("params"):
-            kwargs["params"] = spec["params"]
-        if spec.get("headers"):
-            kwargs["headers"] = spec["headers"]
+        caller_headers = dict(spec.get("headers") or {})
+        cookie_kwargs: dict = {}
         if spec.get("cookies"):
             # libcurl's cookie engine drops a cookie for a host with no dot, so on localhost
-            # it reported sending cookies that never left. The header is scoped the same way:
-            # libcurl does not carry a custom Cookie header to another host on a redirect.
+            # it reported sending cookies that never left. That host gets a Cookie header,
+            # which goes with the caller's headers and so only to the first origin.
             if "." in (urlsplit(spec["url"]).hostname or "."):
-                kwargs["cookies"] = spec["cookies"]
+                # Given on the first hop only: curl scopes them to that host, and the
+                # session's jar carries them, host-only, through the redirects after it.
+                cookie_kwargs["cookies"] = spec["cookies"]
             else:
-                kwargs["headers"] = {
-                    **(kwargs.get("headers") or {}),
-                    "Cookie": "; ".join(f"{k}={v}" for k, v in spec["cookies"].items()),
-                }
-        # json_body takes precedence — curl_cffi overwrites the data-derived
-        # body with the JSON body anyway, so make that explicit and never
-        # pass both (which would also clobber the Content-Type).
-        if spec.get("json_body") is not None:
-            kwargs["json"] = spec["json_body"]
-        elif spec.get("data") is not None:
-            kwargs["data"] = spec["data"]
+                caller_headers["Cookie"] = "; ".join(
+                    f"{k}={v}" for k, v in spec["cookies"].items())
 
+        method, url = rec.method, spec["url"]
+        first_origin = _origin(url)
+        keep_body = True
+        hops: list[dict] = rec.hops  # shared, so a failure on a later hop can report the chain
+        dropped: set[str] = set()
+        note = None
         rec.sent = True
-        resp = await session.request(rec.method, spec["url"], **kwargs)
+        while True:
+            rec.hop_url = url
+            remaining = read_budget - (time.monotonic() - started)
+            kwargs: dict = {
+                "timeout": (connect_timeout, max(0.1, remaining)),
+                # Followed here, not by curl: curl carried every caller header to whatever
+                # host a redirect named, so an X-Api-Key reached a third party.
+                "allow_redirects": False,
+            }
+            if not hops:
+                if spec.get("params"):
+                    kwargs["params"] = spec["params"]
+                kwargs.update(cookie_kwargs)
+            headers = dict(caller_headers)
+            if not keep_body:
+                headers = {k: v for k, v in headers.items()
+                           if k.lower() not in ("content-type", "content-length")}
+            if _origin(url) != first_origin:
+                dropped.update(headers)
+                headers = {}
+            if headers:
+                kwargs["headers"] = headers
+            # json_body takes precedence — curl_cffi overwrites the data-derived
+            # body with the JSON body anyway, so make that explicit and never
+            # pass both (which would also clobber the Content-Type).
+            if keep_body:
+                if spec.get("json_body") is not None:
+                    kwargs["json"] = spec["json_body"]
+                elif spec.get("data") is not None:
+                    kwargs["data"] = spec["data"]
+
+            resp = await session.request(method, url, **kwargs)
+            if not spec["follow_redirects"] or resp.status_code not in _REDIRECT_CODES:
+                break
+            location = resp.headers.get("location")
+            if not location:
+                break
+            target = urljoin(str(resp.url or url), location)
+            if urlsplit(target).scheme.lower() not in ("http", "https"):
+                note = (f"redirect not followed: the {resp.status_code} points to a "
+                        f"{urlsplit(target).scheme}: URL, and only http and https are followed")
+                break
+            if len(hops) >= _MAX_REDIRECTS:
+                from curl_cffi.requests.exceptions import TooManyRedirects
+                raise TooManyRedirects(
+                    f"Maximum ({_MAX_REDIRECTS}) redirects followed; the last pointed to "
+                    f"{shown_url(target)}", 47)
+            hops.append({"status": resp.status_code, "from": str(resp.url or url), "to": target})
+            # As browsers do: 303 turns anything but HEAD into a GET, and 301 and 302 turn
+            # a POST into one. 307 and 308 repeat the method with its body.
+            if (resp.status_code == 303 and method != "HEAD") or (
+                    resp.status_code in (301, 302) and method == "POST"):
+                method, keep_body = "GET", False
+            url = target
 
         return_mode = spec["return_mode"]
         body_text = ""
@@ -402,7 +504,7 @@ async def _perform(rec: _Tracked) -> str:
                 )
 
         elapsed_ms = None
-        if hasattr(resp, "elapsed") and resp.elapsed is not None:
+        if not hops and hasattr(resp, "elapsed") and resp.elapsed is not None:  # last hop only
             try:
                 # curl_cffi returns float seconds OR timedelta depending on version
                 e = resp.elapsed
@@ -415,7 +517,6 @@ async def _perform(rec: _Tracked) -> str:
 
         # Tokens come back in JSON bodies and redirect URLs as well as Set-Cookie, and all
         # of this lands in the transcript.
-        reveal = bool(spec.get("reveal_values"))
         if not reveal:
             body_text = mask_body(body_text)
         meta = {
@@ -430,6 +531,18 @@ async def _perform(rec: _Tracked) -> str:
             "outcome": "completed",
             "transport": spec["transport"],
         }
+        if hops:
+            meta["redirects"] = rec.shown_hops()
+            if method != rec.method:
+                meta["final_method"] = method
+        if dropped:
+            meta["headers_not_forwarded"] = {
+                "names": sorted(dropped),
+                "why": "a redirect left the original origin (scheme, host, port); your "
+                       "headers go only to that origin",
+            }
+        if note:
+            meta["redirect_note"] = note
 
         shown = (lambda parsed: parsed) if reveal else mask_json_value
         if return_mode == "json":
@@ -485,6 +598,7 @@ async def _run_tracked(rec: _Tracked) -> str:
         # Cancelling stops US waiting. If the bytes already went out, the server
         # may have acted on them and nothing here undid that.
         rec.outcome = "unknown" if rec.sent else "not_executed"
+        chain, where = rec.redirect_report()
         rec.detail = {
             "error_class": "cancelled",
             "server_reached": True if rec.sent else False,
@@ -492,9 +606,10 @@ async def _run_tracked(rec: _Tracked) -> str:
             "note": ("cancelled client-side; NO rollback was performed or requested "
                      "of the server" if rec.sent else
                      "cancelled before the request was handed to curl"),
+            **chain,
         }
         rec.result = err(
-            f"http_request {rec.request_id} cancelled — client stopped waiting.\n"
+            f"http_request {rec.request_id} cancelled{where} — client stopped waiting.\n"
             + json.dumps(rec.detail, indent=2, default=str)
         )
         rec.finished_at = time.time()
@@ -502,16 +617,18 @@ async def _run_tracked(rec: _Tracked) -> str:
     except asyncio.TimeoutError:
         rec.state = "failed"
         rec.outcome = "unknown"
+        chain, where = rec.redirect_report()
         rec.detail = {
             "error_class": "operation_deadline",
             "server_reached": rec.sent,
             "outcome": "unknown",
             "message": (f"request exceeded its operation deadline of "
                         f"{rec.operation_deadline:.1f}s and was abandoned"),
+            **chain,
         }
         rec.result = err(
             f"http_request {rec.request_id} hit its operation deadline "
-            f"({rec.operation_deadline:.1f}s) — outcome UNKNOWN.\n"
+            f"({rec.operation_deadline:.1f}s){where} — outcome UNKNOWN.\n"
             + json.dumps(rec.detail, indent=2, default=str)
         )
     except ImportError:
@@ -520,13 +637,16 @@ async def _run_tracked(rec: _Tracked) -> str:
         rec.detail = {"error_class": "missing_dependency", "outcome": "not_executed"}
         rec.result = err("curl-cffi not installed — pip install curl-cffi")
     except Exception as e:
-        detail = _classify_http_error(
-            e,
-            may_have_redirected=bool(rec.spec.get("follow_redirects"))
-            and rec.method.upper() not in ("GET", "HEAD", "OPTIONS"),
-        )
+        # The hops are known now: a failure after one does not show the first server never
+        # got the request, whatever the method.
+        detail = _classify_http_error(e, may_have_redirected=bool(rec.hops))
         rec.state = "failed"
         rec.outcome = detail["outcome"]
+        reveal = bool(rec.spec.get("reveal_values"))
+        if not reveal:
+            detail["message"] = _mask_urls_in(detail["message"], rec.url, rec.hop_url)
+        chain, where = rec.redirect_report()
+        detail.update(chain)
         detail["request_id"] = rec.request_id
         detail["next"] = (
             "http_request_retry(request_id=...) — safe, the server never saw this"
@@ -536,7 +656,7 @@ async def _run_tracked(rec: _Tracked) -> str:
         )
         rec.detail = detail
         rec.result = err(
-            f"http_request: {detail['error_class']} ({rec.method} {rec.shown_url()}) — "
+            f"http_request: {detail['error_class']} ({rec.method} {rec.shown_url()}){where} — "
             f"outcome {detail['outcome']}.\n"
             + json.dumps(detail, indent=2, default=str)
         )
@@ -678,7 +798,7 @@ async def http_request(
         except asyncio.CancelledError:
             return rec.result or err(f"http_request {request_id} cancelled")
         except Exception as e:  # _run_tracked handles its own; belt and braces
-            return err(f"http_request: {e}")
+            return err(f"http_request: {_mask_urls_in(str(e), url) if not reveal_values else e}")
 
     return err(
         f"http_request still running after {wait:.1f}s — outcome UNKNOWN, not failed.\n"
@@ -792,6 +912,7 @@ async def http_request_cancel(request_id: str) -> str:
             "none — the request was never handed to the network"
         ),
         "outcome": rec.outcome,
+        **rec.redirect_report()[0],  # the chain and the hop it stopped on, masked
     }, indent=2, default=str))
 
 
@@ -863,13 +984,13 @@ async def http_session_cookies(url: str) -> str:
         return err("browser_launch first")
     jar, meta = await _snapshot_browser_cookies(url)
     if not meta["measured"]:
-        return err(f"cookies not measured for {url}: {meta['reason']}")
+        return err(f"cookies not measured for {mask_url(url)}: {meta['reason']}")
     try:
         cookies = await _get_browser_cookies_for_url(url)
     except Exception as e:
-        return err(f"cookies not measured for {url}: {e}")
+        return err(f"cookies not measured for {mask_url(url)}: {_mask_urls_in(str(e), url)}")
     return ok(json.dumps({
-        "url": url,
+        "url": mask_url(url),
         "instance": meta["instance"],
         "measured": True,
         "count": len(jar),
@@ -899,27 +1020,29 @@ async def session_warmup(
         if not BrowserState.is_up():
             return err("browser_launch first")
         if not (target_url or "").startswith(("http://", "https://")):
-            return err(f"session_warmup: target_url must be http or https, not {target_url!r}")
+            return err(f"session_warmup: target_url must be http or https, not {mask_url(target_url)!r}")
         from urllib.parse import urlparse
         parsed = urlparse(target_url)
         origin = f"{parsed.scheme}://{parsed.netloc}"
+        # The actions and errors land in the transcript: no userinfo, query or fragment secret.
+        shown, shown_origin = mask_url(target_url), mask_url(origin)
 
         tab = BrowserState.active_tab()
         actions = []
 
         if pattern == "homepage_first":
             await tab.get(origin)
-            actions.append(f"visited {origin}")
+            actions.append(f"visited {shown_origin}")
             await asyncio.sleep(dwell_seconds)
             # mouse drift
             await mouse_drift(duration_seconds=dwell_seconds, segments=3)
             actions.append("mouse drifted")
             await tab.get(target_url)
-            actions.append(f"navigated to {target_url}")
+            actions.append(f"navigated to {shown}")
 
         elif pattern == "referer_chain":
             await tab.get(origin)
-            actions.append(f"visited {origin}")
+            actions.append(f"visited {shown_origin}")
             await asyncio.sleep(dwell_seconds)
             # find link that leads closer to target
             link_data = await tab.evaluate(
@@ -946,20 +1069,20 @@ async def session_warmup(
                 await humanized_move(tab, ldata["x"] + 100, ldata["y"] - 50,
                                       ldata["x"], ldata["y"])
                 await tab.mouse_click(ldata["x"], ldata["y"])
-                actions.append(f"clicked link to {ldata['href']}")
+                actions.append(f"clicked link to {mask_url(ldata['href'])}")
                 await asyncio.sleep(dwell_seconds)
                 # if still not at target, nav directly
                 cur = await get_url(tab)
                 if target_url not in cur:
                     await tab.get(target_url)
-                    actions.append(f"direct nav to {target_url}")
+                    actions.append(f"direct nav to {shown}")
             else:
                 await tab.get(target_url)
-                actions.append(f"no link found, direct nav to {target_url}")
+                actions.append(f"no link found, direct nav to {shown}")
 
         elif pattern == "natural_browse":
             await tab.get(origin)
-            actions.append(f"visited {origin}")
+            actions.append(f"visited {shown_origin}")
             await asyncio.sleep(dwell_seconds / 2)
             # scroll
             await tab.evaluate("window.scrollBy(0, 400)", return_by_value=True)
@@ -990,21 +1113,21 @@ async def session_warmup(
                 await humanized_move(tab, rdata["x"] + 150, rdata["y"] - 60,
                                       rdata["x"], rdata["y"])
                 await tab.mouse_click(rdata["x"], rdata["y"])
-                actions.append(f"random click → {rdata['href']}")
+                actions.append(f"random click → {mask_url(rdata['href'])}")
                 await asyncio.sleep(dwell_seconds)
                 await tab.evaluate("window.scrollBy(0, 300)", return_by_value=True)
                 actions.append("scrolled on intermediate page")
                 await asyncio.sleep(dwell_seconds / 2)
             await tab.get(target_url)
-            actions.append(f"final nav to {target_url}")
+            actions.append(f"final nav to {shown}")
 
         final = await get_url(tab, strict=True)
         if final.startswith("chrome-error:"):
-            return err(f"session warmup ended on an error page: {target_url} did not load. "
+            return err(f"session warmup ended on an error page: {shown} did not load. "
                        f"Steps tried:\n  " + "\n  ".join(actions))
         return ok("session warmup complete:\n  " + "\n  ".join(actions))
     except Exception as e:
-        return err(str(e))
+        return err(_mask_urls_in(str(e), target_url))
 
 
 @mcp.tool()

@@ -12,7 +12,7 @@ from typing import Literal, Optional
 
 from .. import server as _srv
 from .._app import mcp
-from ..helpers import err, ok, parse_json, ts_filename
+from ..helpers import err, ok, parse_json, private_staging, ts_filename
 from ..humanize import humanized_move, move_pointer
 from ..refs import resolve_ref
 from ..state import SCREENSHOT_DIR, BrowserState, ensure_dirs
@@ -238,7 +238,8 @@ async def find_by_image(
         tab = BrowserState.active_tab()
         ensure_dirs()
         tmp_path = SCREENSHOT_DIR / ts_filename("match-tmp", "png")
-        await tab.save_screenshot(filename=str(tmp_path))
+        with private_staging(tmp_path) as staged:
+            await tab.save_screenshot(filename=str(staged))
         try:
             page_img = cv2.imread(str(tmp_path))
             template = cv2.imread(template_path)

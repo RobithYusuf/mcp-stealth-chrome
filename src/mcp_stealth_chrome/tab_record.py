@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from . import state as _state
-from .helpers import _mask_pairs, confined_output_path, mask_url
+from .helpers import confined_output_path, mask_url
 
 def env_number(name: str, default: float) -> float:
     """A number from the environment; a value that is not one leaves the default, so a typo
@@ -78,18 +78,12 @@ def keep_url(url: Any) -> bool:
 
 
 def shown_url(url: Any) -> Any:
-    """A URL fit for tool output: secret query and fragment pairs hidden.
+    """A URL fit for tool output: userinfo and secret query and fragment pairs hidden.
 
-    mask_url covers the query. An OAuth redirect carries its token in the fragment
+    mask_url covers all three. An OAuth redirect carries its token in the fragment
     (#access_token=...), and a reopened tab can sit on exactly that page.
     """
-    url = mask_url(url)
-    if isinstance(url, str) and "#" in url:
-        head, _, fragment = url.partition("#")
-        masked = _mask_pairs(fragment) if "=" in fragment else None
-        if masked:
-            return f"{head}#{masked}"
-    return url
+    return mask_url(url)
 
 
 def ordered_pages(pages: Iterable[tuple[str, str]], known: list[str]) -> list[tuple[str, str]]:

@@ -4095,9 +4095,21 @@ _UNREAD_AFTER_CLICK = ("; the clicked element could no longer be read, while the
 
 
 def _click_outcome(head: str, detail: str, before: dict, after: dict) -> str:
-    """Compare fingerprints and say what the click did, never a bare 'clicked'."""
+    """Compare fingerprints and say what the click did, never a bare 'clicked'.
+
+    Only called when the caller asked to verify. An empty fingerprint is a page that could
+    not be read (a stale context, a navigation under way), so the outcome is unknown; a
+    bare "clicked" there read as success, and a caller retried a click that may have worked.
+    """
     if not (before and after):
-        return ok(f"{head} — {detail}")
+        when = ("before or after" if not (before or after)
+                else "before" if not before else "after")
+        return ok(
+            f"{head} but the outcome could NOT be verified — {detail}. The event was "
+            f"dispatched, but the page could not be read {when} the click, so whether it "
+            f"reacted is unknown. Read the page (browser_snapshot, get_url) before clicking "
+            f"again."
+        )
     change = (_UNREAD_AFTER_CLICK if element_unread(before, after)
               else _click_change(before, after))
     if change is not None:
@@ -4926,10 +4938,20 @@ async def batch_actions(actions: list[dict]) -> str:
     For branching, loops or using one step's result in another, use workflow_run.
     """
     if not isinstance(actions, list):
-        actions = parse_json(actions, [])
+        actions = parse_json(actions, None)
+    # A default of [] turned unparseable input into "0 actions OK": nothing ran, reported
+    # as a batch that worked.
+    if not isinstance(actions, list):
+        return err("batch_actions: actions must be a JSON list of action objects; nothing ran")
+    if not actions:
+        return err("batch_actions: no actions given; nothing ran")
     _register_workflow_tools()
     results = []
     for i, act in enumerate(actions):
+        if not isinstance(act, dict):
+            results.append(f"[{i}] ?: ERR not an action object but {type(act).__name__}: "
+                           f"{str(act)[:80]}")
+            continue
         atype = act.get("type")
         try:
             tool, args = _batch_action_call(act)
@@ -5326,7 +5348,7 @@ def _clear_tab_scoped_state(tabs: list[Any]) -> None:
             watchdog.cancel()
         _capture._INTERCEPT.update({
             "active": False, "tab": None, "handler": None, "handler_tab": None,
-            "watchdog": None, "stop_reason": "target closed",
+            "watchdog": None, "stop_reason": "target closed", "disable_error": None,
         })
     try:
         from .tools import devtools as _dt

@@ -16,7 +16,10 @@ from nodriver.cdp import runtime as cdp_runtime
 
 from .. import image_output as _image_output
 from .._app import mcp
-from ..helpers import confined_output_path, err, get_url, ok, parse_json, select_tab, ts_filename
+from ..helpers import (
+    confined_output_path, err, get_url, ok, parse_json, private_staging, select_tab, ts_filename,
+    write_private,
+)
 from ..refs import MAX_FRAMES, all_frames, collect_snapshot, frame_world, resolve_ref
 from ..result_types import structured_json
 from ..server import (
@@ -281,7 +284,7 @@ async def screenshot(
             b64 = await _wait(tab.send(cdp_page.capture_screenshot(**kwargs)),
                               what="screenshot (region)")
             data = base64.b64decode(b64)
-            path.write_bytes(data)
+            write_private(path, data)
         else:
             # Multi-strategy capture — pages with stuck JS / heavy SPAs can
             # make tab.save_screenshot hang because nodriver's wrapper waits
@@ -300,8 +303,11 @@ async def screenshot(
             strategy_errors: list[str] = []
             captured = False
             try:
-                await _wait(tab.save_screenshot(**save_kwargs),
-                            timeout=15.0, what="screenshot (nodriver)")
+                # nodriver opens the file itself: it writes a private temporary file, which
+                # replaces `path` only once it holds the capture.
+                with private_staging(path) as staged:
+                    await _wait(tab.save_screenshot(**{**save_kwargs, "filename": str(staged)}),
+                                timeout=15.0, what="screenshot (nodriver)")
                 captured = True
             except Exception as e1:
                 strategy_errors.append(f"nodriver(15s): {type(e1).__name__}: {e1}")
@@ -318,7 +324,7 @@ async def screenshot(
                         tab.send(cdp_page.capture_screenshot(**cdp_kwargs)),
                         timeout=10.0, what="screenshot (CDP raw)",
                     )
-                    path.write_bytes(base64.b64decode(b64))
+                    write_private(path, base64.b64decode(b64))
                     captured = True
                 except Exception as e2:
                     strategy_errors.append(f"cdp_raw(10s): {type(e2).__name__}: {e2}")
@@ -334,7 +340,7 @@ async def screenshot(
                         )),
                         timeout=8.0, what="screenshot (viewport JPEG)",
                     )
-                    path.write_bytes(base64.b64decode(b64))
+                    write_private(path, base64.b64decode(b64))
                     captured = True
                 except Exception as e3:
                     strategy_errors.append(f"viewport_jpeg(8s): {type(e3).__name__}: {e3}")
@@ -385,11 +391,12 @@ async def screenshot(
                         new_w = int(round(w * scale))
                         new_h = int(round(h * scale))
                         resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                        if fmt == "jpeg":
-                            cv2.imwrite(str(path), resized,
-                                        [cv2.IMWRITE_JPEG_QUALITY, int(quality or 85)])
-                        else:
-                            cv2.imwrite(str(path), resized)
+                        params = ([cv2.IMWRITE_JPEG_QUALITY, int(quality or 85)]
+                                  if fmt == "jpeg" else [])
+                        encoded, buf = cv2.imencode(path.suffix or ".png", resized, params)
+                        if not encoded:
+                            raise ValueError("resize could not be encoded")
+                        write_private(path, buf.tobytes())
                         resized_info = f" [resized {w}×{h} → {new_w}×{new_h}]"
             except Exception:
                 # Resizing is best-effort; original file is already saved.
@@ -509,7 +516,7 @@ async def save_pdf(filename: Optional[str] = None, landscape: bool = False) -> s
         result = await tab.send(cdp_page.print_to_pdf(landscape=landscape))
         # result[0] is base64 data per CDP spec
         data = result[0] if isinstance(result, tuple) else result
-        path.write_bytes(base64.b64decode(data))
+        write_private(path, base64.b64decode(data))
         return ok(str(path))
     except Exception as e:
         return err(str(e))

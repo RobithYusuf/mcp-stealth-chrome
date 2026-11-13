@@ -26,6 +26,7 @@ from ..helpers import (
     parse_json,
     target_key,
     ts_filename,
+    write_private,
 )
 from ..state import EXPORT_DIR, BrowserState, ensure_dirs
 
@@ -205,7 +206,7 @@ async def performance_trace_stop(filename: Optional[str] = None) -> str:
         path = confined_output_path(EXPORT_DIR, fname)
         ensure_dirs()
         payload = {"traceEvents": list(_TRACE_BUFFER)}
-        path.write_text(json.dumps(payload))
+        write_private(path, json.dumps(payload))
         event_count = len(_TRACE_BUFFER)
         duration = time.time() - _TRACE_ACTIVE["started_at"]
         _TRACE_BUFFER.clear()
@@ -648,7 +649,7 @@ async def memory_heap_snapshot(
         fname = filename or ts_filename("heap", "heapsnapshot")
         path = confined_output_path(EXPORT_DIR, fname)
         ensure_dirs()
-        path.write_text("".join(chunks))
+        write_private(path, "".join(chunks))
         size_mb = path.stat().st_size / 1024 / 1024
         return ok(
             f"{path}\nsize: {size_mb:.1f}MB ({len(chunks)} chunks) — "

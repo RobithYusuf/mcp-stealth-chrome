@@ -32,7 +32,7 @@ from typing import Literal, Optional
 import httpx
 
 from .._app import mcp
-from ..helpers import err, ok, parse_json, ts_filename
+from ..helpers import err, ok, parse_json, private_staging, ts_filename
 from ..humanize import humanized_move
 from ..state import SCREENSHOT_DIR, BrowserState, ensure_dirs
 
@@ -412,7 +412,8 @@ async def solve_recaptcha_ai(
             # the surrounding page content fine.)
             ensure_dirs()
             shot_path = SCREENSHOT_DIR / ts_filename(f"recaptcha-r{round_num}", "png")
-            await tab.save_screenshot(filename=str(shot_path), format="png")
+            with private_staging(shot_path) as staged:  # 0600, published whole
+                await tab.save_screenshot(filename=str(staged), format="png")
             try:
                 img_bytes = shot_path.read_bytes()
                 if not img_bytes:
@@ -453,7 +454,8 @@ async def solve_recaptcha_ai(
                     shot_path = SCREENSHOT_DIR / ts_filename(
                         f"recaptcha-r{round_num}-refresh{refresh_attempt+1}", "png"
                     )
-                    await tab.save_screenshot(filename=str(shot_path), format="png")
+                    with private_staging(shot_path) as staged:
+                        await tab.save_screenshot(filename=str(staged), format="png")
                     try:
                         img_bytes = shot_path.read_bytes()
                         if not img_bytes:
@@ -579,8 +581,9 @@ async def vision_locate(
         # Take screenshot
         ensure_dirs()
         shot_path = SCREENSHOT_DIR / ts_filename("vision-locate", "png")
-        await _wait(tab.save_screenshot(filename=str(shot_path), format="png"),
-                    what="vision_locate screenshot")
+        with private_staging(shot_path) as staged:
+            await _wait(tab.save_screenshot(filename=str(staged), format="png"),
+                        what="vision_locate screenshot")
         img_b64 = _b64.b64encode(Path(str(shot_path)).read_bytes()).decode()
         prompt = _VISION_LOCATE_PROMPT.format(
             viewport_w=vp.get("w", 1280),
@@ -705,9 +708,12 @@ async def _vision_scope(scope: str, selector: Optional[str], tab: Any) -> tuple[
         element = await tab.query_selector(selector)
         if element is None:
             raise ValueError(f"selector not found: {selector}")
-        await element.save_screenshot(filename=str(path), format="png")
+        with private_staging(path) as staged:
+            await element.save_screenshot(filename=str(staged), format="png")
     else:
-        await tab.save_screenshot(filename=str(path), format="png", full_page=scope == "page")
+        with private_staging(path) as staged:
+            await tab.save_screenshot(filename=str(staged), format="png",
+                                      full_page=scope == "page")
     data = path.read_bytes()
     if not data:
         raise ValueError(f"vision scope screenshot is empty: {path}")

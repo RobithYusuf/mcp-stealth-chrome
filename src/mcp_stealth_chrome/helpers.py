@@ -1,12 +1,15 @@
 """Shared helper utilities."""
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import re
+import secrets
 import time
 from pathlib import Path
 from urllib.parse import unquote_plus, urlsplit
-from typing import Any
+from typing import Any, Iterator
 
 from nodriver import Tab
 
@@ -33,8 +36,15 @@ def masked_value(value: Any) -> str:
     return f"*** ({len(str(value))} chars)"
 
 
+# Headers whose value is a URL. Their names are not secret, but a redirect's Location or a
+# Referer can carry a token in its query, fragment or userinfo.
+_URL_HEADERS = {"location", "content-location", "referer"}
+
+
 def mask_headers(headers: dict) -> dict:
-    return {k: masked_value(v) if is_secret_name(k) else v for k, v in (headers or {}).items()}
+    return {k: masked_value(v) if is_secret_name(k)
+            else mask_url(v) if str(k).lower() in _URL_HEADERS else v
+            for k, v in (headers or {}).items()}
 
 
 def _mask_all(node: Any) -> Any:
@@ -111,15 +121,108 @@ def mask_body(body: Any) -> Any:
 
 
 def mask_url(url: Any) -> Any:
-    """Hide credential query parameters such as ?access_token=."""
-    if not isinstance(url, str) or "?" not in url:
+    """Hide what in a URL is a credential: userinfo, and secret query or fragment pairs.
+
+    `user:password@` (or a token as the user name) becomes `***@`. Secret pairs such as
+    ?access_token= are hidden in the query and in the fragment, where an OAuth redirect
+    puts its token (#access_token=, also after a hash route like #/cb?id_token=). Works
+    on the raw text, so every ordinary parameter stays byte for byte what was requested.
+    """
+    if not isinstance(url, str) or not any(mark in url for mark in ("?", "#", "@")):
         return url
+    rest, hash_mark, fragment = url.partition("#")
+    rest, query_mark, query = rest.partition("?")
+    if rest.startswith("//"):  # scheme-relative
+        scheme, sep, after = "", "//", rest[2:]
+    else:
+        scheme, sep, after = rest.partition("://")
+    if sep:
+        netloc, slash, path = after.partition("/")
+        if "@" in netloc:
+            netloc = "***@" + netloc.rpartition("@")[2]
+        rest = f"{scheme}{sep}{netloc}{slash}{path}"
+    else:
+        # An authority with no scheme at all, `user:pass@host/path`, as a caller or a redirect
+        # may hand over. `mailto:` addresses are not credentials, and a leading `@` is a path.
+        head, slash, path = rest.partition("/")
+        if head.find("@") > 0 and not head.lower().startswith("mailto:"):
+            rest = f"***@{head.rpartition('@')[2]}{slash}{path}"
+    if query_mark:
+        query = _mask_pairs(query) or query
+    if hash_mark and "=" in fragment:
+        route, route_mark, pairs = fragment.rpartition("?")
+        if route_mark:
+            fragment = f"{route}?{_mask_pairs(pairs) or pairs}"
+        else:
+            fragment = _mask_pairs(fragment) or fragment
+    return f"{rest}{query_mark}{query}{hash_mark}{fragment}"
+
+
+def _private_sibling(path: Path) -> tuple[int, Path]:
+    """A new file beside `path`, open for writing, readable by this user only.
+
+    O_EXCL and O_NOFOLLOW: the name is fresh and random, so nothing planted there, a symlink
+    included, is ever opened. The umask can only narrow 0600, and fchmod makes it exact.
+    """
+    flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+             | getattr(os, "O_BINARY", 0))
+    for _ in range(16):
+        tmp = path.with_name(f".{path.stem}.{secrets.token_hex(6)}.tmp{path.suffix}")
+        try:
+            fd = os.open(tmp, flags, 0o600)
+        except FileExistsError:
+            continue
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        else:  # Windows before Python 3.13
+            os.chmod(tmp, 0o600)
+        return fd, tmp
+    raise FileExistsError(f"could not create a temporary file beside {path}")
+
+
+def write_private(path: Path, data: bytes | str) -> None:
+    """Write a file readable by this user only, all at once.
+
+    For anything taken from a page: a screenshot or PDF can show a logged-in account, a
+    trace or heap snapshot holds its URLs, form text and tokens, and a 0644 file made under
+    the usual umask is readable by every account on the machine. The data goes to a private
+    file beside `path`, which then replaces it (os.replace): a reader sees the old file or
+    the whole new one, never a truncated or half-written one, and a symlink at `path` is
+    replaced, not followed, so nothing outside the folder is written. Not fsynced: these are
+    artifacts, not records that must survive a power cut. Windows keeps no POSIX mode bits;
+    the user profile's ACLs protect the file there.
+    """
+    raw = data.encode("utf-8") if isinstance(data, str) else bytes(data)
+    fd, tmp = _private_sibling(path)
     try:
-        parts = urlsplit(url)
-        query = _mask_pairs(parts.query)
-        return parts._replace(query=query).geturl() if query else url
-    except ValueError:
-        return url
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(raw)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+
+
+@contextlib.contextmanager
+def private_staging(path: Path) -> Iterator[Path]:
+    """A private temporary path for a writer this code does not control, published at `path`.
+
+    nodriver's save_screenshot opens its filename itself. It writes the temporary file (0600,
+    created like write_private's), and only a file that holds something replaces `path`
+    when the block ends; an empty one raises, so a capture that wrote nothing publishes
+    nothing. On an error the temporary file is removed and `path` is left as it was.
+    """
+    fd, tmp = _private_sibling(path)
+    os.close(fd)
+    try:
+        yield tmp
+        if tmp.stat().st_size == 0:
+            raise RuntimeError(f"nothing was written for {path.name}")
+        os.replace(tmp, path)
+    finally:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
 
 
 def mask_request_entry(entry: dict) -> dict:

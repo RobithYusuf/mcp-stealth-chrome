@@ -441,3 +441,49 @@ def test_resize_leaves_the_window_where_it_was(loop, browser):
 
     assert loop.run_until_complete(place()) == (120, 90)
 
+
+
+# ── page-derived files are private ────────────────────────────────────────
+
+_ONE_PIXEL_PNG = ("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAA"
+                  "AABJRU5ErkJggg==")
+
+
+def test_page_derived_files_are_private(loop, page, monkeypatch, tmp_path):
+    """Screenshots, PDFs, traces, heap snapshots and fetched images were made 0644 under the
+    usual umask, and an existing file kept its mode, readable by every account."""
+    from mcp_stealth_chrome import image_output
+    from mcp_stealth_chrome.tools import devtools
+    from mcp_stealth_chrome.tools import page as page_tools
+
+    for module, name in ((page_tools, "SCREENSHOT_DIR"), (page_tools, "EXPORT_DIR"),
+                         (image_output, "SCREENSHOT_DIR"), (image_output, "ASSET_DIR"),
+                         (devtools, "EXPORT_DIR")):
+        monkeypatch.setattr(module, name, tmp_path)
+    names = ("s.png", "small.png", "r.png", "e.png", "p.pdf", "t.json", "h.heapsnapshot", "a.png")
+    for name in names[1::2]:  # half of them overwrite a file that was 0644
+        (tmp_path / name).write_bytes(b"stale")
+        (tmp_path / name).chmod(0o644)
+    previous = os.umask(0o022)
+    try:
+        for tool, kwargs in (
+            ("screenshot", {"filename": "s.png", "output_mode": "path", "max_dimension": 0}),
+            ("screenshot", {"filename": "small.png", "output_mode": "path", "max_dimension": 64}),
+            ("screenshot", {"filename": "r.png", "output_mode": "path", "region_selector": "#dead"}),
+            ("screenshot_element", {"selector": "#dead", "filename": "e.png", "output": "path"}),
+            ("save_pdf", {"filename": "p.pdf"}),
+            ("performance_trace_start", {}),
+            ("performance_trace_stop", {"filename": "t.json"}),
+            ("memory_heap_snapshot", {"filename": "h.heapsnapshot"}),
+            ("inspect_image", {"url": "data:image/png;base64," + _ONE_PIXEL_PNG,
+                               "filename": "a.png", "output": "path"}),
+        ):
+            out = run(loop, tool, **kwargs)
+            assert not out.startswith("Error"), (tool, out)
+    finally:
+        os.umask(previous)
+    for name in names:
+        path = tmp_path / name
+        assert path.stat().st_size > len(b"stale"), name
+        if sys.platform != "win32":  # Windows keeps no POSIX mode bits
+            assert stat.S_IMODE(path.stat().st_mode) == 0o600, (name, oct(path.stat().st_mode))
