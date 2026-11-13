@@ -3695,7 +3695,7 @@ def test_tab_close_marks_the_browser_before_closing_its_last_tab(monkeypatch):
             order.append("close")
 
     async def refresh():
-        return None
+        return True  # the browser answered
 
     tab = Tab()
     monkeypatch.setattr(server, "_refresh_tabs", refresh)
@@ -3908,3 +3908,160 @@ def test_os_cursor_status_does_not_wait_for_a_slow_first_measurement(monkeypatch
     assert first["available"] is None and "still being measured" in first["detail"], first
     server._OS_CURSOR_PROBE["thread"].join(5)
     assert asyncio.run(server._os_cursor_status()) == {"available": True, "detail": "measured"}
+
+
+def test_the_idle_sweep_leaves_the_current_instance_alone_while_a_call_runs(monkeypatch):
+    """A call running longer than idle_timeout_seconds is use: on Windows CI the reaper closed
+    the current instance during tab_new, and the next tab_select read an empty list."""
+    import asyncio
+    import time
+
+    from mcp_stealth_chrome import _app, server
+
+    ended = []
+
+    async def end(reason=None):
+        ended.append(reason)
+        return True
+
+    monkeypatch.setattr(server, "_end_current_instance", end)
+    monkeypatch.setattr(server.BrowserState, "is_up", classmethod(lambda cls: True))
+    monkeypatch.setattr(server.BrowserState, "instances", {}, raising=False)
+    monkeypatch.setattr(server.BrowserState, "window_closed", {}, raising=False)
+    monkeypatch.setattr(server.BrowserState, "current_idle_timeout", 2, raising=False)
+    monkeypatch.setattr(server.BrowserState, "current_last_active", time.time() - 10, raising=False)
+    key = server.BrowserState.session_key()
+    monkeypatch.setitem(_app._CALLS_IN_FLIGHT, key, 1)
+    asyncio.run(server._sweep_idle_instances())
+    assert ended == []
+    _app._CALLS_IN_FLIGHT.pop(key)
+    asyncio.run(server._sweep_idle_instances())
+    assert ended == ["idle timeout"]
+    assert "idle_timeout_seconds=2" in server.BrowserState.window_closed[
+        server.BrowserState.current_instance_id]
+
+
+def test_the_idle_sweep_skips_an_instance_switched_in_while_it_closed_another(monkeypatch):
+    """Between the sweep's awaits a switch_instance can make a stored instance current; closing
+    it by its old place ended the browser the caller had just switched to."""
+    import asyncio
+
+    from types import SimpleNamespace
+
+    from mcp_stealth_chrome import server
+
+    def snap():
+        return SimpleNamespace(browser=object(), idle_timeout=1, is_running=lambda: True,
+                               is_idle_expired=lambda: True)
+
+    stored = {"a": snap(), "b": snap()}
+    closed = []
+
+    async def end(iid, s, reason=None):
+        closed.append(iid)
+        stored.pop("b", None)  # switch_instance("b") while "a" was being closed
+        return True
+
+    monkeypatch.setattr(server, "_end_stored_instance", end)
+    monkeypatch.setattr(server.BrowserState, "instances", stored, raising=False)
+    monkeypatch.setattr(server.BrowserState, "window_closed", {}, raising=False)
+    monkeypatch.setattr(server.BrowserState, "is_up", classmethod(lambda cls: False))
+    asyncio.run(server._sweep_idle_instances())
+    assert closed == ["a"]
+
+
+def test_switch_instance_waits_while_a_sweep_closes_that_instance(monkeypatch):
+    """Switched in mid-close, the caller got a browser that was going, and the close then reset
+    whichever instance was current by the time it finished."""
+    import asyncio
+
+    from mcp_stealth_chrome import _app, server
+
+    switched = []
+    monkeypatch.setattr(server.BrowserState, "switch_to",
+                        classmethod(lambda cls, iid: switched.append(iid)))
+    monkeypatch.setattr(server.BrowserState, "window_closed",
+                        {"gone": "instance 'gone' was closed (idle_timeout_seconds=2)."}, raising=False)
+
+    async def run():
+        event = asyncio.Event()
+        monkeypatch.setitem(_app.INSTANCE_CLOSING, (server.BrowserState.session_key(), "gone"), event)
+        task = asyncio.ensure_future(server.switch_instance("gone"))
+        await asyncio.sleep(0.2)
+        assert switched == [] and not task.done()
+        event.set()
+        return await asyncio.wait_for(task, 2)
+
+    reply = asyncio.run(run())
+    assert switched == ["gone"]
+    assert "not running" in reply and "idle_timeout_seconds=2" in reply, reply
+
+
+def test_tab_select_names_why_the_browser_went_rather_than_the_index(monkeypatch):
+    import asyncio
+
+    from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import navigation
+
+    iid = server.BrowserState.current_instance_id
+    monkeypatch.setattr(server.BrowserState, "browser", None, raising=False)
+    monkeypatch.setattr(server.BrowserState, "tabs", [], raising=False)
+    monkeypatch.setattr(server.BrowserState, "window_closed",
+                        {iid: f"instance {iid!r} was closed (idle_timeout_seconds=2)."}, raising=False)
+    for reply in (asyncio.run(navigation.tab_select(0)), asyncio.run(navigation.tab_close(0)),
+                  asyncio.run(navigation.tab_list())):
+        assert reply.startswith("Error") and "idle_timeout_seconds=2" in reply, reply
+        assert "out of range" not in reply, reply
+
+
+def test_a_background_target_refresh_of_a_gone_browser_ends_quietly():
+    """nodriver starts update_targets() as tasks nobody awaits. Each one failing on a closed
+    browser was logged as "Task exception was never retrieved" with a Rich traceback, which
+    blocked the event loop 1.1 to 1.3 s per target on Windows; the idle reaper read that as
+    idleness and closed an instance spawned a moment before."""
+    import asyncio
+
+    from nodriver.core import browser as nd_browser
+    from nodriver.core import tab as nd_tab
+
+    from mcp_stealth_chrome import patches
+
+    patches.apply_all()
+    assert patches.status()["healthy"], patches.status()
+
+    class Browser:
+        async def update_targets(self):
+            raise ConnectionRefusedError(61, "Connect call failed")
+
+    async def run():
+        unretrieved = []
+        asyncio.get_running_loop().set_exception_handler(lambda loop, ctx: unretrieved.append(ctx))
+        tasks = [module.asyncio.create_task(Browser().update_targets())
+                 for module in (nd_browser, nd_tab)]
+        await asyncio.wait(tasks)
+        assert [t.result() for t in tasks] == [None, None]
+        with pytest.raises(ConnectionRefusedError):  # awaited, as _refresh_tabs does, it still says so
+            await Browser().update_targets()
+        del tasks
+        import gc
+        gc.collect()
+        return unretrieved
+
+    assert asyncio.run(run()) == []
+
+
+def test_process_command_on_windows_reads_the_process_table_not_ps(monkeypatch):
+    """Windows has no ps. The runner's (Git Bash) took 1.1 s up to the 3 s timeout, on the event
+    loop, at every close, and on a person's machine nothing was checked."""
+    from mcp_stealth_chrome import server, state
+
+    def no_subprocess(*args, **kwargs):
+        raise AssertionError(f"ran {args[0]!r}")
+
+    monkeypatch.setattr(server.sys, "platform", "win32")
+    monkeypatch.setattr(server.subprocess, "run", no_subprocess)
+    monkeypatch.setattr(state, "process_table", lambda: [
+        (4, 0, ""), (77, 4, r'"C:\chrome.exe" --user-data-dir=C:\p'), (78, 77, "")])
+    assert server._process_command(77) == r'"C:\chrome.exe" --user-data-dir=C:\p'
+    assert server._process_command(78) is None  # unreadable is not evidence
+    assert server._process_command(99) is None

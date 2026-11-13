@@ -962,3 +962,42 @@ def test_emulated_phone_has_touch_points_and_desktop_resets_them(page, base):
     page.call("emulate_device", preset="desktop")
     page.call("reload")
     assert page.evaluate("navigator.maxTouchPoints") == "0"
+
+
+# ── the idle reaper ────────────────────────────────────────────────────────
+
+def test_an_instance_in_use_is_not_closed_by_its_idle_timeout(base):
+    """tab_new, tab_select and switch_instance never counted as use, and a call running longer
+    than the timeout did not either. On Windows CI an instance spawned with
+    idle_timeout_seconds=2 was closed during tab_new, and tab_select then read the empty list
+    and answered "tab 0 out of range". Left alone it still goes, and a call says why."""
+    client = Client(env={"BROWSER_IDLE_REAPER_INTERVAL": "1"})
+    try:
+        spawned = client.call("spawn_browser", _timeout=90, instance_id="busy", headless=True,
+                              persistent=False, extra_args=SAFE_ARGS, url=f"{base}/protocol.html",
+                              idle_timeout_seconds=2)
+        assert not spawned.failed, spawned.text
+        assert not client.call("switch_instance", instance_id="busy").failed
+        until = time.time() + 6
+        while time.time() < until:
+            for reply in (client.call("tab_new", url=f"{base}/page2.html"),
+                          client.call("tab_select", index=0)):
+                assert not reply.failed, reply.text
+            time.sleep(0.5)
+        held = client.call("evaluate", expression="new Promise(r => setTimeout(() => r(7), 4000))",
+                           timeout_ms=10000, _timeout=30)
+        assert not held.failed and "7" in held.text, held.text
+        assert not client.call("tab_select", index=0).failed, "closed during the long call"
+        assert not client.call("switch_instance", instance_id="main").failed  # main never ran
+        deadline = time.time() + 30
+        while time.time() < deadline and '"busy"' in client.call("list_instances").text:
+            time.sleep(0.5)
+        assert '"busy"' not in client.call("list_instances").text
+        back = client.call("switch_instance", instance_id="busy")
+        assert "idle_timeout_seconds=2" in back.text, back.text
+        reply = client.call("tab_select", index=0)
+        assert reply.failed and "idle_timeout_seconds=2" in reply.text, reply.text
+        assert "out of range" not in reply.text, reply.text
+    finally:
+        client.call("close_all_instances", _timeout=40)
+        client.close()

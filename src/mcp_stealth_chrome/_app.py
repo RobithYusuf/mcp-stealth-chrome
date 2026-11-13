@@ -33,6 +33,37 @@ _RUNS_DESPITE_DIALOG = frozenset({
 # Called with the tool's name after every tool call, inside the caller's session. server.py adds
 # the saved-tabs writer here. Each must be cheap and must not await; one that raises is ignored.
 AFTER_TOOL_HOOKS: list = []
+# Tool calls running, per session. Every call is use of the session's current instance, so the
+# idle reaper never closes that instance while one runs: tab_new, tab_select and switch_instance
+# never touched last_active, and an instance spawned with idle_timeout_seconds=2 was closed between
+# tab_new and the next call, which then read an empty tab list ("tab 0 out of range").
+_CALLS_IN_FLIGHT: dict[str, int] = {}
+# (session, instance) -> set once a background close (idle timeout, last window gone) of that
+# instance has finished. A call on it waits, rather than acting on a browser half closed or
+# switching it in while the close goes on and resets whichever instance is current by then.
+INSTANCE_CLOSING: dict[tuple[str, str], asyncio.Event] = {}
+_CLOSING_WAIT_SECONDS = 60.0
+
+
+def calls_in_flight(session_key: str) -> int:
+    return _CALLS_IN_FLIGHT.get(session_key, 0)
+
+
+async def wait_while_closing(session_key: str, instance_id: str) -> None:
+    """Return once no background close of that instance is under way (bounded)."""
+    event = INSTANCE_CLOSING.get((session_key, instance_id))
+    if event is not None:
+        try:
+            await asyncio.wait_for(event.wait(), timeout=_CLOSING_WAIT_SECONDS)
+        except asyncio.TimeoutError:
+            pass
+
+
+def _touch_current() -> None:
+    if BrowserState.browser is not None:
+        BrowserState.current_last_active = time.time()
+
+
 # Long enough for a dialog_handle armed in advance to answer, and for an input tool to return
 # its own better message. A dialog still open after this is blocking the tool.
 _DIALOG_GRACE_SECONDS = 1.5
@@ -89,9 +120,18 @@ class StealthMCP(FastMCP):
             headers = getattr(request, "headers", None)
             http_id = headers.get("mcp-session-id") if headers is not None else None
             token = BrowserState.bind_session(session, http_id)
+        key = BrowserState.session_key()
+        _CALLS_IN_FLIGHT[key] = _CALLS_IN_FLIGHT.get(key, 0) + 1
         try:
+            await wait_while_closing(key, BrowserState.current_instance_id)
+            _touch_current()
             return await self._call_bound(name, arguments, context, tool)
         finally:
+            _touch_current()  # the instance current now: switch_instance may have changed it
+            if _CALLS_IN_FLIGHT.get(key, 0) <= 1:
+                _CALLS_IN_FLIGHT.pop(key, None)
+            else:
+                _CALLS_IN_FLIGHT[key] -= 1
             for hook in AFTER_TOOL_HOOKS:
                 try:
                     hook(name)

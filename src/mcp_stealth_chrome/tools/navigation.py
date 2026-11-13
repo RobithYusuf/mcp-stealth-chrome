@@ -335,9 +335,9 @@ async def reload(
 async def tab_list() -> str:
     """List all open tabs with index, URL, title."""
     try:
-        if not BrowserState.browser:
-            return err("browser not running")
-        await _srv._refresh_tabs()
+        problem = await _srv._tab_list_problem()
+        if problem:
+            return err(problem)
         lines = [f"Active tab: {BrowserState.active_tab_index}"]
         for i, t in enumerate(BrowserState.tabs):
             # One combined evaluate per tab (was two: get_url + get_title).
@@ -444,7 +444,12 @@ async def tab_new(
             observed = await _srv._observe_navigation(new_tab, url, disarm())
         finally:
             disarm()
-        await _srv._refresh_tabs()
+        problem = await _srv._tab_list_problem()
+        if problem:
+            return err(f"a tab was opened, but {problem}")
+        if new_tab not in BrowserState.tabs:
+            return err("a tab was opened, but the browser's tab list does not show it, so it was "
+                       "not made the active tab")
         BrowserState.active_tab_index = BrowserState.tabs.index(new_tab)
         if mode == "behind":
             where = await _behind_note(browser, new_tab, before_tab, emulation_error)
@@ -470,9 +475,12 @@ async def tab_select(index: int, focus: bool = False) -> str:
     brings this one to the front.
     """
     try:
-        await _srv._refresh_tabs()
+        problem = await _srv._tab_list_problem()
+        if problem:
+            return err(f"tab {index} not selected: {problem}")
         if index < 0 or index >= len(BrowserState.tabs):
-            return err(f"tab {index} out of range")
+            return err(f"tab {index} out of range: {len(BrowserState.tabs)} tab(s), "
+                       f"0..{len(BrowserState.tabs) - 1}")
         BrowserState.active_tab_index = index
         if focus or BrowserState.current_headless:
             # Headless has no foreground to take, and an unselected tab there stops painting.
@@ -493,10 +501,13 @@ async def tab_select(index: int, focus: bool = False) -> str:
 async def tab_close(index: Optional[int] = None) -> str:
     """Close tab at index (defaults to active)."""
     try:
-        await _srv._refresh_tabs()
+        problem = await _srv._tab_list_problem()
         idx = index if index is not None else BrowserState.active_tab_index
+        if problem:
+            return err(f"tab {idx} not closed: {problem}")
         if idx < 0 or idx >= len(BrowserState.tabs):
-            return err(f"tab {idx} out of range")
+            return err(f"tab {idx} out of range: {len(BrowserState.tabs)} tab(s), "
+                       f"0..{len(BrowserState.tabs) - 1}")
         closed_tab = BrowserState.tabs[idx]
         if len(BrowserState.tabs) == 1:
             # Said before the close: the quit watcher polls on its own and must never see this

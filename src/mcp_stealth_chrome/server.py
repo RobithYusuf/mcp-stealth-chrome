@@ -300,6 +300,14 @@ async def _discard_temp_profile(browser: Any) -> None:
 
 def _process_command(pid: int) -> Optional[str]:
     """The command line of a running PID, or None when it cannot be read."""
+    if sys.platform == "win32":
+        # No ps there. The runner's is Git Bash's, which ran 1.1 s to its 3 s timeout here, on
+        # the event loop, at every close; a person's Windows has none, so nothing was checked.
+        from .state import process_table
+        for row_pid, _ppid, command in process_table() or []:
+            if row_pid == pid:
+                return command or None
+        return None
     try:
         r = subprocess.run(["ps", "-ww", "-o", "command=", "-p", str(pid)],
                            capture_output=True, text=True, timeout=3)
@@ -1410,20 +1418,26 @@ from .tools import turnstile_oscursor as _turnstile_oscursor  # registers the na
 
 # ── Utility: ensure active tab after operations that may shift tabs ────────
 
-async def _refresh_tabs() -> None:
+async def _refresh_tabs() -> bool:
     """Sync BrowserState.tabs with the browser, keeping the active tab selected.
 
     nodriver up to 0.48 tracked new and closed targets by itself. From 0.50 it only learns
     of them on update_targets, so without this a popup stays invisible and a closed tab
     stays listed, and the active one could silently become a different tab.
+
+    True when the browser answered. False means no browser, or a list that may be stale.
     """
     browser = BrowserState.browser
     if not browser:
-        return
+        return False
     index = BrowserState.active_tab_index
     current = BrowserState.tabs[index] if 0 <= index < len(BrowserState.tabs) else None
+    answered = False
     with contextlib.suppress(Exception):
         await asyncio.wait_for(browser.update_targets(), timeout=5)
+        answered = True
+    if BrowserState.browser is not browser:
+        return False  # closed or switched while it was asked; its tabs are not this state's
     BrowserState.tabs = list(browser.tabs)
     if current is not None:
         wanted = _target_key(current)
@@ -1431,6 +1445,28 @@ async def _refresh_tabs() -> None:
             if _target_key(tab) == wanted:
                 BrowserState.active_tab_index = position
                 break
+    return answered
+
+
+async def _tab_list_problem() -> Optional[str]:
+    """Refresh the tab list for a tool that answers from it. An error text when it cannot.
+
+    A browser closed under the caller (idle timeout, last window, crash) left an empty list,
+    and tab_select answered "tab 0 out of range" as if the index were the mistake.
+    """
+    refreshed = await _refresh_tabs()
+    if BrowserState.browser is None or not refreshed:
+        try:
+            BrowserState.active_tab()  # raises with the reason the browser went, when known
+        except Exception as exc:
+            return str(exc)
+        if BrowserState.browser is None:
+            return "browser not running"
+        return ("the browser did not answer when asked for its tabs, so the tab list may be "
+                "stale and nothing was changed; if it keeps happening, browser_recover")
+    if not BrowserState.tabs:
+        return "the browser has no open tab"
+    return None
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -6843,11 +6879,41 @@ async def _launch_browser_instance(
     )
 
 
+@contextlib.contextmanager
+def _closing_in_background(instance_id: str):
+    """While a sweep closes an instance, a call on it waits (_app.INSTANCE_CLOSING) instead of
+    acting on a browser half closed, or switching it in while the close goes on."""
+    key = (BrowserState.session_key(), instance_id)
+    event = asyncio.Event()
+    _app_module.INSTANCE_CLOSING[key] = event
+    try:
+        yield
+    finally:
+        if _app_module.INSTANCE_CLOSING.get(key) is event:
+            del _app_module.INSTANCE_CLOSING[key]
+        event.set()
+
+
+def _still_held(iid: str, snap: Optional[InstanceSnapshot], browser: Any) -> bool:
+    """A sweep's candidate is still where the sweep found it. Between its awaits a switch_instance
+    can make a stored instance current, or store the current one: closing by the old position
+    then ends the wrong browser, or resets the instance that is current by then."""
+    if snap is None:
+        return BrowserState.current_instance_id == iid and BrowserState.browser is browser
+    return BrowserState.instances.get(iid) is snap
+
+
 async def _end_stored_instance(iid: str, snap: InstanceSnapshot,
                                record_reason: Optional[str] = None) -> bool:
     """Close a stored instance like close_instance does. True once its Chrome is verified gone.
 
     record_reason: save its tabs first, under that reason. None when Chrome is already gone."""
+    with _closing_in_background(iid):
+        return await _end_stored_instance_now(iid, snap, record_reason)
+
+
+async def _end_stored_instance_now(iid: str, snap: InstanceSnapshot,
+                                   record_reason: Optional[str]) -> bool:
     _tabs = list(snap.tabs)
     # stop() can return without raising when the socket is gone. Keep the instance
     # reachable and retry later unless the process is really gone; dropping it
@@ -6878,6 +6944,11 @@ async def _end_current_instance(record_reason: Optional[str] = None) -> bool:
     """Close the calling session's current instance. True once its Chrome is verified gone.
 
     record_reason: save its tabs first, under that reason. None when Chrome is already gone."""
+    with _closing_in_background(BrowserState.current_instance_id):
+        return await _end_current_instance_now(record_reason)
+
+
+async def _end_current_instance_now(record_reason: Optional[str]) -> bool:
     _cur_profile = BrowserState.current_profile_dir
     _cur_privacy = BrowserState.current_privacy
     _cur_tabs = list(BrowserState.tabs)
@@ -6903,15 +6974,29 @@ async def _end_current_instance(record_reason: Optional[str] = None) -> bool:
     return True
 
 
+def _idle_closed_note(iid: str, timeout: int) -> str:
+    return (f"instance {iid!r} was closed at {time.strftime('%H:%M:%S')} after {timeout} s with no "
+            f"tool call (idle_timeout_seconds={timeout}).")
+
+
 async def _sweep_idle_instances() -> None:
     """Close the calling session's instances that are past their idle timeout."""
     for iid, snap in list(BrowserState.instances.items()):
+        if not _still_held(iid, snap, snap.browser):
+            continue  # switched in while an earlier one was being closed
         if snap.is_running() and snap.is_idle_expired():
-            await _end_stored_instance(iid, snap, "idle timeout")
+            BrowserState.window_closed[iid] = _idle_closed_note(iid, snap.idle_timeout)
+            if not await _end_stored_instance(iid, snap, "idle timeout"):
+                BrowserState.window_closed.pop(iid, None)
+    # A tool call running in this session is use of its current instance, however long it takes.
     if (BrowserState.is_up()
         and BrowserState.current_idle_timeout > 0
+        and not _app_module.calls_in_flight(BrowserState.session_key())
         and (time.time() - BrowserState.current_last_active) > BrowserState.current_idle_timeout):
-        await _end_current_instance("idle timeout")
+        iid = BrowserState.current_instance_id
+        BrowserState.window_closed[iid] = _idle_closed_note(iid, BrowserState.current_idle_timeout)
+        if not await _end_current_instance("idle timeout"):
+            BrowserState.window_closed.pop(iid, None)
 
 
 async def _idle_reaper_loop() -> None:
@@ -7007,7 +7092,7 @@ async def _sweep_windowless() -> set[int]:
             # The watcher is ending it because its last window went: say so at once, and
             # clean up once the watcher is done.
             BrowserState.window_closed[iid] = quit_watch.closed_note(iid, quit_at)
-            if quit_watch.running(browser):
+            if quit_watch.running(browser) or not _still_held(iid, snap, browser):
                 continue
             if await (_end_current_instance() if snap is None else _end_stored_instance(iid, snap)):
                 quit_watch.forget(browser)
@@ -7035,6 +7120,8 @@ async def _sweep_windowless() -> set[int]:
             continue
         if now - entry["zero_since"] < _WINDOWLESS_GRACE:
             continue
+        if not _still_held(iid, snap, browser):
+            continue  # switched while this sweep awaited; the next one sees it where it is
         # Said before closing starts: a call arriving while Chrome is being ended must not
         # read as a crash that needs browser_recover.
         BrowserState.window_closed[iid] = (
@@ -7276,10 +7363,17 @@ async def switch_instance(instance_id: str) -> str:
     foreign = BrowserState.foreign_instance(instance_id)
     if foreign:
         return err(foreign)
+    # Being closed by a sweep (idle timeout, last window gone): switching it in now would hand
+    # the caller a browser that is going, and the close would then reset the current instance.
+    await _app_module.wait_while_closing(BrowserState.session_key(), instance_id)
     BrowserState.claim_released(instance_id)
     existed = instance_id in BrowserState.instances
     BrowserState.switch_to(instance_id)
     if not existed and not BrowserState.is_up():
+        closed = BrowserState.window_closed.get(instance_id)
+        if closed:
+            return ok(f"switched to {instance_id!r}, which is not running: {closed} Start it again "
+                      f"with spawn_browser or browser_launch")
         return ok(f"switched to {instance_id!r} (not yet running — call spawn_browser or browser_launch)")
     return ok(f"switched to {instance_id!r}")
 
@@ -7326,6 +7420,7 @@ async def close_instance(instance_id: str, forget_tabs: bool = False) -> str:
     foreign = BrowserState.foreign_instance(instance_id)
     if foreign:
         return err(foreign)
+    await _app_module.wait_while_closing(BrowserState.session_key(), instance_id)
     BrowserState.claim_released(instance_id)
     # Close current
     if instance_id == BrowserState.current_instance_id:
@@ -7426,6 +7521,9 @@ async def close_all_instances() -> str:
     """Close every running browser instance. Useful for cleanup."""
     closed = []
     failures = []
+    session = BrowserState.session_key()
+    for key in [k for k in list(_app_module.INSTANCE_CLOSING) if k[0] == session]:
+        await _app_module.wait_while_closing(*key)  # one closer per browser
     # Close stored
     for iid, snap in list(BrowserState.instances.items()):
         _tabs = list(snap.tabs)

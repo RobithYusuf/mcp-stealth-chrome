@@ -223,8 +223,55 @@ def _patch_transaction_late_reply() -> None:
         _STATUS["transaction_late_reply"] = f"{type(e).__name__}: {e}"
 
 
+async def _refresh_nobody_awaits(coro):
+    try:
+        return await coro
+    except Exception:
+        return None  # the browser went; the next call that needs the list asks again
+
+
+def _patch_background_target_refresh() -> None:
+    """nodriver starts update_targets() as a task nobody awaits, on every target event and in
+    Browser.wait and Tab.sleep. When the browser has gone (each target of a closing browser
+    sends one), it fails with ConnectionRefusedError, asyncio logs "Task exception was never
+    retrieved", and FastMCP's Rich handler renders that traceback on the event loop: 1.1 to
+    1.3 s each on the Windows runner, several per close. The idle reaper read the stall as
+    idleness and closed a freshly spawned instance. Those tasks now end quietly; an
+    update_targets that is awaited (_refresh_tabs) still raises.
+    """
+    try:
+        import types
+
+        from nodriver.core import browser as nd_browser
+        from nodriver.core import tab as nd_tab
+
+        class _Asyncio(types.ModuleType):
+            def __getattr__(self, name):
+                return getattr(asyncio, name)
+
+            @staticmethod
+            def create_task(coro, *args, **kwargs):
+                if getattr(coro, "__qualname__", "").endswith("Browser.update_targets"):
+                    coro = _refresh_nobody_awaits(coro)
+                return asyncio.create_task(coro, *args, **kwargs)
+
+        for module in (nd_browser, nd_tab):
+            current = getattr(module, "asyncio", None)
+            if getattr(current, "_mcp_shim", False):
+                continue
+            if current is not asyncio:
+                raise RuntimeError(f"{module.__name__} has no asyncio module to wrap")
+            shim = _Asyncio("asyncio")
+            shim._mcp_shim = True
+            module.asyncio = shim
+        _STATUS["background_target_refresh"] = True
+    except Exception as e:  # never block server startup on patch failure
+        _STATUS["background_target_refresh"] = f"{type(e).__name__}: {e}"
+
+
 def apply_all() -> None:
     _patch_fastmcp_keeps_text()
+    _patch_background_target_refresh()
     _patch_transaction_late_reply()
     _patch_cookie_same_party()
     _patch_client_security_state()

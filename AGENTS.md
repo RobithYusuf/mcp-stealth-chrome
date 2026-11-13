@@ -346,6 +346,17 @@ conclusions. Each rule below replaced a real lie.
   to a newer major says so once in its result.
 - A stdio `browser_launch` sets `current_idle_timeout = 0`. Leaving the reaper off is not enough: any `spawn_browser`
   starts it, and it then closed the browser the person was looking at, 15 minutes after its last tool call.
+- Every tool call is use of its session's current instance: `StealthMCP.call_tool` sets `current_last_active` before
+  and after it, and the reaper leaves that instance alone while a call runs (`_app.calls_in_flight`). Before, only
+  `active_tab()` counted, so `tab_new`, `tab_select` and `switch_instance` did not, and on Windows CI an instance with
+  `idle_timeout_seconds=2` was closed during a `tab_new` while the event loop stalled (the `ps` and `update_targets`
+  facts under Chrome, CDP and nodriver): 14 of 32 runs failed, `tab_new` erring or hanging past 60 s, or `tab_select`
+  reading the empty list as "tab 0 out of range". A sweep that closes an instance registers it in
+  `_app.INSTANCE_CLOSING`: a call on it, `switch_instance` to it and `close_instance` of it wait for the close, and the
+  sweep checks after each await that its candidate is still where it found it (`_still_held`). Switched in mid-close,
+  the close's `reset()` wiped whichever instance was current by then. A tool answering from the tab list goes through
+  `_tab_list_problem`, which names why the browser went (`window_closed` carries the idle note) and refuses a list the
+  browser did not confirm (`_refresh_tabs` returns False).
 - `is_up()` false does not mean Chrome stopped: closing the last tab empties `tabs` while the process runs and
   holds the profile. Close paths branch on `BrowserState.browser is None`, never on `is_up()`.
 - Chrome started with `--no-startup-window` does not exit on Quit: the quit Apple Event closes every window and
@@ -591,6 +602,15 @@ Platform truths, not preferences. Each one cost a release.
 - `os.kill(pid, 0)` is no liveness probe on Windows: 0 is `CTRL_C_EVENT`, sent through `GenerateConsoleCtrlEvent`, and
   `signal.SIGKILL` does not exist. Every close there reported Chrome still running until `_process_exists` asked
   `OpenProcess`/`GetExitCodeProcess` (`state._win_pid_alive`). Probe through `_process_exists`, never `os.kill(pid, 0)`.
+- Nothing on the event loop may shell out to `ps` on Windows. A person's machine has none, and the runner's is Git
+  Bash's: `_process_command` ran it at every close and blocked the loop 1.1 s up to its 3 s timeout, measured with a
+  thread dumping the main thread's stack whenever a 0.1 s heartbeat stopped. Command lines there come from
+  `state.process_table()`.
+- nodriver 0.48 starts `update_targets()` as tasks nobody awaits, on every target event and in `Browser.wait` and
+  `Tab.sleep`. On a closing browser each one fails, asyncio logs "Task exception was never retrieved", and FastMCP's
+  Rich handler renders the traceback on the event loop: 1.1 to 1.3 s each on the Windows runner, five per close.
+  `patches._patch_background_target_refresh` makes those tasks end quietly; an awaited `update_targets` still raises.
+  The idle reaper read these stalls as idleness and closed an instance spawned a moment before.
 - A module-level import of a POSIX-only module (`fcntl`) stopped the server from starting on Windows from 0.12.12 to
   0.15.0, and nothing noticed because no test ran there. CI's Windows jobs are the guard; `test_smoke` imports the
   server with `fcntl` hidden.

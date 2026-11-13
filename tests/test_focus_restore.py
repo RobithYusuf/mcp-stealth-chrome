@@ -241,9 +241,10 @@ def _tab_select_fixture(monkeypatch, headless):
             activated.append(True)
 
     async def refresh():
-        return None
+        return True  # the browser answered
 
     monkeypatch.setattr(server, "_refresh_tabs", refresh)
+    monkeypatch.setattr(server.BrowserState, "browser", object(), raising=False)
     monkeypatch.setattr(server.BrowserState, "tabs", [Tab(), Tab()], raising=False)
     monkeypatch.setattr(server.BrowserState, "active_tab_index", 0, raising=False)
     monkeypatch.setattr(server.BrowserState, "current_headless", headless, raising=False)
