@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from .. import key_outcome
 from .. import server as _srv
 from .._app import mcp
 from ..helpers import err, get_url, ok
@@ -209,22 +210,6 @@ async def hover(ref: Optional[str] = None, selector: Optional[str] = None) -> st
         return err(str(e))
 
 
-def _key_effect(before: dict, after: dict) -> Optional[str]:
-    """What changed between two fingerprints, in words. None when nothing did."""
-    if not before or not after:
-        return None
-    if before.get("url") != after.get("url"):
-        return f"navigated to {after.get('url')}"
-    if (before.get("len") != after.get("len") or before.get("hash") != after.get("hash")
-            or before.get("nodes") != after.get("nodes")):
-        return f"page changed (nodes {before.get('nodes')}→{after.get('nodes')})"
-    if before.get("active") != after.get("active"):
-        return f"focus moved to <{(after.get('active') or '?').lower()}>"
-    if before.get("element") != after.get("element"):
-        return "the focused element changed"
-    return None
-
-
 @mcp.tool()
 async def press_key(key: str, verify: bool = True, settle_ms: int = 1000) -> str:
     """Press a key and report what was observed, not only that it was sent.
@@ -259,16 +244,10 @@ async def press_key(key: str, verify: bool = True, settle_ms: int = 1000) -> str
             return ok(f"pressed {key} — sent to {target}{_srv._dialog_note(tab)}")
         if not verify:
             return ok(f"pressed {key} — sent to {target}; effect not checked (verify=False)")
-        deadline = time.monotonic() + max(0, settle_ms) / 1000
-        after: dict = {}
-        while True:
-            await asyncio.sleep(0.05)
-            after = await _srv._page_sig(tab, focused)
-            effect = _key_effect(before, after)
-            if effect:
-                return ok(f"pressed {key} — sent to {target}; {effect}")
-            if time.monotonic() >= deadline:
-                break
+        effect, after = await key_outcome.watch(
+            lambda: _srv._page_sig(tab, focused), before, settle_ms)
+        if effect:
+            return ok(f"pressed {key} — sent to {target}; {effect}")
         if before and not after:
             return ok(f"pressed {key} — sent to {target}; the page stopped answering "
                       f"within {settle_ms}ms, so the effect is unknown (it may be navigating)")

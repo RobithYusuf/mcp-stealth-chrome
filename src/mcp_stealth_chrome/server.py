@@ -34,6 +34,7 @@ from nodriver.cdp import dom as cdp_dom, runtime as cdp_runtime
 from . import __version__
 from . import patches as _patches
 _patches.apply_all()
+from .key_outcome import element_unread
 from .helpers import (
     OPEN_DIALOGS,
     dialog_note,
@@ -4089,11 +4090,16 @@ def _click_change(before: dict, after: dict) -> Optional[str]:
     return None
 
 
+_UNREAD_AFTER_CLICK = ("; the clicked element could no longer be read, while the page itself "
+                       "shows no change (it may be navigating)")
+
+
 def _click_outcome(head: str, detail: str, before: dict, after: dict) -> str:
     """Compare fingerprints and say what the click did, never a bare 'clicked'."""
     if not (before and after):
         return ok(f"{head} — {detail}")
-    change = _click_change(before, after)
+    change = (_UNREAD_AFTER_CLICK if element_unread(before, after)
+              else _click_change(before, after))
     if change is not None:
         return ok(f"{head} — {detail}{change}")
     return ok(
@@ -4127,10 +4133,16 @@ async def _sig_after_action(tab, before: dict, el=None, pages: bool = False) -> 
         if _dialog_note(tab):
             return after
         after = await _page_sig(tab, el, pages=pages)
+        # Old page, element unreadable: the document went between the two halves of the read.
+        # Not an answer; the next pause shows where the page went (key_outcome).
+        if element_unread(before, after):
+            continue
         if before and after and _click_change(before, after) is not None:
             await asyncio.sleep(_VERIFY_SETTLE)
             if not _dialog_note(tab):
-                after = await _page_sig(tab, el, pages=pages) or after
+                again = await _page_sig(tab, el, pages=pages)
+                if again and not element_unread(before, again):
+                    after = again
             return after
     return after
 

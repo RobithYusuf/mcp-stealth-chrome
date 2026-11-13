@@ -284,6 +284,47 @@ def test_enter_submits_the_form_and_reports_navigation(keys_page):
 
 
 @E2E
+def test_enter_reports_navigation_when_the_document_goes_between_two_reads(keys_page, base_url,
+                                                                          monkeypatch):
+    """The macOS CI flake, forced. There the first read after Enter got its page half from
+    keys.html and its element half after the result page had committed, which comes back
+    empty because the node went with the old document. That read was reported as "the
+    focused element changed". Here the first read after the key is built the same way: the
+    page half read from keys.html before the key, the element half read from Chrome once the
+    navigation is done. The next real read has to show the navigation."""
+    from mcp_stealth_chrome import server
+    lp = keys_page
+    real_sig = server._page_sig
+    reads: list = []
+    torn: list = []
+
+    async def sig(tab, el=None, **kwargs):
+        reads.append(None)
+        if len(reads) != 2 or el is None:  # read 1 is the one before the key
+            out = await real_sig(tab, el, **kwargs)
+            if len(reads) == 1:
+                torn.append({k: v for k, v in out.items() if k != "element"})
+            return out
+        await asyncio.sleep(0.4)  # the form's result page commits meanwhile
+        late = await real_sig(tab, el, **kwargs)
+        torn[0]["element"] = late.get("element")
+        return dict(torn[0])
+
+    monkeypatch.setattr(server, "_page_sig", sig)
+    for i in range(3):
+        if i:
+            run(lp, "navigate", f"{base_url}/keys.html")
+        run(lp, "click", selector="#q")
+        run(lp, "type_text", f"monitor{i}")
+        reads.clear()
+        torn.clear()
+        out = run(lp, "press_key", "Enter")
+        # Chrome itself answered the element half with nothing: its node is gone.
+        assert torn and torn[0]["element"] == {} and torn[0]["url"].endswith("/keys.html"), torn
+        assert "navigated to" in out and f"q=monitor{i}" in out, out
+
+
+@E2E
 def test_key_event_fields_are_complete_and_trusted(keys_page):
     lp = keys_page
     run(lp, "click", selector="#q")

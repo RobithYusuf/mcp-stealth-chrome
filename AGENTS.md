@@ -27,6 +27,7 @@ uvx mcp-stealth-chrome → Python 3.11+ → FastMCP → nodriver → Chrome/Chro
 - `src/mcp_stealth_chrome/helpers.py` — `ok`/`err`, tab selection, path confinement, JSON parsing.
 - `src/mcp_stealth_chrome/patches.py` — runtime monkey-patches for nodriver/CDP drift.
 - `src/mcp_stealth_chrome/identity.py` — key events, client hints and languages. `humanize.py` — pointer and typing input.
+- `src/mcp_stealth_chrome/key_outcome.py`: what `press_key` reports a key did, and the torn-read rule clicks share.
 - `src/mcp_stealth_chrome/dock_icon.py` — Chrome Beta with the project icon for headed launches, and removal of the 0.13.0 Chrome copy. `assets/dock_icon.png` is that icon.
 - `src/mcp_stealth_chrome/profile_version.py` — which Chrome may open a profile: the version guard and `beta_verdict`.
 - `src/mcp_stealth_chrome/quit_watch.py` — starts the per-browser quit watcher and keeps its state files; `_quit_watcher.py` is that watcher, a standalone script.
@@ -140,6 +141,13 @@ conclusions. Each rule below replaced a real lie.
   `clicked but NO page change detected` when nothing moved. The fingerprint includes the element's own
   tree and state, or an iframe, shadow tree or checkbox change reads as no change. A real click focuses its
   target by itself, so focus landing on the clicked element is not a change.
+- `_page_sig` reads the page and then the element in two calls, and a form submitted by Enter can replace the
+  document between them: old URL, empty element half. `press_key` called that "the focused element changed" on
+  macOS CI; forced locally it did in 37 of 100 presses. An empty element half over an unchanged page is no answer
+  yet (`key_outcome.element_unread`, `active` left out because a blur before the submit leaves focus on `<body>`):
+  the next read shows the navigation. `_sig_after_action` uses the same rule within `_VERIFY_PAUSES`, and a click
+  still torn at the end says the element could not be read. `key_outcome.watch` ends at `settle_ms` plus
+  `READ_LIMIT` (5 s) even if a read never answers, and calls the effect unknown; no change still waits `settle_ms`.
 - An empty `_click_probe` is an unanswered question, not a pass: `_blocked_reason({})` refuses. `humanize=True`
   presses a random spot rather than the tested centre, so that spot gets its own hit test first.
 - `Element.click()` in nodriver is a JS `el.click()` (`isTrusted=false`) preceded by `flash()`, which
