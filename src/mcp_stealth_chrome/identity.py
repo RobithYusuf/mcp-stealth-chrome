@@ -31,7 +31,8 @@ def strip_headless(user_agent: str) -> str:
     return (user_agent or "").replace("HeadlessChrome/", "Chrome/")
 
 
-def brand_list(major: int, version: Optional[str] = None) -> list[dict[str, str]]:
+def brand_list(major: int, version: Optional[str] = None,
+               product: str = "Google Chrome") -> list[dict[str, str]]:
     """Chrome's brand list for a major version, ordered and GREASEd as Chrome does.
 
     Chromium derives the GREASE brand, its version and the order from the major
@@ -39,6 +40,9 @@ def brand_list(major: int, version: Optional[str] = None) -> list[dict[str, str]
     the Chrome on this machine by a test; the format has changed across Chrome
     versions before, so a much older major in an override may differ. Pass the full
     version to build fullVersionList instead of brands.
+
+    `product` is the browser's own brand: "Brave" for Brave, which lists itself in the
+    place Google Chrome takes, in the same order (measured on Brave 157).
     """
     grease = f"Not{_ESCAPED[major % 11]}A{_ESCAPED[(major + 1) % 11]}Brand"
     grease_version = _GREASE_VERSIONS[major % 3]
@@ -48,7 +52,7 @@ def brand_list(major: int, version: Optional[str] = None) -> list[dict[str, str]
     entries = (
         {"brand": grease, "version": grease_version},
         {"brand": "Chromium", "version": real},
-        {"brand": "Google Chrome", "version": real},
+        {"brand": product, "version": real},
     )
     order = _ORDERS[major % 6]
     return [entries[i] for i in order]
@@ -103,21 +107,31 @@ def _machine_hints(family: str) -> tuple[str, str]:
     return ".".join(parts), arch
 
 
+BRAVE = "Brave"
+
+
 def ua_metadata_fields(
     user_agent: str, platform: str = "", real_version: Optional[str] = None,
+    product: str = "Google Chrome",
 ) -> Optional[dict[str, Any]]:
     """Client hints that agree with a UA string. None when it is not a Chrome UA,
     since a Firefox or Safari UA has no userAgentData to agree with.
 
     Chrome's UA string is reduced to 156.0.0.0 while its hints carry the real build,
     so real_version supplies that build whenever the major version is the same.
+
+    product="Brave" gives Brave's own hints: its brand in Google Chrome's place, and every
+    full version reduced to major.0.0.0, as Brave reports them (measured on Brave 157:
+    fullVersionList and uaFullVersion read 157.0.0.0 while the engine is 157.0.8103.39).
     """
     full = chrome_version(user_agent)
     family = os_family(user_agent, platform)
     if not full or not family:
         return None
     major = int(full.split(".")[0])
-    if real_version and real_version.split(".")[0] == str(major):
+    if product == BRAVE:
+        full = f"{major}.0.0.0"
+    elif real_version and real_version.split(".")[0] == str(major):
         full = real_version
     platform_version, architecture = _machine_hints(family)
     return {
@@ -128,8 +142,8 @@ def ua_metadata_fields(
         "mobile": False,
         "bitness": "64",
         "full_version": full,
-        "brands": brand_list(major),
-        "full_version_list": brand_list(major, full),
+        "brands": brand_list(major, product=product),
+        "full_version_list": brand_list(major, full, product=product),
     }
 
 
@@ -137,11 +151,11 @@ _ANDROID_UA = re.compile(r"Android ([\d.]+); ([^;)]+)")
 
 
 def device_ua_metadata_fields(
-    user_agent: str, real_version: Optional[str] = None,
+    user_agent: str, real_version: Optional[str] = None, product: str = "Google Chrome",
 ) -> Optional[dict[str, Any]]:
     """ua_metadata_fields for an emulated phone. Android's hints name the device rather
     than the desktop this is running on. None for a Safari UA, which has no hints."""
-    hints = ua_metadata_fields(user_agent, real_version=real_version)
+    hints = ua_metadata_fields(user_agent, real_version=real_version, product=product)
     found = _ANDROID_UA.search(user_agent or "")
     if hints is None or found is None:
         return hints

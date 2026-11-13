@@ -116,6 +116,26 @@ jobs:
         run: |
           sudo ln -sf "$CHROME_PATH" /usr/bin/chrome
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      # Brave for browser="brave" (test_brave_e2e.py, which skips itself when Brave is missing).
+      # Installed where a person's goes: Brave's APT repository on Linux (/usr/bin/brave-browser),
+      # the Homebrew cask on macOS (/Applications/Brave Browser.app), Chocolatey on Windows
+      # (Program Files\BraveSoftware). None of them is on nodriver's list, so Chrome stays the
+      # default browser of every other suite.
+      - name: Install Brave (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo curl -fsSLo /usr/share/keyrings/brave-browser-archive-keyring.gpg \
+            https://brave-browser-apt-release.s3.brave.com/brave-browser-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/brave-browser-archive-keyring.gpg] https://brave-browser-apt-release.s3.brave.com/ stable main" \
+            | sudo tee /etc/apt/sources.list.d/brave-browser-release.list
+          sudo apt-get update -q
+          sudo apt-get install -y -q brave-browser
+      - name: Install Brave (macOS)
+        if: runner.os == 'macOS'
+        run: brew install --cask brave-browser
+      - name: Install Brave (Windows)
+        if: runner.os == 'Windows'
+        run: choco install brave --no-progress -y
       - run: uv sync --locked
       - name: Show the Chrome the server will launch
         shell: bash
@@ -126,11 +146,15 @@ jobs:
           path = _default_chrome()
           print("server picks:", path)
           print("version:", profile_version.binary_version(path))
+          from mcp_stealth_chrome import brave
+          print("browser='brave' picks:", brave.find_brave(),
+                profile_version.binary_version(brave.find_brave()))
           PY
       - name: Real-Chrome suites
         run: >-
           uv run pytest -v -rs --durations=20
           tests/test_cookie_close_e2e.py
+          tests/test_brave_e2e.py
           tests/test_lean_launch_e2e.py
           tests/test_keys_identity.py
           tests/test_old_tools_e2e.py

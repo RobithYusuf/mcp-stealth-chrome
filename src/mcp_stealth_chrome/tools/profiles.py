@@ -23,7 +23,8 @@ from .. import tab_record as _tabs
 from .._app import mcp
 from ..helpers import err, ok
 
-_FALLBACK_NAME = re.compile(r"^profile-pid(\d+)$")
+# Chrome's fallback, and Brave's (browser="brave" keeps its profiles apart, brave.py).
+_FALLBACK_NAME = re.compile(r"^(?:brave-)?profile-pid(\d+)$")
 
 # Regenerable by Chrome. Cookies, Login Data, Local Storage, IndexedDB, Sessions,
 # Preferences and Web Data are deliberately absent: those are the logged-in state.
@@ -146,7 +147,7 @@ def _removal_refusal(name: str, profile: Path, row: dict | None = None) -> str |
     """Why this directory may not be deleted, or None. The one place that decides."""
     match = _FALLBACK_NAME.match(name)
     if not match:
-        return "not a fallback profile (only profile-pid<N> can be removed)"
+        return "not a fallback profile (only profile-pid<N> and brave-profile-pid<N> can be removed)"
     if profile.is_symlink() or not profile.is_dir():
         return "not a real directory"
     if profile.parent.resolve() != _root().resolve():
@@ -165,16 +166,18 @@ def _removal_refusal(name: str, profile: Path, row: dict | None = None) -> str |
 def _named_profiles() -> list[tuple[str, Path, str]]:
     root = _root()
     found: list[tuple[str, Path, str]] = []
-    main = root / "profile"
-    # A symlink here would aim cleanup outside the tree this tool manages.
-    if main.is_dir() and not main.is_symlink():
-        found.append(("profile", main, "main"))
-    named = root / "profiles"
-    if named.is_dir() and not named.is_symlink():
-        found.extend(
-            (f"profiles/{p.name}", p, "named")
-            for p in sorted(named.iterdir()) if p.is_dir() and not p.is_symlink()
-        )
+    # Chrome's folders, then Brave's (browser="brave"), which are named the same way.
+    for main_name, named_name in (("profile", "profiles"), ("brave-profile", "brave-profiles")):
+        main = root / main_name
+        # A symlink here would aim cleanup outside the tree this tool manages.
+        if main.is_dir() and not main.is_symlink():
+            found.append((main_name, main, "main"))
+        named = root / named_name
+        if named.is_dir() and not named.is_symlink():
+            found.extend(
+                (f"{named_name}/{p.name}", p, "named")
+                for p in sorted(named.iterdir()) if p.is_dir() and not p.is_symlink()
+            )
     if root.is_dir():
         found.extend(
             (p.name, p, "fallback")

@@ -403,6 +403,7 @@ Average: 113 s
 | Work with a logged-in account | `browser_launch()` | `~/.mcp-stealth/profile` | Logins, cookies, history, the list of open tabs |
 | Try something without saving a login | `browser_launch(persistent=False)` | Temporary | Nothing |
 | Start with no trace of this browser's past use | `browser_launch(privacy=True)` | Empty, under `privacy-profiles/` | Nothing, and the removal is checked |
+| Use Brave instead of Chrome | `browser_launch(browser="brave")` | `~/.mcp-stealth/brave-profile` | As for Chrome, in a profile of Brave's own |
 
 `privacy=True` starts from an empty profile, deletes it on close, and picks one proxy when you pass a pool (`a|b`). It does not change the identity. User agent, Chrome version, operating system, language and timezone stay those of the real browser and machine in every mode, since a made-up identity on a real engine contradicts itself. To use a logged-in account, leave privacy off.
 
@@ -412,7 +413,38 @@ To use logins from your own browser, `list_chrome_profiles` shows every Chromium
 
 A browser started with `browser_launch` over stdio stays open until you close it, or until the server exits when its client goes away. `keep_alive=True` keeps it past that (see below). Instances from `spawn_browser` and browsers in HTTP mode close after `BROWSER_IDLE_TIMEOUT`.
 
-Runtime data lives in `~/.mcp-stealth/`: `profile/`, `profiles/<id>/`, `screenshots/`, `exports/`, `storage-states/`, `window-state/`, `keep-alive/`. An `app/` folder left by 0.13.0 is removed.
+Runtime data lives in `~/.mcp-stealth/`: `profile/`, `profiles/<id>/`, `brave-profile/`, `brave-profiles/<id>/`, `screenshots/`, `exports/`, `storage-states/`, `window-state/`, `keep-alive/`. An `app/` folder left by 0.13.0 is removed.
+
+### Brave
+
+`browser_launch(browser="brave")` and `spawn_browser(..., browser="brave")` run Brave instead of Chrome, from where Brave installs itself (`/Applications/Brave Browser.app`, `/usr/bin/brave-browser`, `Program Files\BraveSoftware`), or from `MCP_STEALTH_BRAVE_PATH`. Driven over CDP it stays Brave, measured on Brave 157.1.99.55:
+
+- ✅ Shields blocks ads and trackers: a local page loading a script from an EasyList host had it blocked, where Chrome loaded it. A new profile fetches its filter lists first, about 11 to 12 seconds.
+- ✅ Farbling: a canvas reads differently on each site and in each session, as in any Brave. Chrome reads the same everywhere. `fingerprint_audit` counts this as expected on Brave, not as a leak.
+- ✅ The page sees Brave: `navigator.brave.isBrave()` is true and `userAgentData` lists Brave and Chromium with versions reduced to `157.0.0.0`, as Brave reports them. The identity override this server applies (headless, `lang`, `fingerprint`) keeps those, and never names Google Chrome there.
+- Brave's profiles are its own: `~/.mcp-stealth/brave-profile` for main, `~/.mcp-stealth/brave-profiles/<id>` for others. A profile belongs to the browser that made it: Brave and Chrome keep cookies and saved passwords under different keys, so opening a Chrome profile with Brave, or a Brave profile with Chrome, is refused and the result names why. `clone_chrome_profile(browser="brave")` copies into `brave-profiles/<id>`, to launch with `browser="brave"`.
+- `keep_alive=True` works for Brave as for Chrome. The next `browser="brave"` launch reattaches to a kept Brave, and a Chrome launch is never handed one (nor the reverse); the result says why a kept browser was not reattached.
+- The Dock icon switch (`MCP_STEALTH_DOCK_ICON`) applies to Chrome only. Quit, `restore_tabs`, cookies kept across a close, and visible windows that stay behind the app in use work as they do for Chrome.
+- `server_status` reports under `brave` whether Brave is installed, where, and its version, and under `browser` which one is running.
+- A profile whose maker cannot be told (it holds data, and its `Local State` and `Preferences` are missing, any of them is unreadable, or they disagree) is refused to both browsers. A `--user-data-dir` in `extra_args` is treated as the launch's profile folder and gets the same checks; naming two different folders is refused.
+- `attach_to_chrome` tells Brave from Chrome by the process on that port, or `navigator.brave`, and says which. A browser it cannot tell (a wrapper, Edge, Vivaldi, or one on another machine without `navigator.brave`) is reported as such, and `fingerprint_rotate` and `emulate_device` then leave the client hints alone rather than name the wrong browser.
+- Brave 158 handles cookies as Chrome 158 does: in a profile outside its own folder it cannot read the `v10` cookies Brave 157 wrote, and deletes them. The cookie move under Chrome works for Brave too (measured on Brave Beta 158.1.101.48 with a test keychain: 3 cookies moved, read back, stored as `v11`). A Brave whose version cannot be read is refused a profile holding `v10` cookies.
+- `profile_report`, `profile_cleanup` and the start-up cleanup know `brave-profile`, `brave-profiles/<id>` and `brave-profile-pid<N>` as they know Chrome's folders, with the same checks.
+
+Measured through this server on one macOS machine in November 2026, Brave 157.1.99.55 against Google Chrome 157:
+
+| Check | Brave | Chrome |
+|-------|-------|--------|
+| `bot.sannysoft.com`, headless and visible | 30 passed, 1 warning (`TRANSPARENT_PIXEL`, from farbling) in 3 of 4 runs | 31 passed |
+| `browserscan.net/bot-detection` | 18 of 18 "Normal" | 18 of 18 "Normal" |
+| `2captcha.com/demo/cloudflare-turnstile` with `click_turnstile` | Token filled, 3 of 3 | Token filled |
+| `detik.com` front page | 135 requests, 16 iframes | 222 requests, 33 iframes |
+| `cnnindonesia.com` front page | 116 requests, 1 iframe | 231 requests, 16 iframes |
+| A Brave profile copied with `clone_chrome_profile(browser="brave")` | 1575 of its cookies read back, logins kept | Refused, since it would read none |
+
+### Vertical tabs
+
+`browser_launch(vertical_tabs="left")`, `"right"` or `"off"` writes the tab-strip setting into the profile before the browser starts, and the profile keeps it. Leaving it out (`None`) keeps the profile's own setting. Brave has both sides. Google Chrome only has the left, so `vertical_tabs="right"` with Chrome is refused. Checked in visible windows on macOS by where the page starts: Brave's strip is 221 points wide on either side, Chrome's 240 on the left.
 
 ### Reopening the last tabs
 
@@ -467,14 +499,14 @@ Turning the protection off is not safe for every profile: Chrome 158 then delete
 
 Only cookies move. Saved passwords, card and address data and other values Chrome 157 encrypted in that profile stay unreadable to Chrome 158 there. Only the profile folder being launched is moved (`Default`, or the one `--profile-directory` names). A profile in Chrome's own default folder keeps the old key and is left alone. A profile Chrome 158 has opened is refused to Chrome 157.
 
-Two kinds of profile get left behind: `privacy-profiles/<name>`, when a server stops before it could delete one, and `profile-pid<N>`, which a server uses when another one holds `profile/`. A few seconds after it starts, the server checks both on a background thread and removes a folder only when all of these hold:
+Two kinds of profile get left behind: `privacy-profiles/<name>`, when a server stops before it could delete one, and `profile-pid<N>` (or `brave-profile-pid<N>` for Brave), which a server uses when another one holds `profile/` (or `brave-profile/`). A few seconds after it starts, the server checks both on a background thread and removes a folder only when all of these hold:
 
 - ✅ It is a real folder directly in its place, with exactly that name, not a link.
 - ✅ No Chrome holds its lock, no running program names it, and this server does not use it.
 - ✅ Nothing in it changed in the last 10 minutes.
-- ✅ For `profile-pid<N>`: the server with PID N has ended, and the profile holds none of these: cookies, saved passwords, history, autofill or cards, top sites, saved tabs, local storage, IndexedDB, extensions, bookmarks. A file it cannot read counts as holding something.
+- ✅ For `profile-pid<N>` and `brave-profile-pid<N>`: the server with PID N has ended, and the profile holds none of these: cookies, saved passwords, history, autofill or cards, top sites, saved tabs, local storage, IndexedDB, extensions, bookmarks. A file it cannot read counts as holding something.
 
-It never touches `profile/`, `profiles/`, `app/` or anything else. `server_status` shows what the last run removed and what it kept, under `profile_gc`. A `profile-pid<N>` that holds something stays: `profile_report` lists what is in each one (counts and cookie domains, no values), and `profile_cleanup(action="remove_fallback", names=[...], confirm=True)` removes the ones you name. Removal is permanent.
+It never touches `profile/`, `profiles/`, `brave-profile/`, `brave-profiles/`, `app/` or anything else. `server_status` shows what the last run removed and what it kept, under `profile_gc`. A `profile-pid<N>` that holds something stays: `profile_report` lists what is in each one (counts and cookie domains, no values), and `profile_cleanup(action="remove_fallback", names=[...], confirm=True)` removes the ones you name. Removal is permanent.
 
 ## What tool results tell you
 
@@ -787,6 +819,7 @@ Things to know:
 | `MCP_STEALTH_TABS_DIR` | Folder for the saved tab lists of `restore_tabs`. Default `~/.mcp-stealth/window-state` |
 | `MCP_STEALTH_TAB_RECORD_DEBOUNCE` | Seconds after a tool call before the open tabs are saved. Default 2, 0 turns it off |
 | `MCP_STEALTH_TAB_RECORD_PERIOD` | Seconds between saves of the open tabs while a browser runs. Default 30, 0 turns it off |
+| `MCP_STEALTH_BRAVE_PATH` | Brave's executable, when it is not where Brave installs itself |
 | `MCP_STEALTH_RESTORE_TABS_MAX_DAYS` | A saved tab list older than this is not reopened. Default 30, 0 means no limit |
 | `MCP_STEALTH_RESTORE_TABS_MAX` | Tabs kept in a saved list. Default 30 |
 | `MCP_STEALTH_KEEP_ALIVE_MAX_HOURS` | Hours a browser kept with `keep_alive=True` may run with no server before its watcher ends it. Default 24, at most a year; anything not a positive finite number means 24 |

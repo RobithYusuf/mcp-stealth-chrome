@@ -77,6 +77,7 @@ from .refs import (
     release_group,
     resolve_ref,
 )
+from . import brave as brave_mode
 from . import dock_icon
 from . import profile_gc
 from . import profile_version
@@ -906,6 +907,18 @@ def _launch_identity(
     return effective_proxy, effective_fp, source
 
 
+def _brand_for(tab: Any) -> str:
+    """The brand a client-hints override must name for this tab's browser. Raises for a browser
+    whose kind could not be told (attach measured nothing): naming one could be the wrong one."""
+    product = brave_mode.product_of(tab)
+    if product == brave_mode.UNKNOWN:
+        raise RuntimeError(
+            "which browser this is could not be told (it was attached, and neither its process nor "
+            "navigator.brave said), so its client hints were not changed: they would name a "
+            "browser it may not be")
+    return brave_mode.brand(product)
+
+
 def _ua_metadata_param(hints: dict[str, Any]) -> Any:
     """identity.ua_metadata_fields output as the CDP object setUserAgentOverride takes."""
     from nodriver.cdp import emulation as cdp_emulation
@@ -942,6 +955,9 @@ async def _apply_fingerprint_to_tab(tab: Tab, fingerprint: dict[str, str]) -> No
     native = strip_headless(real)
     needs_cleanup = not requested_ua and native != real
     if requested_ua or language or platform or needs_cleanup:
+        # Brave lists itself as Brave, with reduced versions: an override naming Google Chrome
+        # there contradicts navigator.brave, which no override can remove.
+        product = _brand_for(tab)
         user_agent = requested_ua or native or ""
         if not platform and requested_ua:
             platform = navigator_platform(os_family(user_agent)) or ""
@@ -952,7 +968,7 @@ async def _apply_fingerprint_to_tab(tab: Tab, fingerprint: dict[str, str]) -> No
             kwargs["accept_language"] = ",".join(tags)
         if platform:
             kwargs["platform"] = platform
-        hints = ua_metadata_fields(user_agent, platform, real_version)
+        hints = ua_metadata_fields(user_agent, platform, real_version, product=product)
         if hints:
             kwargs["user_agent_metadata"] = _ua_metadata_param(hints)
         await tab.send(cdp_network.set_user_agent_override(**kwargs))
@@ -1602,7 +1618,8 @@ _CLONE_SKIP_FILES = {
 }
 
 
-def _safe_profile_clone(source: Path, instance_id: str) -> tuple[Optional[Path], dict]:
+def _safe_profile_clone(source: Path, instance_id: str,
+                        root: Optional[Path] = None) -> tuple[Optional[Path], dict]:
     """Copy a busy profile into a FRESH directory so a launch can proceed.
 
     The source is only ever read: this is the directory holding the developer's
@@ -1623,7 +1640,7 @@ def _safe_profile_clone(source: Path, instance_id: str) -> tuple[Optional[Path],
         "sqlite_suspect": [],
         "errors": [],
     }
-    target = PROFILES_ROOT / f"{instance_id}-clone-{int(time.time())}"
+    target = (root or PROFILES_ROOT) / f"{instance_id}-clone-{int(time.time())}"
     if target.exists():
         report["errors"].append(f"clone target already exists: {target}")
         return None, report
@@ -1678,6 +1695,7 @@ def _resolve_launch_profile(
     *,
     persistent: bool,
     profile_conflict: str,
+    browser: str = "chrome",
 ) -> tuple[Optional[Path], dict]:
     """Pick browser_launch's user-data dir and say where its session state came from.
 
@@ -1693,6 +1711,9 @@ def _resolve_launch_profile(
 
     "main" keeps the legacy path plus process affinity: that profile holds the
     real logins, and migrating it looks exactly like a wipe.
+
+    browser="brave" resolves the same way among Brave's own folders (brave_mode), without the
+    affinity, which belongs to Chrome's main profile.
     """
     from .state import get_profile_affinity
 
@@ -1709,10 +1730,14 @@ def _resolve_launch_profile(
         )
         return None, info
 
-    desired = PROFILE_DIR if instance_id == "main" else PROFILES_ROOT / instance_id
+    on_brave = browser == brave_mode.BRAVE
+    if on_brave:
+        desired = brave_mode.instance_profile(_brave_data_root(), instance_id)
+    else:
+        desired = PROFILE_DIR if instance_id == "main" else PROFILES_ROOT / instance_id
     info["desired_profile"] = str(desired)
 
-    pinned = get_profile_affinity()
+    pinned = None if on_brave else get_profile_affinity()
     if instance_id == "main" and pinned is not None and not is_chrome_profile_locked(pinned):
         pinned.mkdir(parents=True, exist_ok=True)
         info["actual_profile"] = str(pinned)
@@ -1740,7 +1765,8 @@ def _resolve_launch_profile(
         )
         return None, info
     if profile_conflict == "clone":
-        clone, clone_report = _safe_profile_clone(desired, instance_id)
+        clone, clone_report = _safe_profile_clone(
+            desired, instance_id, brave_mode.profiles_root(_brave_data_root()) if on_brave else None)
         info["clone"] = clone_report
         if clone is None:
             info["error"] = (
@@ -1758,10 +1784,13 @@ def _resolve_launch_profile(
         )
         return clone, info
 
-    fallback = (
-        per_process_profile() if instance_id == "main"
-        else PROFILES_ROOT / f"{instance_id}-pid{os.getpid()}"
-    )
+    if on_brave:
+        fallback = brave_mode.fallback_profile(_brave_data_root(), instance_id)
+    else:
+        fallback = (
+            per_process_profile() if instance_id == "main"
+            else PROFILES_ROOT / f"{instance_id}-pid{os.getpid()}"
+        )
     fallback.mkdir(parents=True, exist_ok=True)
     info["actual_profile"] = str(fallback)
     info["session_state_source"] = (
@@ -2022,13 +2051,17 @@ class _LaunchChoice:
     executable: Optional[str]
     beta: bool = False
     note: str = ""
+    product: str = "chrome"
 
 
 def _launch_choice(profile_path: Optional[Path], headless: bool,
-                   extra_args: Optional[list] = None) -> _LaunchChoice:
+                   extra_args: Optional[list] = None, executable: str = "") -> _LaunchChoice:
     """Chrome Beta only for a profile it cannot damage: see profile_version.beta_verdict.
     Must run before clean_profile_state or the window-state wipe, which write to the profile
-    and would make a new one look used."""
+    and would make a new one look used. `executable` is a browser the caller chose (Brave),
+    which the Dock icon never replaces."""
+    if executable:
+        return _LaunchChoice(executable, product=brave_mode.BRAVE)
     chrome = _default_chrome()
     beta = dock_icon.chosen(headless=headless)
     if not beta:
@@ -2049,6 +2082,10 @@ async def _use_dock_icon_browser(config: Config, headless: bool, choice: _Launch
     headless, otherwise which browser it is and why. Never waits: an icon an update removed
     goes back on in the background while Beta starts.
     """
+    brave_mode.mark(config, choice.product)  # read by the cookie plan, whatever the file is called
+    if choice.product == brave_mode.BRAVE:
+        config.browser_executable_path = choice.executable  # the Dock icon is Chrome's only
+        return ""
     refusal = "" if choice.beta else choice.note
     try:
         picked = await asyncio.to_thread(
@@ -2065,15 +2102,139 @@ async def _use_dock_icon_browser(config: Config, headless: bool, choice: _Launch
     return f" [Dock icon: {picked.note}]" if picked.note else ""
 
 
-def _profile_version_refusal(profile_path: Optional[Path], executable: Optional[str]) -> str:
+def _profile_version_refusal(profile_path: Optional[Path], executable: Optional[str],
+                             product: Optional[str] = None) -> str:
     """Why `executable` must not open this profile, or "": see profile_version. A profile last
-    opened by Chrome Beta is refused to an older Google Chrome rather than damaged by it."""
+    opened by Chrome Beta is refused to an older Google Chrome rather than damaged by it.
+
+    `product` is the browser the launch chose; without it the executable's name decides. A check
+    that fails is a refusal: a guard that cannot answer has not said yes."""
     try:
         executable = str(executable or "")
+        if product is None:
+            product = (brave_mode.BRAVE if brave_mode.is_brave_executable(executable)
+                       else brave_mode.CHROME)
+        # A profile belongs to the browser that made it: Brave and Chrome cannot read each
+        # other's cookies, and each drops what it cannot read.
+        bound = brave_mode.binding_refusal(profile_path, product)
+        if bound:
+            return bound
         return profile_version.refusal(profile_path, executable,
                                        beta=executable.startswith(str(dock_icon.BETA_APP) + "/"))
-    except Exception:
+    except Exception as exc:
+        return (f"refused to open {profile_path}: the profile could not be checked "
+                f"({_exc_text(exc)}). Nothing was started and the profile was not changed.")
+
+
+def _profile_from_extra_args(chosen: Optional[str], extra_args: Optional[list],
+                             label: str) -> tuple[Optional[str], list, str]:
+    """(profile folder, extra_args without --user-data-dir, problem).
+
+    Chromium opens the last --user-data-dir it is given, and nodriver puts its own first, so a
+    --user-data-dir in extra_args is the profile that really opens. It becomes the launch's
+    profile folder, so the lock, binding, version and cookie checks look at that folder and the
+    browser gets it once. Naming a different one in `label` as well is refused."""
+    found, rest, problem = brave_mode.split_profile_args(extra_args)
+    if problem:
+        return chosen, list(extra_args or []), f"{problem}. Nothing was started."
+    if found is None:
+        return chosen, rest, ""
+    if chosen:
+        same = False
+        with contextlib.suppress(OSError):
+            same = Path(chosen).expanduser().resolve() == Path(found).expanduser().resolve()
+        if not same:
+            return chosen, list(extra_args or []), (
+                f"{label}={chosen!r} and --user-data-dir={found!r} in extra_args name two different "
+                f"profile folders. Pass one. Nothing was started.")
+    return found, rest, ""
+
+
+# Executables that are Google Chrome or Chromium by name. Anything else on the port (a wrapper,
+# Edge, Vivaldi) is not assumed to be Chrome.
+_CHROME_EXECUTABLES = {
+    "google chrome", "google chrome beta", "google chrome dev", "google chrome canary",
+    "google chrome for testing", "chrome", "chrome.exe", "google-chrome", "google-chrome-stable",
+    "google-chrome-beta", "google-chrome-unstable", "chromium", "chromium.exe", "chromium-browser",
+}
+
+
+def _attached_product_from_processes(host: str, port: int) -> Optional[str]:
+    """"brave" or "chrome" from the main process listening on this debugging port, when the host
+    is this machine, that process can be found and its executable is one of those browsers by
+    name; otherwise None, and navigator.brave decides."""
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        return None
+    from .state import process_table
+    table = process_table()
+    if not table:
+        return None
+    flag = re.compile(rf"--remote-debugging-port={int(port)}(?!\d)")
+    for _pid, _ppid, command in table:
+        if command and "--type=" not in command and flag.search(command):
+            executable = command.split(" --", 1)[0].strip().strip('"')
+            name = re.split(r"[\\/]", executable)[-1].lower()
+            if brave_mode.is_brave_executable(name):
+                return brave_mode.BRAVE
+            return brave_mode.CHROME if name in _CHROME_EXECUTABLES else None
+    return None
+
+
+async def _attached_product(browser: Any, host: str, port: int) -> str:
+    """What an attached browser is: its process first, then navigator.brave read in a page's
+    isolated world (Brave defines it there too). navigator.brave missing only says "not Brave",
+    so that, like no answer at all, is "unknown": nothing names it Chrome on a guess."""
+    found = await asyncio.to_thread(_attached_product_from_processes, host, port)
+    if found:
+        return found
+    with contextlib.suppress(Exception):
+        # Not an internal page, where no world can be made; a target not yet updated reads "".
+        tabs = [t for t in getattr(browser, "tabs", []) or []
+                if not str(getattr(getattr(t, "target", None), "url", "") or "").startswith(
+                    ("chrome", "devtools:", "brave:", "edge:"))]
+        for tab in tabs[:3]:
+            seen = await _wait(evaluate_isolated(tab, "typeof navigator.brave"), timeout=3,
+                               what="attach product")
+            if seen == "object":
+                return brave_mode.BRAVE
+            if seen == "undefined":
+                break
+    return brave_mode.UNKNOWN
+
+
+def _attached_note(product: str) -> str:
+    """What attach_to_chrome adds when it could not tell which browser it reached."""
+    if product != brave_mode.UNKNOWN:
         return ""
+    return (" Which browser this is could not be told (its executable is not Google Chrome, "
+            "Chromium or Brave by name, or could not be read, and navigator.brave did not say "
+            "Brave), so fingerprint_rotate and emulate_device will not change its client hints.")
+
+
+def _brave_status() -> dict:
+    """Whether browser="brave" can launch here, for server_status."""
+    try:
+        path = brave_mode.find_brave()
+        found = profile_version.binary_version(path) if path else None
+        return {"installed": bool(path), "path": path,
+                "version": profile_version.text(found) if found else None}
+    except Exception as exc:
+        return {"installed": None, "detail": _exc_text(exc)}
+
+
+def _brave_data_root() -> Path:
+    """Where Brave's profiles go: beside Chrome's, so a test pointing PROFILES_ROOT at a
+    temporary folder moves both."""
+    return PROFILES_ROOT.parent
+
+
+def _browser_note(config: Config, product: str) -> str:
+    """The launch result's word on which browser runs, for Brave; Chrome's results read as before."""
+    executable = config.browser_executable_path
+    if product != brave_mode.BRAVE:
+        return ""
+    found = profile_version.binary_version(str(executable))
+    return f" [browser: Brave{' ' + profile_version.text(found) if found else ''}]"
 
 
 def _default_chrome() -> Optional[str]:
@@ -2118,12 +2279,14 @@ async def _prepare_cookie_move(profile_path: Optional[Path], config: Config) -> 
     from a copy, keep them in a durable backup, and say what the launch must commit. Never
     raises, and writes nothing in the profile: a refusal leaves it exactly as it was."""
     executable = str(config.browser_executable_path or "")
+    product = getattr(config, "_mcp_stealth_product", None) or (
+        brave_mode.BRAVE if brave_mode.is_brave_executable(executable) else brave_mode.CHROME)
     plan = await asyncio.to_thread(cookie_migration.plan, profile_path, list(config.browser_args or []),
-                                   executable)
+                                   executable, product)
     if plan.kind == "none":
         return _CookieMove(plan)
     if plan.kind == "refuse":
-        return _CookieMove(plan, refuse=_cookie_refusal(profile_path, plan.reason, plan.marker))
+        return _CookieMove(plan, refuse=_cookie_refusal(profile_path, plan.reason, plan.marker, product))
     if plan.kind == "flag":
         return _CookieMove(plan, flag=True, note=f" [cookies: {plan.reason}]")
     if plan.kind == "resume":
@@ -2135,18 +2298,21 @@ async def _prepare_cookie_move(profile_path: Optional[Path], config: Config) -> 
     except cookie_migration.Changed as exc:
         return _CookieMove(plan, refuse=_cookie_refusal(profile_path, (
             f"its cookies changed while they were being backed up ({exc}), so what Chrome would "
-            "delete is no longer known"), plan.marker))
+            "delete is no longer known"), plan.marker, product))
     except Exception as exc:
         return _cookie_move_failed(plan, profile_path, _exc_text(exc))
 
 
-def _cookie_refusal(profile_path: Any, why: str, marker: Optional[dict] = None) -> str:
-    """The refusal, with what can be done about it. Nothing was started or written."""
+def _cookie_refusal(profile_path: Any, why: str, marker: Optional[dict] = None,
+                    product: str = "chrome") -> str:
+    """The refusal, with what can be done about it. Nothing was started or written. Chrome's
+    text is unchanged; for Brave it names Brave."""
     saved = ""
     if marker and marker.get("backup"):
         saved = (f" A backup of its cookies is at {marker['backup']} (storage_state_load reads it) "
                  f"and a copy of its cookie databases at {marker.get('database_copy') or 'an unrecorded place'}.")
-    return (f"refused to open {profile_path} with Chrome 158 or newer: {why}. Nothing was started and "
+    browser = "Brave" if product == brave_mode.BRAVE else "Chrome"
+    return (f"refused to open {profile_path} with {browser} 158 or newer: {why}. Nothing was started and "
             f"the profile was not changed.{saved} Close every Chrome that has this profile open and "
             "launch again, which decides afresh. To work meanwhile without risking these cookies, "
             "clone_chrome_profile makes a copy to launch instead. If the cookie database itself is "
@@ -2552,9 +2718,12 @@ def _disarm_keep_alive(browser: Any, profile: Any, headless: bool) -> None:
         _keep_alive.remove(profile, _browser_process_pid(browser))
 
 
-def _kept_candidates(instance_id: str) -> list[Path]:
-    """The profiles a persistent launch of this instance would ask for, in that order."""
+def _kept_candidates(instance_id: str, browser: str = "chrome") -> list[Path]:
+    """The profiles a persistent launch of this instance would ask for, in that order. A Brave
+    launch asks for Brave's own folder only (brave_mode), without Chrome main's affinity."""
     from .state import get_profile_affinity
+    if browser == brave_mode.BRAVE:
+        return [brave_mode.instance_profile(_brave_data_root(), instance_id)]
     found: list[Path] = []
     pinned = get_profile_affinity() if instance_id == "main" else None
     if pinned is not None:
@@ -2565,16 +2734,30 @@ def _kept_candidates(instance_id: str) -> list[Path]:
     return found
 
 
-def _kept_verdict(profile: Path) -> Optional[dict]:
+def _kept_verdict(profile: Path, browser: str = "chrome") -> Optional[dict]:
     """keep_alive.check for a profile some Chrome holds, or None when nothing was kept there.
 
     An ok verdict holds the profile's reattach lock: the caller reattaches at once, and
-    _reattach_kept lets it go when done."""
+    _reattach_kept lets it go when done. A profile the other browser made (brave_mode binding)
+    is not reattached for this launch: it would hand a Brave launch a Chrome, or the reverse."""
     if not profile.exists() or chrome_lock_holder_pid(profile) is None:
         return None
-    if _keep_alive.read(profile) is None:
+    record = _keep_alive.read(profile)
+    if record is None:
         return None
+    bound = brave_mode.binding_refusal(profile, browser)
+    if bound:
+        return {"ok": False, "record": record, "holder": None,
+                "reason": f"browser={browser!r} was asked for and {bound}"}
     return _keep_alive.check(profile, hold=True)
+
+
+def _reattached_product(profile: Path) -> str:
+    """What a reattached browser is: the maker of its profile, which the launch's binding has
+    matched to the browser asked for. Marked on the new Browser, whose Config names nodriver's
+    Chrome, so identity overrides name the right brand."""
+    maker = brave_mode.profile_browser(profile)
+    return maker if maker in (brave_mode.BRAVE, brave_mode.CHROME) else brave_mode.UNKNOWN
 
 
 class _ReattachAborted(RuntimeError):
@@ -2644,6 +2827,7 @@ async def _reattach_locked(instance_id: str, profile: Path, verdict: dict, *, ur
     # The folder exactly as Chrome was given it, which is what the watcher and a close compare.
     config = Config(user_data_dir=str(record["user_data_dir"]), headless=headless, host=host, port=port)
     browser = await asyncio.wait_for(nodriver.start(config=config), timeout=BROWSER_LAUNCH_TIMEOUT)
+    brave_mode.mark(browser, _reattached_product(Path(_keep_alive.profile_key(profile))))
     # Not spawned here, but ours: the PID and its start time are what closing it and the
     # watcher go by.
     browser._process_pid = pid
@@ -2837,6 +3021,7 @@ _NEW_CHROME_ONLY = {
     "headless": False, "proxy": None, "user_agent": None, "fingerprint": None,
     "storage_state_path": None, "testing_mode": False, "profile_mode": "default",
     "restore_tabs": False, "extra_args": None, "lang": "en-US", "profile_directory": None,
+    "vertical_tabs": None,
 }
 
 
@@ -3208,6 +3393,8 @@ async def browser_launch(
     profile_mode: Literal["default", "light"] = "default",
     restore_tabs: bool = False,
     keep_alive: Optional[bool] = None,
+    browser: Literal["chrome", "brave"] = "chrome",
+    vertical_tabs: Optional[str] = None,
 ) -> str:
     """Launch stealth Chrome via nodriver. Creates persistent profile by default.
 
@@ -3300,7 +3487,23 @@ async def browser_launch(
             for a new browser and stays as it was on a reattach. A reattach happens whenever
             a profile is held by a browser a previous server of ours kept, whatever this
             value; it never attaches to the person's own Chrome or one a live server drives.
+        browser: "chrome" (default) or "brave". Brave keeps its own Shields (ads and trackers
+            blocked), farbling (canvas and audio values differ per site and per session) and
+            identity (navigator.brave, userAgentData naming Brave). Its profiles are separate:
+            ~/.mcp-stealth/brave-profile for main, ~/.mcp-stealth/brave-profiles/<id> for
+            others. A profile belongs to the browser that made it, and opening it with the
+            other one is refused, since neither can read the other's cookies. The Dock icon
+            switch applies to Chrome only. Needs Brave installed.
+        vertical_tabs: "left", "right" or "off" writes the tab-strip setting into the profile
+            before the browser starts; None (default) leaves the profile's own setting.
+            Brave has both sides; Chrome only "left", and "right" there is refused.
     """
+    product, brave_executable, problem = brave_mode.check_request(browser, vertical_tabs)
+    if problem:
+        return err(problem)
+    user_data_dir, extra_args, problem = _profile_from_extra_args(user_data_dir, extra_args, "user_data_dir")
+    if problem:
+        return err(problem)
     # Local testing wants a clean room by default: a testing_mode run that
     # silently accumulated state in the real login profile was both a surprise
     # and a slow way to make tests depend on each other.
@@ -3350,6 +3553,13 @@ async def browser_launch(
         # Chrome against the same profile is what produces "CDP unreachable",
         # and the half-started process is what gets orphaned.
         if BrowserState.is_up():
+            _running = brave_mode.product_of(BrowserState.browser)
+            if _running != product and _running != brave_mode.UNKNOWN:
+                return err(
+                    f"{brave_mode.name(_running)} is already running as instance "
+                    f"{BrowserState.current_instance_id!r}; browser={product!r} was not applied and "
+                    f"nothing changed. browser_close() first, or spawn_browser(instance_id=..., "
+                    f"browser={product!r}) for one alongside it.")
             _answered = False
             try:
                 # is_up() only proves a handle exists. The socket can be gone
@@ -3366,6 +3576,9 @@ async def browser_launch(
                     reuse_head += (f"; profile_mode={profile_mode!r} NOT applied, it only "
                                    f"takes effect on a new launch")
                 _reuse_keep_note = _keep_alive_on_reuse(keep_alive)
+                if vertical_tabs is not None:
+                    reuse_head += (f"; vertical_tabs={vertical_tabs!r} NOT applied, it only "
+                                   f"takes effect on a new launch")
                 _doc_state, _disarm = await _arm_document_watch(_tab)
                 try:
                     if url and url != "about:blank":
@@ -3459,7 +3672,7 @@ async def browser_launch(
                 )
             holder_pid = chrome_lock_holder_pid(explicit_udd)
             if holder_pid is not None:
-                kept = _kept_verdict(explicit_udd)
+                kept = _kept_verdict(explicit_udd, product)
                 if kept and kept.get("ok"):
                     return await _launch_by_reattach(
                         explicit_udd, kept, url=url, keep_alive=keep_alive,
@@ -3491,8 +3704,8 @@ async def browser_launch(
                 merged_extra_args.append(f"--profile-directory={profile_directory}")
             else:
                 merged_extra_args.extend(_profile_directory_args(explicit_udd, merged_extra_args))
-            launch_choice = _launch_choice(explicit_udd, headless, merged_extra_args)
-            refused = _profile_version_refusal(explicit_udd, launch_choice.executable)
+            launch_choice = _launch_choice(explicit_udd, headless, merged_extra_args, brave_executable)
+            refused = _profile_version_refusal(explicit_udd, launch_choice.executable, product)
             if refused:
                 return err(refused)
             persistent = False  # we're managing user_data_dir ourselves; skip default profile flow
@@ -3510,7 +3723,7 @@ async def browser_launch(
             if custom_udd is not None:
                 holder_pid = chrome_lock_holder_pid(custom_udd) if custom_udd.exists() else None
                 if holder_pid is not None:
-                    kept = _kept_verdict(custom_udd)
+                    kept = _kept_verdict(custom_udd, product)
                     if kept and kept.get("ok"):
                         return await _launch_by_reattach(
                             custom_udd, kept, url=url, keep_alive=keep_alive,
@@ -3529,8 +3742,8 @@ async def browser_launch(
             # A browser a previous server of ours kept alive on the profile this launch asks
             # for is taken over, not raced: falling back would hide its tabs and logins.
             if persistent and custom_udd is None:
-                for _candidate in _kept_candidates(BrowserState.current_instance_id):
-                    _kept = _kept_verdict(_candidate)
+                for _candidate in _kept_candidates(BrowserState.current_instance_id, product):
+                    _kept = _kept_verdict(_candidate, product)
                     if _kept and _kept.get("ok"):
                         return await _launch_by_reattach(
                             _candidate, _kept, url=url, keep_alive=keep_alive,
@@ -3546,6 +3759,7 @@ async def browser_launch(
                 BrowserState.current_instance_id,
                 persistent=bool(persistent),
                 profile_conflict=profile_conflict,
+                browser=product,
             )
             if profile_info.get("error"):
                 return err(profile_info["error"])
@@ -3554,7 +3768,7 @@ async def browser_launch(
             # browser of another session, with its logins.
             profile_path = resolved_profile
             used_fallback = bool(persistent) and "conflict_with_pid" in profile_info
-            if persistent and BrowserState.current_instance_id == "main":
+            if persistent and BrowserState.current_instance_id == "main" and product == brave_mode.CHROME:
                 from .state import set_profile_affinity
                 set_profile_affinity(profile_path)
 
@@ -3571,8 +3785,9 @@ async def browser_launch(
                         f"for an ephemeral throwaway profile."
                     )
                 # Before the window-state wipe below writes to it: a refused profile stays as it was.
-                launch_choice = _launch_choice(profile_path, headless, merged_extra_args)
-                refused = _profile_version_refusal(profile_path, launch_choice.executable)
+                launch_choice = _launch_choice(profile_path, headless, merged_extra_args,
+                                               brave_executable)
+                refused = _profile_version_refusal(profile_path, launch_choice.executable, product)
                 if refused:
                     return err(refused)
                 # clean_profile_state and the window-state wipe write to the profile, so they
@@ -3646,9 +3861,9 @@ async def browser_launch(
 
         browser: Optional[Browser] = None
         if launch_choice is None:
-            launch_choice = _launch_choice(profile_path, headless, merged_extra_args)
+            launch_choice = _launch_choice(profile_path, headless, merged_extra_args, brave_executable)
         dock_note = await _use_dock_icon_browser(config, headless, launch_choice)
-        refused = _profile_version_refusal(profile_path, config.browser_executable_path)
+        refused = _profile_version_refusal(profile_path, config.browser_executable_path, product)
         if refused:
             await _remove_privacy_profile(privacy_profile)
             return err(refused)
@@ -3662,6 +3877,13 @@ async def browser_launch(
             config.add_argument(_cookie_flag_arg(config))
         if not cookie_move.backup:
             dock_note += cookie_move.note
+        try:
+            dock_note += _browser_note(config, product) + brave_mode.write_vertical_tabs(
+                Path(config.user_data_dir), config.browser_args, product, vertical_tabs)
+        except Exception as e:
+            await _remove_privacy_profile(privacy_profile)
+            return err(f"vertical_tabs could not be written into the profile, so nothing was "
+                       f"started: {_exc_text(e)}")
         # Read before Chrome starts, while the person's app is still the frontmost one.
         previous_app = None if headless else await asyncio.to_thread(_frontmost_app)
         if not headless:
@@ -3688,6 +3910,7 @@ async def browser_launch(
             return err(refused)
         try:
             browser = await _start_chrome(config)
+            brave_mode.mark(browser, product)
             if not headless:
                 await _open_background_window(browser, window_width, window_height)
         except asyncio.TimeoutError:
@@ -6662,6 +6885,7 @@ async def server_status() -> str:
         "version": __version__,
         "session": BrowserState.session_key(),
         "browser_running": BrowserState.is_up(),
+        "browser": brave_mode.product_of(BrowserState.browser) if BrowserState.browser is not None else None,
         "instance": BrowserState.current_instance_id,
         "tabs": len(BrowserState.tabs),
         "active_tab": BrowserState.active_tab_index,
@@ -6676,6 +6900,7 @@ async def server_status() -> str:
         "compat_patches": _patches.status(),
         "os_cursor": await _os_cursor_status(),
         "dock_icon": await _dock_icon_status(),
+        "brave": await asyncio.to_thread(_brave_status),
         "profile_gc": profile_gc.status(),
     }
     return ok(json.dumps(status, indent=2, default=str))
@@ -6797,6 +7022,7 @@ _FINGERPRINT_AUDIT_JS = r"""
   out.touch_points = nav.maxTouchPoints;
   out.pdf_viewer = nav.pdfViewerEnabled === undefined ? null : nav.pdfViewerEnabled;
   out.secure_context = window.isSecureContext;
+  out.navigator_brave = typeof nav.brave === "object" && nav.brave !== null;
   out.ua_data = nav.userAgentData
     ? {brands: nav.userAgentData.brands.map(b => b.brand + "/" + b.version),
        platform: nav.userAgentData.platform, mobile: nav.userAgentData.mobile}
@@ -6941,6 +7167,14 @@ async def fingerprint_audit(url: Optional[str] = None) -> str:
         check("HeadlessChrome" not in ua, "headless marker in UA",
               "the User-Agent announces HeadlessChrome")
         not_checked_hints: list[str] = []
+        # Brave is told apart by navigator.brave, which it defines on secure pages, and by the
+        # executable this server started. Its farbling is Brave working as intended.
+        on_brave = bool(fp.get("navigator_brave")) or brave_mode.product_of(tab) == brave_mode.BRAVE
+        own_brand = brave_mode.brand(brave_mode.BRAVE if on_brave else brave_mode.CHROME)
+        if on_brave:
+            passed.append(
+                "Brave farbling: expected, not a leak. Canvas, audio, hardwareConcurrency and "
+                "plugins differ per site and per session by design, as in every Brave")
         ua_data = fp.get("ua_data")
         ua_version = chrome_version(ua)
         if ua_version and ua_data is None:
@@ -6954,11 +7188,16 @@ async def fingerprint_audit(url: Optional[str] = None) -> str:
             check(bool(brands), "userAgentData.brands",
                   "empty on a Chrome UA — real Chrome always lists its brands")
             major = ua_version.split(".")[0]
-            chrome_brand = next((b for b in brands if b.startswith("Google Chrome/")), None)
+            chrome_brand = next((b for b in brands if b.startswith(f"{own_brand}/")), None)
             if brands:
-                check(chrome_brand == f"Google Chrome/{major}",
+                check(chrome_brand == f"{own_brand}/{major}",
                       "UA version vs client hints",
-                      f"UA says Chrome {major}, brands say {brands}")
+                      f"UA says Chrome {major} on {own_brand}, brands say {brands}")
+            if on_brave:
+                check(not any(b.startswith("Google Chrome/") for b in brands),
+                      "Brave vs client hints",
+                      f"brands name Google Chrome ({brands}) while navigator.brave says Brave; "
+                      f"no real browser reports both")
             hint_os = {"Windows": "windows", "macOS": "mac", "Linux": "linux"}.get(
                 ua_data.get("platform") or "")
             if hint_os:
@@ -7462,6 +7701,7 @@ def _instance_profile_path(
     persistent: bool,
     privacy: bool,
     profile_dir_override: Optional[str],
+    browser: str = "chrome",
 ) -> Optional[Path]:
     """Resolve the user-data dir actually passed to a named Chrome launch."""
     if privacy:
@@ -7470,6 +7710,8 @@ def _instance_profile_path(
         return Path(profile_dir_override).expanduser()
     if not persistent:
         return None
+    if browser == brave_mode.BRAVE:
+        return brave_mode.instance_profile(_brave_data_root(), instance_id)
     return PROFILE_DIR if instance_id == "main" else PROFILES_ROOT / instance_id
 
 
@@ -7493,6 +7735,8 @@ async def _launch_browser_instance(
     restore_tabs: bool = False,
     keep_alive: Optional[bool] = None,
     ignored: Optional[list[str]] = None,
+    browser: str = "chrome",
+    vertical_tabs: Optional[str] = None,
 ) -> tuple[bool, str]:
     """Shared launcher for browser_launch + spawn_browser.
 
@@ -7502,9 +7746,16 @@ async def _launch_browser_instance(
         _validate_instance_id(instance_id)
     except ValueError as e:
         return False, str(e)
+    product, brave_executable, problem = brave_mode.check_request(browser, vertical_tabs)
+    if problem:
+        return False, problem
+    profile_dir_override, extra_args, problem = _profile_from_extra_args(
+        profile_dir_override, extra_args, "profile_dir")
+    if problem:
+        return False, problem
 
     # Pre-flight: ensure Chrome is installed before calling nodriver
-    chrome_path = find_chrome_binary()
+    chrome_path = brave_executable or find_chrome_binary()
     if chrome_path is None:
         return False, (
             "Chrome/Chromium not found on this system.\n"
@@ -7537,6 +7788,7 @@ async def _launch_browser_instance(
         persistent=persistent,
         privacy=privacy,
         profile_dir_override=profile_dir_override,
+        browser=product,
     )
     privacy_profile = profile_path if privacy else None
     launch_choice: Optional[_LaunchChoice] = None
@@ -7544,7 +7796,7 @@ async def _launch_browser_instance(
         if profile_path.exists():
             holder = chrome_lock_holder_pid(profile_path)
             if holder is not None:
-                kept = None if privacy else _kept_verdict(profile_path)
+                kept = None if privacy else _kept_verdict(profile_path, product)
                 if kept and kept.get("ok"):
                     return await _spawn_by_reattach(instance_id, profile_path, kept, url=url,
                                                     keep_alive=keep_alive, ignored=ignored or [],
@@ -7557,8 +7809,8 @@ async def _launch_browser_instance(
         # Before anything writes to it (mkdir and clean_profile_state wait for the cookie checks
         # below): whether the profile is new decides
         # whether Chrome Beta may open it, and a refused profile stays as it was.
-        launch_choice = _launch_choice(profile_path, headless, extra_args)
-        refused = _profile_version_refusal(profile_path, launch_choice.executable)
+        launch_choice = _launch_choice(profile_path, headless, extra_args, brave_executable)
+        refused = _profile_version_refusal(profile_path, launch_choice.executable, product)
         if refused:
             await _remove_privacy_profile(privacy_profile)
             return False, refused
@@ -7589,9 +7841,9 @@ async def _launch_browser_instance(
 
     browser: Optional[Browser] = None
     if launch_choice is None:
-        launch_choice = _launch_choice(profile_path, headless, extra_args)
+        launch_choice = _launch_choice(profile_path, headless, extra_args, brave_executable)
     dock_note = await _use_dock_icon_browser(config, headless, launch_choice)
-    refused = _profile_version_refusal(profile_path, config.browser_executable_path)
+    refused = _profile_version_refusal(profile_path, config.browser_executable_path, product)
     if refused:
         await _remove_privacy_profile(privacy_profile)
         return False, refused
@@ -7605,6 +7857,13 @@ async def _launch_browser_instance(
         config.add_argument(_cookie_flag_arg(config))
     if not cookie_move.backup:
         dock_note += cookie_move.note
+    try:
+        dock_note += _browser_note(config, product) + brave_mode.write_vertical_tabs(
+            Path(config.user_data_dir), config.browser_args, product, vertical_tabs)
+    except Exception as e:
+        await _remove_privacy_profile(privacy_profile)
+        return False, (f"vertical_tabs could not be written into the profile, so nothing was "
+                       f"started: {_exc_text(e)}")
     previous_app = None if headless else await asyncio.to_thread(_frontmost_app)
     if not headless:
         for _flag in _BACKGROUND_WINDOW_FLAGS:
@@ -7625,6 +7884,7 @@ async def _launch_browser_instance(
         return False, refused
     try:
         browser = await _start_chrome(config)
+        brave_mode.mark(browser, product)
         if not headless:
             await _open_background_window(browser, window_width, window_height)
     except asyncio.TimeoutError:
@@ -8121,6 +8381,8 @@ async def spawn_browser(
     privacy: bool = False,
     restore_tabs: bool = False,
     keep_alive: Optional[bool] = None,
+    browser: Literal["chrome", "brave"] = "chrome",
+    vertical_tabs: Optional[str] = None,
 ) -> str:
     """Create a new named browser instance running in parallel with main.
     Each instance has its own profile, cookies, tabs, logs. Use for multi-account
@@ -8142,6 +8404,9 @@ async def spawn_browser(
             browser_launch(keep_alive=True) does; a later spawn_browser or browser_launch on
             the same profile reattaches to it. The idle timeout still applies while a server
             holds it
+        browser: "chrome" (default) or "brave", as in browser_launch. A Brave instance's
+            profile defaults to ~/.mcp-stealth/brave-profiles/<id>/
+        vertical_tabs: "left", "right" (Brave only) or "off", as in browser_launch
         other args: same as browser_launch
 
     Use switch_instance(id) to route subsequent tool calls to this instance.
@@ -8206,6 +8471,8 @@ async def spawn_browser(
                 restore_tabs=restore_tabs,
                 keep_alive=keep_alive,
                 ignored=_reattach_ignored(locals()),
+                browser=browser,
+                vertical_tabs=vertical_tabs,
             )
     finally:
         _SPAWNING.pop(instance_id, None)
@@ -8240,6 +8507,7 @@ async def list_instances() -> str:
             "desc": s.desc,
             "headless": s.headless,
             "privacy": s.privacy,
+            "browser": brave_mode.product_of(s.browser) if s.browser is not None else None,
             "uptime_seconds": int(now - s.created_at) if s.is_running() else 0,
         })
     external = find_external_chrome_pids()
@@ -8662,7 +8930,8 @@ async def list_chrome_profiles(browser: Optional[str] = None) -> str:
         "profiles": out,
         "usage_hint": (
             "clone_chrome_profile(browser='brave', source_profile='Default', "
-            "target_instance_id='my_clone') → then spawn_browser(instance_id='my_clone'). "
+            "target_instance_id='my_clone') → then spawn_browser(instance_id='my_clone', "
+            "browser='brave') (a Brave clone runs in Brave; any other in Chrome). "
             "Pick the profile with the most cookies_kb; close its browser first, "
             "or explicitly use allow_running=true for a verified live snapshot."
         ),
@@ -8727,7 +8996,10 @@ async def clone_chrome_profile(
     """Clone a profile from ANY Chrome-family browser into an isolated MCP location.
 
     SAFE: reads the source profile without modification, copies to
-    ~/.mcp-stealth/profiles/<target_instance_id>/Default/
+    ~/.mcp-stealth/profiles/<target_instance_id>/Default/, or for a Brave profile to
+    ~/.mcp-stealth/brave-profiles/<target_instance_id>/Default/, which launches in Brave
+    (spawn_browser(..., browser='brave')) and keeps its logins: Brave's cookies and saved
+    passwords are encrypted with Brave's own key, which Chrome cannot read.
 
     The source browser MUST be closed (we check SingletonLock).
     Preserves: cookies, history, bookmarks, saved passwords, extensions state.
@@ -8753,6 +9025,7 @@ async def clone_chrome_profile(
 
     After clone, launch with:
         spawn_browser(instance_id='<target_instance_id>')
+        spawn_browser(instance_id='<target_instance_id>', browser='brave') for a Brave profile
     """
     import shutil
 
@@ -8791,7 +9064,10 @@ async def clone_chrome_profile(
         )
 
     ensure_dirs()
-    target_root = PROFILES_ROOT / target_instance_id
+    source_name = next((n for n, p in chrome_user_data_roots() if p == root), browser or "")
+    from_brave = (source_name or "").lower().startswith(brave_mode.BRAVE)
+    target_root = (brave_mode.profiles_root(_brave_data_root()) if from_brave
+                   else PROFILES_ROOT) / target_instance_id
     target_default = target_root / "Default"
 
     if target_root.exists():
@@ -8927,7 +9203,8 @@ async def clone_chrome_profile(
     result["usable"] = True
     result["next_step"] = (
         f"spawn_browser(instance_id='{target_instance_id}', "
-        f"url='https://example.com', headless=False)"
+        f"url='https://example.com', headless=False"
+        f"{', browser=' + repr(brave_mode.BRAVE) if from_brave else ''})"
     )
     return ok(json.dumps(result, indent=2, default=str))
 
@@ -10912,6 +11189,10 @@ async def attach_to_chrome(
         )
     except Exception as e:
         return err(f"attach failed after CDP probe ok: {e}")
+    # Config names the Chrome nodriver would start, not the browser on that port, and Brave's
+    # /json/version says Chrome too. So measure it, and say unknown rather than guess.
+    attached_product = await _attached_product(browser, host, port)
+    brave_mode.mark(browser, attached_product)
 
     BrowserState.browser = browser
     BrowserState.current_instance_id = instance_id
@@ -10927,7 +11208,8 @@ async def attach_to_chrome(
     await _refresh_tabs()
     return ok(
         f"Attached to existing Chrome at {host}:{port} as {instance_id!r}. "
-        f"Browser: {info.get('Browser', '?')}, {len(BrowserState.tabs)} tab(s). "
+        f"Browser: {info.get('Browser', '?')} ({brave_mode.name(attached_product)}), "
+        f"{len(BrowserState.tabs)} tab(s).{_attached_note(attached_product)} "
         "Use detach() to release without closing Chrome."
     )
 

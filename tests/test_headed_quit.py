@@ -22,6 +22,7 @@ from pathlib import Path
 import pytest
 
 from _protocol import REPO, SAFE_ARGS, Client
+from mcp_stealth_chrome import brave
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("MCP_HEADED") or sys.platform != "darwin", reason="opens a visible window")
@@ -49,7 +50,8 @@ def _ps() -> list[tuple[int, int, str]]:
 
 def _test_chrome_pids() -> set:
     return {pid for pid, _ppid, cmd in _ps()
-            if ("/Google Chrome " in cmd or "/Google Chrome Beta " in cmd) and "--type=" not in cmd
+            if ("/Google Chrome " in cmd or "/Google Chrome Beta " in cmd or "/Brave Browser " in cmd)
+            and "--type=" not in cmd
             and "EXCLUDE 127.0.0.1" in cmd and "--headless" not in cmd}
 
 
@@ -78,14 +80,14 @@ def _alive(pid: int) -> bool:
     return bool(state) and "Z" not in state
 
 
-def _start(client: Client, instance: str = "main") -> int:
+def _start(client: Client, instance: str = "main", browser: str = "chrome") -> int:
     before = _test_chrome_pids()
     if instance == "main":
         launched = client.call("browser_launch", _timeout=60, url="about:blank", headless=False,
-                               persistent=False, extra_args=SAFE_ARGS)
+                               persistent=False, extra_args=SAFE_ARGS, browser=browser)
     else:
         launched = client.call("spawn_browser", _timeout=60, instance_id=instance, url="about:blank",
-                               headless=False, privacy=True, extra_args=SAFE_ARGS)
+                               headless=False, privacy=True, extra_args=SAFE_ARGS, browser=browser)
     assert not launched.failed, launched.text
     ours = _test_chrome_pids() - before
     assert len(ours) == 1, ours
@@ -140,16 +142,19 @@ def _end(pid: int) -> None:
         os.kill(pid, signal.SIGKILL)
 
 
+@pytest.mark.parametrize("browser", ["chrome", "brave"])
 @pytest.mark.parametrize("instance", ["main", "spawned"])
-def test_quit_ends_the_browser_and_the_next_call_says_why(instance):
+def test_quit_ends_the_browser_and_the_next_call_says_why(instance, browser):
     pytest.importorskip("AppKit")
+    if browser == "brave" and brave.find_brave() is None:
+        pytest.skip("Brave is not installed")
     client = Client()
     pid = None
     try:
-        pid = _start(client, "main" if instance == "main" else "quitme")
+        pid = _start(client, "main" if instance == "main" else "quitme", browser)
         if instance != "main":
             client.call("switch_instance", instance_id="quitme")
-        _assert_quit_ended(pid, f"server alive ({instance})")
+        _assert_quit_ended(pid, f"server alive ({instance}, {browser})")
         reply = client.call("get_url")
         _record(case=f"server alive ({instance}): next call", text=reply.text[:200])
         assert reply.failed and "last window" in reply.text, reply.text
@@ -162,9 +167,12 @@ def test_quit_ends_the_browser_and_the_next_call_says_why(instance):
     time.sleep(1)
 
 
-def test_quit_ends_the_browser_after_its_server_is_gone():
+@pytest.mark.parametrize("browser", ["chrome", "brave"])
+def test_quit_ends_the_browser_after_its_server_is_gone(browser):
     """The stdio server exits on a client reconnect; its headed Chrome stayed with no watcher."""
     pytest.importorskip("AppKit")
+    if browser == "brave" and brave.find_brave() is None:
+        pytest.skip("Brave is not installed")
     before = _server_pids()
     client = Client()
     pid = None
@@ -172,14 +180,14 @@ def test_quit_ends_the_browser_after_its_server_is_gone():
         server = _server_pids() - before
         assert len(server) == 1, server
         server_pid = server.pop()
-        pid = _start(client)
+        pid = _start(client, browser=browser)
         os.kill(server_pid, signal.SIGKILL)  # this test's own server; it ignores SIGTERM
         deadline = time.time() + 5
         while _alive(server_pid) and time.time() < deadline:
             time.sleep(0.05)
         assert not _alive(server_pid)
         assert _alive(pid), "Chrome ended with its server; the Quit is what is under test"
-        _assert_quit_ended(pid, "server process ended")
+        _assert_quit_ended(pid, f"server process ended ({browser})")
     finally:
         with __import__("contextlib").suppress(Exception):
             client.close()

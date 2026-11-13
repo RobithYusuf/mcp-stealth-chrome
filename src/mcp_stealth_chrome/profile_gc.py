@@ -5,7 +5,8 @@ otherwise):
 
 - privacy-profiles/<name>: one per privacy launch, removed at close, left behind when a
   server dies first.
-- profile-pid<N>: the fallback a server takes when another holds the shared profile.
+- profile-pid<N>: the fallback a server takes when another holds the shared profile, and
+  brave-profile-pid<N>, the same for browser="brave".
   Nothing removes it, and someone may have logged in there.
 
 One pass runs on a background thread when the server starts. A folder goes only when every
@@ -37,7 +38,8 @@ ENV_SWITCH = "MCP_STEALTH_PROFILE_GC"
 GC_MIN_AGE = float(os.environ.get("MCP_STEALTH_PROFILE_GC_MIN_AGE", "600"))
 _START_DELAY = float(os.environ.get("MCP_STEALTH_PROFILE_GC_DELAY", "3"))
 
-FALLBACK_NAME = re.compile(r"^profile-pid([0-9]+)$")
+# Chrome's fallback and Brave's (brave-profile-pid<N>), held to exactly the same checks.
+FALLBACK_NAME = re.compile(r"^(?:brave-)?profile-pid([0-9]+)$")
 
 
 def is_server_command(command: str) -> bool:

@@ -13,6 +13,7 @@ import time
 import pytest
 
 from _protocol import SAFE_ARGS, Client
+from mcp_stealth_chrome import brave
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("MCP_HEADED") or sys.platform != "darwin", reason="opens visible windows")
@@ -28,7 +29,8 @@ class _Quiet(http.server.SimpleHTTPRequestHandler):
 def _main_chrome_pids() -> set:
     listing = subprocess.run(["ps", "axo", "pid,args"], capture_output=True, text=True).stdout
     return {int(line.split()[0]) for line in listing.splitlines()
-            if ("/Google Chrome " in line or "/Google Chrome Beta " in line) and "--type=" not in line
+            if ("/Google Chrome " in line or "/Google Chrome Beta " in line or "/Brave Browser " in line)
+            and "--type=" not in line
             and "EXCLUDE 127.0.0.1" in line and "--headless" not in line}
 
 
@@ -59,7 +61,10 @@ class _Frontmost:
         self._thread.join(2)
 
 
-def test_headed_browser_stays_behind_the_app_in_use():
+@pytest.mark.parametrize("browser", ["chrome", "brave"])
+def test_headed_browser_stays_behind_the_app_in_use(browser):
+    if browser == "brave" and brave.find_brave() is None:
+        pytest.skip("Brave is not installed")
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(_Quiet, directory=FIXTURES))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     base = f"http://localhost:{srv.server_port}"
@@ -68,7 +73,7 @@ def test_headed_browser_stays_behind_the_app_in_use():
     client = Client()
     try:
         client.call("browser_launch", _timeout=60, url=f"{base}/protocol.html", headless=False,
-                    persistent=False, extra_args=SAFE_ARGS)
+                    persistent=False, extra_args=SAFE_ARGS, browser=browser)
         ours = _main_chrome_pids() - before
         assert ours
         assert front.ms_of(ours, 0) == 0

@@ -62,13 +62,17 @@ def _profile(folder: Path, *rows, sub: str = "Default", network: bool = False) -
                    (f"c{i}", prefix + b"x", persistent, expires, "x.test", "/"))
     db.commit()
     db.close()
+    # A Chrome profile has a Local State; without one the launch's binding cannot tell which
+    # browser made the folder and refuses it (brave.binding_refusal).
+    if not (folder / "Local State").exists():
+        (folder / "Local State").write_text('{"profile": {}}')
     return folder
 
 
 @pytest.fixture
 def chromes(tmp_path, monkeypatch):
     monkeypatch.setattr(cm.sys, "platform", "darwin")
-    monkeypatch.setattr(cm, "default_data_dirs", lambda: [tmp_path / "default-chrome"])
+    monkeypatch.setattr(cm, "default_data_dirs", lambda product="chrome": [tmp_path / "default-chrome"])
     return SimpleNamespace(c157=_chrome(tmp_path / "157", "157.0.8103.39"),
                            c158=_chrome(tmp_path / "158", "158.0.8127.18"))
 
@@ -443,6 +447,7 @@ def test_an_unreadable_cookie_database_starts_nothing(tmp_path, decided):
     profile = tmp_path / "p"
     (profile / "Default").mkdir(parents=True)
     (profile / "Default" / "Cookies").write_bytes(b"not a database")
+    (profile / "Local State").write_text('{"profile": {}}')  # a Chrome profile, as the binding sees it
     out = _launch_on(profile)
     assert out.startswith("Error: refused to open") and "could not be read" in out, out
     assert "start" not in decided.order

@@ -445,7 +445,7 @@ async def emulate_device(preset: str = "desktop") -> str:
         from nodriver.cdp import emulation as cdp_emu
         from nodriver.cdp import network as cdp_net
         from ..identity import device_navigator_platform, device_ua_metadata_fields, strip_headless
-        from ..server import _apply_fingerprint_to_tab, _ua_metadata_param
+        from ..server import _apply_fingerprint_to_tab, _brand_for, _ua_metadata_param
         p = _DEVICE_PRESETS[preset_lc]
         version = await tab.send(cdp_browser.get_version())
         if preset_lc == "desktop":
@@ -476,7 +476,9 @@ async def emulate_device(preset: str = "desktop") -> str:
             if platform:
                 kwargs["platform"] = platform
             # Without metadata navigator.userAgentData.brands comes back empty.
-            hints = device_ua_metadata_fields(p["ua"], version[1].rsplit("/", 1)[-1])
+            # Brave names itself on a phone too; a browser attach could not tell is refused.
+            hints = device_ua_metadata_fields(p["ua"], version[1].rsplit("/", 1)[-1],
+                                              product=_brand_for(tab))
             if hints:
                 kwargs["user_agent_metadata"] = _ua_metadata_param(hints)
             else:

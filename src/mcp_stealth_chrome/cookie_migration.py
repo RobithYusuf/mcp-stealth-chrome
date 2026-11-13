@@ -113,10 +113,38 @@ def applies(executable: Optional[str]) -> bool:
     return bool(version) and version[0] >= FIRST_MAJOR
 
 
-def default_data_dirs() -> list[Path]:
-    """The folders where Chrome keeps the default key (`IsUsingDefaultDataDirectory`)."""
-    root = Path.home() / "Library" / "Application Support" / "Google"
+def default_data_dirs(product: str = "chrome") -> list[Path]:
+    """The folders where this browser keeps the default key (`IsUsingDefaultDataDirectory`):
+    Chrome's for Chrome, Brave's for browser="brave". Neither is the other's default folder."""
+    support = Path.home() / "Library" / "Application Support"
+    if product == "brave":
+        return [support / "BraveSoftware" / name
+                for name in ("Brave-Browser", "Brave-Browser-Beta", "Brave-Browser-Nightly")]
+    root = support / "Google"
     return [root / name for name in ("Chrome", "Chrome Beta", "Chrome Dev", "Chrome Canary")]
+
+
+def _unknown_brave_version(profile: Path, args: list[str], executable: Optional[str]) -> Optional[Plan]:
+    """Brave on macOS whose version cannot be read: it may be 158 or newer (Brave 158 deletes the
+    v10 cookies Brave 157 wrote, measured on Brave Beta 158.1.101.48), and whether the flag works
+    on it is not known either. So a profile holding a v10 cookie is refused to it. None when the
+    version is known, off macOS, or the profile holds no v10 cookie."""
+    if sys.platform != "darwin" or profile_version.binary_version(executable) is not None:
+        return None
+    subprofile = subprofile_from_args(args)
+    try:
+        if not Path(profile).is_dir():
+            return None
+        watch = candidate_databases(Path(profile), subprofile)
+        found, _ = census([p for p in watch if p.is_file() or p.is_symlink()], watch=watch)
+    except Exception as exc:
+        return Plan("refuse", f"the version of {executable} cannot be read, and neither can the profile's "
+                    f"cookie database ({type(exc).__name__}: {exc})", subprofile=subprofile)
+    if not found.v10:
+        return None
+    return Plan("refuse", f"the version of {executable} cannot be read, and the profile holds {found.v10} "
+                f"v10 cookies that Brave {FIRST_MAJOR} or newer deletes. Launch it with a Brave whose "
+                "version can be read", subprofile=subprofile, rows=found.loaded, v10=found.v10)
 
 
 def subprofile_from_args(args: list[str]) -> str:
@@ -294,18 +322,24 @@ def fsync_folder(folder: Path) -> None:
         os.close(fd)
 
 
-def plan(profile: Optional[Path], args: list[str], executable: Optional[str]) -> Plan:
+def plan(profile: Optional[Path], args: list[str], executable: Optional[str],
+         product: str = "chrome") -> Plan:
     """Decide before Chrome starts. Never raises and never writes: what cannot be read means
-    `refuse`."""
-    if profile is None or not applies(executable):
+    `refuse`. `product` is the browser the launch chose ("brave" for browser="brave"), which
+    picks the default folders and, for Brave, refuses an unknown version (_unknown_brave_version);
+    Chrome is decided exactly as before."""
+    if profile is None:
         return Plan("none")
+    if not applies(executable):
+        unknown = _unknown_brave_version(profile, args, executable) if product == "brave" else None
+        return unknown or Plan("none")
     profile = Path(profile)
     subprofile = subprofile_from_args(args)
     try:
         if not profile.is_dir():
             return Plan("none")
         real = os.path.realpath(profile)
-        if any(real == os.path.realpath(d) for d in default_data_dirs()):
+        if any(real == os.path.realpath(d) for d in default_data_dirs(product)):
             return Plan("none")  # Chrome keeps the v10 key in its own folder
         marker = read_marker(profile)
         major = profile_version.binary_version(executable)[0]

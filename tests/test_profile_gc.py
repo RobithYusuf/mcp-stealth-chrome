@@ -335,3 +335,21 @@ def test_an_empty_sessions_folder_is_not_data(root):
     _old(path)
     gc.run_once(root)
     assert not path.exists()
+
+
+def test_brave_fallbacks_get_the_same_pass_and_nothing_else_brave_is_touched(root):
+    """browser="brave" falls back to brave-profile-pid<N>: removed under exactly the rules of
+    profile-pid<N>, and Brave's main and named profiles never."""
+    empty = _profile(root, f"brave-profile-pid{DEAD}")
+    with_data = _profile(root, f"brave-profile-pid{DEAD - 1}")
+    _db(with_data / "Default" / "Cookies", "cookies", [(".example.com", "sid", "x")])
+    _old(with_data)
+    main = _profile(root, "brave-profile")
+    named = _profile(root / "brave-profiles", f"acct-pid{DEAD}")
+    near = _profile(root, f"xbrave-profile-pid{DEAD}")
+    report = gc.run_once(root)
+    assert _names(report, "removed") == [f"brave-profile-pid{DEAD}"]
+    assert _names(report, "kept_with_data") == [f"brave-profile-pid{DEAD - 1}"]
+    assert not empty.exists() and with_data.exists()
+    assert main.exists() and named.exists() and near.exists()
+    assert report["fallback_profiles_left"]["with_data"] == 1
