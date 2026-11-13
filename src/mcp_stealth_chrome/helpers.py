@@ -26,6 +26,16 @@ _SECRET_NAME = re.compile(
 )
 
 
+# Names that are credentials in a URL only. An OAuth authorization code is exchanged for
+# tokens, a SAML response and a CAS ticket are bearer credentials, a JWT bearer grant sends
+# an assertion. In a JSON body "code" is usually an error number, so these stay URL-only.
+_URL_SECRET_NAME = re.compile(
+    r"^(?:code|authorization[-_]?code|auth[-_]?code|samlresponse|samlrequest|ticket|assertion"
+    r"|client[-_]?assertion)$",
+    re.IGNORECASE,
+)
+
+
 def is_secret_name(name: Any) -> bool:
     """Whether a header, form or JSON field of this name carries a credential."""
     return bool(_SECRET_NAME.search(re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "-", str(name))))
@@ -84,17 +94,18 @@ def mask_json_value(value: Any) -> Any:
     return _mask_json(value)
 
 
-def _mask_pairs(text: str) -> str | None:
+def _mask_pairs(text: str, *, url: bool = False) -> str | None:
     """A query or form body with secret fields hidden, or None when it has none.
 
     Works on the raw pairs. Decoding and re-encoding the rest would rewrite ordinary
-    parameters, and a captured URL has to stay byte for byte what was requested.
+    parameters, and a captured URL has to stay byte for byte what was requested. `url`
+    adds the names that are credentials only in a URL (_URL_SECRET_NAME).
     """
     pieces = text.split("&")
     found = False
     for index, piece in enumerate(pieces):
         name = unquote_plus(piece.partition("=")[0])
-        if is_secret_name(name):
+        if is_secret_name(name) or (url and _URL_SECRET_NAME.match(name.strip())):
             found = True
             pieces[index] = f"{piece.partition('=')[0]}=***"
     return "&".join(pieces) if found else None
@@ -124,9 +135,10 @@ def mask_url(url: Any) -> Any:
     """Hide what in a URL is a credential: userinfo, and secret query or fragment pairs.
 
     `user:password@` (or a token as the user name) becomes `***@`. Secret pairs such as
-    ?access_token= are hidden in the query and in the fragment, where an OAuth redirect
-    puts its token (#access_token=, also after a hash route like #/cb?id_token=). Works
-    on the raw text, so every ordinary parameter stays byte for byte what was requested.
+    ?access_token=, and the URL-only credentials such as an OAuth ?code=, are hidden in the
+    query and in the fragment, where an OAuth redirect puts its token (#access_token=, also
+    after a hash route like #/cb?id_token=). Works on the raw text, so every ordinary
+    parameter stays byte for byte what was requested.
     """
     if not isinstance(url, str) or not any(mark in url for mark in ("?", "#", "@")):
         return url
@@ -148,13 +160,13 @@ def mask_url(url: Any) -> Any:
         if head.find("@") > 0 and not head.lower().startswith("mailto:"):
             rest = f"***@{head.rpartition('@')[2]}{slash}{path}"
     if query_mark:
-        query = _mask_pairs(query) or query
+        query = _mask_pairs(query, url=True) or query
     if hash_mark and "=" in fragment:
         route, route_mark, pairs = fragment.rpartition("?")
         if route_mark:
-            fragment = f"{route}?{_mask_pairs(pairs) or pairs}"
+            fragment = f"{route}?{_mask_pairs(pairs, url=True) or pairs}"
         else:
-            fragment = _mask_pairs(fragment) or fragment
+            fragment = _mask_pairs(fragment, url=True) or fragment
     return f"{rest}{query_mark}{query}{hash_mark}{fragment}"
 
 

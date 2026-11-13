@@ -133,6 +133,17 @@ def test_a_record_names_only_its_own_instance(tabs_dir, profile):
 
 def test_shown_urls_hide_tokens():
     assert "s3cret" not in tab_record.shown_url("https://x/cb?code=1&access_token=s3cret&a=b")
+    # An OAuth authorization code is exchanged for tokens; a SAML response and a CAS ticket
+    # are bearer credentials too. Only in a URL: a JSON "code" is usually an error number.
+    for url in ("https://x/cb?code=s3cret&state=xyz", "https://x/cb#code=s3cret&state=xyz",
+                "https://x/acs?SAMLResponse=s3cret", "https://x/login?ticket=s3cret",
+                "https://x/token?assertion=s3cret", "https://x/cb?authorization_code=s3cret"):
+        shown = tab_record.shown_url(url)
+        assert "s3cret" not in shown and "***" in shown, shown
+    assert "state=xyz" in tab_record.shown_url("https://x/cb?code=s3cret&state=xyz")
+    from mcp_stealth_chrome import helpers
+    assert helpers.mask_body('{"code": 404, "message": "not found"}') == '{"code": 404, "message": "not found"}'
+    assert helpers.mask_body("code=1&a=2") == "code=1&a=2"
     assert tab_record.shown_url("https://x/cb?a=1&b=2") == "https://x/cb?a=1&b=2"
     assert "s3cret" not in tab_record.shown_url("https://x/cb#access_token=s3cret&state=1")
     assert tab_record.shown_url("https://x/page#section-2") == "https://x/page#section-2"
@@ -227,6 +238,40 @@ def test_the_background_writer_skips_a_list_that_is_changing(tabs_dir, profile, 
     assert asyncio.run(server._record_tabs_in_background(key, iid)) == "skipped"
     delattr(browser, server._CLOSING_ATTR)
     assert asyncio.run(server._record_tabs_in_background(key, iid)) == "recorded 2 tab(s)"
+
+
+def test_a_close_that_failed_keeps_its_record_however_long_chrome_lingers(tabs_dir, profile, monkeypatch):
+    """A close records the full list, then the browser does not end (its handle is kept for a
+    retry). Neither the background writer, 30 s or 10 minutes later, nor the retried close may
+    write the half-closed list over it."""
+    reads = {"pages": list(PAGES)}
+
+    async def pages(_browser):
+        return list(reads["pages"])
+
+    browser = SimpleNamespace()
+    monkeypatch.setattr(server, "_page_targets", pages)
+    monkeypatch.setattr(server, "_TAB_RECORD_DIRTY", {})
+    assert asyncio.run(server._record_tabs_before_close(
+        "main", browser, [_tab("t1"), _tab("t2"), _tab("t3")], 0, profile, False,
+        "browser_close")) == "recorded 3 tab(s)"
+    full = (tabs_dir / "main-tabs.json").read_text()
+    reads["pages"] = list(PAGES[:1])  # the windows went one by one, Chrome itself did not
+    monkeypatch.setattr(server.BrowserState, "browser", browser, raising=False)
+    monkeypatch.setattr(server.BrowserState, "tabs", [_tab("t1")], raising=False)
+    monkeypatch.setattr(server.BrowserState, "current_profile_dir", profile, raising=False)
+    monkeypatch.setattr(server.BrowserState, "current_privacy", False, raising=False)
+    key, iid = server.BrowserState.session_key(), server.BrowserState.current_instance_id
+    for later in (31, 600):  # the close began this long ago
+        setattr(browser, server._CLOSING_ATTR, time.monotonic() - later)
+        assert asyncio.run(server._record_tabs_in_background(key, iid)) == "skipped"
+    assert asyncio.run(server._record_tabs_before_close(
+        "main", browser, [_tab("t1")], 0, profile, False, "browser_close")).startswith("not recorded")
+    assert (tabs_dir / "main-tabs.json").read_text() == full
+    # A new browser for the instance is recorded as usual.
+    fresh = SimpleNamespace()
+    monkeypatch.setattr(server.BrowserState, "browser", fresh, raising=False)
+    assert asyncio.run(server._record_tabs_in_background(key, iid)) == "recorded 1 tab(s)"
 
 
 def test_a_tool_call_schedules_a_write_and_nothing_else(tabs_dir, profile, monkeypatch):
@@ -455,3 +500,39 @@ def test_removing_a_fallback_profile_removes_its_saved_tabs(tmp_path, monkeypatc
     assert done["removed"] and done["saved_tab_lists_removed"] == 1
     assert tab_record.load("main", fallback)[0] is None
     assert tab_record.load("main", keep)[0] is not None
+
+
+@pytest.mark.parametrize("tool", ["browser_launch", "spawn_browser"])
+def test_a_launch_records_its_tabs_before_it_returns(tabs_dir, profile, monkeypatch, tool):
+    """The quit watcher ends a browser once its last window has gone, and then nothing is left
+    to read. A Quit in the first seconds, before the background writer's first pass (2 s after
+    the call, two reads 0.3 s apart), lost the list; the launch now records it as it returns."""
+    from test_focus_restore import _fake_launch
+    _fake_launch(monkeypatch)
+
+    async def pages(_browser):
+        return [("T1", "https://a.example/one")]
+
+    monkeypatch.setattr(server, "_page_targets", pages)
+    monkeypatch.setattr(server, "_target_key", lambda tab: "T1")
+    monkeypatch.setattr(server, "_TAB_RECORD_DEBOUNCE", 0)  # no background writer in this test
+    try:
+        if tool == "browser_launch":
+            fn = server.mcp._tool_manager._tools["browser_launch"].fn
+            out = asyncio.run(fn(user_data_dir=str(profile), headless=True, auto_verify=False,
+                                 url="https://a.example/one"))
+            assert "launched" in out and not out.startswith("Error"), out
+            iid = "main"
+        else:
+            ok_, out = asyncio.run(server._launch_browser_instance(
+                instance_id="inst", url="https://a.example/one", headless=True, proxy=None,
+                user_agent=None, window_width=800, window_height=600, persistent=True,
+                lang="en-US", extra_args=None, storage_state_path=None, idle_timeout=0,
+                profile_dir_override=str(profile)))
+            assert ok_, out
+            iid = "inst"
+    finally:
+        server.BrowserState.reset()
+        server.BrowserState.instances.pop("inst", None)
+    entry, _ = tab_record.load(iid, profile)
+    assert entry and [t["url"] for t in entry["tabs"]] == ["https://a.example/one"], entry

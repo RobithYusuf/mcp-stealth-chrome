@@ -175,20 +175,17 @@ def beta_verdict(user_data_dir: Optional[Path], *, chrome: Optional[str], beta: 
 
 def _no_v10_cookies(folder: Path) -> bool:
     """True only when every cookie database in the profile was read and none holds a `v10`
-    value. Opened read-only and immutable, so nothing is written, not even a journal."""
-    import sqlite3
-    from urllib.parse import quote
+    value. Each is read in its committed state from a private copy with its journal rolled
+    back (cookie_db.read), so nothing in the profile is written, and a hot journal or a
+    write-ahead log cannot hide a row."""
+    from . import cookie_db
 
-    databases = [p for sub in folder.iterdir() if sub.is_dir() and not sub.is_symlink()
-                 for p in (sub / "Cookies", sub / "Network" / "Cookies") if p.is_file()]
-    for database in databases:
-        try:
-            with contextlib.closing(sqlite3.connect(
-                    f"file:{quote(str(database))}?mode=ro&immutable=1", uri=True)) as db:
-                found = db.execute("SELECT 1 FROM cookies WHERE substr(encrypted_value, 1, 3) = "
-                                   "CAST('v10' AS BLOB) LIMIT 1").fetchone()
-        except Exception:
-            return False
-        if found:
-            return False
-    return True
+    def has_v10(db) -> bool:
+        return db.execute("SELECT 1 FROM cookies WHERE substr(encrypted_value, 1, 3) = "
+                          "CAST('v10' AS BLOB) LIMIT 1").fetchone() is not None
+
+    try:
+        found, _ = cookie_db.stable_read(cookie_db.all_databases(folder), has_v10)
+    except Exception:
+        return False
+    return not any(found.values())

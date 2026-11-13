@@ -509,20 +509,46 @@ async def tab_close(index: Optional[int] = None) -> str:
             return err(f"tab {idx} out of range: {len(BrowserState.tabs)} tab(s), "
                        f"0..{len(BrowserState.tabs) - 1}")
         closed_tab = BrowserState.tabs[idx]
-        if len(BrowserState.tabs) == 1:
+        browser = BrowserState.browser
+        marked = len(BrowserState.tabs) == 1
+        if marked:
             # Said before the close: the quit watcher polls on its own and must never see this
             # browser empty without knowing a tool emptied it.
-            _srv._window_watch_tool_closed(BrowserState.browser)
-        await closed_tab.close()
-        _srv._clear_tab_scoped_state([closed_tab])
-        await _srv._refresh_tabs()
-        if not BrowserState.tabs:
-            _srv._window_watch_tool_closed(BrowserState.browser)
-        if BrowserState.active_tab_index >= len(BrowserState.tabs):
-            BrowserState.active_tab_index = max(0, len(BrowserState.tabs) - 1)
+            _srv._window_watch_tool_closed(browser)
+        try:
+            await closed_tab.close()
+        except Exception as e:
+            # The mark must not outlive a close that did not happen: the watcher would then
+            # wait on an empty browser for as long as this server runs. Only a target Chrome
+            # no longer lists counts as closed; unknown takes the mark back.
+            gone = await _target_gone(browser, closed_tab)
+            if not gone:
+                if marked:
+                    _srv._window_watch_tool_closed_undo(browser)
+                return err(f"tab {idx} not closed: {e}")
+        try:
+            _srv._clear_tab_scoped_state([closed_tab])
+            await _srv._refresh_tabs()
+            if not BrowserState.tabs:
+                _srv._window_watch_tool_closed(browser)
+            if BrowserState.active_tab_index >= len(BrowserState.tabs):
+                BrowserState.active_tab_index = max(0, len(BrowserState.tabs) - 1)
+        except Exception as e:
+            return err(f"closed tab {idx}, but reading the tabs afterwards failed: {e}; "
+                       "tab_list reads them again")
         return ok(f"closed tab {idx}")
     except Exception as e:
         return err(str(e))
+
+
+async def _target_gone(browser, tab) -> bool:
+    """True only when Chrome answered and no longer lists the tab's page."""
+    try:
+        pages = await asyncio.wait_for(_srv._page_targets(browser), timeout=2)
+    except Exception:
+        return False
+    key = _srv._target_key(tab)
+    return key is not None and all(target_id != key for target_id, _url in pages)
 
 
 # Cookie, storage, IndexedDB and cache tools live in tools/storage.py. These two helpers

@@ -156,12 +156,15 @@ def test_browser_close_saves_the_tabs_and_restore_reopens_them(world):
 
 def test_stdin_eof_saves_the_tabs(world):
     """What an agent session going to sleep does: the client goes, stdin closes, the server exits.
-    The background writer is off, so the list can only come from the exit path."""
+    The background writer is off, so past the launch's own record the list can only come from
+    the exit path."""
     client = Client(env=world.env(MCP_STEALTH_TAB_RECORD_DEBOUNCE="0", MCP_STEALTH_TAB_RECORD_PERIOD="0"))
     try:
         _open_three(client, world, select=2)
         time.sleep(1)
-        assert not world.record.exists(), "something other than the exit path wrote the list"
+        launched = world.entry()
+        assert launched["reason"] == "at launch", "something other than the launch wrote the list"
+        assert [t["url"] for t in launched["tabs"]] == world.urls[:1]
     finally:
         client.close()
     entry = world.entry()
@@ -199,8 +202,9 @@ def test_a_killed_server_leaves_the_last_list_it_saw(world):
     assert ours, "the server this test started was not found"
     try:
         _open_three(client, world, select=0)
-        deadline = time.time() + 10
-        while time.time() < deadline and not world.record.exists():
+        deadline = time.time() + 10  # the launch writes its own record first
+        while time.time() < deadline and not (world.record.exists()
+                                              and world.entry()["reason"] == "while running"):
             time.sleep(0.2)
         entry = world.entry()
         assert entry["reason"] == "while running"
@@ -222,7 +226,8 @@ def test_a_killed_server_leaves_the_last_list_it_saw(world):
 
 def test_named_instances_close_instance_close_all_and_idle_timeout(world):
     """A stored instance: close_instance, close_all_instances and the idle reaper each save its
-    tabs, and spawn_browser(restore_tabs=True) brings them back. Only the closes can write."""
+    tabs, and spawn_browser(restore_tabs=True) brings them back. Past the launch's own record,
+    only the closes can write."""
     record = world.data / "window-state" / "acct-tabs.json"
     acct = world.data / "profiles" / "acct"
     client = Client(env=world.env(MCP_STEALTH_TAB_RECORD_DEBOUNCE="0", MCP_STEALTH_TAB_RECORD_PERIOD="0",
@@ -248,7 +253,7 @@ def test_named_instances_close_instance_close_all_and_idle_timeout(world):
     try:
         spawn()
         open_second_and_leave()
-        assert not record.exists()
+        assert entry()["reason"] == "at launch" and [t["url"] for t in entry()["tabs"]] == world.urls[:1]
         assert not client.call("close_instance", instance_id="acct").failed
         assert entry()["reason"] == "close_instance"
         assert [t["url"] for t in entry()["tabs"]] == world.urls[:2] and entry()["active"] == 0
@@ -325,8 +330,9 @@ def test_headed_quit_and_sleep_keep_the_tabs_and_restore_takes_no_focus(world):
         _open_three(client, world, headless=False, select=1)
         chrome = _chrome_pids() - before
         assert len(chrome) == 1, chrome
-        deadline = time.time() + 10
-        while time.time() < deadline and not world.record.exists():
+        deadline = time.time() + 10  # the launch writes its own record first
+        while time.time() < deadline and not (world.record.exists()
+                                              and world.entry()["reason"] == "while running"):
             time.sleep(0.2)
         assert world.entry()["active"] == 1
         saved = world.record.read_text()

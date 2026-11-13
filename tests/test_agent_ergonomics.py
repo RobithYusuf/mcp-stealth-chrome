@@ -2,6 +2,7 @@
 
 import json
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -3708,6 +3709,55 @@ def test_tab_close_marks_the_browser_before_closing_its_last_tab(monkeypatch):
     assert order[:2] == ["mark", "close"], order
 
 
+@pytest.mark.parametrize("case", ["close_failed", "close_failed_but_tab_gone", "after_close_failed"])
+def test_tab_close_that_fails_leaves_no_false_tool_closed_mark(monkeypatch, case):
+    """The mark tells the quit watcher that a tool emptied the browser, so it waits instead of
+    ending it. A close that did not happen must take it back; one that happened keeps it and
+    says what failed after it."""
+    import asyncio
+
+    from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import navigation
+
+    marked = {"on": False}
+
+    class Tab:
+        target = SimpleNamespace(target_id="T1")
+
+        async def close(self):
+            if case.startswith("close_failed"):
+                raise RuntimeError("websocket closed (simulated)")
+
+    refreshes = []
+
+    async def refresh():
+        refreshes.append(1)
+        if case == "after_close_failed" and len(refreshes) > 1:  # the first is the list check
+            raise RuntimeError("update_targets failed (simulated)")
+        return True
+
+    async def pages(_browser):
+        return [] if case == "close_failed_but_tab_gone" else [("T1", "https://a.example/")]
+
+    tab = Tab()
+    monkeypatch.setattr(server, "_refresh_tabs", refresh)
+    monkeypatch.setattr(server, "_page_targets", pages)
+    monkeypatch.setattr(server, "_clear_tab_scoped_state", lambda tabs: None)
+    monkeypatch.setattr(server, "_window_watch_tool_closed", lambda b: marked.update(on=True))
+    monkeypatch.setattr(server, "_window_watch_tool_closed_undo", lambda b: marked.update(on=False),
+                        raising=False)
+    monkeypatch.setattr(server.BrowserState, "tabs", [tab], raising=False)
+    monkeypatch.setattr(server.BrowserState, "active_tab_index", 0, raising=False)
+    monkeypatch.setattr(server.BrowserState, "browser", object(), raising=False)
+    out = asyncio.run(navigation.tab_close())
+    if case == "close_failed":
+        assert out.startswith("Error: tab 0 not closed") and marked["on"] is False, (out, marked)
+    elif case == "close_failed_but_tab_gone":  # Chrome no longer lists it: it did close
+        assert out == "closed tab 0" and marked["on"] is True, (out, marked)
+    else:
+        assert out.startswith("Error: closed tab 0, but") and marked["on"] is True, (out, marked)
+
+
 def test_testing_mode_features_join_nodrivers_list(tmp_path):
     """Chrome honours only the last --disable-features, and nodriver's own comes first, so
     testing_mode's flag dropped IsolateOrigins,site-per-process."""
@@ -3995,6 +4045,79 @@ def test_switch_instance_waits_while_a_sweep_closes_that_instance(monkeypatch):
     reply = asyncio.run(run())
     assert switched == ["gone"]
     assert "not running" in reply and "idle_timeout_seconds=2" in reply, reply
+
+
+def test_the_idle_sweep_leaves_alone_an_instance_close_instance_is_closing(monkeypatch):
+    """close_instance awaited (window bounds, tab record, Browser.close) without saying it was
+    closing, so the idle sweep could pick the same stored instance and close it a second time."""
+    import asyncio
+
+    from mcp_stealth_chrome import server
+
+    snap = SimpleNamespace(browser=object(), tabs=[], active_tab_index=0, profile_dir=None,
+                           privacy=False, idle_timeout=1, is_running=lambda: True,
+                           is_idle_expired=lambda: True)
+    swept = []
+
+    async def end(iid, s, reason=None):
+        swept.append(iid)
+        return True
+
+    async def noop(*_a, **_kw):
+        return None
+
+    monkeypatch.setattr(server, "_end_stored_instance", end)
+    monkeypatch.setattr(server, "_save_window_bounds", noop)
+    monkeypatch.setattr(server, "_record_tabs_before_close", noop)
+    monkeypatch.setattr(server, "_clear_tab_scoped_state", lambda tabs: None)
+    monkeypatch.setattr(server.BrowserState, "instances", {"a": snap}, raising=False)
+    monkeypatch.setattr(server.BrowserState, "window_closed", {}, raising=False)
+    monkeypatch.setattr(server.BrowserState, "is_up", classmethod(lambda cls: False))
+
+    async def run():
+        release = asyncio.Event()
+
+        async def slow_dead(_browser, _profile):
+            await release.wait()
+            return {"verified": True}
+
+        monkeypatch.setattr(server, "_ensure_browser_dead", slow_dead)
+        closing = asyncio.ensure_future(server.close_instance("a"))
+        await asyncio.sleep(0.05)
+        await server._sweep_idle_instances()
+        release.set()
+        return await asyncio.wait_for(closing, 2)
+
+    reply = asyncio.run(run())
+    assert swept == [], "closed twice"
+    assert "closed instance 'a'" in reply or "closed" in reply, reply
+
+
+def test_a_close_still_running_after_the_wait_is_an_error_not_a_go_ahead(monkeypatch):
+    """wait_while_closing gave up after 60 s and carried on, so the caller switched in, or
+    used, an instance whose close then changed the state under it."""
+    import asyncio
+
+    from mcp_stealth_chrome import _app, server
+
+    switched = []
+    monkeypatch.setattr(_app, "_CLOSING_WAIT_SECONDS", 0.1)
+    monkeypatch.setattr(server.BrowserState, "switch_to",
+                        classmethod(lambda cls, iid: switched.append(iid)))
+
+    async def run():
+        event = asyncio.Event()  # never set: the close is stuck
+        key = server.BrowserState.session_key()
+        monkeypatch.setitem(_app.INSTANCE_CLOSING, (key, "stuck"), event)
+        monkeypatch.setitem(_app.INSTANCE_CLOSING, (key, server.BrowserState.current_instance_id), event)
+        return (await server.switch_instance("stuck"), await server.close_instance("stuck"),
+                await server.mcp.call_tool("tab_list", {}))
+
+    switch_reply, close_reply, listed = asyncio.run(run())
+    assert switched == []
+    for reply in (switch_reply, close_reply):
+        assert reply.startswith("Error") and "still being closed" in reply, reply
+    assert "still being closed" in str(listed), listed
 
 
 def test_tab_select_names_why_the_browser_went_rather_than_the_index(monkeypatch):

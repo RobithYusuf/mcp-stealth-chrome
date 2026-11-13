@@ -8,6 +8,7 @@ Architecture parallels mcp-camoufox (Node/Firefox sister package):
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 import base64
 import contextlib
 import fnmatch
@@ -941,7 +942,7 @@ async def _remove_privacy_profile(profile_dir: Optional[Path]) -> bool:
             return False
     except Exception:
         return False
-    from .state import processes_naming
+    from .state import processes_holding
     _PRIVACY_REMOVE_FAILURES.pop(str(profile_dir), None)
     # Browser.stop() terminates the parent synchronously, but Chrome helpers can
     # write their final Preferences files a beat later. Deleting immediately can
@@ -955,9 +956,15 @@ async def _remove_privacy_profile(profile_dir: Optional[Path]) -> bool:
         delay = _PRIVACY_REMOVE_DELAYS[min(attempt, len(_PRIVACY_REMOVE_DELAYS) - 1)]
         attempt += 1
         # The path as Chrome was given it: resolving can change its spelling (a Windows 8.3
-        # short name becomes the long one), and processes_naming tries both.
-        users = await asyncio.to_thread(processes_naming, profile_dir) or []
-        if users:
+        # short name becomes the long one), and processes_naming tries both. An unreadable
+        # browser process counts too (processes_holding).
+        found = await asyncio.to_thread(processes_holding, profile_dir)
+        users = found or []
+        if found is None:
+            # Unknown is not "none": a helper may still run and write the files back.
+            reason = "the process list could not be read, so it is not known whether Chrome still runs"
+            await asyncio.sleep(delay)
+        elif users:
             reason = "a process still runs with it: " + ", ".join(
                 f"PID {pid} ({_short_command(command)})" for pid, command in users)
             await asyncio.sleep(delay)
@@ -1988,12 +1995,18 @@ def _cdp_call(method: str, params: Optional[dict] = None):
 class _CookieMove:
     """A profile's cookies on their way to Chrome 158's encryption; see cookie_migration.
 
-    `flag`: launch with the protection turned off. `backup`: after the launch, set the
-    cookies in this file again and check them. `note` goes into the launch result."""
+    Preparing it writes nothing in the profile. `flag`: launch with the protection turned off.
+    `refuse`: start nothing, and why. `marker`: the pending marker _commit_cookie_move writes
+    once the launch has checked the profile, and `strip` whether the v10 rows then go from
+    beside v11 ones. `backup`: after the launch, set the cookies in this file again and check
+    them. `note` goes into the launch result."""
     plan: Any
     flag: bool = False
     backup: Optional[Path] = None
     note: str = ""
+    refuse: str = ""
+    marker: Optional[dict] = None
+    strip: bool = False
 
 
 def _cookie_flag_arg(config: Config) -> str:
@@ -2001,47 +2014,151 @@ def _cookie_flag_arg(config: Config) -> str:
 
 
 async def _prepare_cookie_move(profile_path: Optional[Path], config: Config) -> _CookieMove:
-    """Before Chrome 158 opens a profile holding v10 cookies: read them with the protection
-    off, keep them in a backup, and only then let the launch go without it. Never raises;
-    whatever goes wrong before the backup is complete means the flag for this launch."""
+    """Before Chrome 158 opens a profile holding v10 cookies: read them with the protection off
+    from a copy, keep them in a durable backup, and say what the launch must commit. Never
+    raises, and writes nothing in the profile: a refusal leaves it exactly as it was."""
     executable = str(config.browser_executable_path or "")
     plan = await asyncio.to_thread(cookie_migration.plan, profile_path, list(config.browser_args or []),
                                    executable)
     if plan.kind == "none":
         return _CookieMove(plan)
+    if plan.kind == "refuse":
+        return _CookieMove(plan, refuse=_cookie_refusal(profile_path, plan.reason, plan.marker))
     if plan.kind == "flag":
         return _CookieMove(plan, flag=True, note=f" [cookies: {plan.reason}]")
     if plan.kind == "resume":
-        return _CookieMove(plan, backup=Path(str(plan.marker["backup"])))
+        # Every loaded v10 row is in the verified backup (plan checked). Beside v11 rows Chrome
+        # would delete them all, so they go at commit, and the backup sets them again.
+        return _CookieMove(plan, backup=Path(str(plan.marker["backup"])), strip=bool(plan.v10 and plan.v11))
     try:
         return await _move_cookies_out(Path(profile_path), config, plan, executable)
+    except cookie_migration.Changed as exc:
+        return _CookieMove(plan, refuse=_cookie_refusal(profile_path, (
+            f"its cookies changed while they were being backed up ({exc}), so what Chrome would "
+            "delete is no longer known"), plan.marker))
     except Exception as exc:
-        return _CookieMove(plan, flag=True, note=_cookie_move_failed(_exc_text(exc)))
+        return _cookie_move_failed(plan, profile_path, _exc_text(exc))
 
 
-def _cookie_move_failed(why: str) -> str:
-    return (f" [cookies NOT moved to Chrome 158 encryption: {why}. This launch opens the profile with "
-            f"the protection turned off, so nothing is lost, and the next launch tries again]")
+def _cookie_refusal(profile_path: Any, why: str, marker: Optional[dict] = None) -> str:
+    """The refusal, with what can be done about it. Nothing was started or written."""
+    saved = ""
+    if marker and marker.get("backup"):
+        saved = (f" A backup of its cookies is at {marker['backup']} (storage_state_load reads it) "
+                 f"and a copy of its cookie databases at {marker.get('database_copy') or 'an unrecorded place'}.")
+    return (f"refused to open {profile_path} with Chrome 158 or newer: {why}. Nothing was started and "
+            f"the profile was not changed.{saved} Close every Chrome that has this profile open and "
+            "launch again, which decides afresh. To work meanwhile without risking these cookies, "
+            "clone_chrome_profile makes a copy to launch instead. If the cookie database itself is "
+            "damaged, Chrome cannot use it either: restore it from a backup of the profile first. "
+            "persistent=False starts on an empty profile, without these logins")
 
 
-async def _move_cookies_out(profile: Path, config: Config, plan: Any, executable: str) -> _CookieMove:
-    """Steps 1 to 4 of cookie_migration: copy the databases, read every cookie with the flag,
-    write the backup, close that Chrome, and mark the move pending."""
-    ensure_dirs()
-    name = f"{cookie_migration.BACKUP_PREFIX}-{cookie_migration.label(profile)}-{time.strftime('%Y%m%d-%H%M%S')}"
-    db_copy = STORAGE_STATE_DIR / f"{name}-db"
-    databases = cookie_migration.cookie_databases(profile, plan.subprofile)
-    copied = await asyncio.to_thread(cookie_migration.backup_databases, databases, profile, db_copy)
+def _cookie_move_failed(plan: Any, profile_path: Any, why: str) -> _CookieMove:
+    """A move that did not finish preparing; the profile was not touched. The flag keeps the
+    v10 cookies but deletes v11 ones (Beta 159 with the flag read 0 of 3 and left 0 rows), so a
+    profile holding v11 is not started at all."""
+    if getattr(plan, "v11", 0):
+        return _CookieMove(plan, refuse=_cookie_refusal(profile_path, (
+            f"its cookies could not be moved to Chrome 158 encryption ({why}), and it holds "
+            f"{plan.v11} v11 cookies the protection turned off would delete beside "
+            f"{plan.v10} v10 ones it would keep; the next launch tries again"), plan.marker))
+    return _CookieMove(plan, flag=True, note=(
+        f" [cookies NOT moved to Chrome 158 encryption: {why}. This launch opens the profile with "
+        f"the protection turned off, so nothing is lost, and the next launch tries again]"))
+
+
+async def _cookie_preflight(profile_path: Optional[Path], move: _CookieMove) -> str:
+    """The last look before anything is written: the profile must be as the cookie decision
+    found it. A Chrome that took its lock, or a cookie database of the launched sub-profile
+    written since (another program, a v10 cookie arriving after the check), means that decision
+    no longer holds. Only reads. Returns why it is refused, or ""."""
+    plan = move.plan
+    if profile_path is None or getattr(plan, "fingerprint", None) is None:
+        return ""
+
+    def look() -> str:
+        from .state import chrome_lock_state
+        lock, holder = chrome_lock_state(Path(profile_path))
+        if lock == "held":
+            return f"Chrome PID {holder} opened it after this launch checked it"
+        if lock == "unknown":
+            return (f"its SingletonLock ({Path(profile_path) / 'SingletonLock'}) is there but names no "
+                    "process that can be read, so a Chrome may hold it; if none runs, that file is "
+                    "stale and can be removed")
+        try:
+            now = cookie_migration.fingerprint_of(Path(profile_path), plan.subprofile)
+        except Exception as exc:
+            return f"its cookie databases could not be checked again ({_exc_text(exc)})"
+        if now != plan.fingerprint:
+            return "its cookie database changed after this launch read it"
+        return ""
+
+    why = await asyncio.to_thread(look)
+    return _cookie_refusal(profile_path, (
+        f"{why}, so what Chrome would delete is no longer known"), getattr(plan, "marker", None)) if why else ""
+
+
+async def _commit_cookie_move(profile_path: Optional[Path], move: _CookieMove) -> str:
+    """The writes a move makes in the profile, after _cookie_preflight and right before Chrome
+    starts: the pending marker (durable), then, beside v11 cookies, the v10 rows, each database
+    in one transaction that checks they are all in the backup. Returns why the launch must not
+    go on, or "". From the marker on, every crash resumes on the next launch."""
+    if profile_path is None:
+        return ""
+    profile = Path(profile_path)
+    try:
+        if move.marker is not None:
+            await asyncio.to_thread(cookie_migration.write_marker, profile, move.marker)
+        if move.strip:
+            cookies = await asyncio.to_thread(
+                cookie_migration.verified_backup, move.backup, cookie_migration.read_marker(profile))
+            if cookies is None:
+                raise cookie_migration.Changed(f"the backup {move.backup} no longer matches its marker")
+            allowed = dict(Counter(cookie_migration.key(c) for c in cookies))
+            marker = cookie_migration.read_marker(profile)
+            # Every row deleted must be the very row the backup was read from (database copy).
+            snapshot = await asyncio.to_thread(
+                cookie_migration.snapshot_digests, Path(str(marker.get("database_copy") or "")),
+                move.plan.subprofile, b"v10")
+            await asyncio.to_thread(cookie_migration.strip, profile, move.plan.subprofile, b"v10", allowed,
+                                    snapshot)
+            # Its own change, checked row by row: the last look before Chrome starts compares to this.
+            move.plan.fingerprint = await asyncio.to_thread(
+                cookie_migration.fingerprint_of, profile, move.plan.subprofile)
+    except Exception as exc:
+        marker = cookie_migration.read_marker(profile)
+        return _cookie_refusal(profile_path, (
+            f"its cookies could not be prepared for Chrome 158 ({_exc_text(exc)}); the move stays "
+            "pending, and the next launch resumes it from the backup"), marker)
+    return ""
+
+
+async def _close_after_cookie_failure(browser: Any, profile_path: Any) -> str:
+    """Close the browser a move could not finish in, so the next launch resumes the move. What
+    to do next, in words."""
+    closed = await _ensure_browser_dead(browser, profile_path)
+    if _close_incomplete(closed):
+        return (f"The browser could not be closed ({_close_failure(closed)}): close it with browser_close, "
+                "then launch again, which resumes the move")
+    if BrowserState.browser is browser:
+        BrowserState.reset()
+    return "The browser was closed; launch again, which resumes the move"
+
+
+async def _read_v10_cookies(folder: Path, subprofile: str, executable: str) -> list:
+    """Every cookie a headless Chrome with the protection turned off reads from `folder`, a
+    temporary user-data folder. Raises when it cannot read them or does not end."""
     reader_config = Config(
-        user_data_dir=str(profile), headless=True,
-        browser_args=[f"--profile-directory={plan.subprofile}", "--no-default-browser-check",
+        user_data_dir=str(folder), headless=True,
+        browser_args=[f"--profile-directory={subprofile}", "--no-default-browser-check",
                       "--disable-restore-session-state", "--hide-crash-restore-bubble", *_LEAN_FLAGS],
     )
     reader_config.browser_executable_path = executable
     reader_config.add_argument(_cookie_flag_arg(reader_config))
     reader = None
     cookies: list = []
-    problem = ""
+    problem: Optional[BaseException] = None
     try:
         reader = await _start_chrome(reader_config)
         answer = await asyncio.wait_for(
@@ -2049,41 +2166,76 @@ async def _move_cookies_out(profile: Path, config: Config, plan: Any, executable
             timeout=30)
         cookies = list((answer or {}).get("cookies") or [])
     except Exception as exc:
-        problem = f"reading them with the protection turned off failed ({_exc_text(exc)})"
-    closed = await _ensure_browser_dead(reader, profile) if reader is not None else {"verified": True}
+        problem = exc
+    closed = await _ensure_browser_dead(reader, folder) if reader is not None else {"verified": True}
+    if problem is not None:
+        raise RuntimeError(f"reading them with the protection turned off failed ({_exc_text(problem)})")
     if not closed.get("verified"):
-        return _CookieMove(plan, flag=True, note=_cookie_move_failed(
-            f"the Chrome that read them did not end ({_kill_note(closed) or 'not verified'})"))
-    if not problem and len(cookies) < plan.rows:
-        problem = (f"Chrome read {len(cookies)} of the {plan.rows} cookies in the profile with the "
-                   "protection turned off")
-    if problem:
-        # The flag may have stopped working, in which case Chrome deleted what it could not
-        # read: the databases go back as they were.
-        await asyncio.to_thread(cookie_migration.restore_databases, db_copy, profile, copied)
-        return _CookieMove(plan, flag=True, note=_cookie_move_failed(
-            f"{problem}; the cookie databases were put back from {db_copy}"))
+        raise RuntimeError(f"the Chrome that read them did not end ({_kill_note(closed) or 'not verified'})")
+    return cookies
+
+
+async def _move_cookies_out(profile: Path, config: Config, plan: Any, executable: str) -> _CookieMove:
+    """Steps 1 to 4 of cookie_migration. Nothing in the profile is written or opened: the
+    databases are copied (verified, fsynced), a Chrome with the flag reads the v10 rows from a
+    temporary folder, the backup is written durably and read back, and the profile must still
+    be as the decision read it. The pending marker is left to _commit_cookie_move."""
+    ensure_dirs()
+    # Unique: a launch retried within the same second after a cut-off move must not collide.
+    name = (f"{cookie_migration.BACKUP_PREFIX}-{cookie_migration.label(profile)}-"
+            f"{time.strftime('%Y%m%d-%H%M%S')}-{os.urandom(3).hex()}")
+    db_copy = STORAGE_STATE_DIR / f"{name}-db"
+    await asyncio.to_thread(cookie_migration.copy_databases, profile, plan.subprofile, db_copy)
+    folder = await asyncio.to_thread(cookie_migration.reader_folder, db_copy, plan.subprofile, b"v10")
+    try:
+        cookies = await _read_v10_cookies(folder, plan.subprofile, executable)
+    finally:
+        await asyncio.to_thread(shutil.rmtree, folder, True)
+    missing = cookie_migration.missing_from(plan.v10_keys, Counter(cookie_migration.key(c) for c in cookies))
+    expected = sum(plan.v10_keys.values())
+    if missing or len(cookies) < expected:
+        sample = ", ".join(f"{n}@{h}" for n, h, *_ in missing[:5])
+        return _cookie_move_failed(plan, profile, (
+            f"Chrome read {len(cookies)} of the {expected} cookies in the profile with the protection "
+            f"turned off{', not ' + sample if sample else ''}; the profile was not touched"))
+    if plan.marker.get("state") == "pending" and plan.marker.get("backup"):
+        # A move made again over a pending one: cookies only that backup still holds (their rows
+        # already taken out from beside v11 ones) are carried over, or they would be lost.
+        earlier = await asyncio.to_thread(
+            cookie_migration.verified_backup, Path(str(plan.marker["backup"])), plan.marker)
+        read = {cookie_migration.key(c) for c in cookies}
+        cookies += [c for c in earlier or [] if cookie_migration.key(c) not in read]
     backup = STORAGE_STATE_DIR / f"{name}.json"
     document = cookie_migration.backup_document(cookies, profile, executable)
-    await asyncio.to_thread(cookie_migration.write_private, backup, json.dumps(document))
-    # Only now may this Chrome open the profile without the flag: every cookie is in the backup.
-    cookie_migration.write_marker(profile, {
-        "state": "pending", "backup": str(backup), "database_copy": str(db_copy),
-        "count": len(cookies), "major": profile_version.binary_version(executable)[0],
-        "started_at": time.time()})
-    return _CookieMove(plan, backup=backup)
+    await asyncio.to_thread(cookie_migration.write_durable, backup, json.dumps(document))
+    saved = await asyncio.to_thread(cookie_migration.verified_backup, backup)
+    if saved is None or [cookie_migration.value_digest(c) for c in saved] != \
+            [cookie_migration.value_digest(c) for c in cookies]:
+        raise RuntimeError(f"the backup {backup} did not read back as written")
+    now = await asyncio.to_thread(cookie_migration.fingerprint_of, profile, plan.subprofile)
+    if now != plan.fingerprint:
+        raise cookie_migration.Changed("a cookie database of the profile was written meanwhile")
+    marker = {"state": "pending", "version": cookie_migration.MARKER_VERSION,
+              "profile": os.path.realpath(profile), "subprofile": plan.subprofile,
+              "backup": str(backup), "database_copy": str(db_copy),
+              "digest": await asyncio.to_thread(cookie_migration.file_digest, backup),
+              "count": len(cookies), "major": profile_version.binary_version(executable)[0],
+              "started_at": time.time()}
+    return _CookieMove(plan, backup=backup, marker=marker, strip=bool(plan.v11))
 
 
 async def _finish_cookie_move(browser: Any, profile: Path, move: _CookieMove) -> tuple[bool, str]:
-    """Steps 5 and 6: set the backed-up cookies in the Chrome just started without the flag,
-    read them back and compare. (True, note) once all are there and the move is done;
-    (False, text) otherwise, with the marker left pending so the next launch sets them again."""
+    """Step 7: set the backed-up cookies in the Chrome just started without the flag, read them
+    back and compare keys, value digests, flags and expiry. (True, note) once all match and the
+    move is done; (False, text) otherwise, with the marker left pending so the next launch sets
+    them again. No value is printed."""
     if move.backup is None:
         return True, move.note
     connection = getattr(browser, "connection", None) or browser
     try:
-        document = json.loads(move.backup.read_text(encoding="utf-8"))
-        cookies = list(document.get("cdp_cookies") or [])
+        cookies = cookie_migration.verified_backup(move.backup, cookie_migration.read_marker(profile))
+        if cookies is None:
+            raise RuntimeError("the backup does not match its marker")
         params = [cookie_migration.cookie_params(c) for c in cookies]
         refused = []
         for start in range(0, len(params), 200):
@@ -2097,23 +2249,37 @@ async def _finish_cookie_move(browser: Any, profile: Path, move: _CookieMove) ->
                     except Exception as exc:
                         refused.append(f"{one.get('name')}@{one.get('domain')}: {_exc_text(exc)}")
         answer = await connection.send(_cdp_call("Storage.getCookies"))
-        back = {cookie_migration.key(c) for c in (answer or {}).get("cookies") or []}
+        back = list((answer or {}).get("cookies") or [])
     except Exception as exc:
         return False, (f"the cookies could not be set again ({_exc_text(exc)}); every one of them is in "
                        f"{move.backup}, storage_state_load({str(move.backup)!r}) sets them, and the "
                        "next launch of this profile tries again")
-    missing = [k for k in (cookie_migration.key(c) for c in cookies) if k not in back]
-    if missing:
-        sample = ", ".join(f"{n}@{d}" for n, d, *_ in missing[:5])
-        return False, (f"{len(cookies) - len(missing)} of {len(cookies)} cookies came back after the move to "
-                       f"Chrome 158 encryption; missing {sample}{' and more' if len(missing) > 5 else ''}"
+    try:
+        missing, differ = cookie_migration.compare(cookies, back)
+    except Exception as exc:
+        return False, (f"the cookies set again could not be compared ({_exc_text(exc)}); every one of them "
+                       f"is in {move.backup}, and the move stays pending")
+    if missing or differ:
+        wrong = missing + differ
+        sample = ", ".join(f"{n}@{d}" for n, d, *_ in wrong[:5])
+        return False, (f"{len(cookies) - len(wrong)} of {len(cookies)} cookies came back as they were after "
+                       f"the move to Chrome 158 encryption; {len(missing)} missing and {len(differ)} with a "
+                       f"different value, flag or expiry, among them {sample}{' and more' if len(wrong) > 5 else ''}"
                        f"{'; refused: ' + refused[0] if refused else ''}. All {len(cookies)} are in "
                        f"{move.backup}: storage_state_load({str(move.backup)!r}) sets them, and the next "
                        "launch of this profile tries again")
-    marker = cookie_migration.read_marker(profile)
-    cookie_migration.write_marker(profile, {**marker, "state": "done", "finished_at": time.time()})
+    try:
+        marker = cookie_migration.read_marker(profile)
+        cookie_migration.write_marker(profile, {**marker, "state": "done", "finished_at": time.time()})
+    except Exception as exc:
+        return False, (f"every cookie came back, but the move could not be marked done ({_exc_text(exc)}); "
+                       f"they are all in {move.backup}, and the move stays pending")
+    # Backups of earlier moves whose retention has passed; this one stays for its own.
+    with contextlib.suppress(Exception):
+        await asyncio.to_thread(cookie_migration.expire_backups, move.backup.parent)
+    days = cookie_migration.retention_days()
     return True, (f" [cookies: migrated {len(cookies)} cookies to Chrome 158 encryption; "
-                  f"backup at {move.backup}]")
+                  f"backup at {move.backup}, removed after {days:g} days]")
 
 
 async def _dock_icon_status() -> dict:
@@ -2135,9 +2301,10 @@ _TAB_RECORD_READ_TIMEOUT = 1.0
 _TAB_RECORD_DEBOUNCE = tab_record.env_number("MCP_STEALTH_TAB_RECORD_DEBOUNCE", 2)
 _TAB_RECORD_PERIOD = tab_record.env_number("MCP_STEALTH_TAB_RECORD_PERIOD", 30)
 _RESTORE_TABS_MAX_DAYS = tab_record.env_number("MCP_STEALTH_RESTORE_TABS_MAX_DAYS", 30)
-# A browser being closed: the background writer leaves it alone for this long, so the windows
-# closing one by one are never written over the list the close just recorded.
-_TAB_RECORD_CLOSING_SECONDS = 30.0
+# A browser being closed: from then on the background writer leaves it alone, and so does a
+# retried close, so the windows closing one by one are never written over the list the first
+# close recorded. Not for a while but for good: a close that fails keeps the handle, and the
+# browser can linger half closed for minutes. A new launch is a new Browser object.
 _CLOSING_ATTR = "_mcp_stealth_closing_at"
 _TAB_RECORD_DIRTY: dict[tuple[str, str], float] = {}  # (session, instance) -> last tool call
 _tab_record_task: Optional[asyncio.Task] = None
@@ -2179,8 +2346,7 @@ def _mark_closing(browser: Any) -> None:
 
 
 def _closing(browser: Any) -> bool:
-    since = getattr(browser, _CLOSING_ATTR, None)
-    return since is not None and time.monotonic() - since < _TAB_RECORD_CLOSING_SECONDS
+    return getattr(browser, _CLOSING_ATTR, None) is not None
 
 
 async def _page_targets(browser: Any) -> list[tuple[str, str]]:
@@ -2198,6 +2364,8 @@ async def _record_tabs_before_close(instance_id: str, browser: Any, tabs: list, 
     scope = _tab_record_scope(instance_id, profile, privacy)
     if scope is None or browser is None:
         return "not recorded: this profile keeps no tabs"
+    if _closing(browser):
+        return "not recorded: an earlier close of this browser already recorded its tabs"
     _mark_closing(browser)
     keys = [_target_key(t) for t in tabs]
     active = keys[active_index] if 0 <= active_index < len(keys) else None
@@ -2220,6 +2388,25 @@ def _record_tabs_at_exit(instance_id: str, browser: Any, tabs: list, active_inde
     keys = [_target_key(t) for t in tabs]
     active = keys[active_index] if 0 <= active_index < len(keys) else None
     return tab_record.save(instance_id, scope, pages, keys, active, "server exit", force=True)
+
+
+async def _record_tabs_at_launch(instance_id: str) -> str:
+    """The first record of a browser, written as its launch returns. The quit watcher ends a
+    browser once its last window is gone, when nothing is left to read, so a Quit before the
+    background writer's first pass (about 2.3 s after the call) would leave no list at all.
+    One read, capped like a close's; never raises, and an empty list replaces nothing."""
+    try:
+        view = _instance_view(instance_id)
+        if view is None:
+            return "not recorded"
+        browser, keys, active, profile, privacy = view
+        scope = _tab_record_scope(instance_id, profile, privacy)
+        if scope is None or _closing(browser):
+            return "not recorded"
+        pages = await asyncio.wait_for(_page_targets(browser), timeout=_TAB_RECORD_READ_TIMEOUT)
+        return tab_record.save(instance_id, scope, pages, keys, active, "at launch", force=False)
+    except Exception as exc:
+        return f"not recorded: {_exc_text(exc)}"
 
 
 def _mark_tabs_changed(_tool: str) -> None:
@@ -2702,6 +2889,7 @@ async def browser_launch(
         # If the user passed user_data_dir explicitly, that takes precedence over
         # both `persistent` and any --user-data-dir already in extra_args.
         explicit_udd: Optional[Path] = None
+        tidy_profile: Optional[Path] = None
         # Decided before anything writes to the profile; see _launch_choice.
         launch_choice: Optional[_LaunchChoice] = None
         if user_data_dir:
@@ -2808,16 +2996,9 @@ async def browser_launch(
                 refused = _profile_version_refusal(profile_path, launch_choice.executable)
                 if refused:
                     return err(refused)
-                clean_profile_state(profile_path)  # only clears stale locks
-                # Selectively wipe corrupt window-placement / session-restore
-                # state. Idempotent + cheap (a few file writes), preserves
-                # cookies/login. Saves us from "window 0×0, hidden" bugs that
-                # survive macOS sleep/wake cycles. See state.wipe_window_state.
-                try:
-                    from .state import wipe_window_state as _wws
-                    _wws(profile_path)
-                except Exception:
-                    pass
+                # clean_profile_state and the window-state wipe write to the profile, so they
+                # wait until the cookie checks below have passed: a refusal writes nothing.
+                tidy_profile = profile_path
 
         # Determine final user_data_dir for Config (None = nodriver picks a temp dir).
         privacy_profile: Optional[Path] = None
@@ -2895,6 +3076,9 @@ async def browser_launch(
         with contextlib.suppress(Exception):
             dock_note += profile_version.upgrade_note(profile_path, config.browser_executable_path)
         cookie_move = await _prepare_cookie_move(profile_path, config)
+        if cookie_move.refuse:
+            await _remove_privacy_profile(privacy_profile)
+            return err(cookie_move.refuse)
         if cookie_move.flag:
             config.add_argument(_cookie_flag_arg(config))
         if not cookie_move.backup:
@@ -2904,6 +3088,25 @@ async def browser_launch(
         if not headless:
             for _flag in _BACKGROUND_WINDOW_FLAGS:
                 config.add_argument(_flag)
+        refused = await _cookie_preflight(profile_path, cookie_move) \
+            or await _commit_cookie_move(profile_path, cookie_move)
+        if refused:
+            await _remove_privacy_profile(privacy_profile)
+            return err(refused)
+        if tidy_profile is not None:
+            clean_profile_state(tidy_profile)  # only clears stale locks
+            # Selectively wipe corrupt window-placement / session-restore state. Idempotent and
+            # cheap (a few file writes), preserves cookies and logins. Saves us from "window
+            # 0x0, hidden" bugs that survive macOS sleep/wake cycles. See state.wipe_window_state.
+            with contextlib.suppress(Exception):
+                from .state import wipe_window_state as _wws
+                _wws(tidy_profile)
+        # The last look, as close to the start as this server can make it; Chrome takes the lock
+        # about half a second later, and that gap is a known limit (no lock it honours can be
+        # held across it).
+        refused = await _cookie_preflight(profile_path, cookie_move)
+        if refused:
+            return err(refused)
         try:
             browser = await _start_chrome(config)
             if not headless:
@@ -2962,7 +3165,9 @@ async def browser_launch(
         if cookie_move.backup is not None:
             moved, moved_text = await _finish_cookie_move(browser, Path(str(profile_path)), cookie_move)
             if not moved:
-                return err(f"the browser is running, but its cookies were not all moved: {moved_text}")
+                # Left running, the next browser_launch reuses it and never tries the move again.
+                return err(f"its cookies were not all moved: {moved_text}. "
+                           f"{await _close_after_cookie_failure(browser, profile_path)}")
             dock_note += moved_text
 
         if storage_state_path:
@@ -3111,6 +3316,7 @@ async def browser_launch(
                 _launch_observed = {**_launch_observed, "restore_tabs": _report}
             except Exception as e:
                 restore_suffix = f" [restore_tabs: failed: {_exc_text(e)}]"
+        await _record_tabs_at_launch(BrowserState.current_instance_id)
 
         await _give_focus_back(previous_app)
         return _nav_result(
@@ -3139,6 +3345,11 @@ async def browser_close(forget_tabs: bool = False) -> str:
     The open tabs are saved first (persistent profiles only), so browser_launch(restore_tabs=True)
     can reopen them. forget_tabs=True closes without saving and removes the saved list.
     """
+    with _closing_in_background(BrowserState.current_instance_id):
+        return await _browser_close_now(forget_tabs)
+
+
+async def _browser_close_now(forget_tabs: bool) -> str:
     # The handle, not is_up(): closing the last tab makes is_up() false while Chrome
     # still runs and holds the profile, and that is not "not running".
     if BrowserState.browser is None:
@@ -6734,16 +6945,14 @@ async def _launch_browser_instance(
                     f"profile {profile_path} is locked by Chrome PID {holder}; "
                     "close that browser or clone the profile first"
                 )
-        # Before mkdir and clean_profile_state write to it: whether the profile is new decides
+        # Before anything writes to it (mkdir and clean_profile_state wait for the cookie checks
+        # below): whether the profile is new decides
         # whether Chrome Beta may open it, and a refused profile stays as it was.
         launch_choice = _launch_choice(profile_path, headless, extra_args)
         refused = _profile_version_refusal(profile_path, launch_choice.executable)
         if refused:
             await _remove_privacy_profile(privacy_profile)
             return False, refused
-        profile_path.mkdir(parents=True, exist_ok=True)
-        if persistent or profile_dir_override:
-            clean_profile_state(profile_path)
 
     if lang and lang != "en-US" and not effective_fingerprint.get("accept_language"):
         effective_fingerprint = {**effective_fingerprint, "accept_language": lang}
@@ -6780,6 +6989,9 @@ async def _launch_browser_instance(
     with contextlib.suppress(Exception):
         dock_note += profile_version.upgrade_note(profile_path, config.browser_executable_path)
     cookie_move = await _prepare_cookie_move(profile_path, config)
+    if cookie_move.refuse:
+        await _remove_privacy_profile(privacy_profile)
+        return False, cookie_move.refuse
     if cookie_move.flag:
         config.add_argument(_cookie_flag_arg(config))
     if not cookie_move.backup:
@@ -6788,6 +7000,20 @@ async def _launch_browser_instance(
     if not headless:
         for _flag in _BACKGROUND_WINDOW_FLAGS:
             config.add_argument(_flag)
+    refused = await _cookie_preflight(profile_path, cookie_move) \
+        or await _commit_cookie_move(profile_path, cookie_move)
+    if refused:
+        await _remove_privacy_profile(privacy_profile)
+        return False, refused
+    if profile_path is not None:
+        # Only now: clean_profile_state and mkdir write, and a refusal writes nothing.
+        profile_path.mkdir(parents=True, exist_ok=True)
+        if persistent or profile_dir_override:
+            clean_profile_state(profile_path)
+    refused = await _cookie_preflight(profile_path, cookie_move)  # the last look; see browser_launch
+    if refused:
+        await _remove_privacy_profile(privacy_profile)
+        return False, refused
     try:
         browser = await _start_chrome(config)
         if not headless:
@@ -6808,13 +7034,13 @@ async def _launch_browser_instance(
         await _remove_privacy_profile(privacy_profile)
         return False, f"launch failed: {_exc_text(e)}"
 
-    cookie_error = ""
     if cookie_move.backup is not None:
         moved, moved_text = await _finish_cookie_move(browser, Path(str(profile_path)), cookie_move)
-        if moved:
-            dock_note += moved_text
-        else:
-            cookie_error = moved_text
+        if not moved:
+            # Not registered: a running instance would be reused and the move never tried again.
+            return False, (f"instance {instance_id!r}: its cookies were not all moved: {moved_text}. "
+                           f"{await _close_after_cookie_failure(browser, profile_path)}")
+        dock_note += moved_text
 
     if storage_state_path:
         try:
@@ -6900,11 +7126,8 @@ async def _launch_browser_instance(
     BrowserState.window_closed.pop(instance_id, None)
     if not headless:
         _watch_windows(browser)
+    await _record_tabs_at_launch(instance_id)
     await _give_focus_back(previous_app)
-    if cookie_error:
-        # The instance is registered and running; the text must still read as a failure.
-        return True, (f"Error: instance {instance_id!r} is running, but its cookies were not all "
-                      f"moved: {cookie_error}")
     return True, (
         f"instance {instance_id!r} launched (headless={headless}, "
         f"privacy={privacy}, identity={identity_source}, "
@@ -6913,10 +7136,17 @@ async def _launch_browser_instance(
     )
 
 
+def _being_closed(instance_id: str) -> bool:
+    """Another close of this instance is under way; a sweep leaves it to that one."""
+    return (BrowserState.session_key(), instance_id) in _app_module.INSTANCE_CLOSING
+
+
 @contextlib.contextmanager
 def _closing_in_background(instance_id: str):
-    """While a sweep closes an instance, a call on it waits (_app.INSTANCE_CLOSING) instead of
-    acting on a browser half closed, or switching it in while the close goes on."""
+    """While an instance is being closed (by a sweep, close_instance, close_all_instances or
+    browser_close), a call on it waits (_app.INSTANCE_CLOSING) instead of acting on a browser
+    half closed or switching it in while the close goes on, and a sweep does not close it too.
+    Entered with no await before it, after any wait_while_closing, so two closers never overlap."""
     key = (BrowserState.session_key(), instance_id)
     event = asyncio.Event()
     _app_module.INSTANCE_CLOSING[key] = event
@@ -7016,8 +7246,8 @@ def _idle_closed_note(iid: str, timeout: int) -> str:
 async def _sweep_idle_instances() -> None:
     """Close the calling session's instances that are past their idle timeout."""
     for iid, snap in list(BrowserState.instances.items()):
-        if not _still_held(iid, snap, snap.browser):
-            continue  # switched in while an earlier one was being closed
+        if not _still_held(iid, snap, snap.browser) or _being_closed(iid):
+            continue  # switched in while an earlier one was being closed, or closing already
         if snap.is_running() and snap.is_idle_expired():
             BrowserState.window_closed[iid] = _idle_closed_note(iid, snap.idle_timeout)
             if not await _end_stored_instance(iid, snap, "idle timeout"):
@@ -7025,6 +7255,7 @@ async def _sweep_idle_instances() -> None:
     # A tool call running in this session is use of its current instance, however long it takes.
     if (BrowserState.is_up()
         and BrowserState.current_idle_timeout > 0
+        and not _being_closed(BrowserState.current_instance_id)
         and not _app_module.calls_in_flight(BrowserState.session_key())
         and (time.time() - BrowserState.current_last_active) > BrowserState.current_idle_timeout):
         iid = BrowserState.current_instance_id
@@ -7097,6 +7328,14 @@ def _window_watch_tool_closed(browser: Any) -> None:
         entry["zero_since"] = None
 
 
+def _window_watch_tool_closed_undo(browser: Any) -> None:
+    """A tab_close that marked the browser did not close its tab after all."""
+    quit_watch.unmark_tool_closed(browser)
+    entry = _WINDOW_WATCH.get(id(browser))
+    if entry is not None:
+        entry["tool_closed"] = False
+
+
 async def _page_target_count(browser: Any) -> Optional[int]:
     """Pages the browser has, or None when it could not be asked."""
     from nodriver.cdp import target as cdp_target
@@ -7118,6 +7357,8 @@ async def _sweep_windowless() -> set[int]:
         if browser is None:
             continue
         held.add(id(browser))
+        if _being_closed(iid):
+            continue  # a tool or another sweep is closing it
         entry = _WINDOW_WATCH.get(id(browser))
         if entry is None or entry["browser"] is not browser:
             continue
@@ -7399,7 +7640,9 @@ async def switch_instance(instance_id: str) -> str:
         return err(foreign)
     # Being closed by a sweep (idle timeout, last window gone): switching it in now would hand
     # the caller a browser that is going, and the close would then reset the current instance.
-    await _app_module.wait_while_closing(BrowserState.session_key(), instance_id)
+    still = await _app_module.wait_while_closing(BrowserState.session_key(), instance_id)
+    if still:
+        return still
     BrowserState.claim_released(instance_id)
     existed = instance_id in BrowserState.instances
     BrowserState.switch_to(instance_id)
@@ -7454,7 +7697,15 @@ async def close_instance(instance_id: str, forget_tabs: bool = False) -> str:
     foreign = BrowserState.foreign_instance(instance_id)
     if foreign:
         return err(foreign)
-    await _app_module.wait_while_closing(BrowserState.session_key(), instance_id)
+    still = await _app_module.wait_while_closing(BrowserState.session_key(), instance_id)
+    if still:
+        return still
+    # Said before the first await: a sweep picking the same instance would close it twice.
+    with _closing_in_background(instance_id):
+        return await _close_instance_now(instance_id, forget_tabs)
+
+
+async def _close_instance_now(instance_id: str, forget_tabs: bool) -> str:
     BrowserState.claim_released(instance_id)
     # Close current
     if instance_id == BrowserState.current_instance_id:
@@ -7553,11 +7804,21 @@ async def close_instance(instance_id: str, forget_tabs: bool = False) -> str:
 @mcp.tool()
 async def close_all_instances() -> str:
     """Close every running browser instance. Useful for cleanup."""
-    closed = []
-    failures = []
     session = BrowserState.session_key()
     for key in [k for k in list(_app_module.INSTANCE_CLOSING) if k[0] == session]:
-        await _app_module.wait_while_closing(*key)  # one closer per browser
+        still = await _app_module.wait_while_closing(*key)  # one closer per browser
+        if still:
+            return still
+    # Said before the first await, for every instance: a sweep must not close one of them too.
+    with contextlib.ExitStack() as closing:
+        for iid in {BrowserState.current_instance_id, *BrowserState.instances}:
+            closing.enter_context(_closing_in_background(iid))
+        return await _close_all_instances_now()
+
+
+async def _close_all_instances_now() -> str:
+    closed = []
+    failures = []
     # Close stored
     for iid, snap in list(BrowserState.instances.items()):
         _tabs = list(snap.tabs)
@@ -10144,6 +10405,15 @@ def main() -> None:
     # Leftover privacy and fallback profiles: one pass on its own thread, see profile_gc.
     with contextlib.suppress(Exception):
         profile_gc.start_in_background(state_data_root())
+    # Plain-text cookie backups of finished Chrome 158 moves, once their retention has passed.
+    with contextlib.suppress(Exception):
+        def _cookie_leftovers() -> None:
+            with contextlib.suppress(Exception):
+                cookie_migration.expire_backups(state_data_root() / "storage-states")
+            with contextlib.suppress(Exception):
+                cookie_migration.remove_reader_leftovers()
+
+        threading.Thread(target=_cookie_leftovers, daemon=True, name="cookie-leftovers").start()
     # Measured off the critical path, so the first server_status has an answer, not a timeout.
     with contextlib.suppress(Exception):
         _start_os_cursor_probe()

@@ -91,6 +91,18 @@ def _saved_tab_lists_in_a_temp_folder():
 
 
 @pytest.fixture(autouse=True)
+def _cookie_backups_in_a_temp_folder(monkeypatch, tmp_path_factory):
+    """An in-process launch that moves cookies to Chrome 158's encryption writes its backup and
+    database copy through server.STORAGE_STATE_DIR. Under a test that is a temporary folder: a
+    fake Chrome 158 in test_profile_version once left six database copies in the person's
+    ~/.mcp-stealth/storage-states. A test that needs its own folder patches it again."""
+    import sys
+    server = sys.modules.get("mcp_stealth_chrome.server")
+    if server is not None:
+        monkeypatch.setattr(server, "STORAGE_STATE_DIR", tmp_path_factory.mktemp("storage-states"))
+
+
+@pytest.fixture(autouse=True)
 def _no_dock_icon_in_process(request, monkeypatch):
     if request.module.__name__ != "test_dock_icon" and not _BETA_RUN:
         monkeypatch.setattr(dock_icon, "prepare", lambda *_a, **_kw: dock_icon.DockChrome())

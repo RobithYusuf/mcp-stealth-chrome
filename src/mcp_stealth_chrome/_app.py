@@ -38,9 +38,10 @@ AFTER_TOOL_HOOKS: list = []
 # never touched last_active, and an instance spawned with idle_timeout_seconds=2 was closed between
 # tab_new and the next call, which then read an empty tab list ("tab 0 out of range").
 _CALLS_IN_FLIGHT: dict[str, int] = {}
-# (session, instance) -> set once a background close (idle timeout, last window gone) of that
-# instance has finished. A call on it waits, rather than acting on a browser half closed or
-# switching it in while the close goes on and resets whichever instance is current by then.
+# (session, instance) -> set once a close of that instance has finished: a background one (idle
+# timeout, last window gone) or close_instance, close_all_instances and browser_close. A call on
+# it waits, rather than acting on a browser half closed or switching it in while the close goes
+# on and resets whichever instance is current by then, and a sweep leaves it to that close.
 INSTANCE_CLOSING: dict[tuple[str, str], asyncio.Event] = {}
 _CLOSING_WAIT_SECONDS = 60.0
 
@@ -49,14 +50,20 @@ def calls_in_flight(session_key: str) -> int:
     return _CALLS_IN_FLIGHT.get(session_key, 0)
 
 
-async def wait_while_closing(session_key: str, instance_id: str) -> None:
-    """Return once no background close of that instance is under way (bounded)."""
+async def wait_while_closing(session_key: str, instance_id: str) -> str:
+    """Wait until no close of that instance is under way. "" then, or why not after
+    _CLOSING_WAIT_SECONDS: going ahead anyway let the caller act on, or switch in, an instance
+    whose close then changed the state under it."""
     event = INSTANCE_CLOSING.get((session_key, instance_id))
-    if event is not None:
-        try:
-            await asyncio.wait_for(event.wait(), timeout=_CLOSING_WAIT_SECONDS)
-        except asyncio.TimeoutError:
-            pass
+    if event is None:
+        return ""
+    try:
+        await asyncio.wait_for(event.wait(), timeout=_CLOSING_WAIT_SECONDS)
+    except asyncio.TimeoutError:
+        return (f"Error: instance {instance_id!r} is still being closed after "
+                f"{_CLOSING_WAIT_SECONDS:g} s; nothing was done. Try again once that close is over "
+                "(list_instances shows it), or browser_recover if it never ends")
+    return ""
 
 
 def _touch_current() -> None:
@@ -123,7 +130,9 @@ class StealthMCP(FastMCP):
         key = BrowserState.session_key()
         _CALLS_IN_FLIGHT[key] = _CALLS_IN_FLIGHT.get(key, 0) + 1
         try:
-            await wait_while_closing(key, BrowserState.current_instance_id)
+            still = await wait_while_closing(key, BrowserState.current_instance_id)
+            if still:
+                return tool.fn_metadata.convert_result(still)
             _touch_current()
             return await self._call_bound(name, arguments, context, tool)
         finally:

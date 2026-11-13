@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import json
 import plistlib
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -270,6 +271,34 @@ def test_a_beta_looking_profile_in_any_doubt_stays_on_google_chrome(tmp_path, tw
     else:
         _cookies(profile, b"v11")
     assert _verdict(profile, two_chromes)[0] is False, case
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGKILL does not exist on Windows; Beta is chosen on macOS only")
+@pytest.mark.parametrize("journal", ["rollback", "wal"])
+def test_a_v10_cookie_only_a_journal_still_holds_keeps_google_chrome(tmp_path, two_chromes, journal):
+    """Read as the file lies (immutable=1), a database whose committed v10 rows sit behind a
+    hot journal or only in its write-ahead log looks empty, and Beta would delete them."""
+    import sqlite3
+    import subprocess
+    profile = _profile(tmp_path / "p", "158.0.8127.18")
+    database = profile / "Default" / "Cookies"
+    db = sqlite3.connect(database)
+    if journal == "wal":
+        db.execute("PRAGMA journal_mode=WAL")
+    db.execute("CREATE TABLE cookies (name TEXT, encrypted_value BLOB)")
+    if journal == "rollback":
+        db.executemany("INSERT INTO cookies VALUES (?, ?)", [(f"c{i}", b"v10" + b"x" * 500) for i in range(40)])
+    db.commit()
+    db.close()
+    work = ("c.execute('BEGIN'); c.execute('DELETE FROM cookies'); c.execute('CREATE TABLE f (x BLOB)'); "
+            "[c.execute('INSERT INTO f VALUES (zeroblob(4000))') for _ in range(200)]"
+            if journal == "rollback" else "c.execute(\"INSERT INTO cookies VALUES ('a', CAST('v10x' AS BLOB))\")")
+    subprocess.run([sys.executable, "-c",
+                    f"import os, signal, sqlite3\nc = sqlite3.connect({str(database)!r}, isolation_level=None)\n"
+                    f"c.execute('PRAGMA cache_size=1')\n{work}\nos.kill(os.getpid(), signal.SIGKILL)\n"])
+    assert any(Path(str(database) + s).is_file() and Path(str(database) + s).stat().st_size
+               for s in ("-journal", "-wal"))
+    assert _verdict(profile, two_chromes)[0] is False
 
 
 def test_reading_the_cookie_databases_writes_nothing(tmp_path, two_chromes):

@@ -18,6 +18,8 @@ import pytest
 
 from mcp_stealth_chrome import server, state
 
+_real_naming = state.processes_naming
+
 WINDOWS_ONLY = pytest.mark.skipif(sys.platform != "win32", reason=(
     "Toolhelp, NtQueryInformationProcess and Restart Manager exist only on Windows"))
 LOCKED = "[WinError 32] The process cannot access the file because it is being used by another process"
@@ -98,6 +100,34 @@ def test_nothing_is_deleted_while_a_process_still_runs_with_the_profile(monkeypa
     assert profile.exists()
     reason = server._removal_failure(profile)
     assert "still runs with it" in reason and "PID 999" in reason, reason
+
+
+def test_nothing_is_deleted_when_the_process_list_cannot_be_read(monkeypatch, profile):
+    """None from processes_naming means the list could not be read (a failed Toolhelp snapshot
+    on Windows, no ps elsewhere), not that nothing runs: `or []` once turned it into "free"."""
+    monkeypatch.setattr(server, "_PRIVACY_REMOVE_WAIT", 0.3)
+    rmtree, calls = _rmtree_locked(0)
+    monkeypatch.setattr(shutil, "rmtree", rmtree)
+    monkeypatch.setattr(state, "processes_naming", lambda path, table=None: None)
+    assert asyncio.run(server._remove_privacy_profile(profile)) is False
+    assert calls == [], "deleted although nobody knows whether Chrome still runs"
+    assert profile.exists()
+    reason = server._removal_failure(profile)
+    assert "process list could not be read" in reason, reason
+
+
+def test_a_browser_process_whose_command_line_is_unreadable_counts_as_holding_it(monkeypatch, profile):
+    """Windows answers an empty command line when OpenProcess is refused. A chrome.exe whose
+    command line could not be read may be one of this profile's helpers."""
+    monkeypatch.setattr(server, "_PRIVACY_REMOVE_WAIT", 0.3)
+    rmtree, calls = _rmtree_locked(0)
+    monkeypatch.setattr(shutil, "rmtree", rmtree)
+    monkeypatch.setattr(state, "processes_naming", _real_naming)
+    monkeypatch.setattr(state, "process_table", lambda: [
+        (4, 0, "System"), (999, 4, state.UNREADABLE_COMMAND.format(image="chrome.exe"))])
+    assert asyncio.run(server._remove_privacy_profile(profile)) is False
+    assert calls == []
+    assert "PID 999" in server._removal_failure(profile)
 
 
 def test_removal_waits_for_the_last_helper_to_end(monkeypatch, profile):
@@ -267,3 +297,42 @@ def test_windows_names_the_process_holding_a_file_open(tmp_path):
         holders = state._win_file_holders([str(path)])
         assert holders is not None and os.getpid() in [pid for pid, _app in holders], holders
     assert state._win_file_holders([str(path)]) == []
+
+
+def test_a_toolhelp_walk_that_fails_is_not_an_empty_process_list():
+    """Process32FirstW failing, or Process32NextW stopping on an error other than
+    ERROR_NO_MORE_FILES, once read as "no process runs", and the profile was deleted."""
+    def walk(first_ok, items, last):
+        left = list(items)
+        current = {}
+
+        def first():
+            if not first_ok:
+                return False
+            current["row"] = left.pop(0)
+            return True
+
+        def following():
+            if not left:
+                return False
+            current["row"] = left.pop(0)
+            return True
+
+        return state._walk_snapshot(first, following, lambda: current["row"], lambda: last)
+
+    assert walk(True, [(4, 0, "System"), (99, 4, "chrome.exe")], 18) == [(4, 0, "System"), (99, 4, "chrome.exe")]
+    assert walk(False, [], 18) is None, "Process32FirstW failed"
+    assert walk(True, [(4, 0, "System")], 5) is None, "ERROR_ACCESS_DENIED mid-walk"
+
+
+def test_only_the_removal_counts_an_unreadable_browser_as_a_holder(tmp_path):
+    """processes_naming answers which processes name the profile, which the family check of a
+    close compares against. An unreadable chrome.exe of another browser on the machine is not
+    one of them: counted there, the Windows runner saw a PID outside the family. Only the
+    deletion, which must not guess, treats it as possibly holding the profile."""
+    profile = tmp_path / "privacy-profiles" / "main-abc"
+    table = [(4, 0, "System"), (321, 4, f"chrome.exe --user-data-dir={profile} --type=renderer"),
+             (999, 4, state.UNREADABLE_COMMAND.format(image="chrome.exe"))]
+    assert [pid for pid, _c in state.processes_naming(profile, table)] == [321]
+    assert sorted(pid for pid, _c in state.processes_holding(profile, table)) == [321, 999]
+    assert state.processes_holding(profile, []) == []

@@ -32,6 +32,7 @@ uvx mcp-stealth-chrome → Python 3.11+ → FastMCP → nodriver → Chrome/Chro
 - `src/mcp_stealth_chrome/profile_version.py` — which Chrome may open a profile: the version guard and `beta_verdict`.
 - `src/mcp_stealth_chrome/quit_watch.py` — starts the per-browser quit watcher and keeps its state files; `_quit_watcher.py` is that watcher, a standalone script.
 - `src/mcp_stealth_chrome/cookie_migration.py` — moving a profile's `v10` cookies to Chrome 158's `v11` before it loses them.
+  `cookie_db.py` reads a cookie database for such a decision: a private copy with its journal rolled back.
 - `src/mcp_stealth_chrome/tab_record.py`: the saved tab list behind `restore_tabs`: the file, its order, masking, `/json/list` at exit.
 - `src/mcp_stealth_chrome/_app.py` — `StealthMCP`, the FastMCP boundary. `captcha.py`, `image_output.py`, `result_types.py` — their named helpers.
 - `src/mcp_stealth_chrome/tools/` — `research.py`, `devtools.py`, `vision.py`, `network_http.py`, `profiles.py`,
@@ -65,7 +66,9 @@ uvx mcp-stealth-chrome → Python 3.11+ → FastMCP → nodriver → Chrome/Chro
   under a secret key is hidden, except that a `session` object keeps its non-secret fields, and `mask_url` works
   on the raw text so an ordinary parameter stays byte for byte. It also hides userinfo (`***@host`, since a token
   can be the user name; also with no scheme, `user:pass@host/path`, but not `mailto:`) and secret pairs in the
-  fragment, where OAuth puts `access_token`, also after a hash route. `mask_headers` passes `Location`,
+  fragment, where OAuth puts `access_token`, also after a hash route. In a URL only, `code` (OAuth authorization
+  code), `SAMLResponse`, `ticket` and `assertion` are credentials too (`_URL_SECRET_NAME`); in a JSON body `code` is
+  usually an error number and stays readable. `mask_headers` passes `Location`,
   `Content-Location` and `Referer` through it. `http_session_cookies`, `session_warmup` and `http_request` (its
   errors, the redirect chain and the hop that failed) print URLs through it. `export_curl` stays useful because its `http_request` form takes cookies
   from the browser. Bodies other than JSON or forms cannot be read field by field and pass through.
@@ -293,6 +296,10 @@ conclusions. Each rule below replaced a real lie.
   deleted a privacy profile under them, gave up after about a second, and the next launch refused.
 - `_remove_privacy_profile` deletes nothing while a process names the profile on its command line (`state.processes_naming`:
   Chrome hands `--user-data-dir` to every helper, and crashpad gets `--database=<profile>\Crashpad`); it waits for them.
+  It asks `state.processes_holding`, which adds every browser process whose command line Windows would not give
+  (it may be a helper of this profile), and treats a process list it cannot read as in use, never as empty.
+  `processes_naming` itself lists only processes that name the profile: the close's family check compares against
+  it, and counting another browser's unreadable helper there failed it on the Windows runner.
   Then it retries for `MCP_STEALTH_PROFILE_REMOVE_WAIT` (15 s on Windows, where an open handle blocks a delete and a
   deleted file stays until its last handle closes; elsewhere the three tries it always made). A folder that still cannot
   be removed is an error naming why and who holds it: Restart Manager on Windows (`state._win_file_holders`, the API behind
@@ -382,7 +389,10 @@ conclusions. Each rule below replaced a real lie.
   reading the empty list as "tab 0 out of range". A sweep that closes an instance registers it in
   `_app.INSTANCE_CLOSING`: a call on it, `switch_instance` to it and `close_instance` of it wait for the close, and the
   sweep checks after each await that its candidate is still where it found it (`_still_held`). Switched in mid-close,
-  the close's `reset()` wiped whichever instance was current by then. A tool answering from the tab list goes through
+  the close's `reset()` wiped whichever instance was current by then. `close_instance`, `close_all_instances` and
+  `browser_close` register too, before their first await, and both sweeps skip an instance already registered: a
+  stored instance could otherwise be closed twice at once. A close still running after 60 s is an error naming it
+  (`wait_while_closing` returns why); going ahead let the caller act on a state the close then changed. A tool answering from the tab list goes through
   `_tab_list_problem`, which names why the browser went (`window_closed` carries the idle note) and refuses a list the
   browser did not confirm (`_refresh_tabs` returns False).
 - `is_up()` false does not mean Chrome stopped: closing the last tab empties `tabs` while the process runs and
@@ -401,7 +411,7 @@ conclusions. Each rule below replaced a real lie.
   endpoint never counts as no windows. Chrome's DevTools HTTP server keeps the connection open whatever the client
   asks, so the body is read to its Content-Length: read to EOF, every poll timed out and read as unanswered.
 - `tab_close` writes `<key>.tool-closed` BEFORE closing the last tab, or the watcher can read the empty browser
-  first. It counts only while the server that wrote it is the watcher's parent (`getppid`, no signal): nobody can
+  first. A close that raises takes it back (`unmark_tool_closed`) unless Chrome no longer lists the tab. It counts only while the server that wrote it is the watcher's parent (`getppid`, no signal): nobody can
   use an empty browser whose server is gone. A tool close (`_ensure_browser_dead`) stops the watcher first. The
   in-process `_sweep_windowless` never closes while a watcher runs; it records `window_closed` as soon as the
   `.quit` verdict appears and cleans up the handle once the watcher has exited, and it ends the browser itself
@@ -438,16 +448,21 @@ conclusions. Each rule below replaced a real lie.
 - An empty list never replaces a record. A Quit closes every window before anything can read them, a failed read says
   nothing, and a browser holding only about:blank or chrome:// pages has nothing worth reopening. `forget_tabs=True` on
   `browser_close` and `close_instance`, and `profile_cleanup(remove_fallback)`, are the ways to clear one.
-- Written at four moments. (1) Every close this server makes of a browser it started (`browser_close`, `close_instance`,
+- Written at five moments. (1) Every close this server makes of a browser it started (`browser_close`, `close_instance`,
   `close_all_instances`, `_end_current_instance`/`_end_stored_instance` for the idle reaper and the window sweep), before
   `_ensure_browser_dead`, with a 1 s cap on the read. The sweep's branch for a browser the quit watcher already ended
-  passes no reason: Chrome is gone. (2) The background writer, about 2 s after any tool call (`_app.AFTER_TOOL_HOOKS`, a
-  dict write measured at 2 µs) and every 30 s for every recordable instance, since a person can navigate a visible
-  window with no tool call. It reads twice 0.3 s apart and writes only when both agree, and leaves a browser alone for
-  30 s once a close has started (`_CLOSING_ATTR`): windows closing one by one must not be written over the close's
-  list. An unchanged list is not rewritten. (3) stdin EOF, `_stop_all_browsers`: the event loop has closed by then, so
-  the list comes from `/json/list` over plain HTTP with the quit watcher's reader (to Content-Length). (4) Nothing else:
-  a killed server leaves what (2) last wrote.
+  passes no reason: Chrome is gone. Only the first close of a Browser object records: a close that fails keeps the
+  handle, Chrome can linger half closed for minutes, and a retried close read the windows that were left. (2) The
+  background writer, about 2 s after any tool call (`_app.AFTER_TOOL_HOOKS`, a dict write measured at 2 µs) and every
+  30 s for every recordable instance, since a person can navigate a visible window with no tool call. It reads twice
+  0.3 s apart and writes only when both agree, and never touches a browser once a close has started (`_CLOSING_ATTR`,
+  no expiry; it used to lapse after 30 s, and a failed close then had its list written over): windows closing one by
+  one must not be written over the close's list. An unchanged list is not rewritten. (3) As a launch returns
+  (`_record_tabs_at_launch`, one read): the quit watcher acts only once no page is left, so there is nothing to read
+  then, and a Quit in the first two seconds lost the list. (4) stdin EOF, `_stop_all_browsers`: the event loop has
+  closed by then, so the list comes from `/json/list` over plain HTTP with the quit watcher's reader (to
+  Content-Length). (5) Nothing else: a killed server leaves what (2) last wrote, and pages a person changes in the
+  last couple of seconds before a Quit are not in it.
 - Order is the server's tab list (`BrowserState.tabs`, what `tab_list` shows), not Chrome's: see the target-order fact
   below. Active is the server's selected tab, not whichever tab a window happens to show.
 - Restore (`_reopen_saved_tabs`) re-filters every URL (http, https, file only) because the file can be edited, opens
@@ -542,23 +557,83 @@ Platform truths, not preferences. Each one cost a release.
   The framework of 157.0.8103.39 holds no string naming the feature and 158.0.8127.18 holds two, so `applies` decides
   by the major version from Info.plist (free) rather than reading the framework (1 to 2.4 s). Stable 158 was due
   17 Nov 2026, with the feature on at the tip of its branch and no field trial for it.
-- Moving cookies to `v11` (`cookie_migration`, `_prepare_cookie_move`, `_finish_cookie_move`): when Chrome 158+ on macOS
-  is about to open a profile outside Chrome's default folders whose launched sub-profile holds a `v10` cookie, the
-  databases are copied aside, a headless Chrome reads every cookie with the flag (`_cookie_flag_arg`, built by
-  `_disable_features_arg` so nodriver's list survives), the backup is written (`storage-states/pre-v11-migration-*`,
-  0600, `storage_state_load` reads it), that Chrome is closed and verified dead, and only then is a marker
-  (`.mcp-stealth-v11-migration.json`, `pending`) written into the profile. The requested launch then runs without the
-  flag, sets the cookies with `Storage.setCookies` and compares names, domains, paths and partitions read back; all
-  there marks it `done`, anything missing is an error naming them and the backup, and stays `pending`.
-- The order is the guarantee: no Chrome 158 opens a `v10` profile without the flag before the backup is complete and
-  the marker says so. Any failure before that means this launch runs with the flag and the next launch starts over; a
-  pending marker with its backup means the next launch sets the cookies from it. Reading fewer cookies than the
-  database's persistent unexpired rows means the flag did not work, and the copied databases are put back: without
-  the copy, Chrome 158 left 0 rows. `v10` again after a `done` by the same major means this Chrome writes `v10` there
-  (the kill switch was turned on remotely), so the flag is used and nothing moves, instead of moving on every launch.
-  Unreadable means the flag. Beta never opens a profile with data (`beta_verdict`), so it never migrates; tests use
-  Beta 158 as Chrome 158 through a `chrome` script on the server's PATH, shorter than Google Chrome's path because
-  nodriver takes the shortest candidate.
+- Moving cookies to `v11` (`cookie_migration`, `_prepare_cookie_move`, `_commit_cookie_move`, `_finish_cookie_move`):
+  when Chrome 158+ on macOS is about to open a profile outside Chrome's default folders whose launched sub-profile
+  holds a `v10` cookie. Preparing writes nothing in the profile and never opens it: its cookie databases and journals
+  are copied to `storage-states/pre-v11-migration-*-db` (source unchanged across the copy, `integrity_check` on the
+  copy, every file and folder fsynced), a headless Chrome with the flag (`_cookie_flag_arg`, built by
+  `_disable_features_arg` so nodriver's list survives) reads every cookie from a temporary user-data folder holding
+  only that copy's `v10` rows (measured: 5 of 5 read, the Keychain key does not depend on the folder), the backup is
+  written durably (`write_durable`: O_EXCL and O_NOFOLLOW temporary file, fsync, rename, folder fsync) and read back,
+  and the profile's databases must still match the decision's fingerprint. Then `_cookie_preflight` (read only), and
+  only then `_commit_cookie_move` writes: the marker (`.mcp-stealth-v11-migration.json`, `pending`, `version` 2, with
+  the profile folder's real path, the sub-profile, the backup's sha256 and count, durably), and beside `v11` rows the
+  `v10` rows go (`strip`: every database checked first, then each in a `BEGIN IMMEDIATE` transaction that checks
+  again that every row it deletes is in the backup by key and is the very row of the database copy, by a digest of
+  every column but `last_access_utc`). Only after
+  that do `clean_profile_state`, the window-state wipe and mkdir run, and Chrome starts without the flag, sets the
+  cookies with `Storage.setCookies` and compares keys and sha256 digests of value, flags and partition, and expiry
+  (within a second, or capped by Chrome's 400 days); all equal marks it `done`, anything else is an error naming the
+  keys, never a value, and stays `pending`.
+- The order is the guarantee, proved by `test_a_crash_at_any_step_of_a_mixed_move_loses_no_cookie` (a `BaseException`
+  thrown at ten points, then the next launch must end with every cookie) and a real-Chrome kill after the marker. A
+  crash before the marker leaves the profile as it was; from the marker on, the next launch resumes: the backup must
+  match the marker's digest and count and hold every loaded `v10` row still in the profile by name, host, path and
+  partition (counted, so two partitioned cookies of one name are two), or the move is made again, carrying over what
+  only the pending backup holds (rows a half-done strip already took out). A pending marker is used only when it is
+  version 2, names this profile folder and the sub-profile being launched (a move of Default resumed for Profile 1
+  set Default's cookies there); one for another sub-profile refuses until that one is launched, and one from v0.16.1
+  or earlier (no digest, count or binding) refuses. A pending marker whose backup is missing or not the recorded
+  file refuses, never a new move: part of the profile may be stripped already. Each such refusal names the database
+  copy and whether it passes `integrity_check`, with the steps to put it back. A failure while preparing means the flag when the profile
+  holds no `v11` cookie (nothing was touched, so the launch's own check passes), and a refusal when it does. `v10`
+  again after a `done` by the same major means this Chrome writes `v10` there (the kill switch was turned on
+  remotely), so the flag is used and nothing moves, instead of moving on every launch. Beta never opens a profile with
+  data (`beta_verdict`), so it never migrates; tests use Beta 158 or newer as Chrome 158 through a `chrome` script on
+  the server's PATH, shorter than Google Chrome's path because nodriver takes the shortest candidate.
+- A refusal writes nothing in the profile: `clean_profile_state`, the window-state wipe and mkdir wait until the cookie
+  checks and the commit have passed. A sub-profile or `Network` folder that is a link, or a marker that is one, is
+  never read through or written through (`candidate_databases`, `all_databases`, `read_marker`).
+- A backup holds every cookie value in plain text. `cookie_migration.expire_backups` removes a backup and its `-db` copy
+  once the profile's marker says `done` (every cookie read back) and `finished_at` is older than
+  `MCP_STEALTH_MIGRATION_BACKUP_DAYS` (14), at server start on a thread and after each finished move; anything else
+  stays, and what stays is made 0600. Under a test it refuses the person's own folder, and `tests/conftest.py` points
+  `server.STORAGE_STATE_DIR` at a temporary folder for every in-process test: a fake Chrome 158 in
+  `test_profile_version` once left six database copies in the real `~/.mcp-stealth/storage-states`.
+- The flag is not a safe default. Measured on Beta 159 with the real Keychain: three `v11` cookies, opened with the flag,
+  read 0 and left 0 rows. A store holding both kinds is worse: 5 `v10` and 2 `v11` cookies of one host read 0 and left 0
+  rows with the flag and without it, while the `v10` rows alone read 5 with the flag and the `v11` rows alone 2 without.
+  So the flag is used only for a profile read to hold no `v11` (`Plan.v11`), a store holding both is split (the
+  reading Chrome gets a copy with the `v10` rows alone, the launch the profile with the `v11` rows alone once every
+  `v10` cookie is in the backup), and a database that cannot be read with certainty refuses the launch (`refuse`):
+  nothing starts and nothing is written. The refusal says what to do: close every Chrome on the profile and launch
+  again, clone_chrome_profile to work meanwhile, restore a damaged database from a backup; persistent=False does not
+  keep these logins.
+- Chrome keeps cookies in SQLite with a rollback journal, not a WAL (Chrome 157 and Beta 159: header says rollback,
+  `Cookies-journal` beside the file). Beta 159 killed 3 s after setting cookies left a hot journal of 12,824 bytes, and
+  Beta 159 moved `Default/Cookies` to `Default/Network/Cookies` between two starts. `mode=ro&immutable=1` reads the file
+  as it lies: a killed transaction that deleted 40 `v10` rows read as 0 rows, and a row only in a `-wal` was not seen.
+  `mode=ro` refuses a hot journal (rolling it back writes). So every decision reads through `cookie_db.read`: the
+  database with its `-journal` and `-wal` copied to a private 0700 folder, opened normally so SQLite rolls back or
+  replays there, `integrity_check` ok, and each file's size, times and inode unchanged across the copy.
+- A decision holds only until something else touches the profile. `Plan.fingerprint` records the launched
+  sub-profile's cookie databases and companions (`cookie_db.fingerprint`, absent files included; another sub-profile
+  changing does not matter to this launch), and `_cookie_preflight` runs right before the commit: a Chrome holding the
+  lock or any change refuses the launch, since neither the flag nor its absence is then known to be safe. Nothing of
+  the server's own writes the profile before it. A row written between the preflight and the strip stops the strip
+  (its transaction checks). The lock is read three ways (`state.chrome_lock_state`): a `SingletonLock` that names no
+  readable PID is unknown and refuses, never free. After the commit (the fingerprint re-taken after its own strip)
+  and `clean_profile_state`, `_cookie_preflight` runs once more right before `_start_chrome`. What remains is the
+  known limit: the time between that look and Chrome taking the lock, about half a second, since no lock Chrome
+  honours can be held across it.
+- A move that did not finish after Chrome started (`_finish_cookie_move` false, also when comparing or writing the
+  done marker raises) closes that browser (`_close_after_cookie_failure`) and `spawn_browser` does not register it:
+  left running, the next launch reused it and never resumed the move. At server start, besides expired backups,
+  `expire_backups` removes a backup nothing refers to (no marker in its profile, or a done marker naming a later
+  backup) once older than the retention; while a profile's move is pending none of its backups or database copies
+  goes, since a retry carries cookies over from the backup before and a damaged newest one leaves the older as the
+  only copy. `remove_reader_leftovers` removes `mcp-stealth-reader-*` folders a killed server left in the temporary folder
+  (older than an hour, named by no process; unknown keeps them).
 - Chrome lists page targets in neither tab nor creation order. Measured on Chrome 157, four tabs opened A, B, C, D (C
   then activated): `Target.getTargets` gave C, B, D, A and `/json/list` C, D, B, A (it sorts by last activity), while
   nodriver's `browser.tabs` kept A, B, C, D. Anything that must keep tab order orders by the server's own list.

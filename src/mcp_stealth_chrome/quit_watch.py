@@ -188,3 +188,13 @@ def forget(browser: Any) -> None:
 def closed_note(instance_id: str, at: float) -> str:
     return (f"instance {instance_id!r} was closed at {time.strftime('%H:%M:%S', time.localtime(at))} "
             f"because its last window was closed (Quit, or closing every window).")
+
+
+def unmark_tool_closed(browser: Any) -> None:
+    """Take back mark_tool_closed: the tab_close that wrote it did not close its tab."""
+    ident = _identity(browser)
+    if ident is None:
+        return
+    tool_closed, _ = _paths(ident[0], ident[2])
+    with contextlib.suppress(OSError):
+        tool_closed.unlink()

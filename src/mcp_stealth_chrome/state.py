@@ -257,6 +257,21 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
+_ERROR_NO_MORE_FILES = 18
+
+
+def _walk_snapshot(first, following, read, last_error) -> Optional[list]:
+    """The rows of a Toolhelp walk, or None when the walk itself failed. Process32FirstW
+    failing, or Process32NextW stopping for any reason but ERROR_NO_MORE_FILES, is not an empty
+    process list: read as one, a privacy profile was deleted under a live Chrome."""
+    if not first():
+        return None
+    rows = [read()]
+    while following():
+        rows.append(read())
+    return rows if last_error() == _ERROR_NO_MORE_FILES else None
+
+
 def _win_process_table() -> Optional[list[tuple[int, int, str]]]:
     """Windows: (pid, parent pid, command line) of every process, from a Toolhelp snapshot.
 
@@ -321,16 +336,37 @@ def _win_process_table() -> Optional[list[tuple[int, int, str]]]:
         try:
             entry = PROCESSENTRY32W()
             entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
-            more = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
-            while more:
-                rows.append((int(entry.th32ProcessID), int(entry.th32ParentProcessID),
-                             entry.szExeFile))
-                more = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+            walked = _walk_snapshot(
+                lambda: kernel32.Process32FirstW(snapshot, ctypes.byref(entry)),
+                lambda: kernel32.Process32NextW(snapshot, ctypes.byref(entry)),
+                lambda: (int(entry.th32ProcessID), int(entry.th32ParentProcessID), entry.szExeFile),
+                ctypes.get_last_error)
         finally:
             kernel32.CloseHandle(snapshot)
-        return [(pid, ppid, command_line(pid) if pid else "") for pid, ppid, _exe in rows]
+        if walked is None:
+            return None
+        rows = walked
+        return [(pid, ppid, (command_line(pid) or _unreadable(exe)) if pid else "")
+                for pid, ppid, exe in rows]
     except Exception:
         return None
+
+
+# A browser process whose command line Windows would not give (OpenProcess refused). It may be
+# a helper of any profile, so processes_holding (what a deletion asks) counts it as one of every
+# profile's. processes_naming does not: it answers which processes name the profile.
+UNREADABLE_COMMAND = "{image} <command line unreadable>"
+_BROWSER_IMAGES = ("chrome", "chrome beta", "chromium", "msedge", "brave")
+
+
+def _unreadable(image: str) -> str:
+    stem = (image or "").lower().rsplit(".", 1)[0]
+    return UNREADABLE_COMMAND.format(image=image) if stem.startswith(_BROWSER_IMAGES) else ""
+
+
+def _is_unreadable_browser(command: str) -> bool:
+    tail = UNREADABLE_COMMAND.format(image="")
+    return command.endswith(tail) and bool(_unreadable(command[: -len(tail)]))
 
 
 def process_table() -> Optional[list[tuple[int, int, str]]]:
@@ -376,6 +412,22 @@ def processes_naming(path: Path, table: Optional[list[tuple[int, int, str]]] = N
     own = os.getpid()
     return [(pid, command) for pid, _ppid, command in rows
             if pid != own and command and needle.search(command)]
+
+
+def processes_holding(path: Path, table: Optional[list[tuple[int, int, str]]] = None
+                      ) -> Optional[list[tuple[int, str]]]:
+    """processes_naming, plus every browser process whose command line could not be read: it
+    may be one of this profile's helpers, and nothing may be deleted under it. None when the
+    process list cannot be read."""
+    rows = process_table() if table is None else table
+    if rows is None:
+        return None
+    named = processes_naming(path, rows)
+    if named is None:
+        return None
+    seen, own = {pid for pid, _command in named}, os.getpid()
+    return named + [(pid, command) for pid, _ppid, command in rows
+                    if pid != own and pid not in seen and command and _is_unreadable_browser(command)]
 
 
 def _win_file_holders(paths: list[str]) -> Optional[list[tuple[int, str]]]:
@@ -452,6 +504,21 @@ def is_chrome_profile_locked(profile_path: Path) -> bool:
         # Lock exists but unreadable / not a symlink — assume live to be safe
         return True
     return _pid_alive(pid)
+
+
+def chrome_lock_state(profile_path: Path) -> tuple[str, Optional[int]]:
+    """("free" | "held" | "unknown", pid). A SingletonLock that exists but names no PID that
+    can be read is "unknown", never free: chrome_lock_holder_pid answers None for it."""
+    lock = Path(profile_path) / "SingletonLock"
+    try:
+        if not os.path.lexists(lock):
+            return "free", None
+    except OSError:
+        return "unknown", None
+    pid = _read_singleton_pid(Path(profile_path))
+    if pid is None:
+        return "unknown", None
+    return ("held", pid) if _pid_alive(pid) else ("free", None)
 
 
 def chrome_lock_holder_pid(profile_path: Path) -> Optional[int]:
