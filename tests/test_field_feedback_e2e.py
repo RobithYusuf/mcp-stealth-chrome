@@ -178,9 +178,25 @@ def test_8_a_resized_screenshot_says_how_to_map_a_point(mcp, base):
 # ── 3 and 4: bodies ────────────────────────────────────────────────────────
 
 
+def test_3o_a_plain_capture_keeps_nothing_and_says_why_a_body_is_gone(mcp, base):
+    """Opt-in: a plain network_start stores nothing durable, as on origin/main, and a body the
+    page navigated away from says so instead of the raw CDP error."""
+    _go(mcp, f"{base}/plain.html")
+    started = mcp.call("network_start")
+    assert "bodies are not kept past a navigation" in started.text, started.text
+    assert "keep_bodies=True" in started.text
+    _go(mcp, f"{base}/leave.html")
+    assert not mcp.call("wait_for_url", pattern="done.html", timeout=10).failed
+    entry = mcp.call("network_get", include_body=True, filter_url="/api/tokens").json()[-1]
+    body = entry["response_body"]
+    assert "the page navigated" in body and "network_start(keep_bodies=True)" in body, body
+    assert "No resource with given identifier" not in body, body
+
+
 def test_3_a_small_json_body_survives_the_page_moving_on(mcp, base):
     _go(mcp, f"{base}/plain.html")
-    assert not mcp.call("network_start").failed
+    started = mcp.call("network_start", keep_bodies=True)
+    assert "until it closes" in started.text and "64 MB" in started.text, started.text
     _go(mcp, f"{base}/leave.html")
     assert not mcp.call("wait_for_url", pattern="done.html", timeout=10).failed
     time.sleep(0.3)
@@ -197,7 +213,7 @@ def test_3_a_small_json_body_survives_the_page_moving_on(mcp, base):
     shown = mcp.call("network_get", include_body=True, filter_url="/api/tokens",
                      reveal_values="body")
     doc = shown.json()
-    assert doc["reveal_values"] == "body" and "at the caller's request" in doc["note"], doc
+    assert doc["reveal_values"] == "body" and "at the caller's request" in doc["reveal_note"], doc
     entry = doc["entries"][-1]
     card = json.loads(entry["response_body"])["gatewayTokens"][0]
     assert card["cardScheme"] == "VISA" and card["issuerName"] == "Test Bank AG"
@@ -231,7 +247,7 @@ def test_7_network_get_filters_by_resource_type_and_cuts_urls(mcp, base):
 @pytest.mark.parametrize("path", ["/leave.html", "/leave-site.html"])
 def test_3_the_body_survives_a_same_and_a_cross_site_navigation(mcp, base, path):
     _go(mcp, f"{base}/plain.html")
-    started = mcp.call("network_start")
+    started = mcp.call("network_start", keep_bodies=True)
     assert "past a navigation" in started.text, started.text
     _go(mcp, f"{base}{path}")
     assert not mcp.call("wait_for_url", pattern="done.html", timeout=10).failed
@@ -243,17 +259,19 @@ def test_3_the_body_survives_a_same_and_a_cross_site_navigation(mcp, base, path)
 def test_3r_a_clear_says_kept_and_drops_the_old_bodies_from_every_tool(mcp, base):
     """Review 2: re-arming emptied the lists but said nothing of the bodies Chrome kept."""
     _go(mcp, f"{base}/plain.html")
-    started = mcp.call("network_start")
+    started = mcp.call("network_start", keep_bodies=True)
     assert "Chrome keeps response bodies past a navigation" in started.text, started.text
     _go(mcp, f"{base}/leave.html")
     assert not mcp.call("wait_for_url", pattern="done.html", timeout=10).failed
     before = mcp.call("network_get", include_body=True, filter_url="/api/tokens").json()
     assert before and before[-1]["response_body"].startswith("{"), before
-    again = mcp.call("network_start")
-    assert "no tool can read them any more" in again.text, again.text
+    again = mcp.call("network_start", keep_bodies=True)
+    assert "later calls cannot look up the earlier requests" in again.text, again.text
     assert mcp.call("network_get", include_body=True, filter_url="/api/tokens").json() == []
-    off = mcp.call("network_start", capture_bodies=False)
-    assert "keeps response bodies" not in off.text, off.text
+    off = mcp.call("network_start")
+    assert "bodies are not kept" in off.text and "stay in its memory" in off.text, off.text
+    assert not mcp.call("network_start", capture_bodies=False, keep_bodies=True).text.startswith(
+        "network capture started"), "keep_bodies without capture_bodies is refused"
 
 
 POST_JS = ("setTimeout(() => fetch('/api/vault', {method: 'POST', headers: {"
@@ -301,7 +319,7 @@ def test_3_cost_on_a_page_of_300_requests(mcp, base):
     times = {}
     for keep in (False, True, False, True):
         _go(mcp, f"{base}/plain.html")
-        assert not mcp.call("network_start", capture_bodies=keep).failed
+        assert not mcp.call("network_start", keep_bodies=keep).failed
         started = time.monotonic()
         _go(mcp, f"{base}/many.html")
         assert not mcp.call("wait_for_function", expression="window.done === 300",

@@ -463,7 +463,9 @@ async def _coordinate_note(tab, resize_scale: float, size: Optional[tuple[int, i
                 f"({type(exc).__name__}), so CSS coordinates = image coordinates / "
                 f"({resize_scale:.4g} × devicePixelRatio)"]
     css_per_px = 1.0 / (dpr * resize_scale)
-    if abs(css_per_px - 1.0) < 1e-3 and resize_scale == 1.0:
+    one_to_one = abs(css_per_px - 1.0) < 1e-3
+    # A region or a full page has an offset to add or take off even at a scale of 1.
+    if one_to_one and not region and not full_page:
         return []
     r = f"{css_per_px:.4g}"
     head = (f"coordinates: 1 image px = {r} CSS px (devicePixelRatio {dpr:g}, "
@@ -481,10 +483,7 @@ async def _coordinate_note(tab, resize_scale: float, size: Optional[tuple[int, i
                "the scroll offset taken off both")
     else:
         how = f"mouse_click_xy(x=image_x × {r}, y=image_y × {r})"
-    note = f"{head}: {how}"
-    if abs(css_per_px - 1.0) < 1e-3:
-        note = f"{head}: image coordinates are CSS coordinates, use them as they are"
-    return [note]
+    return [f"{head}: {how}"]
 
 
 async def _visible_text_of(tab, el) -> str:

@@ -212,3 +212,122 @@ def test_3r_an_unknown_inner_argument_is_refused_by_name_and_counted():
     assert result.startswith("Error:") and "screenshot does not take 'path'" in result, result
     doc = json.loads(result[len("Error: "):])
     assert doc["failed_at"] == 0
+
+
+def test_r2_1_the_body_warning_survives_a_cut_for_size():
+    """Review 2.1: the size note replaced the reveal_values="body" warning."""
+    from mcp_stealth_chrome import server
+    entries = [{"url": f"https://a.test/{i}", "body": "x" * 900} for i in range(200)]
+    text = server._bounded_entries(entries, server._BODY_MODE_EXTRA)
+    doc = json.loads(text)
+    assert doc["reveal_note"] == helpers.BODY_REVEAL_NOTE and doc["reveal_values"] == "body"
+    assert doc["omitted"] > 0 and "smaller limit" in doc["note"]
+    assert len(text) <= server._NETWORK_GET_MAX_CHARS
+    # The whole envelope counts toward the limit, however large what rides beside entries is.
+    big = server._bounded_entries(entries, {"reveal_values": "body", "reveal_note": "n" * 3000})
+    assert len(big) <= server._NETWORK_GET_MAX_CHARS, len(big)
+
+
+def test_r2_2_offsets_stay_when_the_scale_is_exactly_one(monkeypatch):
+    """Review 2.2: DPR 2 with a 0.5 resize, or DPR 1 with none, dropped the offsets."""
+    import asyncio
+    from mcp_stealth_chrome import image_output
+    from mcp_stealth_chrome.tools import page
+
+    def with_ctx(dpr):
+        async def ctx(_tab, timeout=None):
+            return {"dpr": dpr, "pageLeft": 300, "pageTop": 50}
+        monkeypatch.setattr(image_output, "viewport_context", ctx)
+
+    with_ctx(2)
+    note = asyncio.run(page._coordinate_note(object(), 0.5, (1280, 4000), None, True))[0]
+    assert "x=image_x × 1 − 300" in note and "y=image_y × 1 − 50" in note, note
+    with_ctx(1)
+    note = asyncio.run(page._coordinate_note(object(), 1.0, (1280, 4000), None, True))
+    assert note and "− 300" in note[0], note
+    note = asyncio.run(page._coordinate_note(object(), 1.0, (200, 100), {"x": 40, "y": 60}, False))
+    assert note and "x=40 + image_x × 1" in note[0], note
+    assert asyncio.run(page._coordinate_note(object(), 1.0, (1280, 800), None, False)) == []
+
+
+def test_r2_3_a_network_get_running_across_a_restart_returns_no_old_body(monkeypatch):
+    """Review 2.3: a network_get waiting on getResponseBody returned an old body after a
+    network_start had cleared the capture."""
+    import asyncio
+    from mcp_stealth_chrome import server
+
+    class Tab:
+        target = None
+
+        def __init__(self):
+            self.release = asyncio.Event()
+
+        async def send(self, _cmd):
+            await self.release.wait()
+            return ("OLD-BODY-SYNTH", False)
+
+    async def scenario():
+        tab = Tab()
+        monkeypatch.setattr(server.BrowserState, "active_tab", classmethod(lambda cls: tab))
+        saved = (server.BrowserState.network_index, server.BrowserState.capture_network)
+        server.BrowserState.network_index = {"1.1": {"request_id": "1.1", "url": "https://a.test/x"}}
+        server.BrowserState.capture_network = True
+        try:
+            call = asyncio.ensure_future(server.network_get(include_body=True))
+            await asyncio.sleep(0.05)
+            server._network_restarted()  # what network_start does before clearing
+            server.BrowserState.network_index.clear()
+            tab.release.set()
+            return await call
+        finally:
+            server.BrowserState.network_index, server.BrowserState.capture_network = saved
+
+    out = asyncio.run(scenario())
+    assert "OLD-BODY-SYNTH" not in out and out.startswith("Error:"), out
+    assert "restarted while" in out
+
+
+def test_r2_3_network_start_marks_a_restart_and_a_plain_start_sends_what_main_sent(monkeypatch):
+    import asyncio
+    from mcp_stealth_chrome import server
+
+    class _Target:
+        target_id = "TARGET-FF"
+
+    class _Tab:
+        target = _Target()
+
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, command):
+            request = next(command)
+            self.sent.append((request["method"], request.get("params", {})))
+            return None
+
+        def add_handler(self, *_a):
+            pass
+
+    tab = _Tab()
+    monkeypatch.setattr(server.BrowserState, "active_tab", classmethod(lambda cls: tab))
+    saved = (server.BrowserState.network_logs, server.BrowserState.network_index,
+             server.BrowserState.capture_network)
+    try:
+        before = server._NETWORK_GENERATION[0]
+        out = asyncio.run(server.network_start())
+        assert server._NETWORK_GENERATION[0] == before + 1
+        assert tab.sent == [("Network.enable", {})], tab.sent  # exactly origin/main
+        assert "not kept past a navigation" in out and "keep_bodies=True" in out
+        tab.sent.clear()
+        out = asyncio.run(server.network_start(keep_bodies=True))
+        assert [m for m, _ in tab.sent] == ["Network.enable", "Network.configureDurableMessages"]
+        assert "until it closes" in out
+        tab.sent.clear()
+        asyncio.run(server.network_start())
+        assert tab.sent == [("Network.enable", {}), ("Network.configureDurableMessages", {})]
+    finally:
+        (server.BrowserState.network_logs, server.BrowserState.network_index,
+         server.BrowserState.capture_network) = saved
+        server._NETWORK_ARMED_TAB_IDS.discard("TARGET-FF")
+        server._NETWORK_KEPT_BODIES.discard("TARGET-FF")
+        server._NETWORK_CAPTURE_BODIES.pop("TARGET-FF", None)

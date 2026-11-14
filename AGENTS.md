@@ -300,20 +300,26 @@ conclusions. Each rule below replaced a real lie.
 - Capture buffers are ring buffers (`CAPTURE_MAX_EVENTS`, `CAPTURE_MAX_INDEXED`, both env-tunable).
 - Chrome forgets a response body when the document that loaded it goes: a 324-byte JSON reply read after the page
   navigated answered "No resource with given identifier found". Reading bodies eagerly at `loadingFinished` lost the
-  same race on a page that navigates as soon as its fetch resolves (measured, Chrome 157). `network_start` instead
-  turns on durable messages with `Network.configureDurableMessages` (sizes `CAPTURE_BODY_BUFFER_BYTES`, 64 MB, the
-  oldest dropped, and `CAPTURE_BODY_MAX_BYTES`, 10 MB), which answers, so the result says "keeps"; on a Chrome
+  same race on a page that navigates as soon as its fetch resolves (measured, Chrome 157). Keeping bodies is opt-in,
+  settled by the developer: `network_start(keep_bodies=True)` turns on durable messages with
+  `Network.configureDurableMessages` (sizes `CAPTURE_BODY_BUFFER_BYTES`, 64 MB, the oldest dropped, and
+  `CAPTURE_BODY_MAX_BYTES`, 10 MB), which answers, so the result says "keeps" and states the cost; on a Chrome
   without that command it falls back to `Network.enable(enableDurableMessages)` and says it asked but Chrome did
-  not confirm. Bodies then survive a same-site and a cross-site navigation, a later plain `Network.enable` from
-  another tool does not turn it off, and 300 fetches loaded no slower (0.18 to 0.20 s against 0.23 to 0.25 s).
+  not confirm. A plain `network_start` sends the plain `Network.enable` origin/main sent and keeps nothing; on a tab
+  that kept bodies before it sends `configureDurableMessages({})` so new ones stop being kept. A body lost to a
+  navigation then reads "the page navigated ... network_start(keep_bodies=True) keeps bodies" (the request's
+  `loaderId` against the tab's current main-frame document), not the raw CDP error. Kept bodies survive a same-site
+  and a cross-site navigation, a later plain `Network.enable` from another tool does not turn keeping off, and 300
+  fetches loaded no slower (0.18 to 0.20 s kept against 0.17 to 0.25 s not kept, two runs each, two sessions).
   Measured on Chrome 157, no command drops bodies already kept: not `configureDurableMessages({})` (it stops keeping
   new ones), not smaller sizes, not `Network.disable`. They belong to the tab's DevTools session: another session
   cannot read them (measured), and Chrome holds them until that session ends (tab or browser closed; that the
-  memory is freed then is not measured). So every `network_start` resets the
-  configuration first, forgets the request ids (no tool can read an old body), and says the old bodies stay in
-  Chrome's memory until the tab closes; `capture_bodies=False` stops keeping new ones.
+  memory is freed then is not measured). Every `network_start` forgets the request ids, so later calls cannot look
+  an old body up, and bumps `_NETWORK_GENERATION`: a `network_get` still waiting on Chrome across a restart returns
+  an error instead of a body from before it.
 - `network_get` never slices its JSON: past 50,000 characters it returns `{entries, omitted, note}` with the oldest
-  left out. `[:50000]` cut a body in half and returned text that did not parse. URLs longer than `max_url_len`
+  left out, the whole envelope counted. With reveal_values="body" the warning is `reveal_note`, so the size `note`
+  never replaces it (it did). `[:50000]` cut a body in half and returned text that did not parse. URLs longer than `max_url_len`
   (200) are cut after masking, with `url_cut` saying how much and how to get it whole; `list_frames` does the same.
 
 ### Browser lifecycle
