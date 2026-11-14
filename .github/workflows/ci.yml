@@ -100,6 +100,69 @@ jobs:
           if [ "$RUNNER_OS" = "Windows" ]; then py="$venv/Scripts/python.exe"; else py="$venv/bin/python"; fi
           "$py" -I "$GITHUB_WORKSPACE/.github/scripts/installed_smoke.py" "$wheel" --with-adblock
 
+  lockfree:
+    # The test suites against the newest versions every dependency range allows, as uvx and PyPI
+    # users get them. uv.lock held curl_cffi 0.15 while a fresh install got 0.17, which no longer
+    # copies a request's cookies into the session, so http_request's redirects dropped the
+    # browser's cookies after the first hop with every locked suite green. The install job above
+    # only starts the server; this one runs the fast suite and the real-Chrome suites for the
+    # HTTP client and for closing and reattaching (cookies written at close, nodriver 0.50).
+    name: lockfree (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - uses: browser-actions/setup-chrome@48ad923757ca74d66703209fe939badbdf80f2f4 # v2.2.0
+        if: runner.os == 'Linux'
+        id: chrome
+        with:
+          chrome-version: stable
+          install-dependencies: true
+      - name: Make the stable Chrome the one the server launches
+        if: runner.os == 'Linux'
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+        run: |
+          sudo ln -sf "$CHROME_PATH" /usr/bin/chrome
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - run: uv build
+      # --no-cache and no uv.lock: the newest versions the ranges allow today, not a cached
+      # resolution. The pytest pair comes from the same resolution.
+      - name: Install the wheel and the test runner into a fresh venv without uv.lock
+        shell: bash
+        run: |
+          venv="$RUNNER_TEMP/lockfree-venv"
+          uv venv --python 3.13 "$venv"
+          wheel=$(ls dist/*.whl)
+          VIRTUAL_ENV="$venv" uv pip install --no-cache "${wheel}[adblock]" pytest pytest-asyncio
+          if [ "$RUNNER_OS" = "Windows" ]; then py="$venv/Scripts/python.exe"; else py="$venv/bin/python"; fi
+          echo "VENV_PY=$py" >> "$GITHUB_ENV"
+      - name: What differs from uv.lock
+        shell: bash
+        run: '"$VENV_PY" -I .github/scripts/lock_drift.py uv.lock'
+      - name: Fast suite on the newest allowed versions
+        shell: bash
+        run: '"$VENV_PY" -m pytest tests/ -q -rfE'
+      - name: HTTP, cookie and close suites on real Chrome
+        shell: bash
+        env:
+          MCP_E2E: "1"
+        run: >-
+          "$VENV_PY" -m pytest -v -rs --durations=10
+          tests/test_cookie_close_e2e.py
+          tests/test_protocol_e2e.py
+          tests/test_keep_alive_e2e.py
+
   e2e:
     # Real Chrome, headless, local fixtures only. Suites that open visible windows
     # (MCP_HEADED) or need Chrome Beta on macOS skip themselves here.
@@ -194,11 +257,6 @@ jobs:
           tests/test_sessions_http.py
           tests/test_block_ads.py
           tests/test_block_ads_e2e.py
-      # uv.lock holds nodriver 0.48, but a fresh install gets the newest allowed (0.50), where the
-      # Browser is its own Connection. The close paths are run there too: on 0.50 Browser.close was
-      # never sent, and every close ended Chrome with SIGTERM before it wrote its cookies.
-      - name: Close paths on nodriver 0.50
-        run: >-
-          uv run --with "nodriver>=0.50,<0.51" pytest -v -rs
-          tests/test_cookie_close_e2e.py
-          tests/test_keep_alive_e2e.py
+      # uv.lock holds nodriver 0.48 and a fresh install gets the newest allowed (0.50), where the
+      # Browser is its own Connection. The lockfree job runs the close paths there, with every
+      # other dependency at its newest too.

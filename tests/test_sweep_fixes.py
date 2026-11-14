@@ -12,6 +12,7 @@ import base64
 import http.server
 import json
 import os
+import socket
 import stat
 import sys
 import threading
@@ -153,7 +154,8 @@ def test_the_deadline_retries_a_failed_disable(monkeypatch, intercept):
 
 
 class _Recorder(http.server.BaseHTTPRequestHandler):
-    """/r/<code>/<location with ~ for />, /loop, anything else 200 JSON. Records each request."""
+    """[/prefix]/r/<code>/<location with ~ for />, /loop, anything else 200 JSON. Records each
+    request, with every Cookie header it carried joined by "; "."""
 
     seen: list = []
 
@@ -163,9 +165,12 @@ class _Recorder(http.server.BaseHTTPRequestHandler):
         self.seen.append({"port": self.server.server_port, "method": self.command,
                           "path": self.path, "key": self.headers.get("X-Api-Key"),
                           "auth": self.headers.get("Authorization"),
-                          "cookie": self.headers.get("Cookie"), "body": body})
-        if self.path.startswith(("/r/", "/b/")):
-            _, kind, code, location = self.path.split("/", 3)
+                          "cookie": "; ".join(self.headers.get_all("Cookie") or []) or None,
+                          "body": body})
+        marks = [i for i in (self.path.find("/r/"), self.path.find("/b/")) if i >= 0]
+        route = self.path[min(marks):] if marks else self.path
+        if route.startswith(("/r/", "/b/")):
+            _, kind, code, location = route.split("/", 3)
             location = (base64.urlsafe_b64decode(location).decode() if kind == "b"
                         else location.replace("~", "/"))
             self.send_response(int(code))
@@ -177,6 +182,13 @@ class _Recorder(http.server.BaseHTTPRequestHandler):
             import time
 
             time.sleep(3)
+        if self.path.startswith("/set-sid"):  # a login that rotates the session cookie
+            self.send_response(302)
+            self.send_header("Location", "/final")
+            self.send_header("Set-Cookie", "sid=rotated; Path=/")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if self.path.startswith("/loop"):
             self.send_response(302)
             self.send_header("Location", "/loop")
@@ -209,17 +221,39 @@ def two_origins(monkeypatch):
     for srv in servers:
         threading.Thread(target=srv.serve_forever, daemon=True).start()
 
+    state = SimpleNamespace(a=servers[0].server_port, b=servers[1].server_port, seen=seen,
+                            browser=[_cookie("sid", "abc")])
+
     async def cookies(_url):
-        return [{"name": "sid", "value": "abc", "domain": "127.0.0.1", "path": "/"}]
+        return list(state.browser)
 
     monkeypatch.setattr(server.BrowserState, "browser", object())
     monkeypatch.setattr(network_http, "_get_browser_cookies_for_url", cookies)
     try:
-        yield SimpleNamespace(a=servers[0].server_port, b=servers[1].server_port, seen=seen)
+        yield state
     finally:
         for srv in servers:
             srv.shutdown()
             srv.server_close()
+
+
+def _cookie(name, value, domain="127.0.0.1", path="/", secure=False, expires=-1):
+    """A browser cookie as _get_browser_cookies_for_url hands it over."""
+    return {"name": name, "value": value, "domain": domain, "path": path,
+            "secure": secure, "expires": expires}
+
+
+def _sent(meta):
+    """cookies_sent of every request in order, as the result reports them."""
+    return [h["cookies_sent"] for h in meta.get("redirects", [])] + [meta["cookies_sent"]]
+
+
+def _names(seen_one):
+    return sorted(seen_one["cookie"].split("; ")) if seen_one["cookie"] else []
+
+
+def _received(seen):
+    return [len(s["cookie"].split("; ")) if s["cookie"] else 0 for s in seen]
 
 
 def _request(url, **kwargs):
@@ -262,6 +296,227 @@ def test_a_same_origin_redirect_keeps_the_headers(two_origins):
     assert [s["key"] for s in o.seen] == ["SECRET", "SECRET"]
     assert [s["cookie"] for s in o.seen] == ["sid=abc", "sid=abc"]
     assert "headers_not_forwarded" not in meta and meta["redirects"][0]["status"] == 302
+
+
+def test_a_cookie_a_redirect_sets_replaces_the_browsers_on_the_next_hop(two_origins):
+    """The browser's cookies sit in the session's jar, so a server that rotates the session
+    on the way (a login redirect) is answered with its new value, not the stale one."""
+    o = two_origins
+    json.loads(_request(f"http://127.0.0.1:{o.a}/set-sid"))
+    assert [s["cookie"] for s in o.seen] == ["sid=abc", "sid=rotated"]
+
+
+def test_cookies_sent_is_counted_per_request(two_origins):
+    """Each hop reports what went out with it: the browser cookie on both requests to
+    127.0.0.1, none on the request to another host."""
+    o = two_origins
+    meta = json.loads(_request(f"http://127.0.0.1:{o.a}" + _secret_hop(
+        302, f"http://127.0.0.1:{o.b}" + _hop(302, f"http://localhost:{o.a}/end"))))
+    assert _received(o.seen) == [1, 1, 0]
+    assert _sent(meta) == [1, 1, 0], meta
+
+
+def test_a_path_scoped_browser_cookie_stays_on_its_path(two_origins):
+    """A cookie the browser keeps for /admin went to every path once it was in the jar as /."""
+    o = two_origins
+    o.browser = [_cookie("adm", "1", path="/admin"), _cookie("sid", "abc")]
+    meta = json.loads(_request(f"http://127.0.0.1:{o.a}/admin" + _secret_hop(
+        302, "/admin/next" + _hop(302, "/public"))))
+    assert [s["path"] for s in o.seen][1:] == ["/admin/next/r/302/~public", "/public"]
+    assert [_names(s) for s in o.seen] == [["adm=1", "sid=abc"], ["adm=1", "sid=abc"], ["sid=abc"]]
+    assert _sent(meta) == [2, 2, 1], meta
+
+
+def test_two_browser_cookies_of_one_name_on_two_paths_are_both_kept(two_origins):
+    o = two_origins
+    o.browser = [_cookie("sid", "deep", path="/admin"), _cookie("sid", "site")]
+    meta = json.loads(_request(f"http://127.0.0.1:{o.a}/admin" + _hop(302, "/public")))
+    assert [_names(s) for s in o.seen] == [["sid=deep", "sid=site"], ["sid=site"]]
+    assert _sent(meta) == [2, 1], meta
+
+
+@pytest.mark.parametrize("host", ["localhost", "127.0.0.1"])
+def test_a_loopback_cookie_follows_its_host_to_another_port_and_no_further(two_origins, host):
+    """localhost has no dot. Its cookies went out as a Cookie header with the caller's headers,
+    so a redirect to another port of the same host dropped them, unlike 127.0.0.1's."""
+    o = two_origins
+    o.browser = [_cookie("sid", "abc", domain=host)]
+    other = "127.0.0.1" if host == "localhost" else "localhost"
+    meta = json.loads(_request(f"http://{host}:{o.a}" + _secret_hop(
+        302, f"http://{host}:{o.b}" + _hop(302, f"http://{other}:{o.a}/end"))))
+    assert [s["cookie"] for s in o.seen] == ["sid=abc", "sid=abc", None]
+    assert _sent(meta) == [1, 1, 0], meta
+    assert "Cookie" not in meta.get("headers_not_forwarded", {}).get("names", [])
+
+
+@pytest.fixture()
+def v6_origins(monkeypatch):
+    from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import network_http
+
+    class V6(http.server.ThreadingHTTPServer):
+        address_family = socket.AF_INET6
+
+    seen: list = []
+    handler = type("H", (_Recorder,), {"seen": seen})
+    try:
+        servers = [V6(("::1", 0), handler) for _ in range(2)]
+    except OSError as exc:
+        pytest.skip(f"no IPv6 loopback here: {exc}")
+    for srv in servers:
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    async def cookies(_url):
+        return [_cookie("sid", "abc", domain="::1")]
+
+    monkeypatch.setattr(server.BrowserState, "browser", object())
+    monkeypatch.setattr(network_http, "_get_browser_cookies_for_url", cookies)
+    try:
+        yield SimpleNamespace(a=servers[0].server_port, b=servers[1].server_port, seen=seen)
+    finally:
+        for srv in servers:
+            srv.shutdown()
+            srv.server_close()
+
+
+def test_an_ipv6_cookie_follows_its_host_to_another_port(v6_origins):
+    o = v6_origins
+    meta = json.loads(_request(f"http://[::1]:{o.a}" + _hop(302, f"http://[::1]:{o.b}/final")))
+    assert [s["cookie"] for s in o.seen] == ["sid=abc", "sid=abc"]
+    assert _sent(meta) == [1, 1], meta
+
+
+def _self_signed(folder):
+    """A certificate for shop.test, or skip when the cryptography package is missing."""
+    import datetime
+
+    crypto = pytest.importorskip("cryptography")
+    del crypto
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "shop.test")])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
+            .public_key(key.public_key()).serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(minutes=5))
+            .not_valid_after(now + datetime.timedelta(hours=1))
+            .add_extension(x509.SubjectAlternativeName([x509.DNSName("shop.test")]), critical=False)
+            .sign(key, hashes.SHA256()))
+    cert_file, key_file = folder / "cert.pem", folder / "key.pem"
+    cert_file.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    key_file.write_bytes(key.private_bytes(serialization.Encoding.PEM,
+                                           serialization.PrivateFormat.PKCS8,
+                                           serialization.NoEncryption()))
+    return cert_file, key_file
+
+
+@pytest.fixture()
+def shop(monkeypatch, tmp_path):
+    """https://shop.test:<a> and http://shop.test:<b>, both on 127.0.0.1 through curl's own
+    resolver. Not a loopback name: curl, like Chrome, sends Secure cookies over plain http to
+    localhost, 127.0.0.1 and ::1, so only a real host name shows the Secure rule."""
+    import ssl
+
+    import curl_cffi.requests
+    from curl_cffi import CurlOpt
+
+    from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import network_http
+
+    cert_file, key_file = _self_signed(tmp_path)
+    seen: list = []
+    handler = type("H", (_Recorder,), {"seen": seen})
+    servers = [http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler) for _ in range(2)]
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert_file, key_file)
+    servers[0].socket = context.wrap_socket(servers[0].socket, server_side=True)
+    for srv in servers:
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+    a, b = servers[0].server_port, servers[1].server_port
+    real = curl_cffi.requests.AsyncSession
+
+    class Resolving(real):
+        def __init__(self, **kwargs):
+            kwargs["verify"] = False
+            kwargs["curl_options"] = {CurlOpt.RESOLVE: [f"shop.test:{a}:127.0.0.1",
+                                                        f"shop.test:{b}:127.0.0.1"]}
+            super().__init__(**kwargs)
+
+    state = SimpleNamespace(a=a, b=b, seen=seen, browser=[
+        _cookie("sec", "1", domain="shop.test", secure=True),
+        _cookie("plain", "2", domain=".shop.test")])
+
+    async def cookies(_url):
+        return list(state.browser)
+
+    monkeypatch.setattr(curl_cffi.requests, "AsyncSession", Resolving)
+    monkeypatch.setattr(server.BrowserState, "browser", object())
+    monkeypatch.setattr(network_http, "_get_browser_cookies_for_url", cookies)
+    try:
+        yield state
+    finally:
+        for srv in servers:
+            srv.shutdown()
+            srv.server_close()
+
+
+def test_a_secure_browser_cookie_never_goes_out_over_http(shop):
+    """https -> http on the same host: the Secure cookie went along once it was in the jar
+    without its flag."""
+    meta = json.loads(_request(f"https://shop.test:{shop.a}"
+                               + _hop(302, f"http://shop.test:{shop.b}/final")))
+    assert [s["port"] for s in shop.seen] == [shop.a, shop.b]
+    assert [_names(s) for s in shop.seen] == [["plain=2", "sec=1"], ["plain=2"]]
+    assert _sent(meta) == [2, 1], meta
+
+
+@pytest.fixture()
+def idn_origin(monkeypatch):
+    """http://bücher.example:<port> on 127.0.0.1 through curl's resolver; curl sends the A-label."""
+    import curl_cffi.requests
+    from curl_cffi import CurlOpt
+
+    from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import network_http
+
+    seen: list = []
+    handler = type("H", (_Recorder,), {"seen": seen})
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    port = srv.server_port
+    real = curl_cffi.requests.AsyncSession
+
+    class Resolving(real):
+        def __init__(self, **kwargs):
+            kwargs["curl_options"] = {CurlOpt.RESOLVE: [f"xn--bcher-kva.example:{port}:127.0.0.1"]}
+            super().__init__(**kwargs)
+
+    class _Jar:
+        async def get_all(self):
+            return [SimpleNamespace(name="sid", value="abc", domain="xn--bcher-kva.example",
+                                    path="/", secure=False, expires=-1)]
+
+    monkeypatch.setattr(curl_cffi.requests, "AsyncSession", Resolving)
+    monkeypatch.setattr(server.BrowserState, "browser", SimpleNamespace(cookies=_Jar()))
+    try:
+        yield SimpleNamespace(port=port, seen=seen)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_a_unicode_url_gets_the_cookie_chrome_keeps_under_its_a_label(idn_origin):
+    """Chrome stores an IDN cookie under its A-label; a URL written in Unicode found none of
+    them, and even a match would have gone into the jar under a host curl never asks for."""
+    o = idn_origin
+    meta = json.loads(_request(f"http://bücher.example:{o.port}" + _hop(302, "/final")))
+    assert [s["cookie"] for s in o.seen] == ["sid=abc", "sid=abc"]
+    assert _sent(meta) == [1, 1], meta
+    assert meta["cookie_snapshot"]["count"] == 1
 
 
 @pytest.mark.parametrize("code,method,then,body", [

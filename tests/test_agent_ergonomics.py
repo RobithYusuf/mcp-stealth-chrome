@@ -1425,6 +1425,17 @@ class _CookieAt:
     (_CookieAt("a", "x.test", secure=True), "http://x.test/", False),
     (_CookieAt("a", "x.test", secure=True), "https://x.test/", True),
     (_CookieAt("a", ".x.test"), "https://notx.test/", False),
+    # IDN: Chrome stores the A-label, a caller may write the URL in Unicode, and the reverse.
+    (_CookieAt("a", "xn--bcher-kva.example"), "https://bücher.example/", True),
+    (_CookieAt("a", "bücher.example"), "https://xn--bcher-kva.example/", True),
+    (_CookieAt("a", "xn--bcher-kva.example"), "https://BÜCHER.Example./", True),
+    (_CookieAt("a", ".xn--bcher-kva.example"), "https://shop.bücher.example/", True),
+    (_CookieAt("a", "xn--bcher-kva.example"), "https://shop.bücher.example/", False),
+    # Look-alikes stay apart: no accent, and a Cyrillic с in place of the Latin c.
+    (_CookieAt("a", "xn--bcher-kva.example"), "https://bucher.example/", False),
+    (_CookieAt("a", "xn--bcher-kva.example"), "https://b\u00fc\u0441her.example/", False),
+    # A host IDNA cannot encode matches nothing, not even itself.
+    (_CookieAt("a", "\u2603.example"), "https://\u2603.example/", False),
 ])
 def test_http_requests_only_send_cookies_a_browser_would(cookie, url, sent):
     from urllib.parse import urlparse
@@ -1450,7 +1461,10 @@ def test_same_name_cookie_keeps_the_most_specific_path(monkeypatch):
 
     monkeypatch.setattr(server.BrowserState, "browser", _Browser())
     jar, _meta = asyncio.run(nh._snapshot_browser_cookies("https://x.test/admin/a"))
-    assert jar == {"sid": "admin"}
+    # Both are kept, each with its own path, the most specific first as a browser sends them:
+    # the site-wide one no longer replaces /admin's, and neither goes where its path does not.
+    assert [(c["name"], c["path"], c["value"]) for c in jar] == [
+        ("sid", "/admin", "admin"), ("sid", "/", "site")]
 
 
 def test_sniffed_token_only_goes_back_to_its_exact_origin(monkeypatch):
@@ -2220,7 +2234,7 @@ def test_a_failed_cookie_read_is_not_a_measured_zero(monkeypatch):
 
     monkeypatch.setattr(server.BrowserState, "browser", _Browser())
     jar, meta = asyncio.run(nh._snapshot_browser_cookies("https://x.test/"))
-    assert jar == {} and meta["measured"] is False
+    assert jar == [] and meta["measured"] is False
     assert "cdp gone" in meta["reason"]
 
 

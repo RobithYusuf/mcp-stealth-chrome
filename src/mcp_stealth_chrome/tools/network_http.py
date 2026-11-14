@@ -36,6 +36,7 @@ performed or claimed.
 from __future__ import annotations
 
 import asyncio
+import http.cookiejar
 import ipaddress
 import json
 import os
@@ -138,18 +139,47 @@ async def _get_browser_cookies_for_url(url: str) -> list[dict]:
                 "value": c.value,
                 "domain": c.domain,
                 "path": c.path or "/",
+                "secure": bool(getattr(c, "secure", False)),
+                "expires": getattr(c, "expires", None),
             })
-    # Most specific path first, as a browser sends them: a name-keyed jar keeps the
-    # first, so /admin's cookie is not replaced by the site-wide one of that name.
+    # Most specific path first, as a browser sends them.
     matching.sort(key=lambda c: len(c["path"]), reverse=True)
     return matching
 
 
+def _canonical_host(host: str) -> Optional[str]:
+    """A host as cookies compare it: lower case, no trailing dot, IDNA A-label (UTS 46, as
+    Chrome maps it). None when it cannot be encoded, and None matches nothing.
+
+    Chrome stores an IDN cookie under its A-label (xn--bcher-kva.example) while a caller may
+    write the URL in Unicode (bücher.example): compared as text they never met.
+    """
+    host = (host or "").strip().rstrip(".").lower()
+    if not host:
+        return None
+    if host.isascii():
+        return host
+    try:
+        import idna  # through httpx; UTS 46 like Chrome, where the codec below is IDNA 2003
+
+        return idna.encode(host, uts46=True).decode("ascii").lower()
+    except ImportError:
+        try:
+            return host.encode("idna").decode("ascii").lower()
+        except UnicodeError:
+            return None
+    except (idna.IDNAError, UnicodeError, ValueError):
+        return None
+
+
 def _cookie_applies(cookie: Any, parsed_url: Any) -> bool:
-    """Would a browser send this cookie to this URL? RFC 6265 domain, path and Secure."""
-    host = (parsed_url.hostname or "").lower()
-    raw_domain = (cookie.domain or "").lower()
-    domain = raw_domain.lstrip(".")
+    """Would a browser send this cookie to this URL? RFC 6265 domain, path and Secure, with
+    hosts compared in canonical form (_canonical_host)."""
+    host = _canonical_host(parsed_url.hostname or "")
+    raw_domain = (cookie.domain or "").strip()
+    domain = _canonical_host(raw_domain.lstrip("."))
+    if host is None or domain is None:
+        return False
     if raw_domain.startswith("."):
         if not (host == domain or host.endswith("." + domain)):
             return False
@@ -163,7 +193,7 @@ def _cookie_applies(cookie: Any, parsed_url: Any) -> bool:
     return not getattr(cookie, "secure", False) or parsed_url.scheme == "https"
 
 
-async def _snapshot_browser_cookies(url: str) -> tuple[dict[str, str], dict]:
+async def _snapshot_browser_cookies(url: str) -> tuple[list[dict], dict]:
     """Read the browser's cookies for `url` ONCE, before the request starts.
 
     Taken up front and BY VALUE. A tracked request outlives the tool call that
@@ -172,8 +202,9 @@ async def _snapshot_browser_cookies(url: str) -> tuple[dict[str, str], dict]:
     instance B's jar to a request that belongs to instance A. Snapshotting here
     pins the jar to the instance that was current when the caller asked.
 
-    Returns (cookie dict, meta). `measured` distinguishes "no cookies apply"
-    from "we never got to look".
+    Returns (cookies, meta): each cookie keeps its path, Secure flag and expiry, which decide
+    where it may go on a redirect. `measured` distinguishes "no cookies apply" from "we never
+    got to look".
     """
     meta = {
         "measured": False,
@@ -183,7 +214,7 @@ async def _snapshot_browser_cookies(url: str) -> tuple[dict[str, str], dict]:
     }
     if not BrowserState.browser:
         meta["reason"] = "no browser running — cookie-less request"
-        return {}, meta
+        return [], meta
     try:
         async with _COOKIE_LOCK:
             cookies = await asyncio.wait_for(
@@ -194,13 +225,16 @@ async def _snapshot_browser_cookies(url: str) -> tuple[dict[str, str], dict]:
             f"browser cookie read timed out after {HTTP_COOKIE_TIMEOUT}s — "
             "request sent WITHOUT browser cookies"
         )
-        return {}, meta
+        return [], meta
     except Exception as e:
         meta["reason"] = f"browser cookie read failed: {e} — request sent WITHOUT them"
-        return {}, meta
-    jar: dict[str, str] = {}
-    for c in cookies:
-        jar.setdefault(c["name"], c["value"])
+        return [], meta
+    jar: list[dict] = []
+    seen: set = set()
+    for c in cookies:  # one per name and path, as a cookie store holds them
+        if (c["name"], c["path"]) not in seen:
+            seen.add((c["name"], c["path"]))
+            jar.append(c)
     meta["measured"] = True
     meta["count"] = len(jar)
     return jar, meta
@@ -276,6 +310,16 @@ def _mask_urls_in(text: str, *urls: str) -> str:
         if "@" in parts.netloc:
             text = text.replace(parts.netloc, mask_url(f"//{parts.netloc}")[2:])
     return text
+
+
+class _TooManyRedirects(Exception):
+    """curl's error 47, raised by the redirect loop below. Its own class, not curl_cffi's
+    TooManyRedirects: curl_cffi 0.7 has none, and that ImportError was reported as
+    "curl-cffi not installed", outcome not_executed, after 31 requests had gone out."""
+
+    def __init__(self, message: str, code: int = 47):
+        super().__init__(message)
+        self.code = code
 
 
 def _origin(url: str) -> tuple:
@@ -396,6 +440,81 @@ def _inflight() -> int:
     return sum(1 for r in _TRACKED.values() if r.state == "pending")
 
 
+def _seed_host_only(jar: Any, host: str, cookies: list[dict]) -> None:
+    """Put the browser's cookies in the session's own jar, host-only for `host`, each with its
+    own path, Secure flag and expiry, so curl sends each only where the browser would: not over
+    plain http when Secure (loopback names aside, which Chrome and curl both treat as secure),
+    not to another path, never to another host, and to the same host on any port. A domain
+    cookie (.example.com) is narrowed to `host`: a redirect never widens where it goes.
+
+    The jar, not the request, is what carries them through the redirect loop. Passed as the
+    first request's `cookies`, they reached the later hops only because curl_cffi up to 0.15
+    copied curl's whole cookie store back into the jar after each response; from 0.16 it
+    copies only what a response changed (COOKIECHANGES), so the second hop to the same host
+    went without them. A cookie a response sets or deletes still replaces these, in every
+    version, because it goes into this same jar under the same host, path and name.
+
+    Every host goes through the jar, localhost and ::1 included. Given as a plain dict, curl_cffi
+    named a host with no dot "localhost.local" and curl never sent its cookies, which is why
+    they once went as a Cookie header that a redirect to another port dropped.
+    """
+    for c in cookies:
+        try:
+            expires = int(float(c.get("expires"))) if c.get("expires") is not None else None
+        except (TypeError, ValueError):
+            expires = None
+        if expires is not None and expires <= 0:
+            expires = None  # a session cookie: CDP reports -1
+        jar.set_cookie(http.cookiejar.Cookie(
+            version=0, name=c["name"], value=c["value"], port=None, port_specified=False,
+            domain=host, domain_specified=False, domain_initial_dot=False,
+            path=c.get("path") or "/", path_specified=True, secure=bool(c.get("secure")),
+            expires=expires, discard=expires is None,
+            comment=None, comment_url=None, rest={}))
+
+
+# curl's secure context (Curl_secure_context): https, or one of these names over plain http.
+_SECURE_NAMES = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _cookies_for(jar: Any, url: str) -> int:
+    """How many cookies of the session's jar curl sends with a request to `url`.
+
+    curl_cffi hands curl the whole jar before every request and curl picks by its own rules,
+    which this repeats: domain (host-only or a domain cookie), path, Secure and expiry. Ports do
+    not scope cookies. The redirect tests compare it with what the server received.
+    """
+    parts = urlsplit(url)
+    host = _canonical_host(parts.hostname or "")
+    if host is None:
+        return 0
+    path = parts.path or "/"
+    secure_ok = parts.scheme.lower() == "https" or host in _SECURE_NAMES
+    now = time.time()
+    count = 0
+    for c in jar:
+        domain = (c.domain or "").lower()
+        bare = _canonical_host(domain.lstrip("."))
+        if bare is None:
+            continue
+        if c.domain_specified or domain.startswith("."):
+            if not (host == bare or host.endswith("." + bare)):
+                continue
+        elif host != bare:
+            continue
+        cookie_path = c.path or "/"
+        if not (path == cookie_path or cookie_path == "/" or (
+                path.startswith(cookie_path)
+                and (cookie_path.endswith("/") or path[len(cookie_path)] == "/"))):
+            continue
+        if c.secure and not secure_ok:
+            continue
+        if c.expires is not None and c.expires <= now:
+            continue
+        count += 1
+    return count
+
+
 async def _perform(rec: _Tracked) -> str:
     """Run one curl_cffi request and render its settled response string."""
     from curl_cffi.requests import AsyncSession
@@ -415,18 +534,10 @@ async def _perform(rec: _Tracked) -> str:
     shown_url = (lambda u: u) if reveal else mask_url
     async with AsyncSession(**session_kwargs) as session:
         caller_headers = dict(spec.get("headers") or {})
-        cookie_kwargs: dict = {}
-        if spec.get("cookies"):
-            # libcurl's cookie engine drops a cookie for a host with no dot, so on localhost
-            # it reported sending cookies that never left. That host gets a Cookie header,
-            # which goes with the caller's headers and so only to the first origin.
-            if "." in (urlsplit(spec["url"]).hostname or "."):
-                # Given on the first hop only: curl scopes them to that host, and the
-                # session's jar carries them, host-only, through the redirects after it.
-                cookie_kwargs["cookies"] = spec["cookies"]
-            else:
-                caller_headers["Cookie"] = "; ".join(
-                    f"{k}={v}" for k, v in spec["cookies"].items())
+        first_host = _canonical_host(urlsplit(spec["url"]).hostname or "")
+        if spec.get("cookies") and first_host:
+            # The A-label: curl asks the jar for the host it puts on the wire.
+            _seed_host_only(session.cookies.jar, first_host, spec["cookies"])
 
         method, url = rec.method, spec["url"]
         first_origin = _origin(url)
@@ -444,10 +555,8 @@ async def _perform(rec: _Tracked) -> str:
                 # host a redirect named, so an X-Api-Key reached a third party.
                 "allow_redirects": False,
             }
-            if not hops:
-                if spec.get("params"):
-                    kwargs["params"] = spec["params"]
-                kwargs.update(cookie_kwargs)
+            if not hops and spec.get("params"):
+                kwargs["params"] = spec["params"]
             headers = dict(caller_headers)
             if not keep_body:
                 headers = {k: v for k, v in headers.items()
@@ -466,6 +575,7 @@ async def _perform(rec: _Tracked) -> str:
                 elif spec.get("data") is not None:
                     kwargs["data"] = spec["data"]
 
+            cookies_sent = _cookies_for(session.cookies.jar, url)
             resp = await session.request(method, url, **kwargs)
             if not spec["follow_redirects"] or resp.status_code not in _REDIRECT_CODES:
                 break
@@ -478,11 +588,11 @@ async def _perform(rec: _Tracked) -> str:
                         f"{urlsplit(target).scheme}: URL, and only http and https are followed")
                 break
             if len(hops) >= _MAX_REDIRECTS:
-                from curl_cffi.requests.exceptions import TooManyRedirects
-                raise TooManyRedirects(
+                raise _TooManyRedirects(
                     f"Maximum ({_MAX_REDIRECTS}) redirects followed; the last pointed to "
                     f"{shown_url(target)}", 47)
-            hops.append({"status": resp.status_code, "from": str(resp.url or url), "to": target})
+            hops.append({"status": resp.status_code, "from": str(resp.url or url), "to": target,
+                         "cookies_sent": cookies_sent})
             # As browsers do: 303 turns anything but HEAD into a GET, and 301 and 302 turn
             # a POST into one. 307 and 308 repeat the method with its body.
             if (resp.status_code == 303 and method != "HEAD") or (
@@ -524,7 +634,8 @@ async def _perform(rec: _Tracked) -> str:
             "url": str(resp.url) if reveal else mask_url(str(resp.url)),
             "elapsed_ms": elapsed_ms,
             "headers": dict(resp.headers) if reveal else mask_headers(dict(resp.headers)),
-            "cookies_sent": len(spec.get("cookies") or {}),
+            # Of the request that answered; each redirect names its own.
+            "cookies_sent": cookies_sent,
             "cookie_snapshot": spec.get("cookie_meta"),
             "impersonate": spec["impersonate"],
             "request_id": rec.request_id,
@@ -704,7 +815,9 @@ async def http_request(
         url, method: target URL and HTTP verb
         impersonate: chrome, chrome124, firefox, safari, edge (default chrome)
         use_browser_cookies: snapshot cookies from the active browser instance
-            BEFORE the request starts (a later switch_instance cannot leak in)
+            BEFORE the request starts (a later switch_instance cannot leak in). On a
+            redirect they follow the first host only, by their path and Secure flag;
+            cookies_sent counts what each request carried
         headers, params: extra headers/query params
         data: raw body string (form-urlencoded or custom)
         json_body: JSON body dict (sets Content-Type automatically)
@@ -756,10 +869,10 @@ async def http_request(
             "Cancel one with http_request_cancel or wait for it to settle."
         )
 
-    cookies_dict: dict[str, str] = {}
+    browser_cookies: list[dict] = []
     cookie_meta: dict = {"measured": False, "reason": "use_browser_cookies=False"}
     if use_browser_cookies:
-        cookies_dict, cookie_meta = await _snapshot_browser_cookies(url)
+        browser_cookies, cookie_meta = await _snapshot_browser_cookies(url)
 
     request_id = f"hreq_{uuid.uuid4().hex[:12]}"
     rec = _Tracked(
@@ -775,7 +888,7 @@ async def http_request(
             "params": params,
             "data": data,
             "json_body": json_body,
-            "cookies": cookies_dict,
+            "cookies": browser_cookies,
             "cookie_meta": cookie_meta,
             "timeout": timeout,
             "connect_timeout": conn,

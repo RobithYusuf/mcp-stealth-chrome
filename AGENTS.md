@@ -727,8 +727,25 @@ conclusions. Each rule below replaced a real lie.
   before). curl carried every caller header to whatever host a redirect named: `X-Api-Key` reached a third party,
   and only Cookie and Authorization were dropped, by curl's own rule. Caller headers now go only to the first
   origin (scheme, host, effective port); `headers_not_forwarded` names what stayed behind and `redirects` lists
-  the hops. Browser cookies are passed on the first hop only and the session's jar carries them, host-only, which
-  is what curl did: sent to the same host on another port, never to another host. 303 (not HEAD) and 301/302 after
+  the hops. Browser cookies go into the session's own jar before the first hop, host-only for the first host, each
+  with its own path, Secure flag and expiry (`_seed_host_only`): sent to the same host on another port, never to
+  another host, a `/admin` cookie never to `/public`, a Secure one never over plain http to a real host name (curl,
+  like Chrome, treats `localhost`, `127.0.0.1` and `::1` as secure, so a test of that rule needs another name:
+  `CURLOPT_RESOLVE` in `test_sweep_fixes.py`), and replaced by any cookie of that name a response sets. The snapshot
+  was a name to value dict until 0.19.1, which seeded every cookie as path `/` without Secure, so a Secure cookie
+  went out over http and a path-scoped one to every path. `localhost` and `::1` go through the jar too: given as a
+  dict, curl_cffi named them `localhost.local` and curl never sent them, and the `Cookie` header that replaced it
+  was dropped on a redirect to another port. `cookies_sent` is per request: the final one at the top, each
+  redirect's on its hop (`_cookies_for`, curl's rules, checked against what the server received). Hosts are compared
+  in canonical form (`_canonical_host`: lower case, no trailing dot, IDNA A-label by UTS 46): Chrome stores an IDN
+  cookie under `xn--bcher-kva.example` and a URL written `bücher.example` found none; a host IDNA cannot encode
+  matches nothing, and the jar is seeded under the A-label, which is the host curl sends. Never as the
+  request's `cookies=`: curl_cffi up to 0.15 copied curl's whole
+  store back into the jar after each response, so they reached later hops; from 0.16 it copies only what responses
+  changed (`COOKIECHANGES`), and every redirect after the first went without them, while uv.lock (0.15) kept every
+  suite green. Measured on 0.7.0, 0.7.4, 0.10.0, 0.13.0, 0.15.0, 0.16.3 and 0.17.0. Error 47 is the module's own
+  `_TooManyRedirects`: curl_cffi 0.7 has no `TooManyRedirects`, and the ImportError read as "curl-cffi not installed",
+  `not_executed`, after 31 requests. 303 (not HEAD) and 301/302 after
   a POST continue as a GET without the body; only http and https Locations are followed. A failure on a later hop
   reports the chain and `failed_at` (masked), and is never `not_executed`: the first server got the request.
 
@@ -1022,8 +1039,9 @@ Platform truths, not preferences. Each one cost a release.
   anyway. A `lang` other than en-US goes through the same Accept-Language override as a fingerprint.
 - `Network.deleteCookies` answers success whether or not anything matched, and matches the exact stored domain, path and
   partition. `cookie_delete` reads what exists, deletes those, and reads back.
-- libcurl's cookie engine drops a cookie for a host with no dot, so `localhost` reported `cookies_sent` that never left.
-  Such hosts get a `Cookie` header. libcurl also speaks `file://`, which `http_request` refuses.
+- curl_cffi names a cookie given without a domain after the request host, and a host with no dot becomes
+  `localhost.local`, so curl never sent it on `localhost`. A cookie put in the jar with the host itself (`localhost`,
+  `::1`) is sent. libcurl also speaks `file://`, which `http_request` refuses.
 - `os.kill(pid, 0)` is no liveness probe on Windows: 0 is `CTRL_C_EVENT`, sent through `GenerateConsoleCtrlEvent`, and
   `signal.SIGKILL` does not exist. Every close there reported Chrome still running until `_process_exists` asked
   `OpenProcess`/`GetExitCodeProcess` (`state._win_pid_alive`). Probe through `_process_exists`, never `os.kill(pid, 0)`.
@@ -1099,6 +1117,9 @@ uv run mcp-stealth-chrome --http        # one server for many clients (token req
 - `.github/workflows/ci.yml` runs the fast suite on macOS, Ubuntu and Windows (Python 3.11 and 3.13), a lock-free
   install of the built wheel that checks the `mcp<2` and `nodriver<0.51` caps and calls `server_status`, and the
   headless real-Chrome suites on all three. A test that cannot hold on one OS skips there with a reason naming the code.
+  The `lockfree` job installs the wheel with no uv.lock (the newest every range allows, as uvx gets), prints what
+  differs from uv.lock (`.github/scripts/lock_drift.py`) and runs the fast suite and the HTTP, cookie and close
+  suites there. Only that job shows a dependency that changed behaviour without breaking an import (curl_cffi 0.17).
 - `tests/test_protocol.py` and `tests/test_protocol_e2e.py` drive the server over stdio with `session.call_tool`, so
   FastMCP's argument parsing and the client's output validation run. `MCP_TEST_SERVER_PYTHON` and `MCP_TEST_SRC` run
   them against another interpreter or source tree, which is how to cover both nodriver and mcp versions.

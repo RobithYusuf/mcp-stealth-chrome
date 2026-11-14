@@ -1,6 +1,6 @@
 [project]
 name = "mcp-stealth-chrome"
-version = "0.20.0"
+version = "0.20.1"
 description = "MCP server with 173 tools: a real Chrome browser over CDP with nodriver, HTTP with Chrome's TLS fingerprint, Cloudflare Turnstile handling, session reuse, and web research without API keys"
 readme = "README.md"
 license = { text = "MIT" }
@@ -48,6 +48,9 @@ dependencies = [
     "pydantic>=2.5",
     "httpx>=0.27",
     "opencv-python>=4.8",
+    # No upper bound: 0.16 changed how a session keeps cookies, and http_request now puts the
+    # browser's cookies in the session's jar itself, so the redirect tests in
+    # tests/test_sweep_fixes.py pass on 0.7.0 through 0.17.0. The lockfree CI job runs the newest.
     "curl-cffi>=0.7",
 ]
 

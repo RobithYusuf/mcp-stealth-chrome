@@ -271,7 +271,10 @@ def test_the_flag_deletes_v11_cookies(world):
         async def read():
             browser = await server._start_chrome(config)
             try:
-                answer = await browser.connection.send(server._cdp_call("Storage.getCookies"))
+                # A Browser has .connection up to nodriver 0.48 and is itself a Connection from
+                # 0.50, where .connection stays None: asking it failed every lock-free run.
+                connection = getattr(browser, "connection", None) or browser
+                answer = await connection.send(server._cdp_call("Storage.getCookies"))
                 return answer.get("cookies") or []
             finally:
                 assert (await server._ensure_browser_dead(browser, profile)).get("verified")
