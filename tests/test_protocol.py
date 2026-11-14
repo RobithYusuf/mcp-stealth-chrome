@@ -190,3 +190,29 @@ def test_first_server_status_is_fast_and_never_a_timeout():
         assert reply.seconds < 2.5, reply.seconds
     finally:
         client.close()
+
+
+def test_an_unknown_argument_is_refused_naming_it_and_the_valid_ones(mcp):
+    """screenshot(path=..., quality=45) used to save shot-<ts>.png with no word about `path`:
+    FastMCP's argument model ignores names it does not know, on every tool."""
+    reply = mcp.call("screenshot", path="/tmp/x.jpg", quality=45)
+    assert reply.failed, reply.text
+    assert "'path'" in reply.text and "filename" in reply.text and "nothing was done" in reply.text
+    # The check runs before the tool: a tool with a side effect does nothing.
+    reply = mcp.call("http_request", url="http://127.0.0.1:9/x", methd="POST")
+    assert reply.failed and "'methd'" in reply.text and "method" in reply.text, reply.text
+    assert "server_reached" not in reply.text
+
+
+def test_every_tool_still_takes_every_argument_it_advertises(mcp):
+    """The check reads each tool's advertised schema, so no name a tool takes is refused."""
+    import asyncio
+    from mcp_stealth_chrome._app import unknown_arguments_error
+    tools = asyncio.run_coroutine_threadsafe(mcp.session.list_tools(), mcp._loop).result(30).tools
+    assert len(tools) >= 170
+    from mcp_stealth_chrome.server import mcp as server
+    for listed in tools:
+        tool = server._tool_manager.get_tool(listed.name)
+        names = dict.fromkeys(listed.inputSchema.get("properties") or {}, 1)
+        assert unknown_arguments_error(listed.name, tool, names) is None, listed.name
+        assert unknown_arguments_error(listed.name, tool, {**names, "zz_unknown": 1})

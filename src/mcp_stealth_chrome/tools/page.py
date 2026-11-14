@@ -17,7 +17,8 @@ from nodriver.cdp import runtime as cdp_runtime
 from .. import image_output as _image_output
 from .._app import mcp
 from ..helpers import (
-    confined_output_path, err, get_url, ok, parse_json, private_staging, select_tab, ts_filename,
+    confined_output_path, cut_url, err, get_url, ok, parse_json, private_staging, select_tab,
+    ts_filename,
     write_private,
 )
 from ..refs import MAX_FRAMES, all_frames, collect_snapshot, frame_world, resolve_ref
@@ -246,13 +247,22 @@ async def screenshot(
             return err("output_mode must be artifact, inline_image, path, or base64")
         tab = select_tab(tab)
         ensure_dirs()
-        fname = filename or ts_filename("shot", "png")
+        # quality only means something for JPEG, so asking for it with no name and no format
+        # is asking for a JPEG. It used to give shot-<ts>.png and drop the quality unsaid.
+        wants_jpeg = format == "auto" and quality is not None and not filename
+        fname = filename or ts_filename("shot", "jpg" if wants_jpeg else "png")
         path = confined_output_path(SCREENSHOT_DIR, fname)
         ext = path.suffix.lower().lstrip(".")
         if format == "auto":
             fmt = "png" if ext == "png" else "jpeg"
         else:
             fmt = format
+        format_notes = []
+        if quality is not None and fmt == "png":
+            why = "format='png'" if format == "png" else "from the .png name"
+            format_notes.append(
+                f"quality={quality} not applied: the file is PNG, which is lossless ({why}); "
+                "pass format='jpeg' or a .jpg filename for a JPEG at that quality")
         # Resolve region_selector → region. Measuring the box here is what makes
         # the "which coordinate space?" question disappear for the caller.
         if region_selector:
@@ -379,12 +389,15 @@ async def screenshot(
         # Auto-downscale if either dimension exceeds max_dimension.
         # Uses cv2 (already a dep via opencv-python). INTER_AREA = best for shrinking.
         resized_info = ""
+        resize_scale = 1.0
+        final_size: tuple[int, int] | None = None
         if max_dimension and max_dimension > 0:
             try:
                 import cv2
                 img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
                 if img is not None:
                     h, w = img.shape[:2]
+                    final_size = (w, h)
                     longest = max(h, w)
                     if longest > max_dimension:
                         scale = max_dimension / longest
@@ -398,9 +411,15 @@ async def screenshot(
                             raise ValueError("resize could not be encoded")
                         write_private(path, buf.tobytes())
                         resized_info = f" [resized {w}×{h} → {new_w}×{new_h}]"
+                        resize_scale = new_w / w
+                        final_size = (new_w, new_h)
             except Exception:
                 # Resizing is best-effort; original file is already saved.
                 pass
+        format_notes.extend(await _coordinate_note(
+            tab, resize_scale, final_size, region if region else None, full_page))
+        if resized_info:
+            format_notes.insert(0, resized_info.strip())
         data = path.read_bytes()
         mode = "base64" if return_base64 else output_mode
         if mode == "base64":
@@ -411,7 +430,7 @@ async def screenshot(
                 return _image_output.image_response(
                     path, data, mode="path", notes=[note, "base64 omitted after bounded downscaling"]
                 )
-            notes = [resized_info.strip()] if resized_info else []
+            notes = list(format_notes)
             if note:
                 notes.insert(0, "auto-shrunk: " + note)
             return _image_output.image_response(
@@ -420,10 +439,50 @@ async def screenshot(
         return _image_output.image_response(
             path, data, mode=mode, mime=("image/png" if fmt == "png" else "image/jpeg"),
             facts={"full_page": full_page, "region": bool(region), "tab": tab},
-            notes=[resized_info.strip()] if resized_info else None,
+            notes=format_notes or None,
         )
     except Exception as e:
         return err(str(e))
+
+
+async def _coordinate_note(tab, resize_scale: float, size: Optional[tuple[int, int]],
+                           region: Optional[dict], full_page: bool) -> list[str]:
+    """How a point in the saved image maps to mouse_click_xy, when it is not 1:1.
+
+    A capture is taken at devicePixelRatio and then shrunk to max_dimension, so a point read
+    off the image is not a CSS pixel: a 2560 px wide viewport saved at 1920 px put every click
+    a quarter off, and the result only said "[resized ...]".
+    """
+    try:
+        ctx = await _image_output.viewport_context(tab, timeout=2.0)
+        dpr = float(ctx.get("dpr") or 1)
+    except Exception as exc:
+        if resize_scale == 1.0:
+            return []
+        return [f"image resized by {resize_scale:.4g}; devicePixelRatio not measured "
+                f"({type(exc).__name__}), so CSS coordinates = image coordinates / "
+                f"({resize_scale:.4g} × devicePixelRatio)"]
+    css_per_px = 1.0 / (dpr * resize_scale)
+    if abs(css_per_px - 1.0) < 1e-3 and resize_scale == 1.0:
+        return []
+    r = f"{css_per_px:.4g}"
+    head = (f"coordinates: 1 image px = {r} CSS px (devicePixelRatio {dpr:g}, "
+            f"resize scale {resize_scale:.4g}"
+            + (f", saved {size[0]}×{size[1]}" if size else "") + ")")
+    if region:
+        x0, y0 = float(region.get("x", 0)), float(region.get("y", 0))
+        how = (f"mouse_click_xy(x={x0:g} + image_x × {r}, y={y0:g} + image_y × {r}), "
+               "the region's viewport offset added")
+    elif full_page:
+        top = float(ctx.get("pageTop") or 0)
+        how = (f"page point = (image_x × {r}, image_y × {r}); mouse_click_xy needs the viewport "
+               f"point, so subtract the scroll offset (now {top:g} px) from y")
+    else:
+        how = f"mouse_click_xy(x=image_x × {r}, y=image_y × {r})"
+    note = f"{head}: {how}"
+    if abs(css_per_px - 1.0) < 1e-3:
+        note = f"{head}: image coordinates are CSS coordinates, use them as they are"
+    return [note]
 
 
 async def _visible_text_of(tab, el) -> str:
@@ -631,8 +690,16 @@ async def get_links(same_origin: bool = False, limit: int = 200) -> str:
 
 
 @mcp.tool()
-async def list_frames() -> str:
-    """List every frame on the active tab, cross-origin (out-of-process) ones included."""
+async def list_frames(max_url_len: int = 200) -> str:
+    """List every frame on the active tab, cross-origin (out-of-process) ones included.
+
+    Args:
+        max_url_len: frame URLs longer than this are cut, and the row says by how much
+            (`url_cut`): a payment frame's ?config=<base64>&signature=... runs to thousands
+            of characters. 0 returns every URL whole.
+    """
+    if max_url_len < 0:
+        return err("max_url_len must be >= 0 (0 = whole URLs)")
     try:
         tab = BrowserState.active_tab()
         frames = await _wait(all_frames(tab), what="list_frames")
@@ -646,7 +713,7 @@ async def list_frames() -> str:
                    "out_of_process": f["conn"] is not tab}
             if f["scan_error"]:
                 row["error"] = f"child frames not checked: {f['scan_error']}"
-            rows.append(row)
+            rows.append(cut_url(row, max_url_len))
         return ok(json.dumps(rows, indent=2, default=str))
     except Exception as e:
         return err(str(e))

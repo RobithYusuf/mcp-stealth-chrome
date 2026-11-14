@@ -63,10 +63,33 @@ def enabled() -> bool:
     return os.environ.get(ENV_SWITCH, "1").strip().lower() not in ("0", "false", "no", "off")
 
 
+# Rows of each list server_status shows; the rest are counted and summed. 47 kept fallbacks,
+# each on its own row, made server_status mostly a profile list.
+STATUS_ROWS = 5
+_ROW_LISTS = ("removed", "kept_with_data", "skipped_in_use", "skipped")
+
+
 def status() -> dict:
-    """What the last pass did, for server_status. Starts nothing."""
+    """What the last pass did, for server_status. Starts nothing.
+
+    A list longer than STATUS_ROWS keeps its first rows and says how many there are in all,
+    their size, and where the whole list is (`<list>_more`)."""
     with _LOCK:
-        return json.loads(json.dumps(_LAST, default=str))
+        out = json.loads(json.dumps(_LAST, default=str))
+    for name in _ROW_LISTS:
+        rows = out.get(name)
+        if not isinstance(rows, list) or len(rows) <= STATUS_ROWS:
+            continue
+        out[name] = rows[:STATUS_ROWS]
+        size = sum(r.get("bytes", 0) or 0 for r in rows if isinstance(r, dict))
+        out[f"{name}_more"] = {
+            "count": len(rows), "shown": STATUS_ROWS, "bytes": size,
+            "note": (f"{len(rows) - STATUS_ROWS} more not shown ({size / 2**20:.0f} MB in all "
+                     f"{len(rows)}); "
+                     + ("they are gone, so nothing lists them now" if name == "removed" else
+                        "profile_report lists every profile left with what it holds")),
+        }
+    return out
 
 
 # ── facts about a folder ───────────────────────────────────────────────────────────────────

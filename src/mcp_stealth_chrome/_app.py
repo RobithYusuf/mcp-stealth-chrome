@@ -111,6 +111,38 @@ async def _run_unless_a_dialog_blocks(name: str, run) -> Any:
     return task.result()
 
 
+# Tool name -> the argument names its schema advertises, read once per tool.
+_PARAMETER_NAMES: dict[str, frozenset] = {}
+
+
+def unknown_arguments_error(name: str, tool: Any, arguments: Any) -> str | None:
+    """Words for arguments the tool does not take, or None when every one is known.
+
+    FastMCP's argument model ignores a name it does not know, on every tool, so
+    screenshot(path="x.jpg", quality=45) saved shot-<ts>.png and said nothing about `path`.
+    """
+    if not arguments:
+        return None
+    known = _PARAMETER_NAMES.get(name)
+    if known is None:
+        known = frozenset((tool.parameters or {}).get("properties") or ())
+        _PARAMETER_NAMES[name] = known
+    unknown = [key for key in arguments if key not in known]
+    if not unknown:
+        return None
+    import difflib
+    hints = []
+    for key in unknown:
+        close = difflib.get_close_matches(str(key), sorted(known), n=1, cutoff=0.6)
+        if close:
+            hints.append(f"{key!r}: did you mean {close[0]!r}?")
+    listed = ", ".join(repr(key) for key in unknown)
+    valid = ", ".join(sorted(known)) or "none"
+    return (f"Error: {name} does not take {listed}; nothing was done. "
+            + (" ".join(hints) + " " if hints else "")
+            + f"Valid arguments: {valid}")
+
+
 class StealthMCP(FastMCP):
     """FastMCP boundary preserving native content and rejecting tab races."""
 
@@ -119,6 +151,9 @@ class StealthMCP(FastMCP):
         tool = self._tool_manager.get_tool(name)
         if tool is None:
             return await super().call_tool(name, arguments)
+        refused = unknown_arguments_error(name, tool, arguments)
+        if refused:
+            return tool.fn_metadata.convert_result(refused)
 
         try:
             session = context.session

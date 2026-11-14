@@ -363,6 +363,88 @@ def _mouse_button(name: str):
     return MouseButton(name)
 
 
+_POINT_JS = r"""(() => {
+  let el = document.elementFromPoint(%(x)s, %(y)s);
+  for (let i = 0; el && el.shadowRoot && i < 20; i++) {
+    const inner = el.shadowRoot.elementFromPoint(%(x)s, %(y)s);
+    if (!inner || inner === el) break;
+    el = inner;
+  }
+  if (!el) return {info: ''};
+  const attr = n => (el.getAttribute(n) || '').slice(0, 80);
+  const tag = el.tagName.toLowerCase();
+  const info = {tag, id: el.id ? String(el.id).slice(0, 80) : '', name: attr('name'),
+                role: attr('role'), label: attr('aria-label'), type: attr('type')};
+  if (tag === 'iframe' || tag === 'frame') {
+    const r = el.getBoundingClientRect();
+    info.src = attr('src');
+    info.local = [Math.round(%(x)s - r.left - el.clientLeft), Math.round(%(y)s - r.top - el.clientTop)];
+  } else if (!['input', 'textarea', 'select'].includes(tag) && !el.isContentEditable) {
+    info.text = (el.innerText || '').trim().replace(/\s+/g, ' ').slice(0, 40);
+  }
+  return {el, info: JSON.stringify(info)};
+})()"""
+
+
+async def _what_is_at(tab: Any, x: int, y: int) -> str:
+    """What a click at (x, y) lands on, read in the isolated world: tag, id, name, role and a
+    little text, and for an iframe its name and the URL of the frame it shows, which a
+    form-posted frame has nowhere in the DOM. "" when nothing can be read."""
+    from nodriver import cdp
+    from .. import refs
+    group = refs.new_object_group()
+    try:
+        parts = None
+        for fresh in (False, True):
+            try:
+                ctx = await refs._world_context(tab, str(tab.target.target_id), fresh)
+                parts = await refs.evaluate_parts(
+                    tab, _POINT_JS % {"x": float(x), "y": float(y)}, group, context_id=ctx)
+                break
+            except Exception:
+                continue
+        if parts is None:
+            return "what is there could not be read"
+        info_obj = parts.get("info")
+        raw = getattr(info_obj, "value", None) if info_obj is not None else None
+        if not raw:
+            return "nothing is there (no element at that point)"
+        info = json.loads(raw)
+        words = info["tag"] + (f"#{info['id']}" if info.get("id") else "")
+        for key in ("name", "type", "role", "label"):
+            if info.get(key):
+                words += f" {key}={info[key]!r}"
+        if info.get("text"):
+            words += f" text={info['text']!r}"
+        if info["tag"] in ("iframe", "frame"):
+            frame_url = None
+            el = parts.get("el")
+            try:
+                node = await tab.send(cdp.dom.describe_node(object_id=el.object_id))
+                frame_id = str(node.frame_id) if node.frame_id else None
+                if frame_id:
+                    for found in await refs.all_frames(tab):
+                        if found["frame"] is not None and str(found["frame"].id_) == frame_id:
+                            frame_url = found["frame"].url
+                            break
+            except Exception:
+                frame_url = None
+            if frame_url:
+                shown = frame_url if len(frame_url) <= 200 else (
+                    f"{frame_url[:200]}… ({len(frame_url) - 200} more chars; list_frames(max_url_len=0))")
+                words += f" showing {shown}"
+            else:
+                words += " (its frame URL could not be read" + (
+                    f"; src={info['src']!r})" if info.get("src") else ")")
+            if info.get("local"):
+                words += f", at ({info['local'][0]},{info['local'][1]}) inside the frame"
+        return f"on {words}"
+    except Exception as exc:
+        return f"what is there could not be read ({type(exc).__name__})"
+    finally:
+        await refs.release_group(tab, group)
+
+
 @mcp.tool()
 async def mouse_click_xy(x: int, y: int, button: str = "left",
                          move_first: bool = True) -> str:
@@ -393,8 +475,15 @@ async def mouse_click_xy(x: int, y: int, button: str = "left",
             if _srv._dialog_note(tab):
                 return err(f"mouse_click_xy: NOT clicked — moving the pointer there opened a "
                            f"dialog{_srv._dialog_note(tab)}")
+        # Read just before the press, after the hover: a layout that moved 25 px sent a click
+        # into the next field while the result still said only "clicked (x,y)".
+        try:
+            target = await asyncio.wait_for(_what_is_at(tab, x, y), timeout=3.0)
+        except Exception:
+            target = "what is there could not be read in time"
         await _srv._dispatch_input(tab, tab.mouse_click(x, y, button=_mouse_button(button)))
-        return ok(f"clicked ({x},{y}){' after hover' if move_first else ''}{_srv._dialog_note(tab)}")
+        return ok(f"clicked ({x},{y}){' after hover' if move_first else ''}, {target} "
+                  f"(read before the press){_srv._dialog_note(tab)}")
     except Exception as e:
         return err(str(e))
 
@@ -475,10 +564,48 @@ async def drag_and_drop(start_x: int, start_y: int, end_x: int, end_y: int) -> s
 
 @mcp.tool()
 async def wait_for(selector: Optional[str] = None, text: Optional[str] = None,
-                    timeout: float = 10.0) -> str:
-    """Wait until selector exists or text is visible on the page. With neither, just sleep."""
+                    timeout: float = 10.0, frame_url: Optional[str] = None) -> str:
+    """Wait until selector exists or text is visible on the page. With neither, just sleep.
+
+    Args:
+        selector: CSS selector to wait for in the top document
+        text: rendered text to wait for
+        timeout: seconds before an error says it never came
+        frame_url: regex: wait until a frame whose URL matches exists, cross-origin ones
+            included (the URLs list_frames shows). A frame filled by a form post (3-D Secure)
+            has no src in the DOM, so iframe[src*=...] never matches it. Use one of
+            selector, text or frame_url.
+    """
+    if sum(1 for given in (selector, text, frame_url) if given) > 1:
+        return err("wait_for: give one of selector, text or frame_url; nothing was waited for")
     try:
         tab = BrowserState.active_tab()
+        if frame_url:
+            from ..refs import all_frames
+            try:
+                regex = re.compile(frame_url)
+            except re.error as exc:
+                return err(f"wait_for: frame_url is not a valid regex: {exc}")
+            deadline = time.monotonic() + timeout
+            seen: list[str] = []
+            while True:
+                try:
+                    frames = await asyncio.wait_for(all_frames(tab), timeout=max(
+                        1.0, min(5.0, deadline - time.monotonic())))
+                except Exception:
+                    frames = []
+                seen = [str(f["frame"].url) for f in frames if f["frame"] is not None]
+                for found in frames:
+                    url = str(found["frame"].url) if found["frame"] is not None else ""
+                    if found["depth"] > 0 and regex.search(url):
+                        where = "out of process" if found["conn"] is not tab else "in process"
+                        return ok(f"frame matching {frame_url!r} appeared: {url} "
+                                  f"(depth {found['depth']}, {where})")
+                if time.monotonic() >= deadline:
+                    listed = "; ".join(u[:120] for u in seen[1:6]) or "none"
+                    return err(f"no frame URL matched {frame_url!r} after {timeout}s; "
+                               f"child frames seen: {listed}")
+                await asyncio.sleep(0.25)
         if selector:
             await tab.wait_for(selector=selector, timeout=timeout)
             return ok(f"{selector} appeared")

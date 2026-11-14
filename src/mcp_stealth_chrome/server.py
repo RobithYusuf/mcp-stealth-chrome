@@ -39,6 +39,7 @@ from .key_outcome import element_unread
 from .helpers import (
     OPEN_DIALOGS,
     adblock_package_note,
+    cut_url,
     dialog_note,
     err,
     get_title,
@@ -154,6 +155,20 @@ def _trim_index(index: dict) -> None:
     if overflow > 0:
         for key in list(index)[:overflow]:
             index.pop(key, None)
+
+
+# Response bodies kept by Chrome outside the renderer (Network.enable enableDurableMessages), so
+# they outlive the document that loaded them. Without it a 324-byte JSON reply read after the
+# page moved on answered "No resource with given identifier found". Chrome bounds the store by
+# these sizes and drops the oldest past the total; nothing runs per request on our side.
+CAPTURE_BODY_BUFFER_BYTES = int(os.environ.get("CAPTURE_BODY_BUFFER_BYTES", str(64 * 2**20)))
+CAPTURE_BODY_MAX_BYTES = int(os.environ.get("CAPTURE_BODY_MAX_BYTES", str(10 * 2**20)))
+
+
+def _resource_type(event: Any) -> str:
+    """"XHR", "Fetch", "Document"...: the CDP resource type's own name."""
+    value = getattr(event, "type_", None) or getattr(event, "type", None)
+    return str(getattr(value, "value", value) or "")
 
 
 def _window_state_path(instance_id: str) -> Path:
@@ -6913,8 +6928,23 @@ async def network_start(capture_bodies: bool = True) -> str:
         tid = _target_key(tab)
         # Network.enable so events arrive at all, and so getResponseBody works later. If it
         # fails nothing is captured, and an empty log must not read as a quiet page.
+        kept_note = ""
         try:
-            await tab.send(cdp_network.enable())
+            if capture_bodies and CAPTURE_BODY_BUFFER_BYTES > 0:
+                try:
+                    await tab.send(cdp_network.enable(
+                        max_total_buffer_size=CAPTURE_BODY_BUFFER_BYTES,
+                        max_resource_buffer_size=CAPTURE_BODY_MAX_BYTES,
+                        enable_durable_messages=True))
+                    kept_note = (f"; Chrome asked to keep response bodies past a navigation "
+                                 f"({CAPTURE_BODY_BUFFER_BYTES // 2**20} MB in all, oldest dropped "
+                                 "first)")
+                except Exception as exc:
+                    await tab.send(cdp_network.enable())
+                    kept_note = (f"; this Chrome does not keep bodies past a navigation "
+                                 f"({_exc_text(exc)}): read them before the page moves on")
+            else:
+                await tab.send(cdp_network.enable())
         except Exception as exc:
             BrowserState.capture_network = False
             return err(f"network capture NOT started, Network.enable failed: {_exc_text(exc)}")
@@ -6941,6 +6971,7 @@ async def network_start(capture_bodies: bool = True) -> str:
                     "url": getattr(req, "url", ""),
                     "method": getattr(req, "method", ""),
                     "type": str(getattr(event, "type_", "") or getattr(event, "type", "")),
+                    "resource_type": _resource_type(event),
                     "request_headers": req_headers,
                     "request_body": getattr(req, "post_data", None),
                     "status": None,
@@ -6956,6 +6987,7 @@ async def network_start(capture_bodies: bool = True) -> str:
                 log_sink.append({
                     "type": "request", "request_id": rid,
                     "url": entry["url"], "method": entry["method"],
+                    "resource_type": entry["resource_type"],
                 })
                 _trim_capture(log_sink)
             except Exception:
@@ -6977,6 +7009,7 @@ async def network_start(capture_bodies: bool = True) -> str:
                     "url": getattr(resp, "url", ""),
                     "status": getattr(resp, "status", None),
                     "mime": getattr(resp, "mime_type", None),
+                    "resource_type": _resource_type(event),
                 })
                 _trim_capture(log_sink)
             except Exception:
@@ -6985,12 +7018,12 @@ async def network_start(capture_bodies: bool = True) -> str:
         if tid in _NETWORK_ARMED_TAB_IDS:
             return ok(
                 f"network capture started (capture_bodies={capture_bodies}); "
-                "handler already armed on this tab"
+                f"handler already armed on this tab{kept_note}"
             )
         tab.add_handler(cdp_network.RequestWillBeSent, on_req)
         tab.add_handler(cdp_network.ResponseReceived, on_res)
         _NETWORK_ARMED_TAB_IDS.add(tid)
-        return ok(f"network capture started (capture_bodies={capture_bodies})")
+        return ok(f"network capture started (capture_bodies={capture_bodies}){kept_note}")
     except Exception as e:
         return err(str(e))
 
@@ -7003,15 +7036,19 @@ async def network_get(
     max_body_bytes: int = 10000,
     full: bool = False,
     reveal_values: bool = False,
+    resource_type: Optional[str] = None,
+    max_url_len: int = 200,
 ) -> str:
     """Retrieve captured network events.
 
     Args:
         limit: max entries returned (chronological: oldest first within the last `limit`, newest last)
         filter_url: substring filter on URL
-        include_body: fetch response bodies via CDP Network.getResponseBody
-            for each matching entry. Bodies are truncated to max_body_bytes.
-            Requires network_start(capture_bodies=True) (default).
+        include_body: return response bodies, truncated to max_body_bytes. network_start
+            asks Chrome to keep bodies outside the page (CAPTURE_BODY_BUFFER_BYTES, 64 MB in
+            all, the oldest dropped first; one body up to CAPTURE_BODY_MAX_BYTES, 10 MB), so
+            they can still be read after the page navigated away. Requires
+            network_start(capture_bodies=True).
         max_body_bytes: cap per-body length (default 10000)
         full: if True, return entries with full headers + body fields
             from network_index (use this once you've called network_start).
@@ -7020,21 +7057,34 @@ async def network_get(
             they are. By default their values read "*** (N chars)", because tool output
             lands in the transcript. Bodies other than JSON or forms cannot be read field
             by field and pass through.
+        resource_type: only these CDP resource types, comma separated, any case:
+            "xhr,fetch" leaves out documents, scripts, styles, images and fonts.
+        max_url_len: URLs longer than this are cut, and the entry says by how much
+            (`url_cut`). 0 returns every URL whole.
     """
     if limit < 0:
         return err("limit must be >= 0")
     if max_body_bytes < 0:
         return err("max_body_bytes must be >= 0")
+    if max_url_len < 0:
+        return err("max_url_len must be >= 0 (0 = whole URLs)")
     if not (BrowserState.capture_network or BrowserState.network_logs or BrowserState.network_index):
         return err("NOT listening: call network_start() before the traffic. An empty list "
                    "would read as a quiet page when nothing was monitored.")
+    wanted = None
+    if resource_type:
+        wanted = {part.strip().lower() for part in str(resource_type).split(",") if part.strip()}
+
+    def keep(entry: dict) -> bool:
+        if filter_url and filter_url not in (entry.get("url") or ""):
+            return False
+        return wanted is None or str(entry.get("resource_type") or "").lower() in wanted
+
     if full or include_body:
         # Work on copies: response bodies are fetched on demand, and caching a
         # truncated/error sentinel in network_index made a later call with a
         # larger limit permanently unable to retrieve the real body.
-        entries = [dict(entry) for entry in BrowserState.network_index.values()]
-        if filter_url:
-            entries = [e for e in entries if filter_url in e.get("url", "")]
+        entries = [dict(entry) for entry in BrowserState.network_index.values() if keep(entry)]
         entries = entries[-limit:] if limit else []
         if include_body and entries:
             try:
@@ -7072,15 +7122,41 @@ async def network_get(
                     e["response_body"] = f"<getResponseBody error: {ex}>"
         if not reveal_values:
             entries = [mask_request_entry(e) for e in entries]
-        return ok(json.dumps(entries, indent=2, default=str)[:50000])
+        entries = [cut_url(e, max_url_len) for e in entries]
+        return ok(_bounded_entries(entries))
     # Legacy event-stream view
-    logs = BrowserState.network_logs
-    if filter_url:
-        logs = [l for l in logs if filter_url in l.get("url", "")]
+    logs = [l for l in BrowserState.network_logs if keep(l)]
     selected = logs[-limit:] if limit else []
     if not reveal_values:
         selected = [mask_request_entry(l) for l in selected]
-    return ok(json.dumps(selected, indent=2, default=str))
+    selected = [cut_url(l, max_url_len) for l in selected]
+    return ok(_bounded_entries(selected))
+
+
+_NETWORK_GET_MAX_CHARS = 50000
+
+
+def _bounded_entries(entries: list) -> str:
+    """The entries as a JSON list, or, past _NETWORK_GET_MAX_CHARS, an object naming how many
+    of the oldest were left out. A plain slice of the text cut a body in half and returned
+    JSON that no longer parsed, with nothing saying so."""
+    text = json.dumps(entries, indent=2, default=str)
+    if len(text) <= _NETWORK_GET_MAX_CHARS:
+        return text
+    kept = list(entries)
+    while kept:
+        kept = kept[max(1, len(kept) // 10):] if len(kept) > 10 else kept[1:]
+        text = json.dumps({"entries": kept}, indent=2, default=str)
+        if len(text) <= _NETWORK_GET_MAX_CHARS - 400:
+            break
+    left_out = len(entries) - len(kept)
+    return json.dumps({
+        "entries": kept,
+        "omitted": left_out,
+        "note": (f"{left_out} of {len(entries)} entries, the oldest, were left out to stay under "
+                 f"{_NETWORK_GET_MAX_CHARS} chars; ask with a smaller limit, filter_url, "
+                 "resource_type, max_body_bytes or max_url_len"),
+    }, indent=2, default=str)
 
 
 # ══════════════════════════════════════════════════════════════════════════

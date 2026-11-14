@@ -67,7 +67,12 @@ uvx mcp-stealth-chrome → Python 3.11+ → FastMCP → nodriver → Chrome/Chro
 - Captured requests follow the same rule. `network_get`, `intercept_log`, `wait_for_request`, `auth_capture`,
   `export_curl` and `http_request` responses (headers, JSON body, final URL, pending and status payloads) go
   through `helpers.mask_*`, with `reveal_values=True` as the way out where a caller needs the value. Everything
-  under a secret key is hidden, except that a `session` object keeps its non-secret fields, and `mask_url` works
+  under a secret key is hidden, except that a `session` object keeps its non-secret fields and a value both whose
+  name and shape say it cannot be a credential stays readable (`_harmless_under_secret`: the name's last word
+  describes, such as type, scheme, status, issuer, name, date, month; the value is a boolean, an ISO date, a 2 or
+  3 letter code, a few plain words with no digits, or up to 4 digits under month, year or count names). A token
+  vault's `{"gatewayTokens": [...]}` hid the card's scheme, expiry and issuer, and the caller had to reveal every
+  credential to read a date. A secret name further down hides all below it again. `mask_url` works
   on the raw text so an ordinary parameter stays byte for byte. It also hides userinfo (`***@host`, since a token
   can be the user name; also with no scheme, `user:pass@host/path`, but not `mailto:`) and secret pairs in the
   fragment, where OAuth puts `access_token`, also after a hash route. In a URL only, `code` (OAuth authorization
@@ -109,6 +114,10 @@ uvx mcp-stealth-chrome → Python 3.11+ → FastMCP → nodriver → Chrome/Chro
   call for this reason, and only a real client shows it: test through `tests/_protocol.py`.
 - FastMCP parses a string as JSON unless the annotation is exactly `str`, so `Optional[str]` turned `'{"a":1}'` into a
   validation error and `'null'` into None. `patches._patch_fastmcp_keeps_text` stops that, and `server_status` reports it.
+- FastMCP's argument model ignores a name it does not know, on every tool: `screenshot(path="x.jpg", quality=45)`
+  saved `shot-<ts>.png` and said nothing. `StealthMCP.call_tool` refuses unknown names before the tool runs
+  (`_app.unknown_arguments_error`, from the advertised schema, 0.14 µs a call), naming them and the valid ones.
+  `batch_actions` and `workflow_run` call the functions directly, where Python already raises on them.
 - Do not add a tool that can fail silently. If an action may not have taken effect, the response says
   so — see the honest-reporting invariants below.
 - Do not weaken a security property to make a test pass: managed paths never escape their root,
@@ -214,6 +223,11 @@ conclusions. Each rule below replaced a real lie.
   A dialog only counts once `_watch_dialogs` has armed that tab, so one on a tab no tool has touched yet is not seen.
 - `Transaction` in nodriver up to 0.48 is a Future, so a reply arriving after `wait_for` cancelled it raised inside the CDP
   listener and killed it: every later call on that tab hung. `patches._patch_transaction_late_reply` closes that.
+- `mouse_click_xy` takes coordinates as an explicit choice and does not refuse a covered point, but it reads what
+  is there just before the press, in the isolated world (`_what_is_at`): tag, id, name, a little text, and for an
+  iframe the URL of the frame it shows (`DOM.describeNode` frameId matched in `all_frames`, so a form-posted frame
+  with no `src` is named) and the point inside it. Frame URLs are navigation URLs and are not masked. A layout that
+  moved 25 px sent a click into the next field while the result said only "clicked (x,y)".
 - `hover`, `click_element_offset` and `click_at_corner` go through `_prepare_target` like a click. Without it they answered
   `hovered` and `clicked` at points outside the viewport and on covered elements.
 - A click that opens a tab changes nothing on its own page, so `_page_sig(pages=True)` lists the browser's tabs and
@@ -276,6 +290,17 @@ conclusions. Each rule below replaced a real lie.
   object address changes when nodriver recreates a `Tab` for the same target and can be recycled onto
   a different tab after GC.
 - Capture buffers are ring buffers (`CAPTURE_MAX_EVENTS`, `CAPTURE_MAX_INDEXED`, both env-tunable).
+- Chrome forgets a response body when the document that loaded it goes: a 324-byte JSON reply read after the page
+  navigated answered "No resource with given identifier found". Reading bodies eagerly at `loadingFinished` lost the
+  same race on a page that navigates as soon as its fetch resolves (measured, Chrome 157). `network_start` instead
+  passes `enableDurableMessages` with `maxTotalBufferSize` (`CAPTURE_BODY_BUFFER_BYTES`, 64 MB, Chrome drops the
+  oldest) and `maxResourceBufferSize` (`CAPTURE_BODY_MAX_BYTES`, 10 MB): bodies then survive a same-site and a
+  cross-site navigation, a later plain `Network.enable` from another tool does not turn it off, and 300 fetches
+  loaded no slower (0.18 to 0.20 s against 0.23 to 0.25 s without). A body over the per-resource size, or pushed
+  out of the total, is still lost, and so is one on a Chrome that ignores the flag.
+- `network_get` never slices its JSON: past 50,000 characters it returns `{entries, omitted, note}` with the oldest
+  left out. `[:50000]` cut a body in half and returned text that did not parse. URLs longer than `max_url_len`
+  (200) are cut after masking, with `url_cut` saying how much and how to get it whole; `list_frames` does the same.
 
 ### Browser lifecycle
 
