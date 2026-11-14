@@ -42,7 +42,10 @@ def _pages(cross: str) -> dict:
         "/card.html": ('<!doctype html><title>Card</title><body style="margin:0">'
                        '<input name="expiry" style="width:280px;height:60px"></body>'),
         "/leave.html": ("<!doctype html><title>Leave</title><script>"
-                        "fetch('/api/tokens').then(r => r.text()).then(() => location.href = '/done.html');"
+                        "document.cookie = 'sid=SYNTHSID; path=/';"
+                        "fetch('/api/tokens?access_token=SYNTHURL', {headers: {"
+                        "'Authorization': 'Bearer SYNTHAUTH', 'X-Api-Key': 'SYNTHKEY'}})"
+                        ".then(r => r.text()).then(() => location.href = '/done.html');"
                         "</script>"),
         "/leave-site.html": ("<!doctype html><title>Leave</title><script>"
                              "fetch('/api/tokens').then(r => r.text())"
@@ -85,6 +88,8 @@ class _Fixture(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        if self.path.startswith("/api/"):
+            return self._reply('{"ok": true}', "application/json")
         self._reply("<!doctype html><title>3DS</title><body style='margin:0'><p>Challenge</p></body>")
 
 
@@ -185,13 +190,24 @@ def test_3_a_small_json_body_survives_the_page_moving_on(mcp, base):
     assert not entry["response_body"].startswith("<getResponseBody"), entry["response_body"]
     body = json.loads(entry["response_body"])
     card = body["gatewayTokens"][0]
-    # 4: masked by default, and only the credentials are.
+    # 4: the default hides everything under the secret-named gatewayTokens.
+    assert card["cardScheme"].startswith("***") and card["token"].startswith("***")
+    assert "4111110000001111" not in reply.text and "VISA" not in reply.text
+    # reveal_values="body": values under the parent show, credentials do not.
+    shown = mcp.call("network_get", include_body=True, filter_url="/api/tokens",
+                     reveal_values="body")
+    doc = shown.json()
+    assert doc["reveal_values"] == "body" and "at the caller's request" in doc["note"], doc
+    entry = doc["entries"][-1]
+    card = json.loads(entry["response_body"])["gatewayTokens"][0]
     assert card["cardScheme"] == "VISA" and card["issuerName"] == "Test Bank AG"
     assert card["lastSuccessfulPurchaseDate"] == "2026-11-13T09:41:07Z"
-    assert card["token"].startswith("***") and card["id"].startswith("***")
-    assert "4111110000001111" not in reply.text and "gt_synth" not in reply.text
+    assert card["token"].startswith("***")
+    for secret in ("4111110000001111", "SYNTHAUTH", "SYNTHKEY", "SYNTHSID", "SYNTHURL"):
+        assert secret not in shown.text, secret
+    assert entry["request_headers"]["Authorization"].startswith("***")
     revealed = mcp.call("network_get", include_body=True, filter_url="/api/tokens", reveal_values=True)
-    assert "4111110000001111" in revealed.text
+    assert "4111110000001111" in revealed.text and "SYNTHAUTH" in revealed.text
 
 
 def test_7_network_get_filters_by_resource_type_and_cuts_urls(mcp, base):
@@ -219,8 +235,65 @@ def test_3_the_body_survives_a_same_and_a_cross_site_navigation(mcp, base, path)
     assert "past a navigation" in started.text, started.text
     _go(mcp, f"{base}{path}")
     assert not mcp.call("wait_for_url", pattern="done.html", timeout=10).failed
-    reply = mcp.call("network_get", include_body=True, filter_url="/api/tokens")
-    assert '"cardScheme": "VISA"' in reply.json()[-1]["response_body"], reply.text
+    reply = mcp.call("network_get", include_body=True, filter_url="/api/tokens",
+                     reveal_values="body")
+    assert '"cardScheme": "VISA"' in reply.json()["entries"][-1]["response_body"], reply.text
+
+
+def test_3r_a_clear_says_kept_and_drops_the_old_bodies_from_every_tool(mcp, base):
+    """Review 2: re-arming emptied the lists but said nothing of the bodies Chrome kept."""
+    _go(mcp, f"{base}/plain.html")
+    started = mcp.call("network_start")
+    assert "Chrome keeps response bodies past a navigation" in started.text, started.text
+    _go(mcp, f"{base}/leave.html")
+    assert not mcp.call("wait_for_url", pattern="done.html", timeout=10).failed
+    before = mcp.call("network_get", include_body=True, filter_url="/api/tokens").json()
+    assert before and before[-1]["response_body"].startswith("{"), before
+    again = mcp.call("network_start")
+    assert "no tool can read them any more" in again.text, again.text
+    assert mcp.call("network_get", include_body=True, filter_url="/api/tokens").json() == []
+    off = mcp.call("network_start", capture_bodies=False)
+    assert "keeps response bodies" not in off.text, off.text
+
+
+POST_JS = ("setTimeout(() => fetch('/api/vault', {method: 'POST', headers: {"
+           "'Authorization': 'Bearer SYNTHAUTH', 'Content-Type': 'application/json'}, "
+           "body: JSON.stringify({tokens: {type: 'card', issuerName: 'Test Bank AG', "
+           "token: 'SYNTHTOKEN'}})}), 400); 1")
+
+
+def _check_body_mode(text: str):
+    assert "at the caller's request" in text, text
+    assert "Test Bank AG" in text and "SYNTHTOKEN" not in text and "SYNTHAUTH" not in text, text
+
+
+@pytest.mark.parametrize("tool", ["auth_capture", "wait_for_request", "export_curl",
+                                  "intercept_log"])
+def test_4r_reveal_body_on_every_captured_traffic_tool(mcp, base, tool):
+    _go(mcp, f"{base}/plain.html")
+    assert not mcp.call("network_start").failed
+    if tool == "intercept_log":
+        assert not mcp.call("intercept_start", url_pattern="*api/vault*").failed, "start"
+    mcp.evaluate(POST_JS)
+    if tool == "auth_capture":
+        reply = mcp.call("auth_capture", filter_url_pattern="/api/vault", reveal_values="body")
+    elif tool == "wait_for_request":
+        reply = mcp.call("wait_for_request", url_pattern="/api/vault", reveal_values="body")
+    else:
+        time.sleep(1.5)
+        if tool == "export_curl":
+            reply = mcp.call("export_curl", url_contains="/api/vault", reveal_values="body")
+        else:
+            reply = mcp.call("intercept_log", reveal_values="body")
+            mcp.call("intercept_stop")
+    assert not reply.failed, reply.text
+    _check_body_mode(reply.text)
+    plain = mcp.call(tool, **({"filter_url_pattern": "/api/vault", "timeout": 1}
+                              if tool == "auth_capture" else
+                              {"url_pattern": "/api/vault", "timeout": 1}
+                              if tool == "wait_for_request" else
+                              {"url_contains": "/api/vault"} if tool == "export_curl" else {}))
+    assert "Test Bank AG" not in plain.text
 
 
 def test_3_cost_on_a_page_of_300_requests(mcp, base):

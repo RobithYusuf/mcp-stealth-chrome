@@ -474,9 +474,11 @@ async def _coordinate_note(tab, resize_scale: float, size: Optional[tuple[int, i
         how = (f"mouse_click_xy(x={x0:g} + image_x × {r}, y={y0:g} + image_y × {r}), "
                "the region's viewport offset added")
     elif full_page:
+        left = float(ctx.get("pageLeft") or 0)
         top = float(ctx.get("pageTop") or 0)
         how = (f"page point = (image_x × {r}, image_y × {r}); mouse_click_xy needs the viewport "
-               f"point, so subtract the scroll offset (now {top:g} px) from y")
+               f"point: mouse_click_xy(x=image_x × {r} − {left:g}, y=image_y × {r} − {top:g}), "
+               "the scroll offset taken off both")
     else:
         how = f"mouse_click_xy(x=image_x × {r}, y=image_y × {r})"
     note = f"{head}: {how}"

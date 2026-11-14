@@ -66,73 +66,6 @@ def _mask_all(node: Any) -> Any:
     return node if node is None or isinstance(node, bool) else masked_value(node)
 
 
-# Below a secret key ({"gatewayTokens": [{...}]}) a credential can sit under any name, so every
-# value there is hidden unless both its name and its shape say it cannot be one. The name's
-# last word must describe (a type, a date, a country...), and the value must be a boolean, a
-# date, a 2 or 3 letter code, a few plain words, or a small number under a counting name.
-# Anything long, with digits mixed in, oddly cased, or under id/value/key/number names stays
-# hidden. A token vault's reply then still shows the card's scheme, expiry and issuer.
-_DESCRIPTIVE_LAST = frozenset((
-    "type", "kind", "scheme", "brand", "network", "status", "state", "source", "method",
-    "category", "class", "level", "tier", "mode", "format", "country", "currency", "region",
-    "locale", "language", "lang", "name", "label", "title", "description", "issuer", "provider",
-    "bank", "month", "year", "day", "date", "time", "at", "on", "created", "updated", "expires",
-    "expiry", "expiration", "count", "total", "size", "length", "version", "index", "default",
-    "primary", "enabled", "active", "verified", "valid", "reason", "result",
-))
-_COUNTING_LAST = frozenset(("month", "year", "day", "count", "total", "size", "length",
-                            "version", "index"))
-_ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?"
-                       r"(?:Z|[+-]\d{2}:?\d{2})?)?$")
-_LETTER_CODE = re.compile(r"^[A-Z]{2,3}$")
-_PLAIN_WORD = re.compile(r"^(?:[a-z]{1,15}|[A-Z]{1,15}|[A-Z][a-z]{1,14})$")
-
-
-def _last_word(name: Any) -> str:
-    words = re.split(r"[-_.\s]+", re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "-", str(name)))
-    return words[-1].lower() if words else ""
-
-
-def _plain_words(value: str) -> bool:
-    """A few ordinary words: "VISA", "CONSUMER_CREDIT", "Test Bank AG". Never digits, and
-    each word is lower case, upper case or capitalized, which a random string rarely is."""
-    if len(value) > 40:
-        return False
-    words = [w for w in re.split(r"[ _\-.,&']+", value) if w]
-    return 0 < len(words) <= 6 and all(_PLAIN_WORD.match(w) for w in words)
-
-
-def _harmless_under_secret(name: Any, value: Any) -> bool:
-    """Whether a value below a secret key can be shown: see _DESCRIPTIVE_LAST."""
-    if value is None or isinstance(value, bool):
-        return True
-    last = _last_word(name)
-    if isinstance(value, (int, float)):
-        return last in _COUNTING_LAST and float(value).is_integer() and 0 <= value <= 9999
-    if not isinstance(value, str):
-        return False
-    if last == "code":  # issuerCountryCode, currencyCode; a security code is digits
-        return bool(_LETTER_CODE.match(value))
-    if last not in _DESCRIPTIVE_LAST:
-        return False
-    if last in _COUNTING_LAST and re.fullmatch(r"\d{1,4}", value):
-        return True
-    return bool(_ISO_DATE.match(value) or _LETTER_CODE.match(value) or _plain_words(value))
-
-
-def _mask_under_secret(node: Any, name: Any = None) -> Any:
-    """Everything below a secret key, but for values _harmless_under_secret shows. A secret
-    name further down hides all below it again."""
-    if isinstance(node, dict):
-        return {k: (_mask_all(v) if is_secret_name(k) else _mask_under_secret(v, k))
-                for k, v in node.items()}
-    if isinstance(node, list):
-        return [_mask_under_secret(item, name) for item in node]
-    if name is not None and _harmless_under_secret(name, node):
-        return node
-    return node if node is None or isinstance(node, bool) else masked_value(node)
-
-
 # A session object usually mixes the user and expiry with its tokens. Those stay readable, and
 # any secret names inside are still caught field by field.
 _CONTAINER_ONLY_NAMES = re.compile(r"^(?:session|sessions)$", re.IGNORECASE)
@@ -145,8 +78,7 @@ def _mask_json(node: Any) -> Any:
             if not is_secret_name(k):
                 out[k] = _mask_json(v)
             elif isinstance(v, (dict, list)):
-                out[k] = (_mask_json(v) if _CONTAINER_ONLY_NAMES.match(str(k))
-                          else _mask_under_secret(v))
+                out[k] = _mask_json(v) if _CONTAINER_ONLY_NAMES.match(str(k)) else _mask_all(v)
             elif v is None or isinstance(v, bool):
                 out[k] = v
             else:
@@ -179,10 +111,24 @@ def _mask_pairs(text: str, *, url: bool = False) -> str | None:
     return "&".join(pieces) if found else None
 
 
-def mask_body(body: Any) -> Any:
+def _mask_own_keys(node: Any, name: Any = None) -> Any:
+    """reveal_values="body": only a value whose own key is secret-named is hidden; a value under
+    a secret-named parent is shown. A list's items are under the list's key."""
+    if isinstance(node, dict):
+        return {k: _mask_own_keys(v, k) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_mask_own_keys(item, name) for item in node]
+    if name is None or node is None or isinstance(node, bool) or not is_secret_name(name):
+        return node
+    return masked_value(node)
+
+
+def mask_body(body: Any, *, own_keys_only: bool = False) -> Any:
     """Hide credential fields in a JSON or form body; returned unchanged when it has none.
 
     Other formats cannot be read field by field, so they pass through as they are.
+    own_keys_only is reveal_values="body": in JSON only values whose own key is secret-named
+    stay hidden. A form body is masked by its own names either way.
     """
     if not isinstance(body, str) or not body:
         return body
@@ -192,7 +138,7 @@ def mask_body(body: Any) -> Any:
             parsed = json.loads(text)
         except ValueError:
             return body
-        masked = _mask_json(parsed)
+        masked = _mask_own_keys(parsed) if own_keys_only else _mask_json(parsed)
         return body if masked == parsed else json.dumps(masked, ensure_ascii=False)
     if "=" in text and "\n" not in text and not text.startswith("<"):
         return _mask_pairs(text) or body
@@ -321,18 +267,38 @@ def private_staging(path: Path) -> Iterator[Path]:
             tmp.unlink()
 
 
-def mask_request_entry(entry: dict) -> dict:
-    """A copy of a captured request safe to return from a tool."""
+def mask_request_entry(entry: dict, *, body_mode: bool = False) -> dict:
+    """A copy of a captured request safe to return from a tool. body_mode is
+    reveal_values="body": headers and the URL as always, bodies by their own keys only."""
     out = dict(entry)
     for key in ("headers", "request_headers", "response_headers"):
         if isinstance(out.get(key), dict):
             out[key] = mask_headers(out[key])
     for key in ("body", "request_body"):
         if key in out:
-            out[key] = mask_body(out[key])
+            out[key] = mask_body(out[key], own_keys_only=body_mode)
     if "url" in out:
         out["url"] = mask_url(out["url"])
     return out
+
+
+# reveal_values on the tools that show captured traffic: False hides credentials, True shows
+# everything, "body" shows body values under a secret-named parent but keeps credential headers,
+# URL secrets and every body value whose own key is secret-named hidden.
+BODY_REVEAL_NOTE = ("reveal_values='body': credential headers and URL secrets stay masked, and so "
+                    "does every body value whose own key is secret-named; body values under a "
+                    "secret-named parent were revealed at the caller's request")
+
+
+def reveal_mode(value: Any) -> str:
+    """"none", "all" or "body" for a reveal_values argument; ValueError for anything else."""
+    if value is None or value is False:
+        return "none"
+    if value is True:
+        return "all"
+    if isinstance(value, str) and value.strip().lower() == "body":
+        return "body"
+    raise ValueError(f"reveal_values must be true, false or \"body\", not {value!r}")
 
 
 def cut_url(entry: dict, max_len: int) -> dict:

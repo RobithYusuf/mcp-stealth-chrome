@@ -15,11 +15,14 @@ import re
 import sys
 import threading
 import time
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, Union
 
 from .. import __version__
 from .._app import mcp
-from ..helpers import confined_output_path, err, mask_request_entry, ok, target_key, ts_filename
+from ..helpers import (
+    BODY_REVEAL_NOTE, confined_output_path, err, mask_request_entry, ok, reveal_mode, target_key,
+    ts_filename,
+)
 from ..server import _drop_handlers
 from ..state import EXPORT_DIR, BrowserState, ensure_dirs
 
@@ -410,7 +413,8 @@ async def intercept_start(
 
 
 @mcp.tool()
-async def intercept_log(limit: int = 50, clear: bool = False, reveal_values: bool = False) -> str:
+async def intercept_log(limit: int = 50, clear: bool = False,
+                        reveal_values: Union[bool, Literal["body"]] = False) -> str:
     """Read what interception saw, with its status attached.
 
     Reports whether interception is still active and why it stopped, because an
@@ -418,9 +422,15 @@ async def intercept_log(limit: int = 50, clear: bool = False, reveal_values: boo
     "never started" or "the deadline already fired".
 
     Credential headers, fields and query parameters read "*** (N chars)" because tool
-    output lands in the transcript; reveal_values=True returns them. Bodies other than
-    JSON or forms cannot be read field by field and pass through.
+    output lands in the transcript; reveal_values=True returns them. reveal_values="body"
+    shows body values under a secret-named parent and keeps credential headers, URL secrets
+    and body values whose own key is secret-named hidden. Bodies other than JSON or forms
+    cannot be read field by field and pass through.
     """
+    try:
+        reveal = reveal_mode(reveal_values)
+    except ValueError as exc:
+        return err(f"intercept_log: {exc}; nothing was read")
     state = _INTERCEPT
     holder = state.get("session")
     if holder not in (None, BrowserState.session_key()):
@@ -446,7 +456,11 @@ async def intercept_log(limit: int = 50, clear: bool = False, reveal_values: boo
         }
         if clear:
             state["log"] = []
-    payload["requests"] = entries if reveal_values else [mask_request_entry(e) for e in entries]
+    payload["requests"] = (entries if reveal == "all" else
+                           [mask_request_entry(e, body_mode=reveal == "body") for e in entries])
+    if reveal == "body":
+        payload["reveal_values"] = "body"
+        payload["reveal_note"] = BODY_REVEAL_NOTE
     if state.get("broker") is not None:
         payload["block_ads"] = _ADS_NOTE.strip()
     if not state["active"]:

@@ -415,7 +415,7 @@ requires-dist = [
     { name = "adblock", marker = "extra == 'adblock'", specifier = ">=0.6,<0.7" },
     { name = "curl-cffi", specifier = ">=0.7" },
     { name = "httpx", specifier = ">=0.27" },
-    { name = "mcp", specifier = ">=1.2.0,<2" },
+    { name = "mcp", specifier = ">=1.21.1,<2" },
     { name = "mss", marker = "sys_platform != 'darwin' and extra == 'os-cursor'", specifier = ">=9" },
     { name = "nodriver", specifier = ">=0.48,<0.51" },
     { name = "opencv-python", specifier = ">=4.8" },

@@ -33,37 +33,79 @@ def _masked(doc):
     return json.loads(helpers.mask_body(json.dumps(doc)))
 
 
-def test_4_harmless_fields_under_a_secret_key_stay_readable():
-    """Report 4: every field under gatewayTokens read "*** (N chars)", the date included."""
+# What a review found the narrowed rule let through under a secret parent; the default must hide
+# every one of them, as origin/main did.
+REVIEW_PROBES = {"tokens": {
+    "name": "ABCDEF", "label": "correct horse battery staple", "title": "Recovery Phrase Words",
+    "status": "ACTIVE", "securityEnabled": True, "birthDate": "1990-01-01",
+    "securityCountry": "USA", "securityCurrency": "USD", "count": 1234, "size": 123,
+    "labels": ["ABCDEF", "correct horse battery staple"], "NaMe": "ABCDEF",
+    "cardholderName": "Budi Santoso", "issuerName": "Test Bank AG",
+}}
+
+
+def test_4_the_default_hides_everything_under_a_secret_key():
+    """The narrowed rule leaked short keys, passphrases, 4-digit codes and PII: reverted."""
+    out = _masked(REVIEW_PROBES)["tokens"]
+    for key, value in REVIEW_PROBES["tokens"].items():
+        if isinstance(value, bool):
+            assert out[key] is value
+        elif isinstance(value, list):
+            assert all(str(v).startswith("***") for v in out[key]), key
+        else:
+            assert str(out[key]).startswith("***"), (key, out[key])
     card = _masked(VAULT)["gatewayTokens"][0]
-    assert card["cardScheme"] == "VISA" and card["fundingSource"] == "CREDIT"
-    assert card["ownerType"] == "CONSUMER" and card["panType"] == "FPAN"
-    assert card["cardExpiryMonth"] == "12" and card["cardExpiryYear"] == 2028
-    assert card["issuerName"] == "Test Bank AG" and card["issuerCountryCode"] == "DE"
-    assert card["lastSuccessfulPurchaseDate"] == "2026-11-13T09:41:07Z"
-    assert card["nested"]["status"] == "ACTIVE"
-
-
-def test_4_every_credential_under_a_secret_key_stays_hidden():
-    out = _masked(VAULT)
-    text = json.dumps(out)
-    for secret in SECRETS:
+    assert all(v is None or str(v).startswith("***") for k, v in card.items() if k != "nested")
+    text = json.dumps(_masked(VAULT))
+    for secret in SECRETS + ("VISA", "Test Bank AG", "2026-11-13T09:41:07Z"):
         assert secret not in text, secret
-    card = out["gatewayTokens"][0]
-    for key in ("securityCode", "cvc", "last4", "expiresIn", "keyId", "id", "token", "value"):
-        assert str(card[key]).startswith("***"), key
-    # Shapes that look harmless stay hidden under a name that does not describe.
-    assert _masked({"tokens": [{"value": "VISA"}, "plainword"]})["tokens"] == [
-        {"value": "*** (4 chars)"}, "*** (9 chars)"]
-    assert _masked({"token": {"data": 1234}})["token"]["data"].startswith("***")
-    assert _masked({"token": {"securityCode": 123}})["token"]["securityCode"].startswith("***")
-    assert _masked({"token": {"pinCode": "1234"}})["token"]["pinCode"].startswith("***")
-    assert _masked({"token": {"type": "Bearer abc123"}})["token"]["type"].startswith("***")
-    assert _masked({"token": {"name": "aBcDeFgHiJ"}})["token"]["name"].startswith("***")
-    assert _masked({"token": {"month": "123456"}})["token"]["month"].startswith("***")
-    # A secret name further down hides everything below it again, descriptive names included.
-    inner = _masked({"tokens": [{"password": {"type": "Basic", "createdAt": "2026-01-01"}}]})
-    assert inner["tokens"][0]["password"] == {"type": "*** (5 chars)", "createdAt": "*** (10 chars)"}
+
+
+def _body_mode(doc):
+    return json.loads(helpers.mask_body(json.dumps(doc), own_keys_only=True))
+
+
+def test_4_body_mode_shows_values_under_a_secret_parent_but_not_secret_named_ones():
+    """reveal_values="body": the caller asked to read a token vault's card metadata."""
+    card = _body_mode(VAULT)["gatewayTokens"][0]
+    assert card["cardScheme"] == "VISA" and card["issuerName"] == "Test Bank AG"
+    assert card["lastSuccessfulPurchaseDate"] == "2026-11-13T09:41:07Z"
+    assert card["cardExpiryMonth"] == "12" and card["id"] == "gt_7f3a9c2e41b84d0f"
+    for key in ("token", "accessToken", "authorization"):
+        assert card[key].startswith("***"), key
+    for secret in ("4111110000001111", "eyJhbGciOi", "SYNTHAUTH"):
+        assert secret not in json.dumps(card), secret
+    # A value whose own key is secret-named stays hidden at any depth, list items included.
+    out = _body_mode({"a": {"password": "P1", "pin": 1234, "otp": ["111111"], "cvc": "123",
+                            "nested": [{"apiKey": "K1"}], "ok": True}})["a"]
+    assert out["password"].startswith("***") and out["pin"].startswith("***")
+    assert out["otp"] == ["*** (6 chars)"] and out["cvc"].startswith("***")
+    assert out["nested"][0]["apiKey"].startswith("***") and out["ok"] is True
+    # A form body is masked by its own names in both modes.
+    assert helpers.mask_body("user=budi&password=P1", own_keys_only=True) == "user=budi&password=***"
+
+
+def test_4_body_mode_keeps_credential_headers_and_url_secrets_masked():
+    entry = {"url": "https://a.test/cb?code=SYNTHCODE&page=2",
+             "request_headers": {"Authorization": "Bearer SYNTHAUTH", "Cookie": "sid=SYNTHSID",
+                                 "X-Api-Key": "SYNTHKEY", "Proxy-Authorization": "Basic SYNTHPROXY",
+                                 "Accept": "application/json"},
+             "response_headers": {"Set-Cookie": "sid=SYNTHSETCOOKIE"},
+             "request_body": json.dumps({"tokens": {"type": "card", "token": "SYNTHTOKEN"}})}
+    out = helpers.mask_request_entry(entry, body_mode=True)
+    text = json.dumps(out)
+    for secret in ("SYNTHCODE", "SYNTHAUTH", "SYNTHSID", "SYNTHKEY", "SYNTHPROXY",
+                   "SYNTHSETCOOKIE", "SYNTHTOKEN"):
+        assert secret not in text, secret
+    assert "page=2" in out["url"] and '"type": "card"' in out["request_body"]
+    assert out["request_headers"]["Accept"] == "application/json"
+
+
+def test_4_reveal_mode_reads_only_true_false_and_body():
+    assert helpers.reveal_mode(False) == helpers.reveal_mode(None) == "none"
+    assert helpers.reveal_mode(True) == "all" and helpers.reveal_mode("body") == "body"
+    with pytest.raises(ValueError):
+        helpers.reveal_mode("headers")
 
 
 def test_4_rules_outside_a_secret_key_are_unchanged():
@@ -125,12 +167,48 @@ def test_10_server_status_counts_a_long_profile_list():
     assert len(json.dumps(status)) < 2000
 
 
-@pytest.mark.parametrize("name, value, shown", [
-    ("cardExpiryMonth", "07", True), ("expiryYear", "2031", True), ("currency", "IDR", True),
-    ("createdAt", "2026-01-02", True), ("brand", "MASTERCARD", True), ("issuerName", "Bank X", True),
-    ("bankName", "Bank 9", False), ("countryCode", "123", False), ("label", "x" * 50, False),
-    ("status", "ok!", False), ("type", None, True), ("verified", True, True),
-])
-def test_4_shape_rules(name, value, shown):
-    out = _masked({"tokens": [{name: value}]})["tokens"][0][name]
-    assert (out == value) is shown, out
+def test_8_full_page_note_takes_the_scroll_off_both_axes(monkeypatch):
+    """Review 4: the full-page formula subtracted the scroll from y only."""
+    import asyncio
+    from mcp_stealth_chrome import image_output
+    from mcp_stealth_chrome.tools import page
+
+    async def ctx(_tab, timeout=None):
+        return {"dpr": 2, "pageLeft": 300, "pageTop": 50}
+
+    monkeypatch.setattr(image_output, "viewport_context", ctx)
+    note = asyncio.run(page._coordinate_note(object(), 1.0, (2000, 4000), None, True))[0]
+    assert "x=image_x × 0.5 − 300" in note and "y=image_y × 0.5 − 50" in note, note
+    note = asyncio.run(page._coordinate_note(object(), 1.0, (2000, 4000), None, False))[0]
+    assert "mouse_click_xy(x=image_x × 0.5, y=image_y × 0.5)" in note, note
+
+
+def test_3r_batch_aliases_pass_every_valid_argument_on():
+    """Review 3: batch "wait" dropped frame_url and "navigate" dropped expect_url."""
+    from mcp_stealth_chrome import server
+    server._register_workflow_tools()
+    tool, args = server._batch_action_call({"type": "wait", "frame_url": "/3ds", "timeout": 10})
+    assert (tool, args) == ("wait_for", {"selector": None, "text": None, "timeout": 10,
+                                         "frame_url": "/3ds"})
+    tool, args = server._batch_action_call({"type": "navigate", "url": "https://a.test/",
+                                            "expect_url": "a.test", "expect_status": 200})
+    assert args == {"url": "https://a.test/", "expect_url": "a.test", "expect_status": 200}
+    assert server._batch_action_call({"type": "press"}) == ("press_key", {"key": "Enter"})
+    assert server._batch_action_call({"type": "click", "ref": "e3", "stop_on_error": True}) == (
+        "click", {"ref": "e3", "selector": None, "humanize": False})
+
+
+def test_3r_an_unknown_inner_argument_is_refused_by_name_and_counted():
+    import asyncio
+    from mcp_stealth_chrome import server
+    out = asyncio.run(server.batch_actions([
+        {"type": "screenshot", "path": "x.jpg"},
+        {"type": "wait", "frame_url": "/3ds", "bogus": 1},
+    ]))
+    assert out.startswith("2 actions, 2 failed"), out
+    assert "screenshot does not take 'path'; nothing was done" in out
+    assert "wait_for does not take 'bogus'" in out
+    result = asyncio.run(server.workflow_run([{"tool": "screenshot", "args": {"path": "x.jpg"}}]))
+    assert result.startswith("Error:") and "screenshot does not take 'path'" in result, result
+    doc = json.loads(result[len("Error: "):])
+    assert doc["failed_at"] == 0
