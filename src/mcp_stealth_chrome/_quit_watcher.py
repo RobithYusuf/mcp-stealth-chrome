@@ -248,7 +248,7 @@ def page_count(host, port):
 # the windows of a Quit go one after another in well under that, so a half-closed browser is
 # never written over the full list.
 TABS_SETTLE = 3.0
-TABS_MAX = 60
+TABS_MAX = 300
 TABS_SCHEMES = ("http://", "https://", "file://")
 
 

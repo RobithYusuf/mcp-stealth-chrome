@@ -811,6 +811,12 @@ conclusions. Each rule below replaced a real lie.
   too, while other sites in the same browser read `navigator.brave` and the "Brave" brand (measured on Brave Beta
   158.1.101.47, tab by tab over raw CDP). It is Brave's own compatibility behaviour, not an override of ours: do
   not "fix" the brand there, and do not judge Brave by a probe run on a Google page.
+- A saved tab list keeps 30 pages (`MCP_STEALTH_RESTORE_TABS_MAX`), sized for an agent, whose restore opens a
+  window per page. A person moved 48 tabs into the browser the launcher opened: a Quit would have brought back 30.
+  A person's browser (`_persons_browser`, or the launcher's own process) saves up to `tab_record.MAX_TABS_PERSON`
+  (300, `MCP_STEALTH_RESTORE_TABS_MAX_PERSON`) through `_tab_limit`, the watcher keeps as many, and a restore
+  loads `_RESTORE_PARALLEL` pages at a time. Every `tab_record.save` in the server passes `limit=_tab_limit(...)`:
+  one that did not would write 30 over the full list, and being newer it would win over the watcher's.
 - The launcher did not pass `brave_lean`, and a profile older than lean is not one "the server made empty", so a
   person's agent Brave kept Leo and the rest. `install-launcher --lean` stores the choice in
   `<data>/launcher-lean-<browser>` and `open` reads it (`lean_choice`); unset, the server's own rule decides.

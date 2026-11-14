@@ -3418,6 +3418,15 @@ def _closing(browser: Any) -> bool:
     return getattr(browser, _CLOSING_ATTR, None) is not None
 
 
+def _tab_limit(browser: Any) -> Optional[int]:
+    """How many tabs a saved list keeps: a person's browser (opened from the launcher, in this
+    process or reattached to) holds far more than the 30 an agent's list is cut to, and a
+    server writing 30 over the 48 the person had open would lose the rest at the next start."""
+    if _persons_browser(browser) or _keep_alive.OPENED_BY == _keep_alive.LAUNCHER:
+        return tab_record.MAX_TABS_PERSON
+    return None
+
+
 async def _page_targets(browser: Any) -> list[tuple[str, str]]:
     """(target id, url) of every page, in the order Chrome lists them."""
     from nodriver.cdp import target as cdp_target
@@ -3442,7 +3451,8 @@ async def _record_tabs_before_close(instance_id: str, browser: Any, tabs: list, 
         pages = await asyncio.wait_for(_page_targets(browser), timeout=_TAB_RECORD_READ_TIMEOUT)
     except Exception:
         pages = None
-    return tab_record.save(instance_id, scope, pages, keys, active, reason, force=True)
+    return tab_record.save(instance_id, scope, pages, keys, active, reason, force=True,
+                           limit=_tab_limit(browser))
 
 
 def _record_tabs_at_exit(instance_id: str, browser: Any, tabs: list, active_index: int,
@@ -3456,7 +3466,8 @@ def _record_tabs_at_exit(instance_id: str, browser: Any, tabs: list, active_inde
                                        timeout=_TAB_RECORD_READ_TIMEOUT)
     keys = [_target_key(t) for t in tabs]
     active = keys[active_index] if 0 <= active_index < len(keys) else None
-    return tab_record.save(instance_id, scope, pages, keys, active, "server exit", force=True)
+    return tab_record.save(instance_id, scope, pages, keys, active, "server exit", force=True,
+                           limit=_tab_limit(browser))
 
 
 async def _record_tabs_at_launch(instance_id: str) -> str:
@@ -3473,7 +3484,8 @@ async def _record_tabs_at_launch(instance_id: str) -> str:
         if scope is None or _closing(browser):
             return "not recorded"
         pages = await asyncio.wait_for(_page_targets(browser), timeout=_TAB_RECORD_READ_TIMEOUT)
-        return tab_record.save(instance_id, scope, pages, keys, active, "at launch", force=False)
+        return tab_record.save(instance_id, scope, pages, keys, active, "at launch", force=False,
+                               limit=_tab_limit(browser))
     except Exception as exc:
         return f"not recorded: {_exc_text(exc)}"
 
@@ -3539,7 +3551,8 @@ async def _record_tabs_in_background(key: str, instance_id: str) -> str:
         # a navigation under way. A half-closed list must not replace the record; look again.
         _TAB_RECORD_DIRTY.setdefault((key, instance_id), time.monotonic())
         return "changing"
-    return tab_record.save(instance_id, scope, second, keys, active, "while running", force=False)
+    return tab_record.save(instance_id, scope, second, keys, active, "while running", force=False,
+                           limit=_tab_limit(browser))
 
 
 def _recordable_instances() -> list[tuple[str, str]]:
@@ -3634,6 +3647,7 @@ async def _load_saved_tab(tab: Any, url: str) -> dict:
 # The Dock launcher sets this: a person's browser comes back as one window with its tabs, not as
 # one window per page. An agent's launch keeps a window per page, so each one reads as visible.
 RESTORE_AS_TABS = False
+_RESTORE_PARALLEL = 8
 
 
 async def _reopen_saved_tabs(
@@ -3709,8 +3723,14 @@ async def _reopen_saved_tabs(
         except Exception as exc:
             slot["error"] = f"could not open a tab: {_exc_text(exc)}"
     loads = [s for s in slots if s["tab"] is not None]
-    results = await asyncio.gather(*(_load_saved_tab(s["tab"], s["url"]) for s in loads),
-                                   return_exceptions=True)
+    # A person's list can hold dozens of pages: a few at a time, not all at once.
+    gate = asyncio.Semaphore(_RESTORE_PARALLEL)
+
+    async def load(slot: dict) -> Any:
+        async with gate:
+            return await _load_saved_tab(slot["tab"], slot["url"])
+
+    results = await asyncio.gather(*(load(s) for s in loads), return_exceptions=True)
     for slot, result in zip(loads, results):
         slot["observed"] = result
     # The order tab_list will show: the browser's own list, as _refresh_tabs reads it.

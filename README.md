@@ -987,6 +987,7 @@ The ones most people set:
 | `MCP_STEALTH_BRAVE_PATH` | Brave's executable, when it is not where Brave installs itself |
 | `MCP_STEALTH_RESTORE_TABS_MAX_DAYS` | A saved tab list older than this is not reopened. Default 30, 0 means no limit |
 | `MCP_STEALTH_RESTORE_TABS_MAX` | Tabs kept in a saved list. Default 30 |
+| `MCP_STEALTH_RESTORE_TABS_MAX_PERSON` | Tabs kept for a browser you opened from the Dock launcher. Default 300 |
 | `MCP_STEALTH_KEEP_ALIVE_MAX_HOURS` | Hours a browser kept with `keep_alive=True` may run with no server before its watcher ends it. Default 24, at most a year; anything not a positive finite number means 24 |
 | `MCP_STEALTH_KEEP_ALIVE_DIR` | Folder for the records of kept browsers. Default `~/.mcp-stealth/keep-alive` |
 | `MCP_STEALTH_LAUNCHER_DIR` | Where `install-launcher` builds the Dock launcher. Default `~/Applications` |

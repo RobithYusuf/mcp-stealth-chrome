@@ -255,3 +255,45 @@ def test_forget_tabs_also_forgets_what_the_watcher_kept(world):
     _watched(world, [A], 1.0)
     note = server._forget_tabs_note("main", world, False)
     assert "removed" in note and keep_alive.last_tabs(world) is None
+
+
+def test_a_persons_list_is_not_cut_to_the_thirty_an_agents_is(world, monkeypatch):
+    """A person moved 48 tabs into the browser the launcher opened. Saved lists were cut to 30
+    (sized for an agent, whose restore opens a window per page), so 18 would not have come back."""
+    import time
+
+    from mcp_stealth_chrome import server
+    urls = [f"https://site{n}.test/" for n in range(48)]
+    assert tab_record.MAX_TABS < 48 <= tab_record.MAX_TABS_PERSON
+    _watched(world, urls, time.time())
+    assert "recorded 48 tab(s)" in launcher.adopt_watched_tabs("brave")
+    entry, _why = tab_record.load("main", world)
+    assert [t["url"] for t in entry["tabs"]] == urls and "not_kept" not in entry
+
+    # A server that reattached to the person's browser saves with the same room...
+    person = type("B", (), {})()
+    setattr(person, server._PERSONS_ATTR, True)
+    assert server._tab_limit(person) == tab_record.MAX_TABS_PERSON
+    pages = [(str(n), url) for n, url in enumerate(urls)]
+    keys = [str(n) for n in range(48)]
+    assert "recorded 48" in tab_record.save("main", world, pages, keys, "0", "browser_close",
+                                            force=True, limit=server._tab_limit(person))
+    # ...and so does the launcher's own process, whose browser is new and not "reattached".
+    monkeypatch.setattr(launcher._keep_alive, "OPENED_BY", launcher._keep_alive.LAUNCHER)
+    assert server._tab_limit(type("B", (), {})()) == tab_record.MAX_TABS_PERSON
+    # An agent's own browser keeps the short list, and says how many it left out.
+    monkeypatch.setattr(launcher._keep_alive, "OPENED_BY", None)
+    assert server._tab_limit(type("B", (), {})()) is None
+    assert "recorded 30" in tab_record.save("main", world, pages, keys, "0", "browser_close", force=True)
+    entry, _why = tab_record.load("main", world)
+    assert entry["not_kept"] == 18
+
+
+def test_the_watcher_keeps_as_many_pages_as_a_person_has_open(tmp_path):
+    clock = _Clock()
+    keeper, path = _keeper(tmp_path, clock)
+    urls = [f"https://site{n}.test/" for n in range(120)]
+    keeper.look(urls)
+    clock.now += 5
+    keeper.look(urls)
+    assert len(_read(path)["urls"]) == 120 and qw.TABS_MAX >= 300

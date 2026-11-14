@@ -335,7 +335,8 @@ def adopt_watched_tabs(browser: str) -> str:
             return ""
         keys = [str(n) for n in range(len(watched["urls"]))]
         outcome = tab_record.save(INSTANCE, profile, list(zip(keys, watched["urls"])), keys,
-                                  keys[0], "the quit watcher's last look", force=True)
+                                  keys[0], "the quit watcher's last look", force=True,
+                                  limit=tab_record.MAX_TABS_PERSON)
         return f" [tabs from the last time it was open: {outcome}]"
     except Exception as exc:
         return f" [tabs from the last time could not be read: {type(exc).__name__}]"

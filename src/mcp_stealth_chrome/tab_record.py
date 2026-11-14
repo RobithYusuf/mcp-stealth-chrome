@@ -51,6 +51,9 @@ VERSION = 1
 MAX_PROFILES = 8
 # Tabs kept per record. More than this is noted, not silently dropped.
 MAX_TABS = max(1, int(env_number("MCP_STEALTH_RESTORE_TABS_MAX", 30)))
+# A browser a person uses by hand holds far more than an agent's: 30 was sized for an agent,
+# whose restore opens a window per page. A person's comes back as tabs of one window.
+MAX_TABS_PERSON = max(MAX_TABS, int(env_number("MCP_STEALTH_RESTORE_TABS_MAX_PERSON", 300)))
 # Only these are reopened. chrome://, devtools://, chrome-extension://, about:, data:, blob:
 # and javascript: are never written, and never opened from a file someone edited either.
 _KEEP_SCHEMES = ("http://", "https://", "file://")
@@ -100,20 +103,23 @@ def ordered_pages(pages: Iterable[tuple[str, str]], known: list[str]) -> list[tu
 
 
 def make_entry(pages: Iterable[tuple[str, str]], known: list[str], active_key: Optional[str],
-               profile: Any, reason: str, now: Optional[float] = None) -> Optional[dict]:
-    """The record for one profile, or None when no page is worth reopening."""
+               profile: Any, reason: str, now: Optional[float] = None,
+               limit: Optional[int] = None) -> Optional[dict]:
+    """The record for one profile, or None when no page is worth reopening. `limit` is how
+    many tabs it keeps (MAX_TABS when unset)."""
     kept = [(str(tid), url) for tid, url in ordered_pages(pages, known) if keep_url(url)]
     if not kept:
         return None
+    cap = max(1, int(limit)) if limit else MAX_TABS
     entry: dict[str, Any] = {
         "profile": profile_key(profile),
         "saved_at": time.time() if now is None else now,
         "reason": reason,
-        "tabs": [{"url": url} for _tid, url in kept[:MAX_TABS]],
-        "active": next((i for i, (tid, _u) in enumerate(kept[:MAX_TABS]) if tid == active_key), None),
+        "tabs": [{"url": url} for _tid, url in kept[:cap]],
+        "active": next((i for i, (tid, _u) in enumerate(kept[:cap]) if tid == active_key), None),
     }
-    if len(kept) > MAX_TABS:
-        entry["not_kept"] = len(kept) - MAX_TABS
+    if len(kept) > cap:
+        entry["not_kept"] = len(kept) - cap
     return entry
 
 
@@ -160,7 +166,8 @@ def _prune(profiles: dict, keep: str) -> None:
 
 
 def save(instance_id: str, profile: Any, pages: Optional[Iterable[tuple[str, str]]],
-         known: list[str], active_key: Optional[str], reason: str, *, force: bool) -> str:
+         known: list[str], active_key: Optional[str], reason: str, *, force: bool,
+         limit: Optional[int] = None) -> str:
     """Write what a browser has open. Returns what happened, in words; never raises.
 
     force=False (the background writer) leaves an unchanged list alone. A close passes True, so
@@ -170,7 +177,8 @@ def save(instance_id: str, profile: Any, pages: Optional[Iterable[tuple[str, str
         path = record_path(instance_id)
     except ValueError as exc:
         return f"not recorded: {exc}"
-    entry = make_entry(pages or [], known, active_key, profile, reason) if pages is not None else None
+    entry = (make_entry(pages or [], known, active_key, profile, reason, limit=limit)
+             if pages is not None else None)
     if entry is None:
         why = "the tabs could not be read" if pages is None else "no page worth reopening"
         return f"not recorded: {why}; an earlier record is kept"
