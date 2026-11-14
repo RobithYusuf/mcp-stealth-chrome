@@ -947,6 +947,10 @@ def test_k3_an_unidentifiable_browser_is_left_after_a_bound_and_the_reason_is_ke
     clock = _Clock()
     asked = []
     monkeypatch.setattr(qw, "process_command", lambda _pid: "")  # exists, cannot be read
+    # The start time is unreadable too. Left to the real `ps`, a process that happens to hold
+    # PID 4242 on the machine answered with its own start time and the watcher said "pid
+    # reused" (macOS CI, once).
+    monkeypatch.setattr(qw, "process_start", lambda *_a, **_kw: None)
     monkeypatch.setattr(qw, "page_count", lambda *_a: 0)
     monkeypatch.setattr(qw, "request_browser_close", lambda *_a: asked.append(1) or False)
     monkeypatch.setattr(qw, "wait_gone", lambda *_a, **_kw: False)
