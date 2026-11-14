@@ -374,3 +374,20 @@ def test_a_caller_requested_allow_origins_is_named_and_honoured(loop, site):
         assert json.loads(call(loop, "server_status"))["remote_allow_origins"] == {"main": "off"}
     finally:
         call(loop, "browser_close")
+
+
+@e2e
+def test_launching_again_never_ends_a_browser_whose_active_tab_is_not_the_agents(loop, person, site):
+    from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.state import BrowserState
+    browser = BrowserState.browser
+    person.open_tab(site + "/person")
+    assert call(loop, "tab_close").startswith("closed")  # the agent's own and only tab
+    again = call(loop, "browser_launch", headless=True, persistent=False)
+    assert not again.startswith("Error") and "tab_new" in again, again
+    assert BrowserState.browser is browser, "the browser was replaced"
+    assert server._browser_process_pid(browser) and server._process_exists(server._browser_process_pid(browser))
+    opened = call(loop, "browser_launch", url=site + "/plain?again", headless=True, persistent=False)
+    assert "new tab" in opened and BrowserState.browser is browser, opened
+    assert call(loop, "get_url").endswith("/plain?again")
+    assert "/person" in call(loop, "tab_list")

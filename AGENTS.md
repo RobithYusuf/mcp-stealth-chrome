@@ -784,6 +784,13 @@ the person (the same target events as Cmd+T, a followed link, a closed tab).
   record) or acts on a browser the launch just started.
   Measured with the real `open` command
   (`test_launcher_tabs_e2e.py`).
+- An ownership refusal is `state.TabNotUsable` (a RuntimeError), raised by `active_tab()` and `select_tab` when the
+  tab is not the server's or none is selected. The browser is fine then, and code tells it from a lost connection by
+  its type, never its text: the reuse path of `browser_launch` treated it as a stale handle and ended the browser,
+  the person's own on a launcher browser. Now it leaves the browser as it is and names tab_new and tab_select, or
+  opens the caller's url in a new agent tab. `browser_recover` does not end a person's browser that answers CDP.
+  Nothing else that closes or resets a browser (idle reaper, window sweep, close tools, failed launches) reacts to
+  an `active_tab()` failure; `_tab_list_problem` only reports its text.
 - An active tab closed outside the tools leaves no tab selected (`active_tab_index = -1`, `active_lost`), and the
   next tool says so. Before, the index stayed where it was and the next tool acted on whichever tab slid there, a
   person's included; a stale Tab answered "server rejected WebSocket connection: HTTP 500". `_check_active_tab_alive`

@@ -109,6 +109,7 @@ from .state import (
     STORAGE_STATE_DIR,
     BrowserState,
     InstanceSnapshot,
+    TabNotUsable,
     chrome_install_hint,
     chrome_lock_holder_pid,
     chrome_user_data_root,
@@ -1600,7 +1601,7 @@ async def _refresh_tabs() -> bool:
 def _active_lost_note(tab: Any) -> str:
     return (f"The active tab ({BrowserState.tab_label(tab)}) was closed outside this server's tools, "
             f"by a person or by its own page. No other tab was picked in its place: tab_list shows "
-            f"the tabs, and tab_select picks the one to act on.")
+            f"the tabs, tab_select picks the one to act on, and tab_new opens a new one.")
 
 
 def _own_pages_opened_by_ours() -> None:
@@ -3096,6 +3097,26 @@ def _persons_browser(browser: Any) -> bool:
     return bool(getattr(browser, _PERSONS_ATTR, False))
 
 
+async def _reuse_without_an_agent_tab(refusal: str, url: str, expect_url: Optional[str],
+                                      expect_status: Optional[int], keep_alive: Optional[bool]) -> str:
+    """browser_launch on a running browser whose active tab the tools may not use.
+
+    With a url it opens in a new tab of the agent's, as a reattach does; without one the browser
+    is left exactly as it is and the result says what the agent can do. Nothing is ended.
+    """
+    head = f"reusing the running browser ({len(BrowserState.tabs)} tab(s)), left as it was"
+    keep_note = _keep_alive_on_reuse(keep_alive)
+    if url and url != "about:blank":
+        from .tools import navigation as _navigation
+        opened = await _navigation.tab_new(url=url, expect_url=expect_url, expect_status=expect_status)
+        if opened.startswith("Error"):
+            return err(f"{head}; {url} could not be opened in a new tab of the agent's: "
+                       f"{opened[len('Error: '):]}")
+        return ok(f"{head}; none of its tabs is the agent's to use, so {url} {opened} "
+                  f"(a new tab of the agent's){keep_note}")
+    return ok(f"{head}: {refusal} Or pass url= to open a page in a new tab of the agent's.{keep_note}")
+
+
 def _owned_before(record: dict, tabs: list) -> tuple[set, list]:
     """The tabs an earlier agent session owned, as far as they can count, and notes on any dropped.
 
@@ -3967,6 +3988,12 @@ async def browser_launch(
                     reuse_head, _observed,
                     expect_url=expect_url, expect_status=expect_status, suffix=_reuse_keep_note,
                 )
+            except TabNotUsable as refusal:
+                # The browser is fine; only its active tab is not one the tools may use (the
+                # person's, or none is selected). Never the stale-handle path below: that ends
+                # the browser, and on one the person opened it is theirs.
+                return await _reuse_without_an_agent_tab(str(refusal), url, expect_url,
+                                                         expect_status, keep_alive)
             except Exception as e:
                 # The browser answered, so what failed was the navigation: a bad or slow
                 # URL. Ending it here would lose every tab over a typo.
@@ -4642,6 +4669,16 @@ async def browser_recover() -> str:
     again to start fresh.
     """
     steps: list[str] = []
+    # A browser the person opened from the launcher that still answers is not stuck: whatever
+    # the agent could not do (a tab that is not its own, most likely) is no reason to end it.
+    if BrowserState.browser is not None and _persons_browser(BrowserState.browser):
+        from nodriver.cdp import browser as cdp_browser
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for((getattr(BrowserState.browser, "connection", None)
+                                    or BrowserState.browser).send(cdp_browser.get_version()), timeout=3)
+            return err("browser_recover did not end this browser: the person opened it from the "
+                       "launcher and it answers, so it is not stuck. tab_new opens a tab of the "
+                       "agent's; tab_select picks one of the person's on purpose; the person quits it.")
 
     # 1. Best-effort stop. Capture profile dir BEFORE reset so step 2 can
     #    target only Chrome PIDs that belong to this profile.

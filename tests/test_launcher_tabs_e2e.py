@@ -320,3 +320,31 @@ def test_a_0_20_0_launcher_record_is_the_persons_and_an_older_record_is_an_agent
         assert not again.call("browser_close", _timeout=60).failed
     finally:
         again.close()
+
+
+def test_launching_again_on_a_persons_browser_never_ends_it(world):
+    _start_kept(world, world.base + "?launcher=1")
+    _write_record(world, opened_by="launcher", owned=[])
+    pid = _record(world)["pid"]
+    agent = Client(env=world.env)
+    try:
+        first = _launch(agent, "about:blank", True)
+        assert "Reattached" in first.text, first.text
+        # Again with nothing to open: the person's browser is left as it is, and the result says
+        # what the agent can do.
+        again = _launch(agent, "about:blank", True)
+        assert not again.failed and "tab_new" in again.text and "tab_select" in again.text, again.text
+        assert state._pid_alive(pid), "the person's browser was ended"
+        assert list(_keys(world).values()) == [world.base + "?launcher=1"], _keys(world)
+        # Again with a url: it opens in a new tab of the agent's, as a reattach does.
+        opened = _launch(agent, world.base + "?agent=1", True)
+        assert not opened.failed and "new tab" in opened.text, opened.text
+        assert state._pid_alive(pid), "the person's browser was ended"
+        assert sorted(_keys(world).values()) == sorted([world.base + "?launcher=1", world.base + "?agent=1"])
+        assert agent.call("get_url").text.endswith("?agent=1")
+        # browser_recover is for a stuck browser; the person's answers, so it is not ended either.
+        recovered = agent.call("browser_recover")
+        assert recovered.failed and "person" in recovered.text, recovered.text
+        assert state._pid_alive(pid), "browser_recover ended the person's browser"
+    finally:
+        agent.close()

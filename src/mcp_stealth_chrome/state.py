@@ -823,6 +823,15 @@ def clean_profile_state(profile_dir: Path | str | None = None) -> None:
             pass
 
 
+class TabNotUsable(RuntimeError):
+    """No tab tools may act on: the active tab was not opened by this server, or none is selected.
+
+    The browser itself is fine. Callers tell this apart from a lost connection by its type, never
+    by its text: treated as a stale handle, the reuse path of browser_launch ended the browser,
+    which on a browser the person opened from the launcher is theirs.
+    """
+
+
 @dataclass
 class InstanceSnapshot:
     """Stored state for a non-active instance."""
@@ -1169,14 +1178,14 @@ class BrowserState(metaclass=_SessionRouted):
         cls.current_last_active = time.time()
         index = cls.active_tab_index
         if index < 0:
-            raise RuntimeError(cls.active_lost or
+            raise TabNotUsable(cls.active_lost or
                                "No tab is selected. tab_list shows the tabs; tab_select picks one.")
         if index >= len(cls.tabs):
             index = cls.active_tab_index = 0  # as before; the ownership check below still applies
         cls.own_untracked()
         tab = cls.tabs[index]
         if not cls.acts_on(tab):
-            raise RuntimeError(cls.not_ours_note(index, tab))
+            raise TabNotUsable(cls.not_ours_note(index, tab))
         return tab
 
     # In owned_targets: "counted, and none of the tabs is ours" (a reattach to a browser the person
@@ -1220,7 +1229,8 @@ class BrowserState(metaclass=_SessionRouted):
     def not_ours_note(cls, index: int, tab: Any) -> str:
         return (f"tab {index} ({cls.tab_label(tab)}) was not opened by this server: a person opened "
                 f"it, or a page with no opener did. Nothing was done to it. tab_select({index}) acts "
-                f"on it on purpose; tab_list shows the tabs this server opened.")
+                f"on it on purpose; tab_new opens a tab of the agent's own; tab_list shows which "
+                f"tabs this server opened.")
 
     @classmethod
     def reset(cls) -> None:

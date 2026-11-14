@@ -615,7 +615,8 @@ def _next_own_tab(start: int) -> int:
         if BrowserState.acts_on(tabs[i]):
             return i
     BrowserState.active_lost = ("The active tab was closed, and every tab left was opened outside "
-                                "this server. tab_select picks one to act on it on purpose.")
+                                "this server. tab_new opens a tab of the agent's own; tab_select "
+                                "picks one of the others to act on it on purpose.")
     return -1
 
 

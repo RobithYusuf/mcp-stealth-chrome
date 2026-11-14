@@ -13,7 +13,7 @@ from typing import Any, Iterator
 
 from nodriver import Tab
 
-from .state import BrowserState
+from .state import BrowserState, TabNotUsable
 
 
 # Names whose values are credentials. Matched as whole words, so "author" and the
@@ -298,7 +298,7 @@ def select_tab(index: int | None = None) -> Tab:
     # An index is not the explicit request tab_select is: without this, tab= ran scripts in,
     # read and captured a tab a person opened, which active_tab() refuses.
     if not BrowserState.acts_on(chosen):
-        raise RuntimeError(BrowserState.not_ours_note(index, chosen))
+        raise TabNotUsable(BrowserState.not_ours_note(index, chosen))
     return chosen
 
 
