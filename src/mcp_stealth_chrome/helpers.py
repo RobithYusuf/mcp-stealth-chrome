@@ -313,6 +313,16 @@ def cut_url(entry: dict, max_len: int) -> dict:
     return out
 
 
+def short_url(url: Any, max_len: int = 200) -> str:
+    """A URL for a sentence: cut at max_len, saying how much went and how to get it whole.
+    A payment frame's ?config=<base64>&signature=... runs past a thousand characters, and
+    printing it on every call costs more than the answer it comes with."""
+    text = str(url or "")
+    if not max_len or len(text) <= max_len:
+        return text
+    return f"{text[:max_len]}… ({len(text) - max_len} more chars; list_frames(max_url_len=0))"
+
+
 def target_key(tab: Any) -> str:
     """Stable per-tab identity backed by the CDP target id when available."""
     target = getattr(tab, "target", None)

@@ -217,7 +217,11 @@ async def _save_window_bounds(instance_id: str, tab) -> bool:
         return False
 
 
-async def _restore_window_bounds(instance_id: str, tab) -> dict:
+# browser_launch's own defaults: a size other than this was asked for by the caller.
+_DEFAULT_WINDOW = (1280, 800)
+
+
+async def _restore_window_bounds(instance_id: str, tab, size: Optional[tuple] = None) -> dict:
     """Put the window back where it was, and report what actually happened.
 
     The monitor it was on may be gone. Rather than querying the display layout —
@@ -238,6 +242,10 @@ async def _restore_window_bounds(instance_id: str, tab) -> dict:
         return result
 
     width, height = saved.get("width") or 0, saved.get("height") or 0
+    if size:
+        # The caller asked for a size on this launch: the saved one must not undo it.
+        width, height = int(size[0]), int(size[1])
+        result["size_from"] = "this launch"
     if width < 200 or height < 200:
         # The exact corruption wipe_window_state() exists to cure: a 0x0 or
         # tiny rect produces a window that is technically open and invisible.
@@ -4528,12 +4536,16 @@ async def browser_launch(
             (a or "").startswith("--window-position=") for a in merged_extra_args
         ):
             try:
-                placed = await _restore_window_bounds(BrowserState.current_instance_id, main)
+                asked = ((window_width, window_height)
+                         if (window_width, window_height) != _DEFAULT_WINDOW else None)
+                placed = await _restore_window_bounds(
+                    BrowserState.current_instance_id, main, size=asked)
                 if placed.get("restored"):
                     act = placed.get("actual") or {}
                     place_suffix = (
                         f" [window {'clamped to a connected display' if placed.get('clamped') else 'restored'}"
-                        f" at ({act.get('left')},{act.get('top')}) {act.get('width')}x{act.get('height')}]"
+                        f" at ({act.get('left')},{act.get('top')}) {act.get('width')}x{act.get('height')}"
+                        + (", the size asked for on this launch" if asked else "") + "]"
                     )
             except Exception:
                 pass  # placement is a convenience; never fail a launch over it
@@ -10221,6 +10233,28 @@ async def describe_page(
             return err("describe_page: failed to parse page summary")
         if wait_stable:
             data["stability"] = stability
+        if not (data.get("headings") or data.get("fields") or data.get("actions")
+                or data.get("navigation") or data.get("errors")):
+            # A quiet DOM is not a rendered page: a single-page app whose script is still
+            # loading is "stable" and empty, and the summary alone reads as a blank site.
+            try:
+                seen = await _wait(tab.evaluate(
+                    "JSON.stringify([document.readyState, "
+                    "(document.body ? document.body.innerText.trim().length : 0)])",
+                    return_by_value=True), timeout=3, what="describe_page empty check")
+                ready, chars = parse_json(str(seen.value if hasattr(seen, "value")
+                                              and not isinstance(seen, str) else seen), ["", 0])
+            except Exception:
+                ready, chars = "", None
+            if not chars:
+                data["note"] = (
+                    "nothing is rendered yet"
+                    + (f" (ready_state {ready})" if ready else "")
+                    + ": no visible text, headings, fields or actions. A single-page app that "
+                    "is still loading looks like this; wait_for(text=...) and call again."
+                    if chars == 0 else
+                    "no headings, fields or actions were found, and the page text could not be read"
+                )
         return ok(json.dumps(data, indent=2, ensure_ascii=False))
     except Exception as e:
         return err(str(e))

@@ -19,7 +19,7 @@ from typing import Any, Optional
 from .. import key_outcome
 from .. import server as _srv
 from .._app import mcp
-from ..helpers import err, get_url, ok
+from ..helpers import err, get_url, ok, short_url
 from ..humanize import check_gesture, humanized_move, move_pointer
 from ..identity import key_event_params
 from ..refs import active_element, outer_blocker, resolve_ref
@@ -474,8 +474,7 @@ async def _what_is_at(tab: Any, x: int, y: int) -> str:
             except Exception:
                 frame_url = None
             if frame_url:
-                shown = frame_url if len(frame_url) <= 200 else (
-                    f"{frame_url[:200]}… ({len(frame_url) - 200} more chars; list_frames(max_url_len=0))")
+                shown = short_url(frame_url)
                 words += f" showing {shown}"
             else:
                 words += " (its frame URL could not be read" + (
@@ -643,7 +642,7 @@ async def wait_for(selector: Optional[str] = None, text: Optional[str] = None,
                     url = str(found["frame"].url) if found["frame"] is not None else ""
                     if found["depth"] > 0 and regex.search(url):
                         where = "out of process" if found["conn"] is not tab else "in process"
-                        return ok(f"frame matching {frame_url!r} appeared: {url} "
+                        return ok(f"frame matching {frame_url!r} appeared: {short_url(url)} "
                                   f"(depth {found['depth']}, {where})")
                 if time.monotonic() >= deadline:
                     listed = "; ".join(u[:120] for u in seen[1:6]) or "none"

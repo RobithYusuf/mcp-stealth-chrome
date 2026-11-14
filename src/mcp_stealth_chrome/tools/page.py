@@ -18,6 +18,7 @@ from .. import image_output as _image_output
 from .._app import mcp
 from ..helpers import (
     confined_output_path, cut_url, err, get_url, ok, parse_json, private_staging, select_tab,
+    short_url,
     ts_filename,
     write_private,
 )
@@ -766,7 +767,7 @@ async def frame_evaluate(frame_url_pattern: str, expression: str) -> str:
                 detail = getattr(exc.exception, "description", None) if exc.exception else None
                 return err(f"frame script threw: {detail or exc.text}")
             return ok(f"{json.dumps(remote.value, default=str)}\n"
-                      f"(ran in an isolated world of {found['frame'].url}: DOM shared, "
+                      f"(ran in an isolated world of {short_url(found['frame'].url)}: DOM shared, "
                       f"the frame's own JS globals not visible)")
         return err(f"no frame matched {frame_url_pattern!r}")
     except Exception as e:

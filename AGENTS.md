@@ -886,6 +886,16 @@ the person (the same target events as Cmd+T, a followed link, a closed tab).
 - `delta=True` marks elements added or changed since the tab's previous snapshot with `*`. The
   fingerprint deliberately EXCLUDES the ref: refs are regenerated every snapshot, so including them
   would mark everything as changed, every time.
+- A quiet DOM is not a rendered page. A single-page app whose bundle has not run yet is stable and empty, and
+  `describe_page(wait_stable=True)` answered `stable` with no headings, fields or actions on a real shop. An empty
+  summary now reads the body text and says `nothing is rendered yet`, and a snapshot that matched nothing says so and
+  names `wait_for`. A frame that was walked and matched nothing is listed as `Frames with nothing readable`: a hosted
+  card field keeps its input in a closed shadow root, and `Frames: 7 measured` read as seven empty frames. The frames
+  line shows the host and the last path part (`_frame_hint`), since the frames of one widget differ only at the end.
+- A frame URL inside a sentence goes through `helpers.short_url` (`frame_evaluate`, `wait_for(frame_url=)`,
+  `mouse_click_xy`): a payment frame's URL is over a thousand characters and was printed whole on every call.
+- A window size passed to `browser_launch` wins over the saved placement; the saved position is still restored
+  (`_restore_window_bounds(size=)`, `_DEFAULT_WINDOW`). The saved 1280x800 used to undo a 1400x950 that was asked for.
 - An unchanged `diff_from_last` result keeps the measured element count and says
   `unchanged; details omitted`. Printing `Interactive elements (0)` read as "this page has no
   interactive elements".

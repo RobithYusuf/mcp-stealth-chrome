@@ -519,7 +519,8 @@ async def _walk_frame(
         await release_group(conn, group)
 
     label = "" if is_root else f"f{len(walk.frames)}"
-    walk.frames.append({"label": label or "main", "url": str(frame.url or "")[:200]})
+    walk.frames.append({"label": label or "main", "url": str(frame.url or "")[:200],
+                        "matched": int(payload.get("matched") or 0)})
     walk.loaders.append(str(frame.loader_id))
     _merge_counts(walk, payload)
     entries = payload["elements"]

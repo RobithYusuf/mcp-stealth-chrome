@@ -35,6 +35,20 @@ def element_fingerprint(element: dict) -> str:
     return hashlib.sha1(row.encode("utf-8")).hexdigest()[:16]
 
 
+def _frame_hint(url: str, limit: int = 60) -> str:
+    """A frame URL short enough for one line that still tells sibling frames apart: the host
+    and the last part of the path, since frames of one widget differ only at the end."""
+    text = str(url or "")
+    if len(text) <= limit:
+        return text
+    rest = text.split("://", 1)[-1].split("?", 1)[0].split("#", 1)[0]
+    host, _, path = rest.partition("/")
+    last = path.rstrip("/").rsplit("/", 1)[-1]
+    if not last or last == path.rstrip("/"):
+        return text[:limit]
+    return f"{host}/…/{last[:40]}"
+
+
 def format_snapshot(
     elements: list[dict],
     url: str,
@@ -653,11 +667,27 @@ def format_counts(counts: dict, options: dict) -> list[str]:
         )
     frames = counts.get("frames") or {}
     walked = frames.get("walked") or []
+    scoped = bool((counts.get("container") or {}).get("requested"))
     if len(walked) > 1:
         listed = " · ".join(
-            f"{f['label']}={f['url'][:60]}" for f in walked if f["label"] != "main"
+            f"{f['label']}={_frame_hint(f['url'])}" for f in walked if f["label"] != "main"
         )
         lines.append(f"Frames: {len(walked)} measured ({listed})")
+        # "measured" with no element in it reads as an empty frame. A payment field keeps its
+        # input in a closed shadow root, which no script can enter, so say that it may be that.
+        blank = [f["label"] for f in walked
+                 if f["label"] != "main" and "matched" in f and not f["matched"]]
+        if blank and not scoped:
+            lines.append(
+                f"Frames with nothing readable: {', '.join(blank)}. Each is empty, or keeps its "
+                f"content in a closed shadow root, which cannot be measured. Such a field can "
+                f"still be used by position: mouse_click_xy on the iframe, then type_text."
+            )
+    if not scoped and not counts.get("matched") and not frames.get("failed"):
+        lines.append(
+            "Nothing matched on this page at all. A single-page app that has not rendered yet "
+            "looks like this: wait_for(text=...) or wait_for(selector=...), then snapshot again."
+        )
     if frames.get("failed"):
         detail = " · ".join(f"{f['url'][:60]}: {f['error']}" for f in frames["failed"])
         lines.append(
