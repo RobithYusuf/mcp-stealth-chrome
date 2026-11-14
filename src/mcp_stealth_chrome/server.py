@@ -3102,19 +3102,31 @@ async def _reattach_claimed(browser: Any, instance_id: str, profile: Path, recor
         browser.targets.sort(key=lambda t: rank.get(str(t.target.target_id), len(rank)))
     tabs = list(browser.tabs)
     opened_note = ""
+    # A browser the person opened from the launcher holds the person's tabs: a reattach takes
+    # over only what an agent opened there before (saved at its exit) and what it opens now.
+    # Any other kept browser was an agent's, and every tab it holds is taken over as before.
+    from_launcher = record.get("opened_by") == _keep_alive.LAUNCHER
+    agents_before = {str(k) for k in (record.get("owned") or [])}
+    opened_now: set[str] = set()
     if not tabs:
         tabs = [await (_open_background_window(browser) if not headless
                        else browser.get("about:blank", new_tab=True))]
         opened_note = "; it had no page, so one was opened"
+        opened_now.add(_target_key(tabs[0]))
     for tab in tabs:
         with contextlib.suppress(Exception):
             await _wait(_apply_fingerprint_to_tab(tab, fingerprint), timeout=5, what="identity")
     active_key = record.get("active")
     select = next((i for i, t in enumerate(tabs) if _target_key(t) == active_key), 0)
     observed: dict[str, Any] = {}
+    if from_launcher and _target_key(tabs[select]) not in (agents_before | opened_now):
+        # Not the person's tab they were last on: an agent's own one, if there is any.
+        select = next((i for i, t in enumerate(tabs)
+                       if _target_key(t) in (agents_before | opened_now)), select)
     if url and url != "about:blank":
         match = next((i for i, t in enumerate(tabs)
-                      if str(getattr(t.target, "url", "") or "") == url), None)
+                      if str(getattr(t.target, "url", "") or "") == url
+                      and (not from_launcher or _target_key(t) in agents_before)), None)
         if match is not None:
             select = match
             observed = await _observe_navigation(tabs[match], url, {"armed": False})
@@ -3133,6 +3145,7 @@ async def _reattach_claimed(browser: Any, instance_id: str, profile: Path, recor
             finally:
                 disarm()
             tabs.append(tab)
+            opened_now.add(_target_key(tab))
             select = len(tabs) - 1
             observed["note"] = "opened in a new tab; the kept tabs were left as they were"
     else:
@@ -3169,7 +3182,19 @@ async def _reattach_claimed(browser: Any, instance_id: str, profile: Path, recor
         notes.append(lean_note)
     if ignored:
         notes.append("not applied, the running browser keeps its own: " + ", ".join(ignored))
+    keys = [_target_key(t) for t in tabs]
+    owned = set(keys) if not from_launcher else {k for k in keys if k in agents_before | opened_now}
+    if from_launcher:
+        theirs = len(keys) - len(owned)
+        notes.append(f"the person opened this browser from the launcher, so its tabs are theirs: tools "
+                     f"act on the {len(owned)} tab(s) an agent opened (now or in an earlier session) and "
+                     f"not on the person's {theirs} until tab_select picks one; tab_new or url= opens one "
+                     f"of the agent's own")
+        if keys[select] not in owned:
+            notes.append("the selected tab is the person's, so the next tool refuses it until "
+                         "tab_select or tab_new")
     details["reattached"]["notes"] = notes
+    details["_owned"] = owned
     summary = f"reattached to the running browser (pid {pid}, {len(tabs)} tab(s){opened_note})"
     return browser, tabs, select, {**observed, **details}, summary, keep_text
 
@@ -3209,9 +3234,13 @@ async def _launch_by_reattach(profile: Path, verdict: dict, *, url: str, keep_al
         return err(f"a browser kept alive on {profile} ({_keep_alive.describe(record)}) is ours and "
                    f"free, but connecting to it failed: {_exc_text(e)}. It was left running as it "
                    f"was; browser_launch again to retry, or end it with Quit")
+    owned = observed.pop("_owned", None)
     BrowserState.browser = browser
     BrowserState.tabs = tabs
-    BrowserState.own(BrowserState.tabs)  # opened or taken over by this server
+    BrowserState.owned_targets = ({BrowserState.COUNTED, *owned} if owned is not None
+                                  else {_target_key(t) for t in tabs})
+    BrowserState.adopted_targets = set()
+    BrowserState.active_lost = ""
     BrowserState.active_tab_index = select
     BrowserState.current_profile_dir = Path(_keep_alive.profile_key(profile))
     BrowserState.current_headless = bool(record.get("headless"))
@@ -8414,8 +8443,10 @@ async def _spawn_by_reattach(instance_id: str, profile: Path, verdict: dict, *, 
         return False, (f"a browser kept alive on {profile} ({_keep_alive.describe(record)}) is "
                        f"ours and free, but connecting to it failed: {_exc_text(e)}. It was left "
                        f"running as it was")
+    owned = observed.pop("_owned", None)
+    owned = {BrowserState.COUNTED, *owned} if owned is not None else {_target_key(t) for t in tabs}
     fields = dict(browser=browser, tabs=tabs, active_tab_index=select,
-                  owned_targets={_target_key(t) for t in tabs},
+                  owned_targets=owned,
                   profile_dir=Path(_keep_alive.profile_key(profile)), desc=desc,
                   headless=bool(record.get("headless")), privacy=False,
                   fingerprint=dict(record.get("fingerprint") or {}), proxy=verdict.get("proxy"),
@@ -8423,7 +8454,8 @@ async def _spawn_by_reattach(instance_id: str, profile: Path, verdict: dict, *, 
     if instance_id == BrowserState.current_instance_id:
         BrowserState.browser = browser
         BrowserState.tabs = tabs
-        BrowserState.own(BrowserState.tabs)  # opened or taken over by this server
+        BrowserState.owned_targets, BrowserState.adopted_targets = set(owned), set()
+        BrowserState.active_lost = ""
         BrowserState.active_tab_index = select
         BrowserState.current_profile_dir = fields["profile_dir"]
         BrowserState.current_desc = desc
@@ -11741,15 +11773,18 @@ def _stop_all_browsers() -> None:
             for view in views:
                 with contextlib.suppress(Exception):
                     _record_tabs_at_exit(*view)
+            owned = {BrowserState.current_instance_id: set(BrowserState.owned_targets)}
+            owned.update({iid: set(s.owned_targets) for iid, s in BrowserState.instances.items()})
             for iid, browser, tabs, active_index, profile, privacy in views:
                 with contextlib.suppress(Exception):
-                    _leave_or_end_at_exit(browser, tabs, active_index, profile, privacy)
+                    _leave_or_end_at_exit(browser, tabs, active_index, profile, privacy,
+                                          owned=owned.get(iid))
         finally:
             BrowserState.unbind_session(token)
 
 
 def _leave_or_end_at_exit(browser: Any, tabs: list, active_index: int, profile: Any,
-                          privacy: bool) -> str:
+                          privacy: bool, owned: Optional[set] = None) -> str:
     """At exit, with no event loop: leave a browser kept alive running, end every other one."""
     if browser is None:
         return "none"
@@ -11758,7 +11793,11 @@ def _leave_or_end_at_exit(browser: Any, tabs: list, active_index: int, profile: 
             and isinstance(pid, int) and _process_exists(pid)):
         keys = [_target_key(t) for t in tabs]
         active = keys[active_index] if 0 <= active_index < len(keys) else None
-        if _keep_alive.mark_kept(profile, pid, keys, active) is None:
+        # The launcher's own process opened this browser for the person: none of its tabs is an
+        # agent's, so a later reattach takes over none of them.
+        mine = [] if _keep_alive.OPENED_BY == _keep_alive.LAUNCHER else [
+            k for k in keys if owned is None or not owned or k in owned]
+        if _keep_alive.mark_kept(profile, pid, keys, active, owned=mine) is None:
             _keep_alive.release(browser)
             return "kept"
     config = getattr(browser, "config", None)

@@ -468,13 +468,17 @@ def end_old_watcher(record: dict) -> str:
     return "still running"
 
 
-def mark_kept(profile: Any, pid: int, tab_order: list[str], active: Optional[str]) -> Optional[str]:
-    """At exit: the browser stays, and a later server may take it. None, or why not written."""
+def mark_kept(profile: Any, pid: int, tab_order: list[str], active: Optional[str],
+              owned: Optional[list[str]] = None) -> Optional[str]:
+    """At exit: the browser stays, and a later server may take it. None, or why not written.
+
+    owned: the tabs an agent opened or took over. A reattach to a browser the person opened from
+    the launcher takes over only these, never the person's own tabs."""
     record = read(profile)
     if record is None or record.get("pid") != pid:
         return "no record for this browser"
     return write(profile, state="kept", kept_at=time.time(), tab_order=list(tab_order),
-                 active=active)
+                 active=active, owned=sorted(owned or []))
 
 
 def release(browser: Any) -> None:

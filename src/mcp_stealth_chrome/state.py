@@ -1179,6 +1179,10 @@ class BrowserState(metaclass=_SessionRouted):
             raise RuntimeError(cls.not_ours_note(index, tab))
         return tab
 
+    # In owned_targets: "counted, and none of the tabs is ours" (a reattach to a browser the person
+    # opened from the launcher). An empty set means never counted, which takes every tab as ours.
+    COUNTED = "(counted)"
+
     @staticmethod
     def tab_key(tab: Any) -> str:
         target = getattr(tab, "target", None)
