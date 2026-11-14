@@ -27,7 +27,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [macos-latest, ubuntu-latest, windows-latest]
         python: ["3.11", "3.13"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -49,7 +49,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [macos-latest, ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -113,7 +113,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [macos-latest, ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -159,8 +159,9 @@ jobs:
           MCP_E2E: "1"
         run: >-
           "$VENV_PY" -m pytest -v -rs --durations=10
-          tests/test_field_feedback_e2e.py
+          tests/test_cookie_close_e2e.py
           tests/test_protocol_e2e.py
+          tests/test_keep_alive_e2e.py
 
   e2e:
     # Real Chrome, headless, local fixtures only. Suites that open visible windows
@@ -171,7 +172,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     env:
       MCP_E2E: "1"
     steps:
@@ -241,11 +242,22 @@ jobs:
       - name: Real-Chrome suites
         run: >-
           uv run pytest -v -rs --durations=20
-          tests/test_field_feedback_e2e.py
-          tests/test_protocol_e2e.py
+          tests/test_cookie_close_e2e.py
+          tests/test_brave_e2e.py
+          tests/test_brave_lean_e2e.py
+          tests/test_lean_launch_e2e.py
+          tests/test_keys_identity.py
           tests/test_old_tools_e2e.py
+          tests/test_protocol_e2e.py
           tests/test_reliability_e2e.py
+          tests/test_refs_frames_e2e.py
+          tests/test_slow_start_e2e.py
+          tests/test_profile_gc_e2e.py
+          tests/test_restore_tabs_e2e.py
+          tests/test_keep_alive_e2e.py
           tests/test_sessions_http.py
+          tests/test_block_ads.py
+          tests/test_block_ads_e2e.py
       # uv.lock holds nodriver 0.48 and a fresh install gets the newest allowed (0.50), where the
       # Browser is its own Connection. The lockfree job runs the close paths there, with every
       # other dependency at its newest too.
