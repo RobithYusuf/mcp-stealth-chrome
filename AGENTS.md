@@ -690,6 +690,16 @@ conclusions. Each rule below replaced a real lie.
   = this server): if that write fails, or the previous watcher cannot be ended or proved to be it, the reattach stops
   (`_ReattachAborted`) and the claim is given back. A record still naming the dead server after the lock went let a third
   server take the same browser, and a second watcher beside a live one made two closers.
+- The record is no integrity boundary, and `owned` is not signed: any process running as this user can write the file,
+  and that process can already drive the debugging port and read every cookie (see the port facts under Sharing a
+  browser). So `owned` fails safe instead (`_owned_before`): an entry counts only when the record's `owned_for`
+  equals its own generation (`keep_alive.generation`: pid, pid_start, port, which `check` proved against the live
+  browser) and the target is a page that exists now; anything else is dropped and named in the result. Residual: a
+  same-user process that writes a matching `owned_for` can make a person's tab count as the agent's.
+- `opened_by` came with the launcher, in the same release (0.20.0, 49e521a); before it there was no launcher, and
+  `write` merges, so a later reattach by any server keeps the field. A record without it is a pre-0.20.0 agent
+  launch and is taken over whole. Measured: 0.20.0's own `launcher.cold_launch` leaves `opened_by: launcher` and no
+  `owned`, which takes none of the tabs.
 - The record never holds the proxy (a proxy URL can carry a password); `write` drops the key even from an old record, and a
   reattach reads `--proxy-server` from the running Chrome's command line (`proxy_from_command`).
 - `profile_gc` asks `still_running`, not "is the PID alive": a PID is handed out again. A record whose Chrome is positively gone
@@ -764,7 +774,15 @@ the person (the same target events as Cmd+T, a followed link, a closed tab).
   (`mark_kept(owned=)`; the launcher's own process saves none). It never reuses a person's tab for url=, selects an
   agent tab when there is one, and says how many tabs are the person's. `BrowserState.COUNTED` in `owned_targets`
   means "counted, none ours": an empty set would mean never counted and the first look would take every tab. A kept
-  browser an agent launched is taken over whole, as before. Measured with the real `open` command
+  browser an agent launched is taken over whole, as before. On such a person's browser (`_persons_browser`) nothing of
+  the agent's acts on every tab or ends it: `storage_state_load` navigates only the first tab when the server opened
+  it, else the active tab the tools may use, else a server tab, else refuses naming `tab_new` (it used `browser.tabs[0]`,
+  a person's tab); the record's identity is reapplied to the agent's tabs only; `block_ads` is not attached; the idle
+  timeout is 0 (the reuse path and `spawn_browser` too). Browser-wide cookie reads stay: one cookie jar per profile is
+  what sharing a browser means, and the reattach result says so. Every other `browser.tabs`, `browser.targets`,
+  `tabs[0]`, `main_tab` and `_first_live_tab` use is bookkeeping (tab lists, target counts, window bounds, the tab
+  record) or acts on a browser the launch just started.
+  Measured with the real `open` command
   (`test_launcher_tabs_e2e.py`).
 - An active tab closed outside the tools leaves no tab selected (`active_tab_index = -1`, `active_lost`), and the
   next tool says so. Before, the index stayed where it was and the next tool acted on whichever tab slid there, a

@@ -1566,6 +1566,9 @@ def test_storage_state_load_really_sets_cookies_and_reports_counts(tmp_path, mon
         tabs = [_Tab()]
 
     monkeypatch.setattr(server.BrowserState, "browser", _Browser())
+    # The state mirrors the browser's tabs, as after any launch: storage_state_load picks from it.
+    monkeypatch.setattr(server.BrowserState, "tabs", list(_Browser.tabs))
+    monkeypatch.setattr(server.BrowserState, "owned_targets", set())
     out = asyncio.run(server.mcp._tool_manager._tools["storage_state_load"].fn(str(state_file)))
     assert "2 cookies set" in out and "NOT applied" not in out
     assert sent[0]["params"]["expires"] == 1893456000.0
@@ -1589,6 +1592,9 @@ def test_storage_state_load_says_so_when_nothing_could_be_set(tmp_path, monkeypa
         tabs = [_Tab()]
 
     monkeypatch.setattr(server.BrowserState, "browser", _Browser())
+    # The state mirrors the browser's tabs, as after any launch: storage_state_load picks from it.
+    monkeypatch.setattr(server.BrowserState, "tabs", list(_Browser.tabs))
+    monkeypatch.setattr(server.BrowserState, "owned_targets", set())
     out = asyncio.run(server.mcp._tool_manager._tools["storage_state_load"].fn(str(state_file)))
     assert out.startswith("Error:") and "none of the 1 cookies" in out
 

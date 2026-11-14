@@ -182,3 +182,141 @@ def test_the_open_command_then_an_agent(world):
     assert _record(world).get("opened_by") == "launcher", _record(world)
     _person_opens(world, world.base + "?person=1")
     _agent_reattaches_and_checks(world, headless=False)
+
+
+def _start_kept(world, url, headless=True):
+    first = Client(env=world.env)
+    try:
+        assert "Browser launched" in _launch(first, url, headless).text
+    finally:
+        first.close()
+
+
+def _keys(world) -> dict:
+    """target id -> url of the page targets, read over DevTools HTTP like the person's browser lists them."""
+    from urllib.request import urlopen
+    port = _record(world)["port"]
+    pages = json.loads(urlopen(f"http://127.0.0.1:{port}/json/list", timeout=5).read())
+    return {p["id"]: p["url"] for p in pages if p.get("type") == "page"}
+
+
+def test_a_launcher_reattach_never_writes_storage_into_the_persons_tab(world, tmp_path):
+    _start_kept(world, world.base + "?launcher=1")
+    _write_record(world, opened_by="launcher", owned=[], fingerprint={"accept_language": "id-ID"})
+    state_file = tmp_path / "state.json"
+    origin = world.base.split("/protocol.html")[0]
+    state_file.write_text(json.dumps({"cookies": [], "origins": {origin + "/protocol.html?stored": {"k": "v"}}}))
+    agent = Client(env=world.env)
+    try:
+        out = _launch(agent, "about:blank", True)
+        assert "cookie jar" in out.text, out.text  # the agent shares the person's cookies
+        loaded = agent.call("storage_state_load", file_path=str(state_file))
+        assert loaded.failed and "tab_new" in loaded.text, loaded.text
+        assert list(_keys(world).values()) == [world.base + "?launcher=1"], _keys(world)
+        # The record's identity is not put on the person's tab; a tab the agent opens gets it.
+        assert agent.call("tab_new", url=world.base + "?agent=1").text.startswith("opened tab")
+        assert agent.evaluate("navigator.language") == "id-ID"
+        idx = _index(agent, "?launcher")
+        agent.call("tab_select", index=idx)
+        assert agent.evaluate("navigator.language") != "id-ID"
+        # With a tab of its own, storage_state_load works, in that tab.
+        agent.call("tab_select", index=_index(agent, "?agent"))
+        assert not agent.call("storage_state_load", file_path=str(state_file)).failed
+        assert world.base + "?launcher=1" in _keys(world).values()
+        refused_ads = _launch(agent, "about:blank", True)  # already running: reuse path
+        assert not refused_ads.failed
+    finally:
+        agent.close()
+
+
+def test_block_ads_is_not_put_on_a_persons_browser(world):
+    _start_kept(world, world.base + "?launcher=1")
+    _write_record(world, opened_by="launcher", owned=[])
+    agent = Client(env=world.env)
+    try:
+        out = agent.call("browser_launch", _timeout=90, url="about:blank", headless=True, persistent=True,
+                         keep_alive=True, extra_args=SAFE_ARGS, block_ads=True)
+        assert "Reattached" in out.text and "block_ads: not attached" in out.text, out.text
+    finally:
+        agent.close()
+
+
+def test_a_spawned_reattach_never_idles_a_persons_browser_shut(world):
+    first = Client(env=world.env)
+    try:
+        out = first.call("spawn_browser", _timeout=90, instance_id="person", headless=True,
+                         keep_alive=True, extra_args=SAFE_ARGS)
+        assert "launched" in out.text, out.text
+    finally:
+        first.close()
+    _write_record(world, opened_by="launcher", owned=[])
+    agent = Client(env=world.env)
+    try:
+        out = agent.call("spawn_browser", _timeout=90, instance_id="person", headless=True, keep_alive=True,
+                         extra_args=SAFE_ARGS, idle_timeout_seconds=600)
+        assert "eattached" in out.text, out.text
+        listed = json.loads(agent.call("list_instances").text[agent.call("list_instances").text.index("{"):])
+        rows = listed.get("instances", listed)
+        person = next(r for r in (rows if isinstance(rows, list) else rows.values())
+                      if r.get("instance_id", r.get("id")) == "person")
+        assert person["idle_timeout"] == 0, person
+    finally:
+        agent.close()
+
+
+def test_owned_entries_from_another_browser_or_gone_tabs_are_dropped(world):
+    _start_kept(world, world.base + "?launcher=1")
+    _person_opens(world, world.base + "?person=1")
+    person_key = next(k for k, u in _keys(world).items() if u.endswith("?person=1"))
+    record = _record(world)
+    # Claimed for an earlier browser generation: never trusted.
+    _write_record(world, opened_by="launcher", owned=[person_key, "F" * 32],
+                  owned_for={"pid": record["pid"] + 1, "pid_start": record.get("pid_start"), "port": record["port"]})
+    agent = Client(env=world.env)
+    try:
+        out = _launch(agent, "about:blank", True)
+        assert "not taken over" in out.text and "another browser" in out.text, out.text
+        assert "not opened by this server" in next(r for r in _rows(agent) if "?person" in r)
+    finally:
+        agent.close()
+    # Claimed for this browser, but one entry names no page: dropped and named.
+    record = _record(world)
+    _write_record(world, owned=["F" * 32],
+                  owned_for={"pid": record["pid"], "pid_start": record.get("pid_start"), "port": record["port"]})
+    again = Client(env=world.env)
+    try:
+        out = _launch(again, "about:blank", True)
+        assert "no longer open" in out.text, out.text
+    finally:
+        again.close()
+
+
+def test_a_0_20_0_launcher_record_is_the_persons_and_an_older_record_is_an_agents(world):
+    # 0.20.0's launcher writes opened_by=launcher and no owned (measured on its own code).
+    _start_kept(world, world.base + "?launcher=1")
+    path = next((world.root / "keep").glob("*.json"))
+    data = json.loads(path.read_text())
+    data["opened_by"] = "launcher"
+    data.pop("owned", None)
+    data.pop("owned_for", None)
+    path.write_text(json.dumps(data))
+    agent = Client(env=world.env)
+    try:
+        _launch(agent, "about:blank", True)
+        assert all("not opened by this server" in r for r in _rows(agent)), _rows(agent)
+    finally:
+        agent.close()
+    # Before 0.20.0 there was no launcher and no opened_by: such a record is an agent's launch.
+    data = json.loads(path.read_text())
+    data.pop("opened_by", None)
+    data.pop("owned", None)
+    data.pop("owned_for", None)
+    path.write_text(json.dumps(data))
+    again = Client(env=world.env)
+    try:
+        out = _launch(again, "about:blank", True)
+        assert "from the launcher" not in out.text, out.text
+        assert not any("not opened by this server" in r for r in _rows(again)), _rows(again)
+        assert not again.call("browser_close", _timeout=60).failed
+    finally:
+        again.close()
