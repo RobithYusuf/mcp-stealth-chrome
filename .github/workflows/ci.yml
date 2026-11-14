@@ -244,6 +244,7 @@ jobs:
           uv run pytest -v -rs --durations=20
           tests/test_cookie_close_e2e.py
           tests/test_brave_e2e.py
+          tests/test_brave_lean_e2e.py
           tests/test_lean_launch_e2e.py
           tests/test_keys_identity.py
           tests/test_old_tools_e2e.py

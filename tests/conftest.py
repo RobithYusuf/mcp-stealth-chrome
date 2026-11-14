@@ -91,6 +91,23 @@ def _saved_tab_lists_in_a_temp_folder():
 
 
 @pytest.fixture(scope="session", autouse=True)
+def _brave_lean_records_in_a_temp_folder():
+    """brave_lean's record of the profiles a server made empty, for every server the suite
+    starts and every in-process launch: no test reads or writes ~/.mcp-stealth/brave-lean."""
+    previous = os.environ.get("MCP_STEALTH_BRAVE_LEAN_DIR")
+    folder = tempfile.mkdtemp(prefix="mcp-stealth-brave-lean-")
+    os.environ["MCP_STEALTH_BRAVE_LEAN_DIR"] = folder
+    try:
+        yield folder
+    finally:
+        if previous is None:
+            os.environ.pop("MCP_STEALTH_BRAVE_LEAN_DIR", None)
+        else:
+            os.environ["MCP_STEALTH_BRAVE_LEAN_DIR"] = previous
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+@pytest.fixture(scope="session", autouse=True)
 def _keep_alive_records_in_a_temp_folder():
     """keep_alive records for every server the suite starts and every in-process launch, so no
     test reads or writes the person's ~/.mcp-stealth/keep-alive, and none reattaches to a

@@ -79,6 +79,7 @@ from .refs import (
     resolve_ref,
 )
 from . import brave as brave_mode
+from . import brave_lean
 from . import dock_icon
 from . import brave_beta
 from . import launch_lock
@@ -2251,9 +2252,32 @@ def _brave_status() -> dict:
         path = brave_mode.find_brave()
         found = profile_version.binary_version(path) if path else None
         return {"installed": bool(path), "path": path,
-                "version": profile_version.text(found) if found else None}
+                "version": profile_version.text(found) if found else None,
+                "lean": brave_lean.status()}
     except Exception as exc:
         return {"installed": None, "detail": _exc_text(exc)}
+
+
+def _lean_on_reattach(product: str, given: Optional[bool]) -> str:
+    """A reattach starts no browser, so no lean flag and no setting is applied: the running
+    Brave keeps what it was started with. Said whatever brave_lean was, the default included."""
+    if product != brave_mode.BRAVE:
+        return ""
+    asked = f"brave_lean={given!r}" if given is not None else "brave_lean (default)"
+    return (f"{asked} not applied: the running Brave keeps the flags and settings it was started "
+            f"with; browser_close() and launch again to apply it")
+
+
+def _brave_lean_running() -> Optional[dict]:
+    """The current browser's brave_lean, as its launch decided it; None when it is not Brave."""
+    browser = BrowserState.browser
+    if browser is None or brave_mode.product_of(browser) != brave_mode.BRAVE:
+        return None
+    outcome = getattr(getattr(browser, "config", None), brave_lean.ATTR, None)
+    if outcome is None:
+        return {"enabled": None, "detail": "not started by this server (reattached or attached), "
+                                           "so the launch that started it decided"}
+    return outcome.summary()
 
 
 def _brave_data_root() -> Path:
@@ -2269,6 +2293,33 @@ def _browser_note(config: Config, product: str) -> str:
         return ""
     found = profile_version.binary_version(str(executable))
     return f" [browser: Brave{' ' + profile_version.text(found) if found else ''}]"
+
+
+def _brave_lean_registry() -> Path:
+    """Where brave_lean records the profiles this server made empty: the server's data folder,
+    never a profile, so a copy of a profile carries no proof with it."""
+    chosen = os.environ.get(brave_lean.REGISTRY_ENV, "").strip()
+    return Path(chosen).expanduser() if chosen else _brave_data_root() / "brave-lean"
+
+
+def _apply_brave_lean(config: Config, product: str, brave_lean_arg: Optional[bool],
+                      server_chosen: bool = False, registry: Optional[Path] = None) -> str:
+    """brave_lean before the browser starts (see brave_lean). Left unset it is on only for a
+    profile this server made empty (`server_chosen`: the launch picked the folder, not the
+    caller); True asks for it on any profile but the person's own Brave folder; False puts back
+    what an earlier lean launch wrote. Chrome has none of these features: nothing is done there,
+    and the result says so only when brave_lean was passed. Never raises."""
+    if product != brave_mode.BRAVE:
+        return " [brave_lean ignored: it applies to Brave only]" if brave_lean_arg is not None else ""
+    root = Path(config.user_data_dir) if config.user_data_dir else None
+    outcome = brave_lean.apply(root, list(config.browser_args or []), brave_lean_arg,
+                               server_chosen=server_chosen,
+                               registry=registry or _brave_lean_registry())
+    if outcome.enabled:
+        config.add_argument(_disable_features_arg(config, brave_lean.FEATURES))
+    with contextlib.suppress(Exception):
+        setattr(config, brave_lean.ATTR, outcome)
+    return outcome.note()
 
 
 def _default_chrome() -> Optional[str]:
@@ -3057,6 +3108,12 @@ async def _reattach_claimed(browser: Any, instance_id: str, profile: Path, recor
     if marker.get("state") == "pending":
         notes.append("a cookie move to v11 is still pending for this profile; it runs on the next "
                      "launch that starts Chrome, not on a reattach")
+    given = {"brave_lean=True": True, "brave_lean=False": False}
+    asked = next((given[item] for item in ignored if item in given), None)
+    ignored = [item for item in ignored if item not in given]
+    lean_note = _lean_on_reattach(brave_mode.product_of(browser), asked)
+    if lean_note:
+        notes.append(lean_note)
     if ignored:
         notes.append("not applied, the running browser keeps its own: " + ", ".join(ignored))
     details["reattached"]["notes"] = notes
@@ -3132,7 +3189,7 @@ _NEW_CHROME_ONLY = {
     "headless": False, "proxy": None, "user_agent": None, "fingerprint": None,
     "storage_state_path": None, "testing_mode": False, "profile_mode": "default",
     "restore_tabs": False, "extra_args": None, "lang": "en-US", "profile_directory": None,
-    "vertical_tabs": None,
+    "vertical_tabs": None, "brave_lean": None,
 }
 
 
@@ -3531,6 +3588,7 @@ async def browser_launch(
     browser: Literal["chrome", "brave"] = "chrome",
     vertical_tabs: Optional[str] = None,
     block_ads: bool = False,
+    brave_lean: Optional[bool] = None,
 ) -> str:
     """Launch stealth Chrome via nodriver. Creates persistent profile by default.
 
@@ -3642,6 +3700,20 @@ async def browser_launch(
             whether it is on; server_status shows what was blocked. Blocked requests fail
             with net::ERR_BLOCKED_BY_CLIENT, as with any ad blocker, which a page can notice.
             Brave blocks ads itself with Shields, so there it does nothing.
+        brave_lean: Brave only. True turns off what an agent has no use for (None, the default,
+            does so only on a profile this server made empty; a user_data_dir, a clone or an
+            older profile keeps its settings unless True is passed, and the result says which):
+            Leo AI, VPN, Speedreader and Playlist for this process (--disable-features); P3A,
+            the daily usage ping and Tor windows (Local State); toolbar and sidebar buttons,
+            new tab widgets and sponsored images, Brave News, the wallet's page provider, and
+            the Web Discovery, Wayback Machine and default-browser prompts (Preferences, written
+            before launch into a profile seen free, never into the person's own Brave folder).
+            Shields, farbling, navigator.brave and the brands, vertical tabs, Safe Browsing and
+            filter list updates stay. Rewards, Ads and the wallet page stay as Brave ships them
+            (only policy removes them, and policy would change the person's own Brave). False
+            keeps Brave as it ships and puts back what an earlier lean launch changed. The result
+            says what was turned off and what was not; server_status shows it. Ignored for
+            Chrome, and said so when passed.
     """
     product, brave_executable, problem = brave_mode.check_request(browser, vertical_tabs)
     if problem:
@@ -3730,6 +3802,9 @@ async def browser_launch(
                 _reuse_keep_note = _keep_alive_on_reuse(keep_alive)
                 if vertical_tabs is not None:
                     reuse_head += (f"; vertical_tabs={vertical_tabs!r} NOT applied, it only "
+                                   f"takes effect on a new launch")
+                if brave_lean is not None:
+                    reuse_head += (f"; brave_lean={brave_lean!r} NOT applied, it only "
                                    f"takes effect on a new launch")
                 if block_ads:
                     reuse_head += _adblock_module().reuse_note(block_ads, BrowserState.browser)
@@ -4041,6 +4116,7 @@ async def browser_launch(
             await _remove_privacy_profile(privacy_profile)
             return err(f"vertical_tabs could not be written into the profile, so nothing was "
                        f"started: {_exc_text(e)}")
+        dock_note += _apply_brave_lean(config, product, brave_lean, server_chosen=explicit_udd is None)
         # Read before Chrome starts, while the person's app is still the frontmost one.
         previous_app = None if headless else await asyncio.to_thread(_frontmost_app)
         if not headless:
@@ -7072,7 +7148,7 @@ async def server_status() -> str:
         "os_cursor": await _os_cursor_status(),
         "dock_icon": await _dock_icon_status(),
         "dock_icon_brave": await _brave_beta_status(),
-        "brave": await asyncio.to_thread(_brave_status),
+        "brave": {**(await asyncio.to_thread(_brave_status)), "lean_running": _brave_lean_running()},
         "profile_gc": profile_gc.status(),
         "block_ads": (_adblock_if_loaded().status([BrowserState.browser] + [
             snap.browser for snap in BrowserState.instances.values()]) if _adblock_if_loaded()
@@ -7915,6 +7991,7 @@ async def _launch_browser_instance(
     browser: str = "chrome",
     vertical_tabs: Optional[str] = None,
     block_ads: bool = False,
+    brave_lean: Optional[bool] = None,
 ) -> tuple[bool, str]:
     """Shared launcher for browser_launch + spawn_browser.
 
@@ -8043,6 +8120,8 @@ async def _launch_browser_instance(
         await _remove_privacy_profile(privacy_profile)
         return False, (f"vertical_tabs could not be written into the profile, so nothing was "
                        f"started: {_exc_text(e)}")
+    dock_note += _apply_brave_lean(config, product, brave_lean,
+                                   server_chosen=not profile_dir_override)
     previous_app = None if headless else await asyncio.to_thread(_frontmost_app)
     if not headless:
         for _flag in _BACKGROUND_WINDOW_FLAGS:
@@ -8568,6 +8647,7 @@ async def spawn_browser(
     browser: Literal["chrome", "brave"] = "chrome",
     vertical_tabs: Optional[str] = None,
     block_ads: bool = False,
+    brave_lean: Optional[bool] = None,
 ) -> str:
     """Create a new named browser instance running in parallel with main.
     Each instance has its own profile, cookies, tabs, logs. Use for multi-account
@@ -8594,6 +8674,8 @@ async def spawn_browser(
         vertical_tabs: "left", "right" (Brave only) or "off", as in browser_launch
         block_ads: block ad and tracker requests in this instance, as
             browser_launch(block_ads=True) does
+        brave_lean: Brave only; as in browser_launch (None: lean on a profile this server
+            made empty, True: lean, False: as it ships)
         other args: same as browser_launch
 
     Use switch_instance(id) to route subsequent tool calls to this instance.
@@ -8670,6 +8752,7 @@ async def spawn_browser(
                     browser=browser,
                     vertical_tabs=vertical_tabs,
                     block_ads=block_ads,
+                    brave_lean=brave_lean,
                 )
                 msg += launch_lock.note() if ok_flag else ""
     finally:

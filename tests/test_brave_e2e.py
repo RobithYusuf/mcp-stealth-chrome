@@ -324,6 +324,7 @@ def test_a_kept_brave_is_reattached_as_brave_and_never_handed_to_chrome(site, da
                       keep_alive=False, extra_args=[LOOPBACK_ONLY])
         assert "Reattached to the running browser" in out.text, out.text
         assert "vertical_tabs='right'" in out.text, "not named as not applied"
+        assert "brave_lean (default) not applied: the running Brave keeps" in out.text, out.text
         seen = json.loads(second.evaluate("JSON.stringify({b: typeof navigator.brave, "
                                           "brands: navigator.userAgentData ? navigator.userAgentData.brands.map(x => x.brand) : [], "
                                           "ua: navigator.userAgent})"))

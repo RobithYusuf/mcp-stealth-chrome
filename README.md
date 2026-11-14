@@ -452,7 +452,7 @@ To use logins from your own browser, `list_chrome_profiles` shows every Chromium
 
 A browser started with `browser_launch` over stdio stays open until you close it, or until the server exits when its client goes away. `keep_alive=True` keeps it past that (see below). Instances from `spawn_browser` and browsers in HTTP mode close after `BROWSER_IDLE_TIMEOUT`.
 
-Runtime data lives in `~/.mcp-stealth/`: `profile/`, `profiles/<id>/`, `brave-profile/`, `brave-profiles/<id>/`, `screenshots/`, `exports/`, `storage-states/`, `window-state/`, `keep-alive/`, `adblock/`. An `app/` folder left by 0.13.0 is removed.
+Runtime data lives in `~/.mcp-stealth/`: `profile/`, `profiles/<id>/`, `brave-profile/`, `brave-profiles/<id>/`, `screenshots/`, `exports/`, `storage-states/`, `window-state/`, `keep-alive/`, `adblock/`, `brave-lean/`. An `app/` folder left by 0.13.0 is removed.
 </details>
 
 Options for one launch. Open one for the details:
@@ -463,6 +463,7 @@ Options for one launch. Open one for the details:
 | Reopen the tabs from last time | `restore_tabs=True` |
 | Block ads and trackers in Chrome | `block_ads=True` |
 | Tabs in a side bar | `vertical_tabs="left"`, or `"right"` in Brave |
+| Brave without Leo, VPN, P3A and the other extras (on by default for a profile the server made) | `brave_lean=True`, or `False` to keep Brave as it ships |
 | Open the agent's browser from the Dock | `mcp-stealth-chrome install-launcher` |
 
 
@@ -516,6 +517,35 @@ Measured through this server on one macOS machine in November 2026, Brave 157.1.
 - `--use-mock-keychain` in `extra_args` is for tests only and refused otherwise: cookies written with it can only be read with it again.
 - An agent that should launch the same Brave Beta when none runs needs `MCP_STEALTH_DOCK_ICON=1` in its server's environment too. Without it, its Brave launch on a profile Brave Beta opened is refused, since Brave 157 is older than the Beta that last opened it.
 - On Linux `open` works without the app; on Windows it says why not (keep_alive needs the quit watcher, which does not run there).
+</details>
+
+<details>
+<summary><b>Brave lean</b></summary>
+
+With `browser="brave"` the server turns off the parts of Brave an agent has no use for. It is on by default for a profile the server makes in an empty folder (`brave-profile`, `brave-profiles/<id>`, `persistent=False`, `privacy=True`), which it records as its own in its data folder (`~/.mcp-stealth/brave-lean`), so a copy or a moved folder does not count. A profile you name with `user_data_dir`, a copy from `clone_chrome_profile`, or one made before this release keeps its settings unless you pass `brave_lean=True`; the launch result says which applies and why. `brave_lean=False` keeps Brave as it ships and puts back what an earlier lean launch changed, in every sub-profile it wrote. Reattaching to a kept Brave applies nothing and says so. Chrome has none of this, and says so when `brave_lean` is passed.
+
+| Turned off | How |
+|------------|-----|
+| Leo AI chat, Brave VPN, Speedreader and its prompts, Playlist | `--disable-features` for this browser process only |
+| P3A, the daily usage ping, Tor windows | the profile's `Local State` |
+| Toolbar and sidebar buttons, new tab widgets (stats, Rewards, News, VPN, Talk) and sponsored images, Brave News, the wallet's page provider (`window.ethereum` and the like), the Web Discovery, Wayback Machine and default-browser prompts | the profile's `Preferences`, written before launch |
+
+Kept: Shields, farbling, `navigator.brave` and the Brave brands, vertical tabs, Safe Browsing, and component updates, which bring Shields its filter lists.
+
+- Brave's enterprise policies (`BraveRewardsDisabled` and the rest) are not used: they apply to every Brave on the machine, including your own. So Rewards, Brave Ads and the wallet page stay as Brave ships them: Rewards and Ads are off until someone opts in, and lean only hides their button and cards.
+- Settings are written only into a profile no browser holds, never through a link (the profile folder included), and never into Brave's own folder (your Brave). A file that does not parse is left alone, and so is a setting whose parent holds something other than settings. Whatever could not be written is named in the launch result, and the launch goes on.
+- The launch result lists what was turned off; `server_status` shows it under `brave.lean_running`, and what lean does under `brave.lean`.
+
+Measured on Brave 157.1.99.55, macOS, November 2026:
+
+| Check | Lean | Not lean |
+|-------|------|----------|
+| Brave servers a new profile left idle for 90 s contacted (net-log) | componentupdater, go-updater, redirector, brave-core-ext.s3 and variations, the same as without lean (safebrowsing in some runs) | the same, plus usage-ping, star-randsrv.bsg and collector.bsg (the usage ping and P3A) |
+| Read from the running browser (brave://settings) | P3A, usage ping, Tor, Leo, VPN, Speedreader off | all on |
+| Visible window | Toolbar: Shields and the menu; new tab page: background and search box | Toolbar adds Rewards, sidebar, wallet, Leo and VPN buttons; new tab page adds stats, News and VPN cards |
+| Memory and processes on example.com, 3 runs each | headless 494 to 535 MB, 6 processes; visible 511 to 582 MB, 7 | headless 513 to 521 MB, 6; visible 517 to 540 MB, 7 (no difference beyond run-to-run spread) |
+| `bot.sannysoft.com`, headless and visible | 30 passed and `TRANSPARENT_PIXEL` warned (farbling), or 31 passed | the same |
+| `browserscan.net/bot-detection` | every check "Normal" | the same |
 </details>
 
 <details>
