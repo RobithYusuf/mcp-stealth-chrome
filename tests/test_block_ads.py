@@ -936,3 +936,23 @@ def test_a_reattach_to_brave_leaves_ads_to_shields(monkeypatch):
     brave_mode.mark(kept, brave_mode.BRAVE)
     note = asyncio.run(server._block_ads_on_reattach(True, kept, "main"))
     assert "Shields" in note and "nothing done" in note, note
+
+
+@needs_engine
+def test_a_request_the_page_dropped_before_the_answer_is_not_an_answer_error():
+    """detik.com, 399 requests: answer_errors 2, both "Invalid InterceptionId.". Measured on
+    Chrome 157 by holding a paused request and answering it late: a fetch the page aborted, an
+    iframe or image removed, and a navigation away each give exactly that, and the page has
+    already settled (the fetch rejected with AbortError). Chrome holds nothing then, so it is
+    counted as gone_before_answer, and answer_errors keeps the real failures."""
+    b = _blocker()
+    b._count_answer_error({"id": 1, "result": {}})
+    b._count_answer_error({"id": 2, "error": {"code": -32602, "message": "Invalid InterceptionId."}})
+    b._count_answer_error({"id": 3, "error": {"code": -32602, "message": "Invalid InterceptionId."}})
+    report = b.report()
+    assert report["gone_before_answer"] == 2
+    assert "answer_errors" not in report and "answer_error_samples" not in report
+    b._count_answer_error({"id": 4, "error": {"code": -32000, "message": "Invalid header: x"}})
+    report = b.report()
+    assert report["answer_errors"] == 1 and report["answer_error_samples"] == ["Invalid header: x"]
+    assert report["gone_before_answer"] == 2

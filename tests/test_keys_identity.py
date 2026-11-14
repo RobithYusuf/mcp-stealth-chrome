@@ -439,7 +439,8 @@ def test_generated_brands_match_a_chrome_with_no_override(loop, base_url):
     import nodriver
 
     async def scenario():
-        browser = await nodriver.start(headless=True)
+        from _protocol import run_mark
+        browser = await nodriver.start(headless=True, browser_args=run_mark())
         try:
             tab = await browser.get(f"{base_url}/keys.html")
             await asyncio.sleep(0.3)
@@ -774,6 +775,8 @@ def _start_external_chrome(tmp_path):
     import subprocess
     import time
 
+    from _protocol import run_mark
+
     from mcp_stealth_chrome.state import find_chrome_binary
 
     with socket.socket() as s:
@@ -781,7 +784,7 @@ def _start_external_chrome(tmp_path):
         port = s.getsockname()[1]
     proc = subprocess.Popen([
         str(find_chrome_binary()), f"--remote-debugging-port={port}", "--headless=new",
-        f"--user-data-dir={tmp_path}", "--use-mock-keychain", "--no-first-run", "about:blank",
+        f"--user-data-dir={tmp_path}", "--use-mock-keychain", "--no-first-run", *run_mark(), "about:blank",
     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     import urllib.request
 

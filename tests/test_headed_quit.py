@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from _protocol import REPO, SAFE_ARGS, Client
+from _protocol import REPO, SAFE_ARGS, Client, run_mark
 from mcp_stealth_chrome import brave
 
 pytestmark = pytest.mark.skipif(
@@ -271,7 +271,7 @@ def test_the_watcher_never_ends_another_chrome(tmp_path):
         second = _start(client, "bystander")
         chrome = next(cmd.split(" --", 1)[0] for p, _pp, cmd in _ps() if p == first)
         loose = subprocess.Popen([chrome, f"--user-data-dir={loose_profile}", "--headless=new",
-                                  "--use-mock-keychain", "--no-first-run", "about:blank"],
+                                  "--use-mock-keychain", "--no-first-run", *run_mark(), "about:blank"],
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(2)
         _assert_quit_ended(first, "first of two")

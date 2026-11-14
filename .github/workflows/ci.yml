@@ -194,3 +194,11 @@ jobs:
           tests/test_sessions_http.py
           tests/test_block_ads.py
           tests/test_block_ads_e2e.py
+      # uv.lock holds nodriver 0.48, but a fresh install gets the newest allowed (0.50), where the
+      # Browser is its own Connection. The close paths are run there too: on 0.50 Browser.close was
+      # never sent, and every close ended Chrome with SIGTERM before it wrote its cookies.
+      - name: Close paths on nodriver 0.50
+        run: >-
+          uv run --with "nodriver>=0.50,<0.51" pytest -v -rs
+          tests/test_cookie_close_e2e.py
+          tests/test_keep_alive_e2e.py

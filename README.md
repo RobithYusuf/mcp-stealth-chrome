@@ -271,6 +271,8 @@ click(ref="e7")
 switch_instance("main")
 ```
 
+Closing the instance you are on leaves its name current: after `close_instance("account_2")` the next `browser_launch` starts `account_2` again on its own profile, and both results say so. Call `switch_instance("main")` first to go back to the main profile.
+
 Find out what protects a page before choosing an approach:
 
 ```

@@ -103,3 +103,11 @@ class Client:
 # Headed launches run from Chrome Beta with the project icon (macOS). The suite turns it off for
 # the servers it starts; a test about it passes this.
 DOCK_ICON_ON = {"MCP_STEALTH_DOCK_ICON": "1"}
+
+
+def run_mark() -> list[str]:
+    """This test run's flag, for a Chrome a test starts itself (conftest finds and ends what is
+    left of those by it). Read when called: conftest sets it once the session starts."""
+    from mcp_stealth_chrome import run_marker
+    flag = run_marker.arg()
+    return [flag] if flag else []

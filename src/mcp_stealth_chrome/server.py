@@ -86,6 +86,8 @@ from . import cookie_migration
 from . import quit_watch
 from . import keep_alive as _keep_alive
 from . import tab_record
+from . import instance_notes
+from . import run_marker
 from .state import data_root as state_data_root
 from .workflow import WorkflowError, run_workflow
 from .humanize import (
@@ -431,21 +433,32 @@ _CLOSE_WAIT = float(os.environ.get("MCP_STEALTH_CLOSE_WAIT", "5"))
 async def _request_browser_close(browser: Any) -> bool:
     """Send Browser.close over CDP. True when Chrome acknowledged it; never raises."""
     from nodriver.cdp import browser as cdp_browser
-    connection = getattr(browser, "connection", None)
-    if connection is None or getattr(connection, "closed", False):
+    if browser is None or _socket_dropped(browser):
         return False
+    # Up to 0.48 the socket is browser.connection; from 0.50 the Browser is the Connection and
+    # .connection stays None. Asking only .connection never sent Browser.close on 0.50, so every
+    # close there ended Chrome with SIGTERM before it wrote its cookies.
+    connection = getattr(browser, "connection", None)
+    if connection is None:
+        connection = browser
     try:
         await asyncio.wait_for(connection.send(cdp_browser.close()), timeout=2)
         return True
     except Exception:
         # The reply can be lost as Chrome closes the socket on its way out; whether it is
         # really going is decided by watching the process, not by this answer.
-        return True if _socket_dropped(connection) else False
+        return _socket_dropped(browser)
 
 
-def _socket_dropped(connection: Any) -> bool:
+def _socket_dropped(browser: Any) -> bool:
+    """The browser's CDP socket was open and is now closed, on either nodriver design. A socket
+    never opened is not dropped: send() opens it."""
     with contextlib.suppress(Exception):
-        return bool(getattr(connection, "closed", False))
+        connection = getattr(browser, "connection", None)
+        if connection is not None:
+            return bool(getattr(connection, "closed", False))
+        socket = getattr(browser, "socket", None)
+        return socket is not None and getattr(socket, "close_code", None) is not None
     return False
 
 
@@ -3410,6 +3423,7 @@ async def _reopen_saved_tabs(
 
 
 @mcp.tool()
+@instance_notes.names_the_instance
 async def browser_launch(
     url: str = "about:blank",
     headless: bool = False,
@@ -7650,6 +7664,7 @@ async def _start_chrome(config: Config) -> Browser:
     A failed exception carries `reap_report`: the launch's Chrome is already dealt with.
     """
     host, port = config.host, config.port
+    run_marker.mark(config)  # only while a test run sets MCP_STEALTH_TEST_RUN
     for attempt in (1, 2):
         try:
             browser = await asyncio.wait_for(
@@ -8695,11 +8710,15 @@ async def instance_release(instance_id: str) -> str:
 
 
 @mcp.tool()
+@instance_notes.says_what_stays_current
 async def close_instance(instance_id: str, forget_tabs: bool = False) -> str:
     """Close a specific browser instance (frees profile + memory).
 
     Its open tabs are saved first (persistent profiles only) for restore_tabs=True on the next
     launch of that instance. forget_tabs=True closes without saving and removes the saved list.
+    Closing the current instance leaves that id current, not running: the next browser_launch
+    starts it again on its own profile, and the result says so. switch_instance('main') to go
+    back to main.
     """
     try:
         _validate_instance_id(instance_id)

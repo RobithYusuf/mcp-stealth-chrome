@@ -566,6 +566,13 @@ def _watchdog_loop() -> None:
 # THE BLOCKER: one CDP connection per browser
 # ══════════════════════════════════════════════════════════════════════════
 
+# Chrome's answer to Fetch.continueRequest or failRequest for a request it no longer holds. Measured
+# on Chrome 157 by answering a held request late: a fetch the page aborted, an iframe or image
+# removed, and a navigation away all give exactly this, and the page had already settled (the
+# fetch rejected with AbortError). Redirects and a target closed while a request waited gave none.
+_GONE_BEFORE_ANSWER = "Invalid InterceptionId"
+
+
 class _Session:
     __slots__ = ("sid", "target_id", "type", "url", "fetch", "root_frame")
 
@@ -609,7 +616,7 @@ class Blocker:
         self.ended_at: Optional[float] = None
         self.end_reason: Optional[str] = None
         self.counts = {"seen": 0, "blocked": 0, "allowed": 0, "answer_errors": 0,
-                       "main_frame_mismatch": 0}
+                       "gone_before_answer": 0, "main_frame_mismatch": 0}
         self.blocked_types: collections.Counter = collections.Counter()
         self.blocked_hosts: collections.Counter = collections.Counter()
         self.recent: collections.deque = collections.deque(maxlen=20)
@@ -759,9 +766,14 @@ class Blocker:
 
     def _count_answer_error(self, reply: dict) -> None:
         if "error" in reply:
+            message = str((reply["error"] or {}).get("message"))
             with self._lock:
+                if message.startswith(_GONE_BEFORE_ANSWER):
+                    # The page cancelled the request while it was paused; Chrome holds nothing.
+                    self.counts["gone_before_answer"] += 1
+                    return
                 self.counts["answer_errors"] += 1
-                self.answer_error_samples.append(str((reply["error"] or {}).get("message"))[:120])
+                self.answer_error_samples.append(message[:120])
 
     async def start(self) -> None:
         try:
@@ -987,8 +999,12 @@ class Blocker:
                 "recent_blocked": list(self.recent)[-10:],
                 "targets_covered": dict(self.covered),
             }
+            if counts["gone_before_answer"]:
+                # Cancelled by the page before the answer arrived (aborted, its element or frame
+                # removed, navigated away): nothing was left waiting.
+                out["gone_before_answer"] = counts["gone_before_answer"]
             if counts["answer_errors"]:
-                # A request whose target closed meanwhile cannot be answered; Chrome dropped it.
+                # Anything else Chrome refused: a real failure to answer.
                 out["answer_errors"] = counts["answer_errors"]
                 out["answer_error_samples"] = list(self.answer_error_samples)
             if counts["main_frame_mismatch"]:

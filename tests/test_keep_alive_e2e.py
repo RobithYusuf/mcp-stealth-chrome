@@ -27,7 +27,7 @@ import urllib.request
 
 import pytest
 
-from _protocol import SAFE_ARGS, Client
+from _protocol import SAFE_ARGS, Client, run_mark
 from mcp_stealth_chrome import state
 
 pytestmark = [
@@ -295,7 +295,7 @@ def test_a_foreign_chrome_on_the_profile_is_never_attached(world, monkeypatch):
     port = _free_port()
     world.profile.mkdir(parents=True)
     proc = subprocess.Popen([chrome, f"--user-data-dir={world.profile}", f"--remote-debugging-port={port}",
-                             "--headless=new", "--no-first-run", *SAFE_ARGS,
+                             "--headless=new", "--no-first-run", *SAFE_ARGS, *run_mark(),
                              *(["--no-sandbox"] if sys.platform.startswith("linux") else []), "about:blank"],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
@@ -443,3 +443,42 @@ def test_two_servers_reattaching_at_once_never_share_the_browser(world):
             c.call("browser_close", _timeout=40)
             c.close()
     assert _wait_gone(pid, 15)
+
+
+@pytest.mark.parametrize("forget_tabs", [True, False])
+def test_closing_a_reattached_browser_asks_it_to_quit_and_keeps_its_cookies(world, forget_tabs):
+    """v0.19.0 on nodriver 0.50: close_instance of a reattached browser said "CDP stop did not end
+    the process; signalled PID(s) [...] directly". Browser.close went only to `.connection`, which
+    0.50 leaves at None, so Chrome was signalled and a cookie set just before the close was lost.
+    forget_tabs=True skips the tab read that used to open the browser socket first."""
+    def spawn(client, **kw):
+        out = client.call("spawn_browser", _timeout=90, instance_id="acct", headless=True,
+                          extra_args=SAFE_ARGS, **kw)
+        assert not out.failed, out.text
+        return out
+
+    client = Client(env=world.env())
+    try:
+        spawn(client, url=world.urls[0], keep_alive=True)
+        pid = world.record()["pid"]
+    finally:
+        client.close()
+    time.sleep(2)
+    assert _alive(pid)
+    client = Client(env=world.env())
+    try:
+        out = spawn(client, url="about:blank")
+        assert f"reattached to the running browser (pid {pid}" in out.text, out.text
+        assert not client.call("switch_instance", instance_id="acct").failed
+        assert client.evaluate("document.cookie = 'kept=1; max-age=86400; path=/', 'ok'") == "ok"
+        closed = client.call("close_instance", instance_id="acct", forget_tabs=forget_tabs, _timeout=40)
+        assert not closed.failed, closed.text
+        assert "signalled" not in closed.text and "STILL RUNNING" not in closed.text, closed.text
+        assert _wait_gone(pid, 10)
+        out = spawn(client, url=world.urls[0])
+        assert "reattached" not in out.text, out.text
+        assert not client.call("switch_instance", instance_id="acct").failed
+        assert client.evaluate("document.cookie") == "kept=1"
+        assert not client.call("close_instance", instance_id="acct", _timeout=40).failed
+    finally:
+        client.close()

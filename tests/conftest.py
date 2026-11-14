@@ -141,3 +141,83 @@ def _adblock_lists_in_a_temp_folder():
         else:
             os.environ["MCP_STEALTH_ADBLOCK_DIR"] = previous
         shutil.rmtree(folder, ignore_errors=True)
+
+
+# ── Browsers the run started are ended by the run, and a leak fails it ──────────────────────
+#
+# A headed Chrome a block_ads test started stayed for 8 hours: parent PID 1, a uc_* temp profile,
+# no CDP client, in the person's Dock. Every Chrome the suite starts carries this run's own flag
+# (run_marker), which is how it is found: never by application name, since the person's browsers
+# and those of another test run on the same machine run beside it.
+# - after each test (MCP_E2E runs): a browser of this run whose starter is gone (its server was
+#   killed, or exited without ending it) is ended, and recorded as left by that test;
+# - after each module (MCP_E2E runs): every browser of this run still running is ended and
+#   recorded (module fixtures holding one have been torn down by then);
+# - at the end: anything left is ended, and the run fails naming every browser recorded.
+# A process list, command line or start time that cannot be read fails the run too, naming what,
+# and a process whose identity is not proved is never signalled.
+# A test ends what it starts in its own finalizer; this is the net under that, and it reports.
+
+import secrets  # noqa: E402
+
+import _leftovers  # noqa: E402
+from mcp_stealth_chrome import run_marker  # noqa: E402
+
+_RUN = secrets.token_hex(8)
+_LEFT: list[str] = []
+# A browser being closed when the check runs (an EOF close, a SIGTERM a fixture just sent) is
+# given this long to go on its own before it counts.
+_GRACE = float(os.environ.get("MCP_TEST_LEFTOVER_GRACE", "8"))
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _browsers_of_this_run_are_marked():
+    previous = os.environ.get(run_marker.ENV)
+    os.environ[run_marker.ENV] = _RUN
+    try:
+        yield _RUN
+    finally:
+        if previous is None:
+            os.environ.pop(run_marker.ENV, None)
+        else:
+            os.environ[run_marker.ENV] = previous
+
+
+def _sweep(where: str, only_orphans: bool) -> None:
+    # A process list or identity that cannot be read is recorded too: unknown is never gone.
+    _LEFT.extend(_leftovers.sweep(_RUN, where, only_orphans, _GRACE))
+
+
+# One process list per test costs about 60 ms; only runs that start browsers pay it.
+_PER_TEST = bool(os.environ.get("MCP_E2E"))
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _a_module_ends_the_browsers_it_started(request):
+    yield
+    if _PER_TEST:
+        _sweep(f"module {request.node.nodeid}", only_orphans=False)
+
+
+@pytest.fixture(autouse=True)
+def _a_test_ends_the_browsers_it_orphaned(request):
+    yield
+    if _PER_TEST:
+        # An orphan from an earlier test was caught by that test's own sweep.
+        _sweep(request.node.nodeid, only_orphans=True)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    _sweep("end of the run", only_orphans=False)
+    if not _LEFT:
+        return
+    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+    lines = [f"{len(_LEFT)} browser(s) this run started were left running, or could not be "
+             f"checked:", *_LEFT]
+    if reporter is not None:
+        reporter.write_sep("=", "browsers left running", red=True)
+        for line in lines:
+            reporter.write_line(line)
+    else:
+        print("\n".join(lines))
+    session.exitstatus = pytest.ExitCode.TESTS_FAILED

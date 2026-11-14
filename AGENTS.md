@@ -243,6 +243,12 @@ conclusions. Each rule below replaced a real lie.
   state selected by a ContextVar, which `StealthMCP.call_tool` binds. A stdio server has one session, the
   primary, so every call site behaves as if the state were global. A background task must bind a session
   explicitly (`in_session`), as the idle reaper does, or it only ever sees the primary.
+- `close_instance` of the current instance leaves that id current, not running; it is not switched to main,
+  because a tool call after the close would then act on main's browser, which may be the person's. The next
+  `browser_launch` starts that instance again on its own profile (`profiles/<id>`, `brave-profiles/<id>`).
+  v0.19.0 did that answering "Browser launched ...", naming neither, and an agent expecting main got another
+  cookie jar. `instance_notes` wraps both tools: the close says the id stays current, a launch of any instance
+  but main names it and its profile on the summary line (the JSON body after it still parses).
 - Each stdio client has its own server process, so sessions matter only over `--http`. Subagents
   sharing a connection are one session to the server: session isolation does not separate them.
 - A session that disconnects moves its browsers to the pool rather than dropping them: losing the handle
@@ -314,6 +320,10 @@ conclusions. Each rule below replaced a real lie.
   writes about every 30 s: three cookies set and closed at once left 0 rows. With `Browser.close` they were written
   and the close took 0.75 s. A lost reply counts as asked when the socket dropped, since Chrome closes it on its way
   out; whether it really went is decided by watching the process, and `verified` keeps its meaning.
+  From nodriver 0.50 the Browser is its own Connection and `.connection` stays None: asking only `.connection`
+  never sent `Browser.close` there, so on every fresh install (0.50.99) a close ended Chrome with SIGTERM and lost
+  its cookies, and closing a reattached keep_alive Chrome said "CDP stop did not end the process; signalled ...".
+  uv.lock held 0.48.1, so every suite passed. CI runs the close paths on 0.50 as well (`uv run --with`).
 - nodriver stops probing for Chrome after about 2.3 seconds. `_start_chrome` waits for that same process and adopts it
   (`config.host`/`port` set means connect, not spawn), moving `_process` across or a close would only drop the socket.
   Only one that never answers is ended and respawned, with host and port restored first.
@@ -759,6 +769,11 @@ conclusions. Each rule below replaced a real lie.
   `block_ads` is not in `_NEW_CHROME_ONLY`, since a running browser can take it.
 - Counts per browser are in `server_status.block_ads`: requests seen, blocked, allowed, by type and host, the
   last blocked URLs through `mask_url`, the targets covered and any that could not be, coverage, answer errors.
+  `Invalid InterceptionId.` is not one: it is Chrome's reply to an answer for a request the page cancelled while it
+  was paused, and it is counted as `gone_before_answer`. Measured on Chrome 157 by answering a held request late: a
+  fetch the page aborted, an iframe or image removed and a navigation away each give exactly that, with the page
+  already settled (the fetch rejected with AbortError); a redirect and a target closed meanwhile give no error.
+  Nothing is left held then. `answer_errors` counts every other refusal, with samples (detik.com showed 2 of 399).
 
 ### Request interception
 
@@ -1043,6 +1058,16 @@ uv run mcp-stealth-chrome --http        # one server for many clients (token req
   code reads its own import of `X` (`srv.B64_INLINE_LIMIT = 500` stopped reaching `screenshot` this way). A fixture patching `server.STORAGE_STATE_DIR` let the `cookie_export` tests write into the real
   `~/.mcp-stealth/storage-states` after the cookie tools moved. Before each move, grep the tests for every module-level
   name the moved code reads and point those patches at the new module, then check the real folders stayed untouched.
+- Every Chrome a test run starts carries `--mcp-stealth-test-run=<token>` (`run_marker`; `_start_chrome` adds it
+  while `MCP_STEALTH_TEST_RUN` is set, and a test starting Chrome itself adds `run_mark()`). `tests/conftest.py`
+  ends what a test orphaned (its starter gone) and what a module left (MCP_E2E runs), and at the end of every run
+  fails it naming each browser it had to end. Signals go by PID with the flag and start time checked right
+  before; never by application name, since the person's browsers and other runs' run beside. Unknown is never
+  gone: a process list, command line or start time that cannot be read fails the run naming what, and a process
+  whose identity is not proved is never signalled (each layer, `end` and `_signal`, refuses it on its own). Why it matters: a
+  Chrome started in-process outlives its event loop, because asyncio's subprocess transport raises "Event loop is
+  closed" in `close()` before it reaches `kill()`, and at pytest's exit it is reparented to PID 1. One stayed 8
+  hours in the person's Dock.
 - Mutation-check a new guard: reintroduce the bug and confirm the test fails. Two tests in this repo
   passed against a deliberately reintroduced defect and had to be rewritten.
 - After editing `src/`, reinstall (`uv tool install --force .`) and restart the MCP client — a
