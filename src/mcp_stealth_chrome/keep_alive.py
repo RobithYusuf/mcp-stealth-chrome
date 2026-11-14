@@ -155,7 +155,8 @@ def last_tabs(profile: Any) -> Optional[dict]:
     Never through a link, and only a file of ours that names this profile."""
     path = tabs_path(profile)
     try:
-        if path.is_symlink() or path.stat().st_uid != os.getuid():
+        uid = getattr(os, "getuid", lambda: None)()  # POSIX; keep_alive does not run elsewhere
+        if path.is_symlink() or (uid is not None and path.stat().st_uid != uid):
             return None
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):

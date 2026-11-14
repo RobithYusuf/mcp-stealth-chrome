@@ -5,11 +5,17 @@ tests cover the watcher's list, the launcher turning it into the saved one, and 
 """
 import json
 import os
+import sys
 
 import pytest
 
 from mcp_stealth_chrome import _quit_watcher as qw
 from mcp_stealth_chrome import keep_alive, launcher, tab_record
+
+# keep_alive, the quit watcher and `open` are POSIX only (keep_alive.supported): on Windows no
+# browser is ever kept, so nothing here can run there. Windows also keeps no 0600 mode bits.
+pytestmark = pytest.mark.skipif(sys.platform == "win32",
+                                reason="keep_alive and the quit watcher are POSIX only")
 
 A, B, C = "https://a.test/one", "https://b.test/two", "file:///tmp/three.html"
 
