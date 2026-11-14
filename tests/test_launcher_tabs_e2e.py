@@ -441,3 +441,39 @@ def test_open_with_lean_starts_brave_without_its_extras(world):
     assert "AIChat" in features and "BraveVPN" in features, features
     prefs = json.loads(next((world.root / "data").glob("brave-profile/Default/Preferences")).read_text())
     assert prefs["brave"]["ai_chat"]["show_toolbar_button"] is False, prefs["brave"].get("ai_chat")
+
+
+def _window_of(world, needle) -> int:
+    from mcp_stealth_chrome import _quit_watcher as qw
+    port = _record(world)["port"]
+    page = next(p for p in _pages(world) if needle in p["url"])
+    return (qw.browser_call("127.0.0.1", port, "Browser.getWindowForTarget",
+                            params={"targetId": page["id"]}) or {}).get("windowId")
+
+
+@pytest.mark.skipif(not os.environ.get("MCP_HEADED"), reason="opens a visible browser: MCP_HEADED=1")
+def test_an_agents_tab_opens_inside_the_persons_window(world):
+    """A window of the agent's own opened exactly over the person's (the same saved placement),
+    and the person read that as their tabs being gone. In a browser they opened, an agent's
+    url= and tab_new land as tabs of their window; new_window=True still gives a window."""
+    cli = str(pathlib.Path(sys.executable).parent / "mcp-stealth-chrome")
+    env = {**os.environ, **world.env, "PYTHONPATH": str(pathlib.Path(__file__).parent.parent / "src")}
+    done = subprocess.run([cli, "open", "--browser", "chrome", "--url", world.base + "?launcher=1"],
+                          env=env, capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0, done.stdout + done.stderr
+    theirs = _window_of(world, "?launcher=1")
+    agent = Client(env=world.env)
+    try:
+        out = _launch(agent, world.base + "?agent=1", False)
+        assert "Reattached" in out.text and "the person's window" in out.text, out.text
+        assert _window_of(world, "?agent=1") == theirs
+        opened = agent.call("tab_new", url=world.base + "?agent=2")
+        assert not opened.failed, opened.text
+        assert _window_of(world, "?agent=2") == theirs
+        # The person's tab is still theirs, and still the one their window shows.
+        assert "not opened by this server" in next(r for r in _rows(agent) if "?launcher" in r)
+        own = agent.call("tab_new", url=world.base + "?agent=3", new_window=True)
+        assert not own.failed, own.text
+        assert _window_of(world, "?agent=3") != theirs
+    finally:
+        agent.close()

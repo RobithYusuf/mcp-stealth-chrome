@@ -802,6 +802,15 @@ conclusions. Each rule below replaced a real lie.
   and `cold_launch` passes `restore_tabs=True` with `server.RESTORE_AS_TABS`: tabs in one window for a person, where
   an agent's restore keeps a window per page so each reads as visible. The suffix is `.tabs`, not `.json`, because
   `live_profiles` reads every `.json` there as a record. `_forget_tabs_note` drops it with the saved list.
+- In a browser the person opened from the launcher, an agent's `url=` on reattach and a `tab_new` with
+  `new_window` unset open as a tab of the person's window (`_open_background_tab`, focus emulation), not as a
+  window of the agent's own. That window took the saved placement, sat exactly over the person's, and read as
+  "my tabs are gone". `new_window=True` still gives a window; an agent's own browser keeps a window per tab.
+- Brave reports itself as Google Chrome on Google's own sites: on google.com, accounts.google.com, youtube.com and
+  workspace.google.com `navigator.brave` is undefined and the brands name "Google Chrome", in the person's own tabs
+  too, while other sites in the same browser read `navigator.brave` and the "Brave" brand (measured on Brave Beta
+  158.1.101.47, tab by tab over raw CDP). It is Brave's own compatibility behaviour, not an override of ours: do
+  not "fix" the brand there, and do not judge Brave by a probe run on a Google page.
 - The launcher did not pass `brave_lean`, and a profile older than lean is not one "the server made empty", so a
   person's agent Brave kept Leo and the rest. `install-launcher --lean` stores the choice in
   `<data>/launcher-lean-<browser>` and `open` reads it (`lean_choice`); unset, the server's own rule decides.

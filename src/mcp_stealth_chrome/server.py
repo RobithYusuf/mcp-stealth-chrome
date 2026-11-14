@@ -3215,10 +3215,20 @@ async def _reattach_claimed(browser: Any, instance_id: str, profile: Path, recor
             observed["note"] = "already open in a tab of the reattached browser; selected, not reloaded"
         else:
             # A new tab, so no page the kept browser holds (a half-filled form) is navigated away.
-            tab = await (_open_background_window(browser) if not headless
-                         else browser.get("about:blank", new_tab=True))
+            # In a browser the person opened, as a tab of their window: a window of the agent's
+            # own opened exactly over theirs (same saved placement) and read as "my tabs are gone".
+            in_their_window = from_launcher and not headless
+            if headless:
+                tab = await browser.get("about:blank", new_tab=True)
+            elif in_their_window:
+                tab = await _open_background_tab(browser)
+            else:
+                tab = await _open_background_window(browser)
             with contextlib.suppress(Exception):
                 await _wait(_apply_fingerprint_to_tab(tab, fingerprint), timeout=5, what="identity")
+            if in_their_window:
+                with contextlib.suppress(Exception):
+                    await _wait(_keep_painting_behind(tab), timeout=5, what="focus emulation")
             doc_state, disarm = await _arm_document_watch(tab)
             try:
                 await asyncio.wait_for(tab.get(url), timeout=BROWSER_NAV_TIMEOUT)
@@ -3229,7 +3239,10 @@ async def _reattach_claimed(browser: Any, instance_id: str, profile: Path, recor
             tabs.append(tab)
             opened_now.add(_target_key(tab))
             select = len(tabs) - 1
-            observed["note"] = "opened in a new tab; the kept tabs were left as they were"
+            observed["note"] = ("opened as a new tab behind the one the person's window shows; their "
+                                "tabs were left as they were, and tab_focus shows this one"
+                                if in_their_window else
+                                "opened in a new tab; the kept tabs were left as they were")
     else:
         # Nothing navigated: read back the page the selected tab shows.
         observed = await _observe_navigation(tabs[select], None, {"armed": False})

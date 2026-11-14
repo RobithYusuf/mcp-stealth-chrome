@@ -442,7 +442,8 @@ async def tab_new(
     See navigate() for the expect_* rules.
 
     new_window: where it opens. Left unset: headed, its own window behind the app the
-        person is using; headless, a tab. True: its own window in both. False: a tab in
+        person is using (in a browser the person opened from the Dock launcher: a tab of
+        their window, as False); headless, a tab. True: its own window in both. False: a tab in
         an existing window. Headed, that tab stays behind the tab its window shows, so
         Chrome never comes to the front, and focus emulation keeps the page reading as
         visible (and focused). Chrome picks the window, usually the browser's first one
@@ -453,6 +454,10 @@ async def tab_new(
         if not BrowserState.browser:
             return err("browser not running")
         browser = BrowserState.browser
+        # A browser the person opened from the launcher: a tab of their window, unless the
+        # caller says otherwise. A window of the agent's own lands exactly over theirs.
+        if new_window is None and not BrowserState.current_headless and _srv._persons_browser(browser):
+            new_window = False
         mode = _tab_new_mode(BrowserState.current_headless, new_window)
         before_tab = None
         if mode == "behind":
