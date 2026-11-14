@@ -44,7 +44,7 @@ Chrome did not answer in time. The server waits for it and tries once more, so t
 
 ### macOS shows "A keychain cannot be found to store Chrome"
 
-Click Cancel, never "Reset To Defaults", which can reset your login keychain. The dialog appears when Chrome runs with a temporary `HOME`, as a test setup might. Pass `--use-mock-keychain` in `extra_args` in that setup.
+Click Cancel, never "Reset To Defaults", which can reset your login keychain. The dialog appears when Chrome runs with a temporary `HOME`, as a test setup might. In this project's test suite `--use-mock-keychain` is passed in `extra_args` for that; the server accepts it only while pytest runs, since cookies written with it can only be read with it again.
 
 ### A "Restore pages?" bubble covers the page
 

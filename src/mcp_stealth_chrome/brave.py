@@ -38,7 +38,8 @@ BROWSERS = (CHROME, BRAVE)
 VERTICAL_TABS = ("left", "right", "off")
 
 _NAMES = {CHROME: "Google Chrome", BRAVE: "Brave"}
-_BRAVE_EXECUTABLES = {"brave browser", "brave", "brave.exe", "brave-browser", "brave-browser-stable"}
+_BRAVE_EXECUTABLES = {"brave browser", "brave browser beta", "brave", "brave.exe", "brave-browser",
+                      "brave-browser-stable"}
 
 
 def name(browser: str) -> str:

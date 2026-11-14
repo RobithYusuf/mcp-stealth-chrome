@@ -11,19 +11,31 @@ An MCP server with 173 tools that gives an AI agent a real Chrome browser and an
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org)
 [![CI](https://github.com/RobithYusuf/mcp-stealth-chrome/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/RobithYusuf/mcp-stealth-chrome/actions/workflows/ci.yml)
 
+<p align="center"><a href="#install">Install</a> · <a href="#test-results">Test results</a> · <a href="#usage-examples">Usage</a> · <a href="#profiles-and-launch-options">Launch options</a> · <a href="#tools">Tools</a> · <a href="#limits">Limits</a> · <a href="#configuration">Configuration</a></p>
+
 </div>
 
 It drives Chrome over CDP with [nodriver](https://github.com/ultrafunkamsterdam/nodriver), so there is no WebDriver and the identity stays that of your real browser and machine. Requests that need no browser go through [curl_cffi](https://github.com/lexiforest/curl_cffi), which is much lighter than rendering a page. Search and page reading work without an API key.
 
 Use the browser when a page needs JavaScript, a login or a person looking at it. Use HTTP when you only need the data.
 
-- ✅ Real Chrome over CDP, with no WebDriver
-- ✅ HTTP with the TLS fingerprint of Chrome, Firefox or Safari
-- ✅ Search and page reading without an API key
-- ✅ Real mouse input, and results that say what actually happened
-- ✅ Passwords and cookies hidden from tool output by default
-- ✅ Several browsers side by side, each with its own profile
-- ✅ Works with Claude Code, Cursor, Codex, Gemini CLI, OpenCode, Droid and other MCP clients
+## What it can do
+
+| | Feature | What you get |
+|--|---------|--------------|
+| ✅ | Real browser | Chrome or Brave over CDP with real mouse and key input. No WebDriver, and the identity is your real browser and machine |
+| ✅ | Honest results | A click says whether the page changed and names what covers a blocked element. Nothing reports success on a guess |
+| ✅ | Small page reads | `browser_snapshot` and `describe_page` return compact refs an agent can act on, reaching into iframes and open shadow roots |
+| ✅ | HTTP without a browser | `http_request`, `scrape_markdown` and `smart_fetch` send the TLS fingerprint of Chrome, Firefox or Safari and can reuse the browser's cookies |
+| ✅ | Search and research | `web_search`, `deep_research`, `github_read` and `youtube_read`, with no API key |
+| ✅ | Logins that last | A kept profile, saved sessions, and cloning a profile from your own browser. Passwords and cookies are hidden from tool output by default |
+| ✅ | Several browsers | Instances side by side, each with its own profile, tabs and logs |
+| ✅ | Stays out of your way | A visible browser opens behind the app you are using and does not take the keyboard |
+| ✅ | Anti-bot help | Detection of the protection in use, Turnstile and reCAPTCHA tools, and handing over to a person when needed |
+| ✅ | Options per launch | Keep the browser open after the agent ends, reopen the last tabs, block ads, vertical tabs, a throwaway profile |
+| ✅ | Debugging | Network capture, request interception, HAR and curl export, console, performance traces |
+
+Works with Claude Code, Cursor, Codex, Gemini CLI, OpenCode, Droid and other MCP clients, on macOS, Linux and Windows.
 
 ## Install
 
@@ -35,10 +47,7 @@ You need [uv](https://docs.astral.sh/uv/) and Chrome or Chromium. uv takes care 
 | Ubuntu or Debian | `curl -LsSf https://astral.sh/uv/install.sh \| sh` | `sudo apt install -y google-chrome-stable` |
 | Windows | `powershell -c "irm https://astral.sh/uv/install.ps1 \| iex"` | `winget install Google.Chrome` |
 
-Then add the server to your client. Open the one you use:
-
-<details>
-<summary><b>Claude Code</b></summary>
+Then add the server to your client. For Claude Code:
 
 All projects:
 
@@ -51,7 +60,8 @@ Current project only:
 ```bash
 claude mcp add stealth-chrome -- uvx mcp-stealth-chrome@latest
 ```
-</details>
+
+Other clients:
 
 <details>
 <summary><b>Claude Desktop</b></summary>
@@ -229,9 +239,141 @@ Add to `~/.omp/agent/mcp.json`:
 
 See [docs/INSTALL.md](docs/INSTALL.md) for verification and troubleshooting.
 
+### Optional extras
+
+| Extra | Needed for | In your client config |
+|-------|------------|-----------------------|
+| `os-cursor` | `solve_turnstile_oscursor` | `"args": ["mcp-stealth-chrome[os-cursor]@latest"]` |
+| `adblock` | `block_ads` | `"args": ["mcp-stealth-chrome[adblock]@latest"]` |
+| both | | `"args": ["mcp-stealth-chrome[adblock,os-cursor]@latest"]` |
+
+<details>
+<summary><b>Permissions, other ways to install, and why they are optional</b></summary>
+
 `solve_turnstile_oscursor` needs the optional `os-cursor` extra. On macOS, use `uvx 'mcp-stealth-chrome[os-cursor]'` in your client config (`"args": ["mcp-stealth-chrome[os-cursor]@latest"]`), or install it with `uv tool install 'mcp-stealth-chrome[os-cursor]'`. Then give the app or terminal that runs your client **Accessibility** and **Screen Recording** permission in System Settings > Privacy & Security. `server_status` shows under `os_cursor` whether this is ready. Windows and Linux backends exist but have not been field-tested.
 
 `block_ads` needs the optional `adblock` extra, which installs Brave's adblock-rust engine: `uvx 'mcp-stealth-chrome[adblock]'` in your client config (`"args": ["mcp-stealth-chrome[adblock]@latest"]`), `uv tool install 'mcp-stealth-chrome[adblock]'`, or `pip install 'mcp-stealth-chrome[adblock]'`. It is not installed by default because the engine has no prebuilt package for Alpine and other musl Linux or for Windows on ARM, where installing it would need Rust. Without it, `block_ads=True` still launches, and the result and `server_status` say ad blocking is off and how to install the extra. Extras combine: `mcp-stealth-chrome[adblock,os-cursor]`.
+
+</details>
+
+## Test results
+
+Sites change, so read these as results from the screenshots below and not as a guarantee.
+
+| Site | What it checks | Result |
+|------|----------------|--------|
+| `bot.sannysoft.com` | Fingerprint tests | ✅ All passed |
+| `browserscan.net/bot-detection` | WebDriver, Selenium, CDP, headless | ✅ All "Normal" |
+| `arh.antoinevastel.com` areyouheadless | Headless Chrome | ✅ "You are not Chrome headless" |
+| `2captcha.com/demo/cloudflare-turnstile` | Turnstile widget, with Cloudflare's test key | ✅ Checkbox reaches "Success!" with `click_turnstile` |
+| `nopecha.com/demo/cloudflare` | Full-page "Just a moment..." challenge | ❌ `click_turnstile`: 0 of 3<br>✅ `solve_turnstile_oscursor`: 3 of 3 (one Mac, one IP) |
+| `google.com/recaptcha/api2/demo` | reCAPTCHA v2 images | ✅ 5 of 5 runs with `solve_recaptcha_ai` |
+| `tls.browserleaks.com` | JA3 and JA4 | ✅ Shows the JA3 of the browser it impersonates |
+
+### Screenshots
+
+<table>
+<tr>
+<td align="center" valign="top"><img src="https://raw.githubusercontent.com/RobithYusuf/mcp-stealth-chrome/main/docs/images/turnstile.jpg" alt="Cloudflare Turnstile widget showing Success" width="260"><br><sub>Cloudflare Turnstile</sub></td>
+<td align="center" valign="top"><img src="https://raw.githubusercontent.com/RobithYusuf/mcp-stealth-chrome/main/docs/images/sannysoft.jpg" alt="bot.sannysoft.com fingerprint tests passing" width="260"><br><sub>bot.sannysoft.com</sub></td>
+<td align="center" valign="top"><img src="https://raw.githubusercontent.com/RobithYusuf/mcp-stealth-chrome/main/docs/images/areyouheadless.jpg" alt="areyouheadless reporting not Chrome headless" width="260"><br><sub>areyouheadless</sub></td>
+</tr>
+<tr>
+<td align="center" valign="top"><img src="https://raw.githubusercontent.com/RobithYusuf/mcp-stealth-chrome/main/docs/images/browserscan.jpg" alt="browserscan.net showing every category as Normal" width="260"><br><sub>browserscan.net</sub></td>
+<td align="center" valign="top"><img src="https://raw.githubusercontent.com/RobithYusuf/mcp-stealth-chrome/main/docs/images/recaptcha.jpg" alt="reCAPTCHA v2 demo solved" width="260"><br><sub>reCAPTCHA v2</sub></td>
+</tr>
+</table>
+
+
+<details>
+<summary><b>Speed and size, measured</b></summary>
+
+Measured in November 2026 on one Mac (M4 Pro, Chrome 157, headless, a throwaway profile), with both servers driven over MCP by the same script. The other server is Google's `chrome-devtools-mcp` 1.12.0. Each number is the median of 5 runs, or of 9 clicks. One machine and one day, so read the ratios, not the digits.
+
+| What | This server | chrome-devtools-mcp |
+|------|-------------|---------------------|
+| Open a local page in a running browser | 63 ms | 131 ms |
+| Open `en.wikipedia.org/wiki/Cat`, cached | 276 ms | 370 ms |
+| Click a button that changes the page | 160 ms | 253 ms |
+| Click a button that does nothing | 577 ms, says `NO page change detected` | 262 ms, says it clicked |
+| Click a button under an overlay | 88 ms, refuses and names the overlay | 252 ms, says it clicked; the overlay took the click |
+| Click a disabled button | 89 ms, says it is disabled | 5.0 s, then a timeout |
+| Fill a text field | 12 ms | 248 ms |
+| Close the browser | 0.11 s | 0.11 s |
+| Snapshot of a form with 158 elements | 2,181 tokens | 3,888 tokens |
+| Snapshot of the Wikipedia page | 2,405 tokens for the first 100 elements, 100,127 for all | 225,658 tokens |
+| Start the browser and load the first page | 1.07 s | 0.66 s |
+| Memory with one page open | 941 MB in 10 processes | 585 MB in 6 processes |
+| Tool definitions sent to the client | 39,877 tokens for 173 tools | 7,300 tokens for 32 tools |
+
+- ✅ Faster at opening pages, clicking, filling and reading, and smaller snapshots. A snapshot here lists what can be acted on; the other server's lists the whole accessibility tree including text, so the two are not the same content.
+- ❌ Slower to start, heavier in memory, and its tool list costs a client that loads every definition about five times as much. `profile_mode="light"` brought one page to about 630 MB in 7 processes, at the cost described under Speed, memory and disk.
+- Tokens were counted with the `o200k_base` tokenizer as an estimate.
+</details>
+
+<details>
+<summary><b>Cloudflare Turnstile</b></summary>
+
+| Situation | Tool |
+|-----------|------|
+| Checkbox embedded in a page, such as a login or signup form | `click_turnstile` |
+| Full-page "Just a moment..." challenge, on macOS, with the desktop free for up to a minute | `solve_turnstile_oscursor` |
+| Full-page challenge where the mouse cannot be taken over, or on Windows or Linux | A saved session with `storage_state_load`, or `solve_captcha` (paid) |
+
+`click_turnstile`, `verify_cf` and `auto_verify` click through CDP. When a challenge is still there afterwards, their result says so and names `solve_turnstile_oscursor`.
+
+One call moves the checkbox from "Verify you are human" to "Success!". This demo uses Cloudflare's test sitekey and returns a dummy token, so it shows that the click lands on the widget. It does not show that a protected site lets you through.
+
+- ✅ Finds and clicks the embedded widget (`.cf-turnstile`, `[data-sitekey]`, or a `challenges.cloudflare.com` iframe). Earlier runs also passed the `dash.cloudflare.com` login and `nopecha.com/captcha/turnstile`, not retested since
+- ❌ `click_turnstile` does not get through Cloudflare's full-page "Just a moment..." challenge. On `nopecha.com/demo/cloudflare`, the click earned a `cf_clearance` cookie, but the page stayed at status 403, in 3 of 3 tries, one of them with the VPN off
+- ✅ `solve_turnstile_oscursor` got the main browser through the same page in 3 of 3 tries: status 200, title "NopeCHA - CAPTCHA Demo", no challenge, checked from the main browser. Measured in November 2026 on one macOS machine with one home IP. It is not a claim about other sites, other IPs, or Windows and Linux
+</details>
+
+<details>
+<summary><b>bot.sannysoft.com</b></summary>
+
+`navigator.webdriver` is missing, WebDriver Advanced passes, Chrome and its plugins read as normal, and WebGL reports the real GPU.
+</details>
+
+<details>
+<summary><b>areyouheadless</b></summary>
+
+Antoine Vastel's public test reports "You are not Chrome headless" for a Chrome controlled by this server.
+</details>
+
+<details>
+<summary><b>browserscan.net</b></summary>
+
+Every signal it checks reads "Normal", including WebDriver, Selenium, CDP and headless Chrome.
+</details>
+
+<details>
+<summary><b>TLS fingerprint</b></summary>
+
+Measured at `tls.browserleaks.com`. Each impersonation shows the JA3 of the browser it names, and a plain Python client does not. Hashes change with browser versions.
+
+```
+httpx:                JA3 37f7d09ced1a845dc48872abc1a29d7b   python-httpx/0.28.1
+impersonate=chrome:   JA3 f830262a93191fd695c65531282d5657   Chrome/146.0.0.0
+impersonate=firefox:  JA3 6f7889b9fb1a62a9577e685c1fcfa919   Firefox/147.0
+impersonate=safari:   JA3 ecdf4f49dd59effc439639da29186671   Safari/605.1.15
+```
+</details>
+
+<details>
+<summary><b>reCAPTCHA v2 images</b></summary>
+
+Five runs in a row on Google's demo page, with a fresh profile and a vision model through an OpenAI-compatible API:
+
+```
+Run 1: passed, 2169-char token, tiles [3,4,7],        146 s
+Run 2: passed, 2126-char token, tiles [0,2,4,7],       80 s
+Run 3: passed, 2169-char token, tiles [1,2,4,8],      143 s
+Run 4: passed, 2148-char token, tiles [1,4,5,6,8,9],  126 s
+Run 5: passed, 2169-char token, tiles [0,3,4],         69 s
+Average: 113 s
+```
+</details>
 
 ## Usage examples
 
@@ -290,117 +432,7 @@ intercept_log()
 dry_run(enable=false)
 ```
 
-## Test results
-
-Sites change, so read these as results from the screenshots below and not as a guarantee.
-
-| Site | What it checks | Result |
-|------|----------------|--------|
-| `bot.sannysoft.com` | Fingerprint tests | ✅ All passed |
-| `browserscan.net/bot-detection` | WebDriver, Selenium, CDP, headless | ✅ All "Normal" |
-| `arh.antoinevastel.com` areyouheadless | Headless Chrome | ✅ "You are not Chrome headless" |
-| `2captcha.com/demo/cloudflare-turnstile` | Turnstile widget, with Cloudflare's test key | ✅ Checkbox reaches "Success!" with `click_turnstile` |
-| `nopecha.com/demo/cloudflare` | Full-page "Just a moment..." challenge | ❌ Stays on the challenge with `click_turnstile`, 0 of 3 |
-| `nopecha.com/demo/cloudflare` | Same challenge | ✅ Main browser gets the page with `solve_turnstile_oscursor`, 3 of 3 (one macOS machine, one IP) |
-| `google.com/recaptcha/api2/demo` | reCAPTCHA v2 images | ✅ 5 of 5 runs with `solve_recaptcha_ai` |
-| `tls.browserleaks.com` | JA3 and JA4 | ✅ Shows the JA3 of the browser it impersonates |
-
-### Speed and size, measured
-
-Measured in November 2026 on one Mac (M4 Pro, Chrome 157, headless, a throwaway profile), with both servers driven over MCP by the same script. The other server is Google's `chrome-devtools-mcp` 1.12.0. Each number is the median of 5 runs, or of 9 clicks. One machine and one day, so read the ratios, not the digits.
-
-| What | This server | chrome-devtools-mcp |
-|------|-------------|---------------------|
-| Open a local page in a running browser | 63 ms | 131 ms |
-| Open `en.wikipedia.org/wiki/Cat`, cached | 276 ms | 370 ms |
-| Click a button that changes the page | 160 ms | 253 ms |
-| Click a button that does nothing | 577 ms, says `NO page change detected` | 262 ms, says it clicked |
-| Click a button under an overlay | 88 ms, refuses and names the overlay | 252 ms, says it clicked; the overlay took the click |
-| Click a disabled button | 89 ms, says it is disabled | 5.0 s, then a timeout |
-| Fill a text field | 12 ms | 248 ms |
-| Close the browser | 0.11 s | 0.11 s |
-| Snapshot of a form with 158 elements | 2,181 tokens | 3,888 tokens |
-| Snapshot of the Wikipedia page | 2,405 tokens for the first 100 elements, 100,127 for all | 225,658 tokens |
-| Start the browser and load the first page | 1.07 s | 0.66 s |
-| Memory with one page open | 941 MB in 10 processes | 585 MB in 6 processes |
-| Tool definitions sent to the client | 39,877 tokens for 173 tools | 7,300 tokens for 32 tools |
-
-- ✅ Faster at opening pages, clicking, filling and reading, and smaller snapshots. A snapshot here lists what can be acted on; the other server's lists the whole accessibility tree including text, so the two are not the same content.
-- ❌ Slower to start, heavier in memory, and its tool list costs a client that loads every definition about five times as much. `profile_mode="light"` brought one page to about 630 MB in 7 processes, at the cost described under Speed, memory and disk.
-- Tokens were counted with the `o200k_base` tokenizer as an estimate.
-
-### Cloudflare Turnstile
-
-| Situation | Tool |
-|-----------|------|
-| Checkbox embedded in a page, such as a login or signup form | `click_turnstile` |
-| Full-page "Just a moment..." challenge, on macOS, with the desktop free for up to a minute | `solve_turnstile_oscursor` |
-| Full-page challenge where the mouse cannot be taken over, or on Windows or Linux | A saved session with `storage_state_load`, or `solve_captcha` (paid) |
-
-`click_turnstile`, `verify_cf` and `auto_verify` click through CDP. When a challenge is still there afterwards, their result says so and names `solve_turnstile_oscursor`.
-
-<img src="https://raw.githubusercontent.com/RobithYusuf/mcp-stealth-chrome/main/docs/images/turnstile.jpg" alt="Cloudflare Turnstile widget showing Success" width="500">
-
-One call moves the checkbox from "Verify you are human" to "Success!". This demo uses Cloudflare's test sitekey and returns a dummy token, so it shows that the click lands on the widget. It does not show that a protected site lets you through.
-
-- ✅ Finds and clicks the embedded widget (`.cf-turnstile`, `[data-sitekey]`, or a `challenges.cloudflare.com` iframe). Earlier runs also passed the `dash.cloudflare.com` login and `nopecha.com/captcha/turnstile`, not retested since
-- ❌ `click_turnstile` does not get through Cloudflare's full-page "Just a moment..." challenge. On `nopecha.com/demo/cloudflare`, the click earned a `cf_clearance` cookie, but the page stayed at status 403, in 3 of 3 tries, one of them with the VPN off
-- ✅ `solve_turnstile_oscursor` got the main browser through the same page in 3 of 3 tries: status 200, title "NopeCHA - CAPTCHA Demo", no challenge, checked from the main browser. Measured in November 2026 on one macOS machine with one home IP. It is not a claim about other sites, other IPs, or Windows and Linux
-
-### bot.sannysoft.com
-
-<img src="https://raw.githubusercontent.com/RobithYusuf/mcp-stealth-chrome/main/docs/images/sannysoft.jpg" alt="bot.sannysoft.com fingerprint tests passing" width="500">
-
-`navigator.webdriver` is missing, WebDriver Advanced passes, Chrome and its plugins read as normal, and WebGL reports the real GPU.
-
-### areyouheadless
-
-<img src="https://raw.githubusercontent.com/RobithYusuf/mcp-stealth-chrome/main/docs/images/areyouheadless.jpg" alt="areyouheadless reporting not Chrome headless" width="500">
-
-Antoine Vastel's public test reports "You are not Chrome headless" for a Chrome controlled by this server.
-
-### browserscan.net
-
-<img src="https://raw.githubusercontent.com/RobithYusuf/mcp-stealth-chrome/main/docs/images/browserscan.jpg" alt="browserscan.net showing every category as Normal" width="500">
-
-Every signal it checks reads "Normal", including WebDriver, Selenium, CDP and headless Chrome.
-
-### TLS fingerprint
-
-Measured at `tls.browserleaks.com`. Each impersonation shows the JA3 of the browser it names, and a plain Python client does not. Hashes change with browser versions.
-
-```
-httpx:                JA3 37f7d09ced1a845dc48872abc1a29d7b   python-httpx/0.28.1
-impersonate=chrome:   JA3 f830262a93191fd695c65531282d5657   Chrome/146.0.0.0
-impersonate=firefox:  JA3 6f7889b9fb1a62a9577e685c1fcfa919   Firefox/147.0
-impersonate=safari:   JA3 ecdf4f49dd59effc439639da29186671   Safari/605.1.15
-```
-
-### reCAPTCHA v2 images
-
-<img src="https://raw.githubusercontent.com/RobithYusuf/mcp-stealth-chrome/main/docs/images/recaptcha.jpg" alt="reCAPTCHA v2 demo solved" width="350">
-
-Five runs in a row on Google's demo page, with a fresh profile and a vision model through an OpenAI-compatible API:
-
-```
-Run 1: passed, 2169-char token, tiles [3,4,7],        146 s
-Run 2: passed, 2126-char token, tiles [0,2,4,7],       80 s
-Run 3: passed, 2169-char token, tiles [1,2,4,8],      143 s
-Run 4: passed, 2148-char token, tiles [1,4,5,6,8,9],  126 s
-Run 5: passed, 2169-char token, tiles [0,3,4],         69 s
-Average: 113 s
-```
-
-## Limits
-
-- DataDome, Kasada, PerimeterX/HUMAN and ChatGPT's managed Turnstile are hard to pass with open source tools. A session saved after a manual login is the most reliable option, and commercial services may be needed in production.
-- Datacenter IPs and fresh profiles get blocked more often. For search engines, a warm profile with `engine="brave"` returns the most, and an empty result page usually comes from the environment.
-- Headless is easier to detect, so keep `headless=false` on difficult sites.
-- A Chrome profile can only be open once at a time. A second browser on the same profile moves to a separate one and says so.
-- Closed shadow roots cannot be read.
-- On Windows, tests saw Google Chrome read back none of a profile's cookies after a relaunch, so a login may not survive a restart there. Linux and macOS keep them. This is being looked into.
-
-## Profiles and privacy
+## Profiles and launch options
 
 | You want to | Use | Profile | Kept after closing |
 |-------------|-----|---------|--------------------|
@@ -408,6 +440,9 @@ Average: 113 s
 | Try something without saving a login | `browser_launch(persistent=False)` | Temporary | Nothing |
 | Start with no trace of this browser's past use | `browser_launch(privacy=True)` | Empty, under `privacy-profiles/` | Nothing, and the removal is checked |
 | Use Brave instead of Chrome | `browser_launch(browser="brave")` | `~/.mcp-stealth/brave-profile` | As for Chrome, in a profile of Brave's own |
+
+<details>
+<summary><b>Privacy mode, identity overrides, cloning your own profile, the data folder</b></summary>
 
 `privacy=True` starts from an empty profile, deletes it on close, and picks one proxy when you pass a pool (`a|b`). It does not change the identity. User agent, Chrome version, operating system, language and timezone stay those of the real browser and machine in every mode, since a made-up identity on a real engine contradicts itself. To use a logged-in account, leave privacy off.
 
@@ -418,8 +453,22 @@ To use logins from your own browser, `list_chrome_profiles` shows every Chromium
 A browser started with `browser_launch` over stdio stays open until you close it, or until the server exits when its client goes away. `keep_alive=True` keeps it past that (see below). Instances from `spawn_browser` and browsers in HTTP mode close after `BROWSER_IDLE_TIMEOUT`.
 
 Runtime data lives in `~/.mcp-stealth/`: `profile/`, `profiles/<id>/`, `brave-profile/`, `brave-profiles/<id>/`, `screenshots/`, `exports/`, `storage-states/`, `window-state/`, `keep-alive/`, `adblock/`. An `app/` folder left by 0.13.0 is removed.
+</details>
 
-### Brave
+Options for one launch. Open one for the details:
+
+| You want to | Pass |
+|-------------|------|
+| Keep the browser open after the agent ends | `keep_alive=True` |
+| Reopen the tabs from last time | `restore_tabs=True` |
+| Block ads and trackers in Chrome | `block_ads=True` |
+| Tabs in a side bar | `vertical_tabs="left"`, or `"right"` in Brave |
+| Open the agent's browser from the Dock | `mcp-stealth-chrome install-launcher` |
+
+
+
+<details>
+<summary><b>Brave</b></summary>
 
 `browser_launch(browser="brave")` and `spawn_browser(..., browser="brave")` run Brave instead of Chrome, from where Brave installs itself (`/Applications/Brave Browser.app`, `/usr/bin/brave-browser`, `Program Files\BraveSoftware`), or from `MCP_STEALTH_BRAVE_PATH`. Driven over CDP it stays Brave, measured on Brave 157.1.99.55:
 
@@ -428,7 +477,8 @@ Runtime data lives in `~/.mcp-stealth/`: `profile/`, `profiles/<id>/`, `brave-pr
 - ✅ The page sees Brave: `navigator.brave.isBrave()` is true and `userAgentData` lists Brave and Chromium with versions reduced to `157.0.0.0`, as Brave reports them. The identity override this server applies (headless, `lang`, `fingerprint`) keeps those, and never names Google Chrome there.
 - Brave's profiles are its own: `~/.mcp-stealth/brave-profile` for main, `~/.mcp-stealth/brave-profiles/<id>` for others. A profile belongs to the browser that made it: Brave and Chrome keep cookies and saved passwords under different keys, so opening a Chrome profile with Brave, or a Brave profile with Chrome, is refused and the result names why. `clone_chrome_profile(browser="brave")` copies into `brave-profiles/<id>`, to launch with `browser="brave"`.
 - `keep_alive=True` works for Brave as for Chrome. The next `browser="brave"` launch reattaches to a kept Brave, and a Chrome launch is never handed one (nor the reverse); the result says why a kept browser was not reattached.
-- The Dock icon switch (`MCP_STEALTH_DOCK_ICON`) applies to Chrome only. Quit, `restore_tabs`, cookies kept across a close, and visible windows that stay behind the app in use work as they do for Chrome.
+- With `MCP_STEALTH_DOCK_ICON=1` a visible Brave runs from Brave Beta (`/Applications/Brave Browser Beta.app`) with the project icon, on the same terms as Chrome Beta (see "Own Dock icon" below): only a profile Beta cannot damage, the icon outside `Contents/`, Beta missing means Brave with a note. `/Applications/Brave Browser.app` is never changed. Quit, `restore_tabs`, cookies kept across a close, and visible windows that stay behind the app in use work as they do for Chrome.
+- Brave Beta is not on the access list of the "Brave Safe Storage" Keychain item that Brave created, so the first time Brave Beta needs it macOS asks you. Always Allow keeps its logins. Deny, or no answer, leaves it unable to read the profile's cookies, and it drops them (measured on a test profile: 3 cookies, then none). The launch result says this whenever Brave Beta runs.
 - `server_status` reports under `brave` whether Brave is installed, where, and its version, and under `browser` which one is running.
 - A profile whose maker cannot be told (it holds data, and its `Local State` and `Preferences` are missing, any of them is unreadable, or they disagree) is refused to both browsers. A `--user-data-dir` in `extra_args` is treated as the launch's profile folder and gets the same checks; naming two different folders is refused.
 - `attach_to_chrome` tells Brave from Chrome by the process on that port, or `navigator.brave`, and says which. A browser it cannot tell (a wrapper, Edge, Vivaldi, or one on another machine without `navigator.brave`) is reported as such, and `fingerprint_rotate` and `emulate_device` then leave the client hints alone rather than name the wrong browser.
@@ -445,12 +495,37 @@ Measured through this server on one macOS machine in November 2026, Brave 157.1.
 | `detik.com` front page | 135 requests, 16 iframes | 222 requests, 33 iframes |
 | `cnnindonesia.com` front page | 116 requests, 1 iframe | 231 requests, 16 iframes |
 | A Brave profile copied with `clone_chrome_profile(browser="brave")` | 1575 of its cookies read back, logins kept | Refused, since it would read none |
+</details>
 
-### Vertical tabs
+<details>
+<summary><b>Opening the agent's browser from the Dock</b></summary>
+
+`mcp-stealth-chrome open --browser brave` opens the agent's Brave without an agent. If it is already running on its profile it comes to the front (with `--url`, the page opens in a new tab). If not, it starts exactly as `browser_launch(browser="brave", keep_alive=True)` would, through that function: same flags, profile folder, debugging port, quit watcher and keep_alive record. It then stays open with no server running, and the next `browser_launch(browser="brave")` from any agent reattaches to it. `--browser chrome` does the same for Chrome.
+
+`mcp-stealth-chrome install-launcher` builds `~/Applications/Stealth Brave.app` (macOS), a small app with the project icon, signed on this Mac, that runs `open`. To use it:
+
+- Pin it: drag it to the Dock. A click opens the agent's Brave or brings it forward. The app exits at once and has no Dock icon of its own, so while the browser runs the Dock shows the pinned launcher and Brave Beta with the project icon. Measured: cold click to a running browser in about 3 seconds, a click on a running one about 2 seconds.
+- Pinning Brave Beta itself does not work as a launcher: a click on it when it is not running starts plain Brave Beta on its own default profile, with no debugging port and nothing an agent can reach. macOS has no way to send that click through the launcher without changing Beta's bundle, which this project does not do.
+- Default browser: the app declares `http` and `https`, so it appears in System Settings > Desktop & Dock > Default web browser. Choose "Stealth Brave" there and links from other apps open in the agent's Brave, in a new tab when it runs and through a cold start when it does not. Only `http://` and `https://` links are passed on: any other scheme (`file:`, `chrome:`, `brave:`, a bare host name) is refused and nothing opens. The app does not open local files. Nothing changes the default for you; macOS asks you. Brave Beta should not be the default browser itself, for the reason above.
+- It never starts a second browser on a profile: a click reserves the profile the way `browser_launch` and `spawn_browser` do (one reservation per profile, shared by every process of this project), so a double click, or a click while an agent launches on that profile, waits and then finds that browser running. A profile held by any other browser is only ever brought forward, or refused with the reason. When the browser could not be brought to the front, or a window could not be opened, the click says so and fails rather than reporting success. A lock left by a browser that is gone (after a restart) is cleared when its PID now runs something else and no process uses the profile.
+- Safety: a click starts a browser with a DevTools port on 127.0.0.1 without any agent asking. Any program running as you on this Mac can drive that browser, read its pages and use its logins, as with any browser this server starts. It stays open when no agent runs, until you Quit it. The app says so and asks once before its first start. It never opens your own Brave or Chrome profile, and it sets nothing system-wide (no LaunchAgent, no managed preferences).
+- A browser opened from the launcher is yours: it is recorded as opened by the launcher and its time cap is a year instead of 24 hours, also after an agent reattached to it and left, unless you set `MCP_STEALTH_KEEP_ALIVE_MAX_HOURS`. Quit ends it as usual, and so does closing its last window.
+- The app finds the command it recorded when it was built, then `~/.local/bin`, Homebrew's `bin` folders and your shell's PATH, so a reinstall with `uv tool install --force` keeps it working. When the command cannot be found it says so in a dialog with the install command. `install-launcher --remove` takes it away again; `--dir` builds it elsewhere.
+- The launcher does not modify other apps: macOS blocks an app from writing into another app's bundle (App Management), so when an update of Brave Beta removed the project icon, the window shows Beta's own icon until the next launch from an agent or from `mcp-stealth-chrome open` in a terminal puts it back.
+- `open --move-to-beta` moves a profile Brave made to Brave Beta, once and one way: its cookies go through the cookie move, and Brave older than Beta is refused the profile afterwards. It is only applied when the profile is a folder of its own that Brave made, and both the version that last opened it and Brave Beta's are known; anything unknown is refused. If Brave Beta cannot read the cookies (macOS did not let it use "Brave Safe Storage": answer the Keychain dialog with Always Allow), the launch is refused and the profile is left as it was.
+- `--use-mock-keychain` in `extra_args` is for tests only and refused otherwise: cookies written with it can only be read with it again.
+- An agent that should launch the same Brave Beta when none runs needs `MCP_STEALTH_DOCK_ICON=1` in its server's environment too. Without it, its Brave launch on a profile Brave Beta opened is refused, since Brave 157 is older than the Beta that last opened it.
+- On Linux `open` works without the app; on Windows it says why not (keep_alive needs the quit watcher, which does not run there).
+</details>
+
+<details>
+<summary><b>Vertical tabs</b></summary>
 
 `browser_launch(vertical_tabs="left")`, `"right"` or `"off"` writes the tab-strip setting into the profile before the browser starts, and the profile keeps it. Leaving it out (`None`) keeps the profile's own setting. Brave has both sides. Google Chrome only has the left, so `vertical_tabs="right"` with Chrome is refused. Checked in visible windows on macOS by where the page starts: Brave's strip is 221 points wide on either side, Chrome's 240 on the left.
+</details>
 
-### Reopening the last tabs
+<details>
+<summary><b>Reopening the last tabs</b></summary>
 
 `browser_launch(restore_tabs=True)` reopens the tabs this instance had on this profile when the server last closed it: `browser_close`, `close_instance`, `close_all_instances`, the idle timeout, a Quit, or the server exiting because its client went away, which is what happens when an agent session is put to sleep. `spawn_browser(restore_tabs=True)` does the same for a named instance. Chrome's own session restore stays off, because restored window placement opened windows that could not be seen.
 
@@ -460,8 +535,10 @@ Measured through this server on one macOS machine in November 2026, Brave 157.1.
 - The list is saved when the server closes the browser, about 2 seconds after tool calls, and every 30 seconds while the browser runs, so a server that was killed still leaves the last list it saw. Saving takes about 1 ms. A Quit closes every window before anything can read them, so the list saved before the Quit stays: a browser with no pages never replaces a saved list. Only `http`, `https` and `file` pages are kept, up to 30.
 - `persistent=False` and `privacy=True` keep no tabs.
 - The list is in `~/.mcp-stealth/window-state/<instance>-tabs.json`, one entry per profile, readable by you only. Page URLs can carry tokens. `browser_close(forget_tabs=True)` and `close_instance(instance_id, forget_tabs=True)` close without saving and remove the list. `profile_cleanup(action="remove_fallback", ...)` removes the list of the profile it deletes. Deleting the file removes all of them.
+</details>
 
-### Keeping a browser open when the agent goes away
+<details>
+<summary><b>Keeping a browser open when the agent goes away</b></summary>
 
 When an agent session sleeps, reconnects (`/mcp`) or ends, its client closes the server's stdin and the server closes every browser it started. `browser_launch(keep_alive=True)` and `spawn_browser(instance_id, keep_alive=True)` leave that one browser running instead, with its tabs and page state, and the next launch on the same profile picks it up:
 
@@ -484,7 +561,10 @@ browser_launch()   # a new agent, same profile
 - A signal from the watcher or the server only goes to a process proved to be the one meant, checked right before it: exact profile, and the start time recorded for it. A process whose command line or start time cannot be read is not signalled, and the close says it is not verified. On Linux the signal goes through a pidfd, so it cannot reach a process that took the PID after the check. On macOS the start time has one-second resolution and the check and the signal are separate calls, and Windows goes by the exact command line: small residual risks, not guarantees.
 - If the watcher cannot identify the browser after its last window was closed, it stops after three tries and leaves the reason behind; the next tool call says the browser may still be running and was not ended.
 - `MCP_STEALTH_KEEP_ALIVE_MAX_HOURS` must be a positive finite number. `inf`, `nan`, 0 or a negative value fall back to 24 and a value over a year is cut to a year; the launch result names either.
-### Blocking ads
+</details>
+
+<details>
+<summary><b>Blocking ads</b></summary>
 
 `browser_launch(block_ads=True)` and `spawn_browser(block_ads=True)` block ad and tracker requests with EasyList and EasyPrivacy, using [adblock-rust](https://github.com/brave/adblock-rust), the engine inside Brave. Off by default, and it needs the `adblock` extra (see Install).
 
@@ -497,37 +577,39 @@ browser_launch()   # a new agent, same profile
 - Brave blocks ads itself with Shields, so `block_ads` does nothing there and says so.
 - With `keep_alive=True`, ad blocking ends when the server exits and the browser stays open: the browser goes on unblocked. A later launch that reattaches to it with `block_ads=True` blocks again; one without it does not. A kept Brave is left to Shields on a reattach too.
 - Measured on three Indonesian news home pages, 5 runs each, headless, with and without `block_ads`: frames went from 33 to 16 (detik.com), 30 to 5 (kompas.com) and 12 to 1 (cnnindonesia.com), and requests from 225 to 118, at least 250 to 145, and at least 250 to 118. The page's load event came within 60 s in 15 of 15 runs with blocking and 9 of 15 without, where ad auctions kept loading frames. The article text stayed the same apart from sponsored items. On a local page of 200 requests the load event took 178 ms instead of 138 ms (median of 24 loads), about 0.2 ms per request. A page can also wait longer for a widget it starts from a blocked tag manager: on cnnindonesia.com, its article recommendations started about 2 s later.
+</details>
 
-### Chrome 158 and saved logins (macOS)
+<details>
+<summary><b>Chrome 158 and saved logins (macOS)</b></summary>
 
-Chrome 158 on macOS encrypts with a new key in any profile outside its own default folder, which is every profile this server uses. It does not read the cookies Chrome 157 stored there, and deletes them. The server moves them first, once per profile, the first time Chrome 158 or newer opens it:
+Chrome 158 on macOS stops reading the cookies an older Chrome wrote in a profile outside its default folder. Before such a launch the server backs the cookies up, moves them to the new format and checks every one came back. When it cannot be sure, it refuses the launch and says what to do. Steps, recovery and limits are in [docs/CHROME-158.md](docs/CHROME-158.md).
+</details>
 
-1. It copies the profile's cookie databases to `~/.mcp-stealth/storage-states`, checks the copy, and reads every old cookie from that copy with a headless Chrome started with `--disable-features=KeychainKeyProviderUserDataDirProtection`, which keeps the old cookies readable. The profile itself is not opened or changed at this point.
-2. It writes them to `~/.mcp-stealth/storage-states/pre-v11-migration-<profile>-<time>.json`, readable by you only, and makes sure the file is on disk. `storage_state_load` accepts that file.
-3. Only then does it mark the move as pending in the profile, start the launch you asked for normally, set the cookies again, and read them back, comparing values without printing them.
+<details>
+<summary><b>Own Dock icon (macOS, opt-in)</b></summary>
 
-If the server or the machine stops at any point, the next launch either finds the profile as it was, or finds the pending move and finishes it from the backup.
+With `MCP_STEALTH_DOCK_ICON=1`, a visible browser on a new profile runs from Google Chrome Beta (`/Applications/Google Chrome Beta.app`) with the project icon, so it is not mistaken for your own Chrome. It needs Chrome Beta installed. Measured on Chrome Beta 158:
 
-The launch result says `migrated N cookies to Chrome 158 encryption; backup at <path>, removed after 14 days`. If fewer come back, the launch result is an error that names the missing cookies and the backup, and the next launch tries again. If anything fails before the backup is complete, that launch keeps the protection turned off so nothing is lost, and the next launch tries again. If Chrome reads fewer cookies than the profile holds, the copied databases are put back. Measured with Chrome Beta 158 and 159 standing in for Chrome 158, on profiles made by Chrome 157.
-
-The backup holds every cookie value in plain text. Once the move is done and every cookie was read back, it is kept 14 days (`MCP_STEALTH_MIGRATION_BACKUP_DAYS`) in case something is missed, then removed with its database copy, when a server starts or finishes another move. A backup whose move is not done stays.
-
-Turning the protection off is not safe for every profile: Chrome 158 then deletes the cookies it already stored with the new key (measured on Chrome Beta 159: 3 of 3), and a cookie store holding both kinds loses all of them either way. So the protection is turned off only for a profile read to hold no new-key cookie, a store holding both is moved in two steps, and a launch whose cookie database cannot be read for certain, or changes between the check and the start, is refused with the reason and starts nothing.
-
-Only cookies move. Saved passwords, card and address data and other values Chrome 157 encrypted in that profile stay unreadable to Chrome 158 there. Only the profile folder being launched is moved (`Default`, or the one `--profile-directory` names). A profile in Chrome's own default folder keeps the old key and is left alone. A profile Chrome 158 has opened is refused to Chrome 157.
-
-Two kinds of profile get left behind: `privacy-profiles/<name>`, when a server stops before it could delete one, and `profile-pid<N>` (or `brave-profile-pid<N>` for Brave), which a server uses when another one holds `profile/` (or `brave-profile/`). A few seconds after it starts, the server checks both on a background thread and removes a folder only when all of these hold:
-
-- ✅ It is a real folder directly in its place, with exactly that name, not a link.
-- ✅ No Chrome holds its lock, no running program names it, and this server does not use it.
-- ✅ Nothing in it changed in the last 10 minutes.
-- ✅ For `profile-pid<N>` and `brave-profile-pid<N>`: the server with PID N has ended, and the profile holds none of these: cookies, saved passwords, history, autofill or cards, top sites, saved tabs, local storage, IndexedDB, extensions, bookmarks. A file it cannot read counts as holding something.
-
-It never touches `profile/`, `profiles/`, `brave-profile/`, `brave-profiles/`, `app/` or anything else. `server_status` shows what the last run removed and what it kept, under `profile_gc`. A `profile-pid<N>` that holds something stays: `profile_report` lists what is in each one (counts and cookie domains, no values), and `profile_cleanup(action="remove_fallback", names=[...], confirm=True)` removes the ones you name. Removal is permanent.
+- Only a profile nothing has written to goes to Beta: `persistent=False`, `privacy=True`, or a profile folder that does not exist yet or is empty. A profile that already holds data stays on Google Chrome and the result says why. Chrome 158 does not read the `v10` cookies Chrome 157 stores in a profile outside its default folder, and deletes them: a copy of a profile with 1172 cookies had none left after Beta opened it. When in doubt, Google Chrome is used.
+- A profile Beta made stays on Beta, and the result says so. Google Chrome 157 is refused it, headless too, until Google Chrome reaches the version that last opened it.
+- The icon is a custom Finder icon at the top of the Beta app (`Icon\r` and a Finder flag). Nothing inside `Contents/` changes, and `codesign --verify --deep` still passes. An update of Beta removes the icon. The next visible launch puts it back in the background, about 0.3 seconds, and does not wait for it. `/Applications/Google Chrome.app` is never changed.
+- Beta registers with Google's updater under its own entry, `com.google.chrome.beta`. The `com.google.chrome` entry is not changed. Headless browsers, `attach_to_chrome` and the `solve_turnstile_oscursor` helper keep Google Chrome. The helper stops at once when the main browser runs a different Chrome version, because a clearance bound to the user agent could not be moved over.
+- `server_status` reports `dock_icon`: `off`, `beta-ready`, `beta-missing`, `icon-missing` or `unavailable`, with the reason, and `dock_icon_brave` the same for Brave Beta.
+- The Chrome copy used by 0.13.0 is gone. A copy left in `~/.mcp-stealth/app` is removed when a server starts and no browser runs from it.
+</details>
 
 ## What tool results tell you
 
 Results describe what was observed. A tool that reports success when nothing happened would leave an agent building on a false result, so these rules hold across the server:
+
+- ✅ A click says whether the page changed. One that changed nothing answers `clicked but NO page change detected`
+- ✅ A click on a covered element is refused, and the result names what covers it
+- ✅ An empty capture says whether anything was being captured
+- ✅ A browser is reported closed only after its process was seen gone
+- ✅ A visible browser stays behind the app you are using
+
+<details>
+<summary><b>Every rule, in full</b></summary>
 
 - ✅ Clicks are real mouse input. `click`, `click_text`, `click_role`, `click_element_offset`, `click_at_corner` and `hover` test the target first and refuse by name when something covers it. Clicks say `clicked but NO page change detected` when nothing happened, `the outcome could NOT be verified` when the page could not be read before or after, and name any new tab the click opened. A JS click only happens with `js_fallback=True`, and the result says so.
 - ✅ A click is checked as soon as it lands and reported when the page changes, about 160 ms for a button that works. Only a click that changes nothing waits the full 450 ms before saying so, so a handler that reacts after 300 ms is not reported as dead.
@@ -537,13 +619,6 @@ Results describe what was observed. A tool that reports success when nothing hap
 - ✅ `browser_snapshot` writes nothing to the page. Refs live on the server and reach into iframes, cross-origin ones included, and open shadow roots. A field shows its label as `label="..."`, taken from `<label for>`, a label around it or `aria-labelledby`, and `name_contains` finds it by that. The label's own row is left out when its field is listed, and the count of those rows is reported.
 - ✅ `navigate` reports the final URL, redirects, status and ready state, and waits for the load event up to 15 seconds. `expect_url` and `expect_status` turn a redirect into a failure. A page that did not load is an error, and `batch_actions` and `workflow_run` count it as failed. It no longer raises the window unless you pass `focus=True`.
 - ✅ A visible browser stays behind the app you are using. `browser_launch`, `spawn_browser`, `tab_new`, `tab_select` and page actions do not take the keyboard, measured with `lsappinfo` on macOS. `tab_new` opens its own background window, or with `new_window=False` a tab behind the one its window shows, which pages still read as visible (Chrome picks the window and the result names it). `tab_select` only changes which tab tools act on unless you pass `focus=True`, and says when the page it selected reads as hidden. A click that calls `window.open` still brings Chrome forward for about 130 ms before focus returns, so keys typed in that moment reach Chrome. `tab_focus` raises the window on request. Quitting it with Cmd+Q or the Dock, or closing all its windows, ends it within about 3.5 seconds, also when the server that launched it has exited or was reinstalled meanwhile: each visible browser has a small watcher process of its own. The next tool call says it was closed, and nothing starts it again by itself. Closing the last tab with `tab_close` does not count as a Quit.
-- Own Dock icon (macOS, opt-in): with `MCP_STEALTH_DOCK_ICON=1`, a visible browser on a new profile runs from Google Chrome Beta (`/Applications/Google Chrome Beta.app`) with the project icon, so it is not mistaken for your own Chrome. It needs Chrome Beta installed. Measured on Chrome Beta 158:
-  - Only a profile nothing has written to goes to Beta: `persistent=False`, `privacy=True`, or a profile folder that does not exist yet or is empty. A profile that already holds data stays on Google Chrome and the result says why. Chrome 158 does not read the `v10` cookies Chrome 157 stores in a profile outside its default folder, and deletes them: a copy of a profile with 1172 cookies had none left after Beta opened it. When in doubt, Google Chrome is used.
-  - A profile Beta made stays on Beta, and the result says so. Google Chrome 157 is refused it, headless too, until Google Chrome reaches the version that last opened it.
-  - The icon is a custom Finder icon at the top of the Beta app (`Icon\r` and a Finder flag). Nothing inside `Contents/` changes, and `codesign --verify --deep` still passes. An update of Beta removes the icon. The next visible launch puts it back in the background, about 0.3 seconds, and does not wait for it. `/Applications/Google Chrome.app` is never changed.
-  - Beta registers with Google's updater under its own entry, `com.google.chrome.beta`. The `com.google.chrome` entry is not changed. Headless browsers, `attach_to_chrome` and the `solve_turnstile_oscursor` helper keep Google Chrome. The helper stops at once when the main browser runs a different Chrome version, because a clearance bound to the user agent could not be moved over.
-  - `server_status` reports `dock_icon`: `off`, `beta-ready`, `beta-missing`, `icon-missing` or `unavailable`, with the reason.
-  - The Chrome copy used by 0.13.0 is gone. A copy left in `~/.mcp-stealth/app` is removed when a server starts and no browser runs from it.
 - ✅ A profile last opened by a newer Chrome is never opened by an older one. The launch is refused with both versions named, nothing starts, and the profile is not changed. The version is read from `Last Version` and `Local State` in the profile. An older Chrome can damage a profile a newer one has upgraded.
   - It needs macOS with the copy on the same APFS volume as Chrome. If the copy cannot be made, launches use Chrome itself and the result says why. Headless launches and `attach_to_chrome` are not affected.
 - ✅ `evaluate`, `frame_evaluate` and `wait_for_function` report a JavaScript exception as an error, and promises are awaited. Objects and arrays come back as JSON.
@@ -557,6 +632,7 @@ Results describe what was observed. A tool that reports success when nothing hap
 - ✅ A lost browser connection names the condition and how to recover. `browser_recover` handles a stuck browser and only touches this server's profiles.
 
 ✅ Credentials stay out of tool output, since output lands in the agent's transcript. `cookie_list`, `network_get`, `intercept_log`, `wait_for_request`, `auth_capture`, `export_curl`, `http_request` and `http_request_with_session` hide cookies, credential headers, JSON and form fields, and query parameters unless you pass `reveal_values=True`. A URL in their output, a `Location`, `Content-Location` or `Referer` header, and the URLs `http_session_cookies` and `session_warmup` print also hide a `user:password@` part and secret pairs in the fragment, such as an OAuth `#access_token=`. Ordinary parameters stay as they are. Navigation tools (`get_url`, `navigate`, `tab_list` and the like) return the page's URL as it is, because agents use it to keep working. Bodies in other formats pass through unchanged. `export_curl` also returns an `http_request` call that replays the session with the browser's own cookies. Files holding credentials are written mode 600, and so are files taken from a page: screenshots, `save_pdf`, `screenshot_element`, `inspect_image`, traces and heap snapshots. They are written whole to a new private file that then replaces the old one, so nobody reads a half-written file and a symlink in the folder is replaced rather than followed.
+</details>
 
 ## Tools
 
@@ -678,7 +754,7 @@ Open a group to see its tools.
 `console_start`, `console_get`, `console_clear`, `get_page_errors`, `performance_trace_start`, `performance_trace_stop`, `performance_metrics`, `performance_timeline`, `web_vitals`, `coverage_start`, `coverage_stop`, `memory_heap_snapshot`, `emulate_network`, `emulate_cpu`, `emulate_device`
 </details>
 
-## Main features
+### What the main tools do
 
 <details>
 <summary><b>Tools for agents</b></summary>
@@ -764,7 +840,18 @@ These run without a browser and without a search API key, and use the stealth br
 | `profile_report`, `profile_cleanup` | Size and use of every profile, and cleanup of caches. Cleanup previews unless `confirm=True`, and refuses main and named profiles and anything in use |
 </details>
 
-## API keys
+## Limits
+
+- DataDome, Kasada, PerimeterX/HUMAN and ChatGPT's managed Turnstile are hard to pass with open source tools. A session saved after a manual login is the most reliable option, and commercial services may be needed in production.
+- Datacenter IPs and fresh profiles get blocked more often. For search engines, a warm profile with `engine="brave"` returns the most, and an empty result page usually comes from the environment.
+- Headless is easier to detect, so keep `headless=false` on difficult sites.
+- A Chrome profile can only be open once at a time. A second browser on the same profile moves to a separate one and says so.
+- Closed shadow roots cannot be read.
+- On Windows, tests saw Google Chrome read back none of a profile's cookies after a relaunch, so a login may not survive a restart there. Linux and macOS keep them. This is being looked into.
+
+## Configuration
+
+### API keys
 
 ✅ 167 of the 173 tools need no key. These six do:
 
@@ -794,7 +881,7 @@ Any provider with `/v1/chat/completions` and `image_url` support works.
 
 Order of use: arguments to the tool, then `OPENAI_*`, then `AI_VISION_*` (deprecated, it logs a warning), then `ANTHROPIC_*`.
 
-## One server for many clients
+### One server for many clients
 
 By default each client starts its own server over stdio. With `--http`, one server handles them all, and each connection (`Mcp-Session-Id`) gets its own instances, tabs and logs. Another session's instance is refused until that session calls `instance_release`.
 
@@ -808,30 +895,40 @@ The server can act as whoever is logged in to its browsers, so access is restric
 - ✅ Only loopback is allowed unless you pass `--allow-remote`. The token then travels unencrypted without a TLS proxy. Behind a proxy or on a wildcard address, name what clients use with `--allowed-host`.
 - ✅ Host and Origin checks stay on, which blocks DNS rebinding from a web page.
 
-Things to know:
+<details>
+<summary><b>Things to know</b></summary>
 
 - A second session's default browser gets its own profile without the first session's logins. Use `instance_release` or `clone_chrome_profile` to share.
 - Subagents on one connection count as one session and share state.
 - Each session runs its own Chrome, so this saves server processes and not browser memory.
 - When a client ends its session, its browsers wait to be claimed or closed by the idle timeout.
 - Request interception and performance tracing work for one session at a time.
+</details>
 
-## Environment variables
+### Environment variables
+
+The ones most people set:
 
 | Variable | Purpose |
 |----------|---------|
 | `BROWSER_IDLE_TIMEOUT` | Seconds before an idle `spawn_browser` instance or HTTP-mode browser closes. Default 600, 0 means never |
+| `MCP_STEALTH_TOKEN` | Token for HTTP mode |
+| `MCP_STEALTH_DOCK_ICON` | Set to `1` to run visible browsers on new profiles from Google Chrome Beta, or Brave Beta for `browser="brave"`, with the project icon (macOS). See "Own Dock icon" under What tool results tell you |
+| `MCP_STEALTH_DATA_DIR` | Folder used instead of `~/.mcp-stealth` for profiles, screenshots, exports and the rest. Chrome keeps your real home folder. The HTTP token stays in `~/.mcp-stealth` |
+
+<details>
+<summary><b>All other variables</b> (30)</summary>
+
+| Variable | Purpose |
+|----------|---------|
 | `BROWSER_IDLE_REAPER_INTERVAL` | How often idle browsers are checked. Default 60 |
 | `BROWSER_LAUNCH_TIMEOUT`, `BROWSER_NAV_TIMEOUT`, `TOOL_ACTION_TIMEOUT` | Time limits for launching, navigating, and single actions |
 | `CAPTURE_MAX_EVENTS`, `CAPTURE_MAX_INDEXED` | Size of the capture buffers |
-| `MCP_STEALTH_TOKEN` | Token for HTTP mode |
-| `MCP_STEALTH_DOCK_ICON` | Set to `1` to run visible browsers on new profiles from Google Chrome Beta with the project icon (macOS). See "Own Dock icon" under What tool results tell you |
 | `MCP_STEALTH_APP_DIR` | Folder of the Chrome copy left by 0.13.0, which is removed. Default `~/.mcp-stealth/app` |
 | `MCP_WINDOWLESS_CLOSE_SECONDS` | Seconds a visible browser may have no window before it is ended as quit. Default 3 |
 | `MCP_STEALTH_QUIT_WATCHER` | Set to `0` to leave quitting to the server alone, without the per-browser watcher process |
 | `MCP_STEALTH_CLOSE_WAIT` | Seconds a browser asked to quit is given to write its state and exit before it is ended with a signal. Default 5 |
 | `MCP_STEALTH_PROFILE_REMOVE_WAIT` | Seconds a privacy profile's removal keeps trying after its browser has gone, while Windows still holds its files open. Default 15 on Windows, 0 elsewhere (three quick tries) |
-| `MCP_STEALTH_DATA_DIR` | Folder used instead of `~/.mcp-stealth` for profiles, screenshots, exports and the rest. Chrome keeps your real home folder. The HTTP token stays in `~/.mcp-stealth` |
 | `MCP_STEALTH_PROFILE_GC` | Set to `0` to turn off the cleanup of leftover profiles when the server starts |
 | `MCP_STEALTH_TABS_DIR` | Folder for the saved tab lists of `restore_tabs`. Default `~/.mcp-stealth/window-state` |
 | `MCP_STEALTH_TAB_RECORD_DEBOUNCE` | Seconds after a tool call before the open tabs are saved. Default 2, 0 turns it off |
@@ -841,6 +938,9 @@ Things to know:
 | `MCP_STEALTH_RESTORE_TABS_MAX` | Tabs kept in a saved list. Default 30 |
 | `MCP_STEALTH_KEEP_ALIVE_MAX_HOURS` | Hours a browser kept with `keep_alive=True` may run with no server before its watcher ends it. Default 24, at most a year; anything not a positive finite number means 24 |
 | `MCP_STEALTH_KEEP_ALIVE_DIR` | Folder for the records of kept browsers. Default `~/.mcp-stealth/keep-alive` |
+| `MCP_STEALTH_LAUNCHER_DIR` | Where `install-launcher` builds the Dock launcher. Default `~/Applications` |
+| `MCP_STEALTH_LAUNCHER_ACTIVATE` | Set to `0` so `open` leaves the browser behind the app in use instead of bringing it forward (tests) |
+| `MCP_STEALTH_LAUNCHER_EXTRA_ARGS` | A JSON list of extra browser flags for `open`, used by tests |
 | `MCP_STEALTH_ADBLOCK_DIR` | Folder for the filter lists and engine of `block_ads`. Default `~/.mcp-stealth/adblock` |
 | `MCP_STEALTH_ADBLOCK_DOWNLOAD_TIMEOUT` | Seconds a list download may take in all. Default 20 |
 | `MCP_STEALTH_ADBLOCK_MAX_BYTES` | Largest list accepted, in bytes. Default 16 MB |
@@ -851,6 +951,7 @@ Things to know:
 | `EXA_API_KEY` | Exa as a `web_search` engine |
 | `GITHUB_TOKEN`, `GH_TOKEN` | Higher rate limit for `github_read` |
 | `RESEARCH_PROXY` | Proxy for the research tools |
+</details>
 
 ## Development
 
@@ -863,7 +964,13 @@ uv run pytest tests/ -q                  # fast tests
 MCP_E2E=1 uv run pytest tests/ -q        # adds the real Chrome tests
 ```
 
-CI runs the fast tests on macOS, Ubuntu and Windows with Python 3.11 and 3.13, installs the built wheel without `uv.lock` and calls `server_status` through a real MCP client, and runs the real Chrome tests headless on all three. Tests that need a visible window or Chrome Beta run only on a developer's Mac.
+CI runs on macOS, Ubuntu and Windows:
+
+- the fast tests, with Python 3.11 and 3.13
+- an install of the built wheel without `uv.lock`, then `server_status` through a real MCP client
+- the real Chrome tests, headless
+
+Tests that need a visible window or Chrome Beta run only on a developer's Mac.
 
 [AGENTS.md](AGENTS.md) records the rules and platform facts behind the code.
 

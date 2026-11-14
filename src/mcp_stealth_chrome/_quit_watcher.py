@@ -294,7 +294,7 @@ def _read_exact(sock, count):
     return data
 
 
-def browser_call(host, port, method, timeout=3.0):
+def browser_call(host, port, method, timeout=3.0, params=None):
     """One CDP call on the browser websocket, its `result` dict, or None on any failure."""
     body = http_get(host, port, "/json/version")
     try:
@@ -321,13 +321,18 @@ def browser_call(host, port, method, timeout=3.0):
         if b" 101 " not in reply.split(b"\r\n", 1)[0]:
             return None
         leftover = reply.partition(b"\r\n\r\n")[2]
-        payload = json.dumps({"id": 1, "method": method}).encode()
+        message = {"id": 1, "method": method}
+        if params:
+            message["params"] = params
+        payload = json.dumps(message).encode()
         mask = os.urandom(4)
         header = bytes([0x81])
         if len(payload) < 126:
             header += bytes([0x80 | len(payload)])
-        else:
+        elif len(payload) < 65536:
             header += bytes([0x80 | 126]) + struct.pack(">H", len(payload))
+        else:
+            header += bytes([0x80 | 127]) + struct.pack(">Q", len(payload))
         sock.sendall(header + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
 
         class _Buffered:

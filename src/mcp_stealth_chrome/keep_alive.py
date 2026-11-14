@@ -104,6 +104,22 @@ def max_hours_problem() -> Optional[str]:
     return _max_hours_read()[1]
 
 
+# Who asked for the browser this process launches: "agent" (a tool call), or "launcher" when the
+# person opened it from the Dock or `mcp-stealth-chrome open` (set by launcher.py, in its own
+# process only). Recorded, and kept across reattaches.
+LAUNCHER = "launcher"
+OPENED_BY = "agent"
+
+
+def cap_hours(opened_by: Optional[str] = None) -> float:
+    """The time cap for a kept browser. One the person opened from the launcher is theirs, visible
+    and ended by Quit, so it gets the longest cap (a year) unless MCP_STEALTH_KEEP_ALIVE_MAX_HOURS
+    says otherwise; every other one gets max_hours()."""
+    if (opened_by or OPENED_BY) == LAUNCHER and not (os.environ.get(ENV_MAX_HOURS) or "").strip():
+        return MAX_HOURS_LIMIT
+    return max_hours()
+
+
 def proxy_from_command(command: Optional[str]) -> Optional[str]:
     """The --proxy-server a running Chrome was given. The record never holds it: a proxy URL can
     carry a password, and the running Chrome's own command line already says it."""

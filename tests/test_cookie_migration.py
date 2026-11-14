@@ -585,7 +585,7 @@ class _Crash(BaseException):
     """The process dying: not an Exception, so no handler on the way turns it into a result."""
 
 
-async def _fake_reader(folder, sub, _executable):
+async def _fake_reader(folder, sub, _executable, _launch_args=None):
     """What Chrome with the flag reads: every v10 row of the temporary folder, decrypted."""
     cookies = []
     for database in (Path(folder) / sub / "Network" / "Cookies", Path(folder) / sub / "Cookies"):
@@ -1190,3 +1190,28 @@ def test_f21_a_finish_that_raises_closes_the_browser(tmp_path, decided, fake_rea
     assert out.startswith("Error:") and "simulated" in out and closed, out
     assert "launch again" in out, out
     assert cm.read_marker(profile)["state"] == "pending"
+
+
+@pytest.mark.parametrize("failure", ["raises", "reads_none"])
+def test_a_brave_reader_that_cannot_read_the_cookies_refuses_and_changes_nothing(tmp_path, chromes, failure, monkeypatch):
+    """Brave Beta without access to "Brave Safe Storage" (the person denied or did not answer the
+    Keychain dialog) read 0 of 3 cookies; the launch that followed with the protection turned off
+    could not decrypt them either and dropped all 3. For Brave a reader that fails is a refusal."""
+    from mcp_stealth_chrome import brave as brave_mode
+    profile = _profile(tmp_path / "p", (b"v10", 1, 3600), (b"v10", 1, 3600))
+    before = _names(profile)
+
+    async def reader(*_a, **_kw):
+        if failure == "raises":
+            raise RuntimeError("Chrome did not answer (simulated)")
+        return []
+
+    monkeypatch.setattr(server, "_read_v10_cookies", reader)
+    config = server.Config(user_data_dir=str(profile), headless=True, browser_args=ARGS)
+    config.browser_executable_path = chromes.c158
+    brave_mode.mark(config, brave_mode.BRAVE)
+    move = asyncio.run(server._prepare_cookie_move(profile, config))
+    assert move.refuse and not move.flag, move
+    assert "Keychain" in move.refuse and "Brave Safe Storage" in move.refuse
+    assert "Nothing was started and the profile was not changed" in move.refuse
+    assert _names(profile) == before and cm.read_marker(profile) == {}

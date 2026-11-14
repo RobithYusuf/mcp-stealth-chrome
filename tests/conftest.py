@@ -126,6 +126,21 @@ def _no_dock_icon_in_process(request, monkeypatch):
         monkeypatch.setattr(dock_icon, "prepare", lambda *_a, **_kw: dock_icon.DockChrome())
 
 
+# Test files that work on the real /Applications/Brave Browser Beta.app on purpose.
+_REAL_BRAVE_BETA = {"test_brave_beta_e2e", "test_launcher_e2e"}
+
+
+@pytest.fixture(autouse=True)
+def _no_real_brave_beta_in_process(request, monkeypatch, tmp_path_factory):
+    """Brave Beta in the pytest process is a folder that does not exist, unless the run asks for
+    the Beta channels or the test file works on the real one. A fake icon writer in a unit test
+    once wrote its stand-in `Icon\r` into the real Brave Beta, beside Contents/."""
+    from mcp_stealth_chrome import brave_beta
+    if request.module.__name__ not in _REAL_BRAVE_BETA and not _BETA_RUN:
+        monkeypatch.setattr(brave_beta, "BETA_APP",
+                            tmp_path_factory.mktemp("no-apps") / "Brave Browser Beta.app")
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _adblock_lists_in_a_temp_folder():
     """block_ads keeps its filter lists and engine here for every server the suite starts and

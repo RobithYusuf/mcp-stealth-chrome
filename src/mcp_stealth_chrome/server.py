@@ -80,6 +80,8 @@ from .refs import (
 )
 from . import brave as brave_mode
 from . import dock_icon
+from . import brave_beta
+from . import launch_lock
 from . import profile_gc
 from . import profile_version
 from . import cookie_migration
@@ -2075,7 +2077,10 @@ def _launch_choice(profile_path: Optional[Path], headless: bool,
     and would make a new one look used. `executable` is a browser the caller chose (Brave),
     which the Dock icon never replaces."""
     if executable:
-        return _LaunchChoice(executable, product=brave_mode.BRAVE)
+        # A visible Brave runs from Brave Beta with the project icon on the same terms.
+        picked, on_beta, note = brave_beta.choose(profile_path, headless=headless,
+                                                  brave=executable, extra_args=extra_args)
+        return _LaunchChoice(picked, beta=on_beta, note=note, product=brave_mode.BRAVE)
     chrome = _default_chrome()
     beta = dock_icon.chosen(headless=headless)
     if not beta:
@@ -2098,8 +2103,19 @@ async def _use_dock_icon_browser(config: Config, headless: bool, choice: _Launch
     """
     brave_mode.mark(config, choice.product)  # read by the cookie plan, whatever the file is called
     if choice.product == brave_mode.BRAVE:
-        config.browser_executable_path = choice.executable  # the Dock icon is Chrome's only
-        return ""
+        config.browser_executable_path = choice.executable
+        if not choice.beta:
+            return f" [Dock icon: Brave, because {choice.note}]" if choice.note else ""
+        picked = await asyncio.to_thread(brave_beta.prepare, headless=headless)
+        if not picked.executable:
+            # Beta went between the choice and now: Brave itself, and say so.
+            config.browser_executable_path = brave_mode.find_brave() or choice.executable
+            return f" [Dock icon: Brave, because {picked.note or 'Brave Beta could not be used'}]"
+        config.browser_executable_path = picked.executable
+        version = f" {picked.version}" if picked.version else ""
+        keychain = "" if "--use-mock-keychain" in (config.browser_args or []) else brave_beta.KEYCHAIN_NOTE
+        tail = "".join(f"; {t}" for t in (picked.note, choice.note, keychain) if t)
+        return f" [Dock icon: Brave Beta{version}{tail}]"
     refusal = "" if choice.beta else choice.note
     try:
         picked = await asyncio.to_thread(
@@ -2133,6 +2149,10 @@ def _profile_version_refusal(profile_path: Optional[Path], executable: Optional[
         bound = brave_mode.binding_refusal(profile_path, product)
         if bound:
             return bound
+        if product == brave_mode.BRAVE:
+            return profile_version.refusal(
+                profile_path, executable,
+                name="Brave Beta" if brave_beta.is_beta_executable(executable) else "Brave")
         return profile_version.refusal(profile_path, executable,
                                        beta=executable.startswith(str(dock_icon.BETA_APP) + "/"))
     except Exception as exc:
@@ -2308,13 +2328,13 @@ async def _prepare_cookie_move(profile_path: Optional[Path], config: Config) -> 
         # would delete them all, so they go at commit, and the backup sets them again.
         return _CookieMove(plan, backup=Path(str(plan.marker["backup"])), strip=bool(plan.v10 and plan.v11))
     try:
-        return await _move_cookies_out(Path(profile_path), config, plan, executable)
+        return await _move_cookies_out(Path(profile_path), config, plan, executable, product)
     except cookie_migration.Changed as exc:
         return _CookieMove(plan, refuse=_cookie_refusal(profile_path, (
             f"its cookies changed while they were being backed up ({exc}), so what Chrome would "
             "delete is no longer known"), plan.marker, product))
     except Exception as exc:
-        return _cookie_move_failed(plan, profile_path, _exc_text(exc))
+        return _cookie_move_failed(plan, profile_path, _exc_text(exc), product)
 
 
 def _cookie_refusal(profile_path: Any, why: str, marker: Optional[dict] = None,
@@ -2334,10 +2354,21 @@ def _cookie_refusal(profile_path: Any, why: str, marker: Optional[dict] = None,
             "persistent=False starts on an empty profile, without these logins")
 
 
-def _cookie_move_failed(plan: Any, profile_path: Any, why: str) -> _CookieMove:
+def _cookie_move_failed(plan: Any, profile_path: Any, why: str, product: str = "chrome") -> _CookieMove:
     """A move that did not finish preparing; the profile was not touched. The flag keeps the
     v10 cookies but deletes v11 ones (Beta 159 with the flag read 0 of 3 and left 0 rows), so a
-    profile holding v11 is not started at all."""
+    profile holding v11 is not started at all.
+
+    For Brave it is always a refusal. Brave Beta is not on the ACL of the "Brave Safe Storage"
+    Keychain item, and a reader that cannot read the cookies is most likely one macOS did not let
+    use that key: the launch with the flag cannot decrypt them either, and dropped all 3 (measured
+    with the dialog unanswered). Unknown is not safe."""
+    if product == brave_mode.BRAVE:
+        return _CookieMove(plan, refuse=_cookie_refusal(profile_path, (
+            f"Brave could not read the cookies it would have to move ({why}). Usually this means "
+            f"macOS did not let this Brave use 'Brave Safe Storage' in your Keychain: the first "
+            f"start asks, and only Always Allow lets it read them. Opened now, Brave would drop "
+            f"every cookie it cannot read"), plan.marker, product))
     if getattr(plan, "v11", 0):
         return _CookieMove(plan, refuse=_cookie_refusal(profile_path, (
             f"its cookies could not be moved to Chrome 158 encryption ({why}), and it holds "
@@ -2426,13 +2457,20 @@ async def _close_after_cookie_failure(browser: Any, profile_path: Any) -> str:
     return "The browser was closed; launch again, which resumes the move"
 
 
-async def _read_v10_cookies(folder: Path, subprofile: str, executable: str) -> list:
+async def _read_v10_cookies(folder: Path, subprofile: str, executable: str,
+                            launch_args: Optional[list] = None) -> list:
     """Every cookie a headless Chrome with the protection turned off reads from `folder`, a
-    temporary user-data folder. Raises when it cannot read them or does not end."""
+    temporary user-data folder. Raises when it cannot read them or does not end.
+
+    The reader keeps the launch's Keychain: a launch with --use-mock-keychain encrypted with the
+    mock key, and a reader on the real Keychain read none of it and asked the person's login
+    Keychain for Brave Beta, which its item does not list (a dialog on their screen)."""
+    keychain = [a for a in (launch_args or []) if a == "--use-mock-keychain"]
     reader_config = Config(
         user_data_dir=str(folder), headless=True,
         browser_args=[f"--profile-directory={subprofile}", "--no-default-browser-check",
-                      "--disable-restore-session-state", "--hide-crash-restore-bubble", *_LEAN_FLAGS],
+                      "--disable-restore-session-state", "--hide-crash-restore-bubble", *_LEAN_FLAGS,
+                      *keychain],
     )
     reader_config.browser_executable_path = executable
     reader_config.add_argument(_cookie_flag_arg(reader_config))
@@ -2455,7 +2493,8 @@ async def _read_v10_cookies(folder: Path, subprofile: str, executable: str) -> l
     return cookies
 
 
-async def _move_cookies_out(profile: Path, config: Config, plan: Any, executable: str) -> _CookieMove:
+async def _move_cookies_out(profile: Path, config: Config, plan: Any, executable: str,
+                            product: str = "chrome") -> _CookieMove:
     """Steps 1 to 4 of cookie_migration. Nothing in the profile is written or opened: the
     databases are copied (verified, fsynced), a Chrome with the flag reads the v10 rows from a
     temporary folder, the backup is written durably and read back, and the profile must still
@@ -2468,7 +2507,8 @@ async def _move_cookies_out(profile: Path, config: Config, plan: Any, executable
     await asyncio.to_thread(cookie_migration.copy_databases, profile, plan.subprofile, db_copy)
     folder = await asyncio.to_thread(cookie_migration.reader_folder, db_copy, plan.subprofile, b"v10")
     try:
-        cookies = await _read_v10_cookies(folder, plan.subprofile, executable)
+        cookies = await _read_v10_cookies(folder, plan.subprofile, executable,
+                                          list(config.browser_args or []))
     finally:
         await asyncio.to_thread(shutil.rmtree, folder, True)
     missing = cookie_migration.missing_from(plan.v10_keys, Counter(cookie_migration.key(c) for c in cookies))
@@ -2477,7 +2517,7 @@ async def _move_cookies_out(profile: Path, config: Config, plan: Any, executable
         sample = ", ".join(f"{n}@{h}" for n, h, *_ in missing[:5])
         return _cookie_move_failed(plan, profile, (
             f"Chrome read {len(cookies)} of the {expected} cookies in the profile with the protection "
-            f"turned off{', not ' + sample if sample else ''}; the profile was not touched"))
+            f"turned off{', not ' + sample if sample else ''}; the profile was not touched"), product)
     if plan.marker.get("state") == "pending" and plan.marker.get("backup"):
         # A move made again over a pending one: cookies only that backup still holds (their rows
         # already taken out from beside v11 ones) are carried over, or they would be lost.
@@ -2569,6 +2609,13 @@ async def _dock_icon_status() -> dict:
         return {"state": "unavailable", "detail": _exc_text(exc)}
 
 
+async def _brave_beta_status() -> dict:
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(brave_beta.status), timeout=3)
+    except Exception as exc:
+        return {"state": "unavailable", "detail": _exc_text(exc)}
+
+
 # ── Saved tabs (restore_tabs) ─────────────────────────────────────────────
 # Chrome's own session restore stays off (wipe_window_state, --disable-restore-session-state):
 # restored window placement is what opened windows invisible. So the server keeps the list
@@ -2601,6 +2648,37 @@ def _tab_record_scope(instance_id: str, profile: Any, privacy: bool) -> Optional
     return Path(str(profile))
 
 
+# The test switch for --use-mock-keychain. It reads and writes cookies under a key no other
+# browser has, so a production launch carrying it would leave a profile whose logins only a mock
+# can read. pytest sets PYTEST_CURRENT_TEST for every test and the servers a test starts inherit
+# it; a server started by a person never has it.
+_MOCK_KEYCHAIN = "--use-mock-keychain"
+
+
+def _mock_keychain_refusal(extra_args: Optional[list]) -> str:
+    if _MOCK_KEYCHAIN not in [str(a).strip() for a in (extra_args or [])]:
+        return ""
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return ""
+    return (f"{_MOCK_KEYCHAIN} is refused: it is for tests only (it applies only under pytest). "
+            f"Cookies written with it can only be read with it again. Nothing was started.")
+
+
+def _launch_reservation(instance_id: str, product: str, *, persistent: bool, privacy: bool,
+                        explicit: Optional[str], extra_args: Optional[list]) -> list:
+    """The profiles a launch may open, reserved across processes (launch_lock) from the first look
+    at who holds them until the browser holds them itself. None for a temporary profile."""
+    if privacy:
+        return []
+    root, _rest, _problem = brave_mode.split_profile_args(extra_args)
+    chosen = explicit or root
+    if chosen:
+        return [Path(str(chosen)).expanduser()]
+    if not persistent:
+        return []
+    return _kept_candidates(instance_id, product if product in brave_mode.BROWSERS else "chrome")
+
+
 # ── keep_alive: a browser left running when this server exits, and reattaching to it ──────
 
 def _keep_alive_decision(keep_alive: Optional[bool], profile: Any, privacy: bool,
@@ -2621,13 +2699,14 @@ def _keep_alive_decision(keep_alive: Optional[bool], profile: Any, privacy: bool
     if why:
         return False, f" [keep_alive ignored: {why}]"
     cap_note = f"; {_keep_alive.max_hours_problem()}" if _keep_alive.max_hours_problem() else ""
+    hours = _keep_alive.cap_hours()
     if headless:
         return True, (f" [keep_alive{cap_note}: this headless browser keeps running after this server "
                       f"exits, an invisible Chrome holding memory, until a later launch on "
                       f"this profile reattaches and closes it, or it has had no server for "
-                      f"{_keep_alive.max_hours():g} h (MCP_STEALTH_KEEP_ALIVE_MAX_HOURS)]")
+                      f"{hours:g} h (MCP_STEALTH_KEEP_ALIVE_MAX_HOURS)]")
     return True, (f" [keep_alive{cap_note}: stays open when this server exits; Quit still ends it, and "
-                  f"it ends once it has had no server for {_keep_alive.max_hours():g} h "
+                  f"it ends once it has had no server for {hours:g} h "
                   f"(MCP_STEALTH_KEEP_ALIVE_MAX_HOURS). A later browser_launch on this "
                   f"profile reattaches to it]")
 
@@ -2687,7 +2766,8 @@ def _arm_keep_alive(browser: Any, profile: Any, instance_id: str, headless: bool
         return (" [keep_alive not armed: the start time of the browser's process could not be "
                 "read, so it closes with this server]")
     path = str(_keep_alive.record_path(profile))
-    cap = _keep_alive.max_hours() * 3600
+    opened_by = (previous or {}).get("opened_by") or _keep_alive.OPENED_BY
+    cap = _keep_alive.cap_hours(opened_by) * 3600
     if headless:
         proc = quit_watch.start(browser, _WINDOWLESS_GRACE, _CLOSE_WAIT, max_orphan_seconds=cap,
                                 pages_matter=False, keep_alive_record=path)
@@ -2707,7 +2787,8 @@ def _arm_keep_alive(browser: Any, profile: Any, instance_id: str, headless: bool
         user_data_dir=str(getattr(config, "user_data_dir", "") or profile),
         pid_start=started, watcher_pid=proc.pid,
         watcher_start=_keep_alive._watcher.process_start(proc.pid), state="held", launched_at=(previous or {}).get("launched_at", now),
-        attached_at=now if previous else None, kept_at=None, max_hours=_keep_alive.max_hours())
+        attached_at=now if previous else None, kept_at=None, max_hours=cap / 3600,
+        opened_by=opened_by)
     if failed:
         # A plain watcher, as any headed browser has; none for headless.
         if headless:
@@ -2890,7 +2971,7 @@ async def _reattach_connected(browser: Any, instance_id: str, profile: Path, rec
         if watcher_note == "ended" and not quit_watch.running(browser):
             proc = quit_watch.start(
                 browser, _WINDOWLESS_GRACE, _CLOSE_WAIT,
-                max_orphan_seconds=_keep_alive.max_hours() * 3600,
+                max_orphan_seconds=_keep_alive.cap_hours(record.get("opened_by")) * 3600,
                 pages_matter=not headless, keep_alive_record=str(_keep_alive.record_path(profile)))
             if proc is not None:
                 fields.update(watcher_pid=proc.pid,
@@ -3568,6 +3649,9 @@ async def browser_launch(
     user_data_dir, extra_args, problem = _profile_from_extra_args(user_data_dir, extra_args, "user_data_dir")
     if problem:
         return err(problem)
+    problem = _mock_keychain_refusal(extra_args)
+    if problem:
+        return err(problem)
     # Local testing wants a clean room by default: a testing_mode run that
     # silently accumulated state in the real login profile was both a surprise
     # and a slow way to make tests depend on each other.
@@ -3611,7 +3695,11 @@ async def browser_launch(
     if _LAUNCH_LOCK.locked():
         return err("another launch is already in progress — wait for it to finish")
 
-    async with _LAUNCH_LOCK:
+    _reserved = _launch_reservation(BrowserState.current_instance_id, product, persistent=bool(persistent),
+                                    privacy=privacy, explicit=user_data_dir, extra_args=extra_args)
+    async with _LAUNCH_LOCK, launch_lock.reserve(_reserved, BROWSER_LAUNCH_TIMEOUT) as _busy:
+        if _busy:
+            return err(_busy)
         # Re-check inside the lock (race with another concurrent call).
         # Reusing a live browser is not just an optimisation: starting a second
         # Chrome against the same profile is what produces "CDP unreachable",
@@ -4731,6 +4819,8 @@ def _nav_result(
     # load must carry it even though the tool itself ran.
     if observed.get("load_failure"):
         return err(f"{action}: the page did not load ({observed['load_failure']})\n{body}")
+    # A launch going on without its profile reservation says so (launch_lock); "" otherwise.
+    suffix += launch_lock.note()
     return ok(
         f"{action}: {final_url} [{status_part}{redirect_part}, ready_state {ready}]"
         f"{suffix}\n{body}"
@@ -6981,6 +7071,7 @@ async def server_status() -> str:
         "compat_patches": _patches.status(),
         "os_cursor": await _os_cursor_status(),
         "dock_icon": await _dock_icon_status(),
+        "dock_icon_brave": await _brave_beta_status(),
         "brave": await asyncio.to_thread(_brave_status),
         "profile_gc": profile_gc.status(),
         "block_ads": (_adblock_if_loaded().status([BrowserState.browser] + [
@@ -8511,6 +8602,9 @@ async def spawn_browser(
         _validate_instance_id(instance_id)
     except ValueError as e:
         return err(str(e))
+    problem = _mock_keychain_refusal(extra_args)
+    if problem:
+        return err(problem)
     foreign = BrowserState.foreign_instance(instance_id)
     if foreign:
         return err(foreign)
@@ -8547,30 +8641,37 @@ async def spawn_browser(
                     f"instance {instance_id!r} already exists ({state}). "
                     "Call close_instance() before reusing its name."
                 )
-            ok_flag, msg = await _launch_browser_instance(
-                instance_id=instance_id,
-                url=url,
-                headless=headless,
-                proxy=proxy,
-                user_agent=user_agent,
-                window_width=window_width,
-                window_height=window_height,
-                persistent=persistent,
-                lang=lang,
-                extra_args=extra_args,
-                storage_state_path=storage_state_path,
-                idle_timeout=idle_timeout_seconds,
-                profile_dir_override=profile_dir,
-                fingerprint=fingerprint,
-                privacy=privacy,
-                desc=desc,
-                restore_tabs=restore_tabs,
-                keep_alive=keep_alive,
-                ignored=_reattach_ignored(locals()),
-                browser=browser,
-                vertical_tabs=vertical_tabs,
-                block_ads=block_ads,
-            )
+            _reserved = _launch_reservation(
+                instance_id, (browser or "chrome").strip().lower(), persistent=bool(persistent),
+                privacy=privacy, explicit=profile_dir, extra_args=extra_args)
+            async with launch_lock.reserve(_reserved, BROWSER_LAUNCH_TIMEOUT) as _busy:
+                if _busy:
+                    return err(_busy)
+                ok_flag, msg = await _launch_browser_instance(
+                    instance_id=instance_id,
+                    url=url,
+                    headless=headless,
+                    proxy=proxy,
+                    user_agent=user_agent,
+                    window_width=window_width,
+                    window_height=window_height,
+                    persistent=persistent,
+                    lang=lang,
+                    extra_args=extra_args,
+                    storage_state_path=storage_state_path,
+                    idle_timeout=idle_timeout_seconds,
+                    profile_dir_override=profile_dir,
+                    fingerprint=fingerprint,
+                    privacy=privacy,
+                    desc=desc,
+                    restore_tabs=restore_tabs,
+                    keep_alive=keep_alive,
+                    ignored=_reattach_ignored(locals()),
+                    browser=browser,
+                    vertical_tabs=vertical_tabs,
+                    block_ads=block_ads,
+                )
+                msg += launch_lock.note() if ok_flag else ""
     finally:
         _SPAWNING.pop(instance_id, None)
     if not ok_flag:
@@ -11471,6 +11572,10 @@ def main() -> None:
     """
     import signal
 
+    from . import launcher
+    if sys.argv[1:2] and sys.argv[1] in launcher.COMMANDS:
+        # Not a server: open the agent browser (or bring it forward), or build the Dock launcher.
+        sys.exit(launcher.cli(sys.argv[1:]))
     cli = _parse_cli(sys.argv[1:])
     # A thread, so neither the start nor any tool waits on it; a failure stays in there.
     with contextlib.suppress(Exception):

@@ -89,10 +89,12 @@ def _binary_version(executable: str, _stamp: int) -> Optional[tuple[int, int, in
     return parse(done.stdout)
 
 
-def refusal(user_data_dir: Optional[Path], executable: Optional[str], *, beta: bool = False) -> str:
+def refusal(user_data_dir: Optional[Path], executable: Optional[str], *, beta: bool = False,
+            name: Optional[str] = None) -> str:
     """Why `executable` must not open `user_data_dir`, or "" when it may.
 
-    `beta` says this launch runs from Chrome Beta, which only changes the advice.
+    `beta` says this launch runs from Chrome Beta, which only changes the advice. `name` is the
+    browser as the message should call it (Brave, Brave Beta); Chrome's names by default.
     """
     if user_data_dir is None:
         return ""
@@ -103,7 +105,19 @@ def refusal(user_data_dir: Optional[Path], executable: Optional[str], *, beta: b
     running = binary_version(executable)
     if recorded is None or running is None or running >= recorded:
         return ""
-    name = "Chrome Beta" if beta else "Google Chrome"
+    brave = bool(name) and name.startswith("Brave")
+    name = name or ("Chrome Beta" if beta else "Google Chrome")
+    if brave:
+        advice = (
+            f"Launch it with a Brave of version {text(recorded)} or newer. If Brave Beta opened it "
+            "(MCP_STEALTH_DOCK_ICON=1 runs visible Brave from Brave Beta), open it the same way, "
+            "visible and with the switch on, or wait until Brave reaches that version. "
+            "persistent=False, or another instance_id, starts on a profile of its own.")
+        return (
+            f"refused to open {folder}: it was last opened by version {text(recorded)}, and this "
+            f"launch would use {name} {text(running)}, which is older. An older browser can damage "
+            f"a profile a newer one has upgraded. Nothing was started and the profile was not "
+            f"changed. {advice}")
     advice = (
         f"Launch it with a Chrome of version {text(recorded)} or newer. If Chrome Beta opened it "
         "(MCP_STEALTH_DOCK_ICON=1 runs visible browsers from Beta), open it the same way, "
@@ -134,7 +148,8 @@ def upgrade_note(user_data_dir: Optional[Path], executable: Optional[str]) -> st
 
 
 def beta_verdict(user_data_dir: Optional[Path], *, chrome: Optional[str], beta: Optional[str],
-                 extra_args=()) -> tuple[bool, str]:
+                 extra_args=(), names: tuple[str, str] = ("Google Chrome", "Chrome Beta")
+                 ) -> tuple[bool, str]:
     """Whether Chrome Beta may open this profile, and what the launch result should say.
 
     Chrome 158, in any profile outside its default folder, does not read the `v10` cookies
@@ -143,10 +158,15 @@ def beta_verdict(user_data_dir: Optional[Path], *, chrome: Optional[str], beta: 
     profile nothing else has written to: none at all (a temporary one), a folder that does not
     exist yet or is empty, or one only Beta can open, because Beta wrote it last and it holds
     no `v10` cookie. Anything in doubt is a no, and Google Chrome opens it.
+
+    `names` is (release, beta) as the note calls them; Brave and Brave Beta follow the same
+    rule (brave_beta.py), since Brave 158 drops `v10` cookies too.
     """
+    release_name, beta_name = names
+    family = release_name.split()[-1] if release_name.startswith("Google") else release_name
     if any((arg or "").startswith("--user-data-dir=") for arg in (extra_args or ())):
-        return False, ("this launch names its own --user-data-dir, which may hold data from "
-                       "Google Chrome, and Chrome Beta would delete its cookies")
+        return False, (f"this launch names its own --user-data-dir, which may hold data from "
+                       f"{release_name}, and {beta_name} would delete its cookies")
     if user_data_dir is None:
         return True, ""
     folder = Path(user_data_dir)
@@ -166,11 +186,11 @@ def beta_verdict(user_data_dir: Optional[Path], *, chrome: Optional[str], beta: 
     chrome_version, beta_version = binary_version(chrome), binary_version(beta)
     if (recorded and chrome_version and beta_version and recorded[0] > chrome_version[0]
             and recorded <= beta_version and _no_v10_cookies(folder)):
-        return True, (f"this profile was last opened by Chrome {text(recorded)}, newer than Google "
-                      f"Chrome {text(chrome_version)}, so it stays on Chrome Beta")
-    who = f"Chrome {text(recorded)}" if recorded else "another Chrome"
-    return False, (f"this profile already holds data from {who}, and Chrome Beta would delete "
-                   "its cookies (it cannot read the v10 cookies Google Chrome writes)")
+        return True, (f"this profile was last opened by {family} {text(recorded)}, newer than "
+                      f"{release_name} {text(chrome_version)}, so it stays on {beta_name}")
+    who = f"{family} {text(recorded)}" if recorded else f"another {family}"
+    return False, (f"this profile already holds data from {who}, and {beta_name} would delete "
+                   f"its cookies (it cannot read the v10 cookies {release_name} writes)")
 
 
 def _no_v10_cookies(folder: Path) -> bool:

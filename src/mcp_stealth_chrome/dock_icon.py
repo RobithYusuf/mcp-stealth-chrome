@@ -45,6 +45,10 @@ ENV_APP_DIR = "MCP_STEALTH_APP_DIR"
 BETA_APP = Path("/Applications/Google Chrome Beta.app")
 BETA_BINARY = Path("Contents/MacOS/Google Chrome Beta")
 CHROME_APP = Path("/Applications/Google Chrome.app")
+# The person's own browsers, never written to whatever a path resolves to, and the only bundle
+# names the icon may go on: the Beta channels, each with its own bundle id and updater entry.
+BRAVE_APP = Path("/Applications/Brave Browser.app")
+ICON_TARGETS = ("Google Chrome Beta.app", "Brave Browser Beta.app")
 # The Chrome copy made by 0.13.0, only ever removed now.
 APP_NAME = "Stealth Chrome.app"
 MARKER_NAME = "Stealth Chrome.json"
@@ -82,6 +86,14 @@ _last_note = ""
 # An icon that could not be put on is not tried again for the same Beta and icon: a Beta the
 # person cannot write to would otherwise cost a subprocess on every headed launch.
 _icon_failed: dict[tuple, str] = {}
+
+# False in a process the Dock launcher app started: macOS App Management blocks an app from
+# modifying another app's bundle (it showed "Stealth Brave was prevented from modifying apps on
+# your Mac"), so the launcher never tries; a server or the command line puts the icon back on.
+ICON_WRITES = True
+NO_WRITES_NOTE = ("the project icon is not on it now (an update removes it); the launcher does not "
+                  "modify other apps, so the next launch by a server or `mcp-stealth-chrome open` "
+                  "puts it back on")
 
 PENDING_NOTE = ("the project icon is being put back on Chrome Beta (an update removes it), "
                 "so this window may show Beta's own icon")
@@ -137,6 +149,8 @@ def prepare(chrome_binary: Optional[str] = None, *, headless: bool,
         version = (_bundle_version(BETA_APP) or ("",))[0]
         if _icon_current(BETA_APP):
             return DockChrome(executable=binary, version=version)
+        if not ICON_WRITES:  # before any write, the dangling flag's clearing included
+            return DockChrome(executable=binary, version=version, note=NO_WRITES_NOTE)
         # The custom-icon flag without its `Icon\r` shows a folder in the Dock, so this launch
         # gets Beta's own icon instead while the project's goes back on.
         _clear_dangling_flag(BETA_APP)
@@ -170,7 +184,10 @@ def start_in_background(root: Optional[Path] = None) -> bool:
         return False
     old_copy = (root or app_dir()).is_dir()
     wants_icon = enabled() and beta_binary() is not None and not _icon_current(BETA_APP)
-    if not old_copy and not wants_icon:
+    from . import brave_beta  # here: it imports this module
+    wants_brave = (enabled() and brave_beta.beta_binary() is not None
+                   and not _icon_current(brave_beta.BETA_APP))
+    if not old_copy and not wants_icon and not wants_brave:
         return False
 
     def job() -> None:
@@ -179,8 +196,12 @@ def start_in_background(root: Optional[Path] = None) -> bool:
             outcome = discard_copy(root)
             if outcome != "removed" and outcome != "nothing to remove":
                 notes.append(f"old Chrome copy {outcome}")
-        if wants_icon:
-            put_icon_on(BETA_APP)
+        for wanted, app in ((wants_icon, BETA_APP), (wants_brave, brave_beta.BETA_APP)):
+            if wanted:
+                try:
+                    put_icon_on(app)
+                except _Note as why:
+                    notes.append(f"{app.name}: {why}")
         if notes:
             raise _Note("; ".join(notes))
 
@@ -192,15 +213,18 @@ class _Note(Exception):
 
 
 def put_icon_on(app: Path) -> None:
-    """Set the project icon as the custom Finder icon of `app`. Only ever Chrome Beta.
+    """Set the project icon as the custom Finder icon of `app`. Only ever Chrome Beta or
+    Brave Beta (brave_beta.py), never a bundle that resolves to the person's Chrome or Brave.
 
     NSWorkspace writes `Icon\\r` and the FinderInfo flag at the bundle root and nothing under
     `Contents/`. Which icon went on is recorded on `Icon\\r`, so a new project icon is noticed.
     A failure is remembered for this Beta and icon, and raised for the thread to keep.
     """
     target = Path(os.path.abspath(app))
-    if os.path.realpath(target) == os.path.realpath(CHROME_APP) or target.name != BETA_APP.name:
-        raise _Note(f"refused: the icon only goes on {BETA_APP.name}, not {target}")
+    if (target.name not in ICON_TARGETS
+            or any(os.path.realpath(target) == os.path.realpath(mine) for mine in (CHROME_APP, BRAVE_APP))):
+        raise _Note(f"refused: the icon only goes on {' or '.join(sorted(ICON_TARGETS))}, "
+                    f"not {target}")
     key = _icon_key(target)
     try:
         if not ICON_PATH.is_file():

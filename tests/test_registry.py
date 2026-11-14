@@ -173,7 +173,7 @@ def test_readme_lists_every_tool():
     from mcp_stealth_chrome.server import mcp
 
     readme = (pathlib.Path(__file__).parent.parent / "README.md").read_text(encoding="utf-8")
-    table = readme[readme.index("## Tools"):readme.index("## Main features")]
+    table = readme[readme.index("## Tools"):readme.index("### What the main tools do")]
     listed = set(re.findall(r"`([a-z_]+)`", table))
     registered = set(mcp._tool_manager._tools)
     assert registered - listed == set(), "missing from the README"
