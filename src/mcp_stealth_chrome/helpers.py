@@ -111,10 +111,24 @@ def _mask_pairs(text: str, *, url: bool = False) -> str | None:
     return "&".join(pieces) if found else None
 
 
-def mask_body(body: Any) -> Any:
+def _mask_own_keys(node: Any, name: Any = None) -> Any:
+    """reveal_values="body": only a value whose own key is secret-named is hidden; a value under
+    a secret-named parent is shown. A list's items are under the list's key."""
+    if isinstance(node, dict):
+        return {k: _mask_own_keys(v, k) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_mask_own_keys(item, name) for item in node]
+    if name is None or node is None or isinstance(node, bool) or not is_secret_name(name):
+        return node
+    return masked_value(node)
+
+
+def mask_body(body: Any, *, own_keys_only: bool = False) -> Any:
     """Hide credential fields in a JSON or form body; returned unchanged when it has none.
 
     Other formats cannot be read field by field, so they pass through as they are.
+    own_keys_only is reveal_values="body": in JSON only values whose own key is secret-named
+    stay hidden. A form body is masked by its own names either way.
     """
     if not isinstance(body, str) or not body:
         return body
@@ -124,7 +138,7 @@ def mask_body(body: Any) -> Any:
             parsed = json.loads(text)
         except ValueError:
             return body
-        masked = _mask_json(parsed)
+        masked = _mask_own_keys(parsed) if own_keys_only else _mask_json(parsed)
         return body if masked == parsed else json.dumps(masked, ensure_ascii=False)
     if "=" in text and "\n" not in text and not text.startswith("<"):
         return _mask_pairs(text) or body
@@ -253,17 +267,49 @@ def private_staging(path: Path) -> Iterator[Path]:
             tmp.unlink()
 
 
-def mask_request_entry(entry: dict) -> dict:
-    """A copy of a captured request safe to return from a tool."""
+def mask_request_entry(entry: dict, *, body_mode: bool = False) -> dict:
+    """A copy of a captured request safe to return from a tool. body_mode is
+    reveal_values="body": headers and the URL as always, bodies by their own keys only."""
     out = dict(entry)
     for key in ("headers", "request_headers", "response_headers"):
         if isinstance(out.get(key), dict):
             out[key] = mask_headers(out[key])
     for key in ("body", "request_body"):
         if key in out:
-            out[key] = mask_body(out[key])
+            out[key] = mask_body(out[key], own_keys_only=body_mode)
     if "url" in out:
         out["url"] = mask_url(out["url"])
+    return out
+
+
+# reveal_values on the tools that show captured traffic: False hides credentials, True shows
+# everything, "body" shows body values under a secret-named parent but keeps credential headers,
+# URL secrets and every body value whose own key is secret-named hidden.
+BODY_REVEAL_NOTE = ("reveal_values='body': credential headers and URL secrets stay masked, and so "
+                    "does every body value whose own key is secret-named; body values under a "
+                    "secret-named parent were revealed at the caller's request")
+
+
+def reveal_mode(value: Any) -> str:
+    """"none", "all" or "body" for a reveal_values argument; ValueError for anything else."""
+    if value is None or value is False:
+        return "none"
+    if value is True:
+        return "all"
+    if isinstance(value, str) and value.strip().lower() == "body":
+        return "body"
+    raise ValueError(f"reveal_values must be true, false or \"body\", not {value!r}")
+
+
+def cut_url(entry: dict, max_len: int) -> dict:
+    """The entry with its URL cut to max_len, saying how much went (`url_cut`). Callers that
+    mask a URL do it before the cut, so a secret past the cut is hidden either way."""
+    url = entry.get("url")
+    if not max_len or not isinstance(url, str) or len(url) <= max_len:
+        return entry
+    out = dict(entry)
+    out["url"] = url[:max_len] + "…"
+    out["url_cut"] = f"{len(url) - max_len} of {len(url)} chars cut; max_url_len=0 for whole URLs"
     return out
 
 

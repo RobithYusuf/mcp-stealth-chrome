@@ -184,12 +184,18 @@ async def wait_for_human(
         done_selector: finish as soon as this CSS selector appears
 
     With neither signal, any URL/DOM change since the handoff counts as done.
-    A timeout is reported as an error — never as a silent success.
+    A timeout is reported as an error — never as a silent success. Without a
+    request_human_help on this tab nothing was handed over, so the result says the change
+    it saw was measured from this call, not from a person's work.
     """
     try:
         tab = BrowserState.active_tab()
         key = _srv._target_key(tab)
         request = _srv._HUMAN_HELP.get(key, {})
+        # Without a handoff any change at all, a timer or an ad, read as "the human finished".
+        unasked = "" if request else (
+            "; no handoff was pending on this tab (request_human_help was not called), so this "
+            "only says the page changed after wait_for_human started")
         # None means "inherit". Keying off the literal 300 would silently
         # override a caller who genuinely asked for 300 seconds.
         if timeout is None:
@@ -214,7 +220,7 @@ async def wait_for_human(
                     _srv._HUMAN_HELP.pop(key, None)
                     return ok(
                         f"human handoff completed after {elapsed}s: URL contains "
-                        f"{done_url_contains!r}"
+                        f"{done_url_contains!r}{unasked}"
                     )
             if selector_expr:
                 value = await tab.evaluate(selector_expr, return_by_value=True)
@@ -223,7 +229,7 @@ async def wait_for_human(
                     _srv._HUMAN_HELP.pop(key, None)
                     return ok(
                         f"human handoff completed after {elapsed}s: selector "
-                        f"{done_selector!r} appeared"
+                        f"{done_selector!r} appeared{unasked}"
                     )
             if not done_url_contains and not done_selector:
                 current = await _srv._page_sig(tab)
@@ -234,7 +240,7 @@ async def wait_for_human(
                     or current.get("hash") != baseline.get("hash")
                 ):
                     _srv._HUMAN_HELP.pop(key, None)
-                    return ok(f"human handoff completed after {elapsed}s: page changed")
+                    return ok(f"human handoff completed after {elapsed}s: page changed{unasked}")
             await asyncio.sleep(0.25)
         # Drop the pending handoff so a later wait re-baselines against the page
         # as it is now, instead of measuring against a stale pre-handoff snapshot.
@@ -242,7 +248,7 @@ async def wait_for_human(
         return err(
             f"timeout after {timeout}s waiting for human completion — nothing changed "
             "and no completion signal was observed. Call request_human_help again "
-            "if the person still needs to act."
+            f"if the person still needs to act{unasked}."
         )
     except Exception as e:
         return err(str(e))

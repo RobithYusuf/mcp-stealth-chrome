@@ -76,6 +76,16 @@ uvx mcp-stealth-chrome → Python 3.11+ → FastMCP → nodriver → Chrome/Chro
   `Content-Location` and `Referer` through it. `http_session_cookies`, `session_warmup` and `http_request` (its
   errors, the redirect chain and the hop that failed) print URLs through it. `export_curl` stays useful because its `http_request` form takes cookies
   from the browser. Bodies other than JSON or forms cannot be read field by field and pass through.
+- A rule that kept "harmless" values readable under a secret parent (by name and shape) was tried and reverted:
+  a review read `"ABCDEF"` under `name`, a passphrase under `label`, 4-digit codes under `count`, `birthDate` and
+  `cardholderName` through it. The default stays everything under a secret key. The way out is explicit:
+  `reveal_values="body"` on `network_get`, `intercept_log`, `wait_for_request`, `auth_capture` and `export_curl`
+  (`helpers.reveal_mode`, `mask_body(own_keys_only=True)`): credential headers and URL secrets stay masked, a body
+  value whose own key is secret-named stays masked at any depth, and values under a secret-named parent show. The
+  reply names the mode and says those values were revealed at the caller's request (`BODY_REVEAL_NOTE`).
+  `Union[bool, Literal["body"]]` reaches the tool as given over a real client on mcp 1.21.1, 1.27 and 1.30: `true`,
+  `false`, `"body"`; `"BODY"` and `null` are validation errors, and `"yes"`, `"true"` and `1` read as True
+  (pydantic's lax bool, as for every bool argument).
 - Where URLs are masked, settled by the developer: masking applies to the HTTP client's output (`http_request`
   and its status, retry and errors, `http_session_cookies`, `session_warmup`, the `Location`, `Content-Location` and
   `Referer` of a response) and to captured traffic (`network_get`, `intercept_log`, `wait_for_request`,
@@ -109,6 +119,13 @@ uvx mcp-stealth-chrome → Python 3.11+ → FastMCP → nodriver → Chrome/Chro
   call for this reason, and only a real client shows it: test through `tests/_protocol.py`.
 - FastMCP parses a string as JSON unless the annotation is exactly `str`, so `Optional[str]` turned `'{"a":1}'` into a
   validation error and `'null'` into None. `patches._patch_fastmcp_keeps_text` stops that, and `server_status` reports it.
+- FastMCP's argument model ignores a name it does not know, on every tool: `screenshot(path="x.jpg", quality=45)`
+  saved `shot-<ts>.png` and said nothing. `StealthMCP.call_tool` refuses unknown names before the tool runs
+  (`_app.unknown_arguments_error`, from the advertised schema, 0.14 µs a call), naming them and the valid ones.
+  `batch_actions` and `workflow_run` call the functions directly, so each step goes through the same check
+  (`_inner_arguments_error`) and a refused step is a counted failure with the same message. The six legacy batch
+  names (`click`, `fill`, `type`, `press`, `wait`, `navigate`) keep their defaults and pass every other key on:
+  `wait` dropped `frame_url` and `navigate` dropped `expect_url` and `expect_status`.
 - Do not add a tool that can fail silently. If an action may not have taken effect, the response says
   so — see the honest-reporting invariants below.
 - Do not weaken a security property to make a test pass: managed paths never escape their root,
@@ -214,6 +231,11 @@ conclusions. Each rule below replaced a real lie.
   A dialog only counts once `_watch_dialogs` has armed that tab, so one on a tab no tool has touched yet is not seen.
 - `Transaction` in nodriver up to 0.48 is a Future, so a reply arriving after `wait_for` cancelled it raised inside the CDP
   listener and killed it: every later call on that tab hung. `patches._patch_transaction_late_reply` closes that.
+- `mouse_click_xy` takes coordinates as an explicit choice and does not refuse a covered point, but it reads what
+  is there just before the press, in the isolated world (`_what_is_at`): tag, id, name, a little text, and for an
+  iframe the URL of the frame it shows (`DOM.describeNode` frameId matched in `all_frames`, so a form-posted frame
+  with no `src` is named) and the point inside it. Frame URLs are navigation URLs and are not masked. A layout that
+  moved 25 px sent a click into the next field while the result said only "clicked (x,y)".
 - `hover`, `click_element_offset` and `click_at_corner` go through `_prepare_target` like a click. Without it they answered
   `hovered` and `clicked` at points outside the viewport and on covered elements.
 - A click that opens a tab changes nothing on its own page, so `_page_sig(pages=True)` lists the browser's tabs and
@@ -276,6 +298,29 @@ conclusions. Each rule below replaced a real lie.
   object address changes when nodriver recreates a `Tab` for the same target and can be recycled onto
   a different tab after GC.
 - Capture buffers are ring buffers (`CAPTURE_MAX_EVENTS`, `CAPTURE_MAX_INDEXED`, both env-tunable).
+- Chrome forgets a response body when the document that loaded it goes: a 324-byte JSON reply read after the page
+  navigated answered "No resource with given identifier found". Reading bodies eagerly at `loadingFinished` lost the
+  same race on a page that navigates as soon as its fetch resolves (measured, Chrome 157). Keeping bodies is opt-in,
+  settled by the developer: `network_start(keep_bodies=True)` turns on durable messages with
+  `Network.configureDurableMessages` (sizes `CAPTURE_BODY_BUFFER_BYTES`, 64 MB, the oldest dropped, and
+  `CAPTURE_BODY_MAX_BYTES`, 10 MB), which answers, so the result says "keeps" and states the cost; on a Chrome
+  without that command it falls back to `Network.enable(enableDurableMessages)` and says it asked but Chrome did
+  not confirm. A plain `network_start` sends the plain `Network.enable` origin/main sent and keeps nothing; on a tab
+  that kept bodies before it sends `configureDurableMessages({})` so new ones stop being kept. A body lost to a
+  navigation then reads "the page navigated ... network_start(keep_bodies=True) keeps bodies" (the request's
+  `loaderId` against the tab's current main-frame document), not the raw CDP error. Kept bodies survive a same-site
+  and a cross-site navigation, a later plain `Network.enable` from another tool does not turn keeping off, and 300
+  fetches loaded no slower (0.18 to 0.20 s kept against 0.17 to 0.25 s not kept, two runs each, two sessions).
+  Measured on Chrome 157, no command drops bodies already kept: not `configureDurableMessages({})` (it stops keeping
+  new ones), not smaller sizes, not `Network.disable`. They belong to the tab's DevTools session: another session
+  cannot read them (measured), and Chrome holds them until that session ends (tab or browser closed; that the
+  memory is freed then is not measured). Every `network_start` forgets the request ids, so later calls cannot look
+  an old body up, and bumps `_NETWORK_GENERATION`: a `network_get` still waiting on Chrome across a restart returns
+  an error instead of a body from before it.
+- `network_get` never slices its JSON: past 50,000 characters it returns `{entries, omitted, note}` with the oldest
+  left out, the whole envelope counted. With reveal_values="body" the warning is `reveal_note`, so the size `note`
+  never replaces it (it did). `[:50000]` cut a body in half and returned text that did not parse. URLs longer than `max_url_len`
+  (200) are cut after masking, with `url_cut` saying how much and how to get it whole; `list_frames` does the same.
 
 ### Browser lifecycle
 

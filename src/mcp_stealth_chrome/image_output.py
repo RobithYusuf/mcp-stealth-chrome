@@ -223,6 +223,9 @@ def shrink_for_inline(
                     note = (f"inline copy re-encoded to {sw}×{sh} jpeg q{quality} "
                             f"to fit the {limit:,}-char inline limit; "
                             f"the saved file is untouched")
+                    if sw != w0:
+                        note += (f"; a point read off the inline copy × {w0 / sw:.4g} "
+                                 f"is the point in the saved image")
                 return base64.b64encode(candidate).decode(), "image/jpeg", note
     except Exception as exc:
         return None, mime, f"inline downscale failed: {type(exc).__name__}: {exc}"

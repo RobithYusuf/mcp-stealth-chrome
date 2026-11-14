@@ -24,7 +24,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, Union
 
 import httpx
 
@@ -39,6 +39,8 @@ from .key_outcome import element_unread
 from .helpers import (
     OPEN_DIALOGS,
     adblock_package_note,
+    BODY_REVEAL_NOTE,
+    cut_url,
     dialog_note,
     err,
     get_title,
@@ -49,6 +51,7 @@ from .helpers import (
     mask_request_entry,
     mask_url,
     masked_value,
+    reveal_mode,
     ok,
     PageReadError,
     parse_json,
@@ -155,6 +158,20 @@ def _trim_index(index: dict) -> None:
     if overflow > 0:
         for key in list(index)[:overflow]:
             index.pop(key, None)
+
+
+# Response bodies kept by Chrome outside the renderer (Network.enable enableDurableMessages), so
+# they outlive the document that loaded them. Without it a 324-byte JSON reply read after the
+# page moved on answered "No resource with given identifier found". Chrome bounds the store by
+# these sizes and drops the oldest past the total; nothing runs per request on our side.
+CAPTURE_BODY_BUFFER_BYTES = int(os.environ.get("CAPTURE_BODY_BUFFER_BYTES", str(64 * 2**20)))
+CAPTURE_BODY_MAX_BYTES = int(os.environ.get("CAPTURE_BODY_MAX_BYTES", str(10 * 2**20)))
+
+
+def _resource_type(event: Any) -> str:
+    """"XHR", "Fetch", "Document"...: the CDP resource type's own name."""
+    value = getattr(event, "type_", None) or getattr(event, "type", None)
+    return str(getattr(value, "value", value) or "")
 
 
 def _window_state_path(instance_id: str) -> Path:
@@ -1554,6 +1571,7 @@ async def _auto_verify_cf(tab: Tab, max_attempts: int = 2, budget: float = 24.0)
             f"session that holds a valid cf_clearance, or solve_captcha]")
 
 from ._app import mcp  # single FastMCP instance shared with tools/* submodules
+from . import _app
 from . import image_output as _image_output  # noqa: F401  -- registers native image inspection tools
 from .tools import turnstile_oscursor as _turnstile_oscursor  # registers the native-cursor tool
 
@@ -6423,6 +6441,8 @@ async def batch_actions(actions: list[dict]) -> str:
     Each action: {type: click|fill|type|wait|press|navigate, ...params}, or the name
     of any workflow_run tool with its arguments alongside, such as
     {"type": "select_option", "selector": "#c", "value": "x"}.
+    The six short names (click, fill, type, press, wait, navigate) pass every other key on
+    to their tool, and a key the tool does not take fails that action by name.
     Add "stop_on_error": true to an action to stop there if it fails.
     Example: [{"type":"click","ref":"e3"},{"type":"fill","ref":"e4","value":"x"}]
 
@@ -6449,7 +6469,7 @@ async def batch_actions(actions: list[dict]) -> str:
             if tool is None:
                 r = err(f"unknown action type: {atype}")
             else:
-                r = await _WORKFLOW_TOOLS[tool](**args)
+                r = _inner_arguments_error(tool, args) or await _WORKFLOW_TOOLS[tool](**args)
             results.append(f"[{i}] {atype}: {str(r)[:160]}")
             # A tool can return an "Error: ..." string WITHOUT raising — honor
             # stop_on_error for those too, not just for exceptions.
@@ -6464,28 +6484,37 @@ async def batch_actions(actions: list[dict]) -> str:
     return ok(header + "\n" + "\n".join(results))
 
 
+# The six legacy batch names and the defaults they always had. Every other key of the action
+# is passed on too: "wait" dropped frame_url and "navigate" expect_url, unsaid.
+_BATCH_ALIASES = {
+    "click": ("click", {"ref": None, "selector": None, "humanize": False}),
+    "fill": ("fill", {"ref": None, "selector": None, "value": ""}),
+    "type": ("type_text", {"text": "", "humanize": False}),
+    "press": ("press_key", {"key": "Enter"}),
+    "wait": ("wait_for", {"selector": None, "text": None, "timeout": 5.0}),
+    "navigate": ("navigate", {"url": None}),
+}
+
+
 def _batch_action_call(act: dict) -> tuple[Optional[str], dict]:
     """Map a batch action to (tool, args). The six legacy names keep their defaults."""
     atype = act.get("type")
-    if atype == "click":
-        return "click", {"ref": act.get("ref"), "selector": act.get("selector"),
-                         "humanize": act.get("humanize", False)}
-    if atype == "fill":
-        return "fill", {"ref": act.get("ref"), "selector": act.get("selector"),
-                        "value": act.get("value", "")}
-    if atype == "type":
-        return "type_text", {"text": act.get("text", ""),
-                             "humanize": act.get("humanize", False)}
-    if atype == "press":
-        return "press_key", {"key": act.get("key", "Enter")}
-    if atype == "wait":
-        return "wait_for", {"selector": act.get("selector"), "text": act.get("text"),
-                            "timeout": act.get("timeout", 5.0)}
-    if atype == "navigate":
-        return "navigate", {"url": act.get("url")}
+    rest = {k: v for k, v in act.items() if k not in ("type", "stop_on_error")}
+    if atype in _BATCH_ALIASES:
+        tool, defaults = _BATCH_ALIASES[atype]
+        return tool, {**defaults, **rest}
     if atype in _WORKFLOW_TOOLS:
-        return atype, {k: v for k, v in act.items() if k not in ("type", "stop_on_error")}
+        return atype, rest
     return None, {}
+
+
+def _inner_arguments_error(tool: str, args: dict) -> Optional[str]:
+    """The refusal a direct call would get for arguments `tool` does not take, for a step of
+    batch_actions or workflow_run, which call the function itself and so skip that check."""
+    registered = mcp._tool_manager.get_tool(tool)
+    if registered is None:
+        return None
+    return _app.unknown_arguments_error(tool, registered, args)
 
 
 @mcp.tool()
@@ -6826,6 +6855,8 @@ def _clear_tab_scoped_state(tabs: list[Any]) -> None:
         _CONSOLE_ARMED_TAB_IDS.discard(key)
         _NETWORK_ARMED_TAB_IDS.discard(key)
         _NETWORK_CAPTURE_BODIES.pop(key, None)
+        _NETWORK_KEPT_BODIES.discard(key)
+        _NETWORK_DOC_LOADER.pop(key, None)
     # Interception pauses every matching request until the handler answers it, so
     # it must not survive its target. Left armed, the next launch would inherit a
     # handler bound to a dead tab and the first request would stall with no error.
@@ -7126,26 +7157,117 @@ async def console_get(limit: int = 100) -> str:
     return ok(json.dumps(payload, indent=2, default=str))
 
 
+# Tabs whose DevTools session had Chrome keep bodies past a navigation at some point.
+_NETWORK_KEPT_BODIES: set = set()
+
+
+def _cdp_raw(method: str, params: Optional[dict] = None):
+    """A CDP command nodriver has no wrapper for (Network.configureDurableMessages is newer)."""
+    response = yield {"method": method, "params": params or {}}
+    return response
+
+
+# Bumped by every network_start: a network_get still waiting on Chrome when the capture is
+# restarted must not hand back a body from before the restart.
+_NETWORK_GENERATION = [0]
+# Target key -> loaderId of the tab's current main-frame document, to tell a body lost to a
+# navigation from any other getResponseBody error.
+_NETWORK_DOC_LOADER: dict[str, str] = {}
+
+
+def _network_restarted() -> None:
+    _NETWORK_GENERATION[0] += 1
+
+
+_KEPT_COST = (f"bodies stay in Chrome's memory for this tab until it closes, up to "
+              f"{CAPTURE_BODY_BUFFER_BYTES // 2**20} MB in all (oldest dropped first, one body up "
+              f"to {CAPTURE_BODY_MAX_BYTES // 2**20} MB); no command frees them earlier (measured, "
+              "Chrome 157), and after a later network_start no call can look them up, though a "
+              "network_get already running is stopped rather than finished. Loading 300 fetches "
+              "measured no slower with them kept")
+
+
+async def _configure_kept_bodies(tab: Any, keep: bool, tid: str) -> str:
+    """Words for whether Chrome keeps response bodies past a navigation, after setting it.
+
+    Opt-in (keep_bodies=True): a plain network_start sends what origin/main sent and keeps
+    nothing. Measured on Chrome 157: Network.configureDurableMessages with sizes turns keeping
+    on and answers, with no sizes it stops keeping new bodies, and no command drops bodies
+    already kept (not configureDurableMessages({}), smaller sizes, nor Network.disable):
+    Chrome holds them for this tab's DevTools session. Another session cannot read them.
+    """
+    from nodriver.cdp import network as cdp_network
+    earlier = ""
+    if tid in _NETWORK_KEPT_BODIES:
+        earlier = ("; bodies Chrome kept before this call stay in its memory until the tab "
+                   "closes, and later calls cannot look up the earlier requests (their ids are "
+                   "cleared)")
+    not_kept = ("; response bodies are not kept past a navigation: read one before the page "
+                "moves on, or call network_start(keep_bodies=True) to keep them")
+    if not keep:
+        if tid in _NETWORK_KEPT_BODIES:
+            # Stop keeping new ones; the old ones cannot be dropped (see above).
+            with contextlib.suppress(Exception):
+                await tab.send(_cdp_raw("Network.configureDurableMessages", {}))
+            _NETWORK_KEPT_BODIES.discard(tid)
+        return not_kept + earlier
+    try:
+        await tab.send(_cdp_raw("Network.configureDurableMessages", {
+            "maxTotalBufferSize": CAPTURE_BODY_BUFFER_BYTES,
+            "maxResourceBufferSize": CAPTURE_BODY_MAX_BYTES}))
+    except Exception as exc:
+        try:
+            await tab.send(cdp_network.enable(
+                max_total_buffer_size=CAPTURE_BODY_BUFFER_BYTES,
+                max_resource_buffer_size=CAPTURE_BODY_MAX_BYTES, enable_durable_messages=True))
+        except Exception as exc2:
+            return (f"; bodies are NOT kept past a navigation ({_exc_text(exc2)}): read them "
+                    f"before the page moves on{earlier}")
+        _NETWORK_KEPT_BODIES.add(tid)
+        return (f"; asked Chrome to keep response bodies past a navigation, but this Chrome did "
+                f"not confirm it ({_exc_text(exc)}); if it does keep them, {_KEPT_COST}{earlier}")
+    _NETWORK_KEPT_BODIES.add(tid)
+    return f"; Chrome keeps response bodies past a navigation: {_KEPT_COST}{earlier}"
+
+
 @mcp.tool()
-async def network_start(capture_bodies: bool = True) -> str:
+async def network_start(capture_bodies: bool = True, keep_bodies: bool = False) -> str:
     """Begin capturing network requests + responses with full headers.
 
     Args:
         capture_bodies: if True (default), also indexes by request_id so
             network_get(include_body=True) can fetch response bodies on
             demand via CDP Network.getResponseBody.
+        keep_bodies: have Chrome keep response bodies past a navigation, so a body can still
+            be read after the page moved on (a page that navigates as soon as its fetch
+            returns). Off by default: Chrome then drops a body with its document. The cost:
+            kept bodies stay in Chrome's memory for this tab until it closes, up to
+            CAPTURE_BODY_BUFFER_BYTES (64 MB), and nothing frees them earlier.
     """
+    if keep_bodies and not capture_bodies:
+        return err("network_start: keep_bodies=True needs capture_bodies=True, which is what "
+                   "lets network_get read a body; nothing was started")
     try:
         tab = BrowserState.active_tab()
         from nodriver.cdp import network as cdp_network
         tid = _target_key(tab)
+        keep = bool(keep_bodies) and CAPTURE_BODY_BUFFER_BYTES > 0
         # Network.enable so events arrive at all, and so getResponseBody works later. If it
         # fails nothing is captured, and an empty log must not read as a quiet page.
         try:
-            await tab.send(cdp_network.enable())
+            if keep:
+                await tab.send(cdp_network.enable(
+                    max_total_buffer_size=CAPTURE_BODY_BUFFER_BYTES,
+                    max_resource_buffer_size=CAPTURE_BODY_MAX_BYTES))
+            else:
+                await tab.send(cdp_network.enable())
         except Exception as exc:
             BrowserState.capture_network = False
             return err(f"network capture NOT started, Network.enable failed: {_exc_text(exc)}")
+        kept_note = (await _configure_kept_bodies(tab, keep, tid)) if capture_bodies else ""
+        if keep_bodies and not keep:
+            kept_note = "; keep_bodies=True not applied: CAPTURE_BODY_BUFFER_BYTES is 0" + kept_note
+        _network_restarted()
         BrowserState.network_logs.clear()
         BrowserState.network_index.clear()
         BrowserState.capture_network = True
@@ -7169,6 +7291,8 @@ async def network_start(capture_bodies: bool = True) -> str:
                     "url": getattr(req, "url", ""),
                     "method": getattr(req, "method", ""),
                     "type": str(getattr(event, "type_", "") or getattr(event, "type", "")),
+                    "resource_type": _resource_type(event),
+                    "_loader": str(getattr(event, "loader_id", "") or ""),
                     "request_headers": req_headers,
                     "request_body": getattr(req, "post_data", None),
                     "status": None,
@@ -7178,12 +7302,16 @@ async def network_start(capture_bodies: bool = True) -> str:
                     "timestamp": getattr(event, "timestamp", None),
                     "wall_time": getattr(event, "wall_time", None),
                 }
+                if (entry["resource_type"] == "Document" and entry["_loader"]
+                        and str(getattr(event, "frame_id", "") or "") == tid):
+                    _NETWORK_DOC_LOADER[tid] = entry["_loader"]
                 if _NETWORK_CAPTURE_BODIES.get(tid, False):
                     index_sink[rid] = entry
                     _trim_index(index_sink)
                 log_sink.append({
                     "type": "request", "request_id": rid,
                     "url": entry["url"], "method": entry["method"],
+                    "resource_type": entry["resource_type"],
                 })
                 _trim_capture(log_sink)
             except Exception:
@@ -7205,6 +7333,7 @@ async def network_start(capture_bodies: bool = True) -> str:
                     "url": getattr(resp, "url", ""),
                     "status": getattr(resp, "status", None),
                     "mime": getattr(resp, "mime_type", None),
+                    "resource_type": _resource_type(event),
                 })
                 _trim_capture(log_sink)
             except Exception:
@@ -7213,12 +7342,12 @@ async def network_start(capture_bodies: bool = True) -> str:
         if tid in _NETWORK_ARMED_TAB_IDS:
             return ok(
                 f"network capture started (capture_bodies={capture_bodies}); "
-                "handler already armed on this tab"
+                f"handler already armed on this tab{kept_note}"
             )
         tab.add_handler(cdp_network.RequestWillBeSent, on_req)
         tab.add_handler(cdp_network.ResponseReceived, on_res)
         _NETWORK_ARMED_TAB_IDS.add(tid)
-        return ok(f"network capture started (capture_bodies={capture_bodies})")
+        return ok(f"network capture started (capture_bodies={capture_bodies}){kept_note}")
     except Exception as e:
         return err(str(e))
 
@@ -7230,46 +7359,74 @@ async def network_get(
     include_body: bool = False,
     max_body_bytes: int = 10000,
     full: bool = False,
-    reveal_values: bool = False,
+    reveal_values: Union[bool, Literal["body"]] = False,
+    resource_type: Optional[str] = None,
+    max_url_len: int = 200,
 ) -> str:
     """Retrieve captured network events.
 
     Args:
         limit: max entries returned (chronological: oldest first within the last `limit`, newest last)
         filter_url: substring filter on URL
-        include_body: fetch response bodies via CDP Network.getResponseBody
-            for each matching entry. Bodies are truncated to max_body_bytes.
-            Requires network_start(capture_bodies=True) (default).
+        include_body: return response bodies, truncated to max_body_bytes. network_start
+            asks Chrome to keep bodies outside the page (CAPTURE_BODY_BUFFER_BYTES, 64 MB in
+            all, the oldest dropped first; one body up to CAPTURE_BODY_MAX_BYTES, 10 MB), so
+            they can still be read after the page navigated away. Requires
+            network_start(capture_bodies=True).
         max_body_bytes: cap per-body length (default 10000)
         full: if True, return entries with full headers + body fields
             from network_index (use this once you've called network_start).
             Default False = legacy flat event stream (backward compat).
         reveal_values: True returns credential headers, fields and query parameters as
             they are. By default their values read "*** (N chars)", because tool output
-            lands in the transcript. Bodies other than JSON or forms cannot be read field
-            by field and pass through.
+            lands in the transcript. "body" shows body values under a secret-named parent
+            (a token vault's {"gatewayTokens": [...]}) and keeps credential headers, URL
+            secrets and every body value whose own key is secret-named hidden; the reply is
+            then {reveal_values, note, entries}. Bodies other than JSON or forms cannot be
+            read field by field and pass through.
+        resource_type: only these CDP resource types, comma separated, any case:
+            "xhr,fetch" leaves out documents, scripts, styles, images and fonts.
+        max_url_len: URLs longer than this are cut, and the entry says by how much
+            (`url_cut`). 0 returns every URL whole.
     """
     if limit < 0:
         return err("limit must be >= 0")
     if max_body_bytes < 0:
         return err("max_body_bytes must be >= 0")
+    if max_url_len < 0:
+        return err("max_url_len must be >= 0 (0 = whole URLs)")
+    try:
+        reveal = reveal_mode(reveal_values)
+    except ValueError as exc:
+        return err(f"network_get: {exc}; nothing was read")
+    body_mode = reveal == "body"
+    extra = _BODY_MODE_EXTRA if body_mode else None
     if not (BrowserState.capture_network or BrowserState.network_logs or BrowserState.network_index):
         return err("NOT listening: call network_start() before the traffic. An empty list "
                    "would read as a quiet page when nothing was monitored.")
+    wanted = None
+    if resource_type:
+        wanted = {part.strip().lower() for part in str(resource_type).split(",") if part.strip()}
+
+    def keep(entry: dict) -> bool:
+        if filter_url and filter_url not in (entry.get("url") or ""):
+            return False
+        return wanted is None or str(entry.get("resource_type") or "").lower() in wanted
+
     if full or include_body:
         # Work on copies: response bodies are fetched on demand, and caching a
         # truncated/error sentinel in network_index made a later call with a
         # larger limit permanently unable to retrieve the real body.
-        entries = [dict(entry) for entry in BrowserState.network_index.values()]
-        if filter_url:
-            entries = [e for e in entries if filter_url in e.get("url", "")]
+        entries = [dict(entry) for entry in BrowserState.network_index.values() if keep(entry)]
         entries = entries[-limit:] if limit else []
+        generation = _NETWORK_GENERATION[0]
         if include_body and entries:
             try:
                 tab = BrowserState.active_tab()
             except Exception as e:
                 return err(f"response body capture unavailable: {e}")
             from nodriver.cdp import network as cdp_network
+            tid = _target_key(tab)
             for e in entries:
                 rid = e.get("request_id")
                 if not rid:
@@ -7286,8 +7443,8 @@ async def network_get(
                     if body is None and isinstance(result, tuple):
                         body = result[0]
                     body_str = str(body) if body is not None else ""
-                    if not reveal_values:
-                        body_str = mask_body(body_str)
+                    if reveal != "all":
+                        body_str = mask_body(body_str, own_keys_only=body_mode)
                     orig_len = len(body_str)
                     if orig_len > max_body_bytes:
                         body_str = body_str[:max_body_bytes] + (
@@ -7297,18 +7454,77 @@ async def network_get(
                 except asyncio.TimeoutError:
                     e["response_body"] = "<getResponseBody timeout>"
                 except Exception as ex:
-                    e["response_body"] = f"<getResponseBody error: {ex}>"
-        if not reveal_values:
-            entries = [mask_request_entry(e) for e in entries]
-        return ok(json.dumps(entries, indent=2, default=str)[:50000])
+                    e["response_body"] = _lost_body_text(ex, e, tid)
+                if _NETWORK_GENERATION[0] != generation:
+                    # network_start cleared the capture while this call waited on Chrome: a
+                    # body read from before it is not handed back.
+                    return err("network_get: network capture was restarted while this call ran; "
+                               "nothing is returned, so no body from before the restart leaves. "
+                               "Call network_get again")
+        for e in entries:
+            e.pop("_loader", None)
+        if reveal != "all":
+            entries = [mask_request_entry(e, body_mode=body_mode) for e in entries]
+        entries = [cut_url(e, max_url_len) for e in entries]
+        return ok(_bounded_entries(entries, extra))
     # Legacy event-stream view
-    logs = BrowserState.network_logs
-    if filter_url:
-        logs = [l for l in logs if filter_url in l.get("url", "")]
+    logs = [l for l in BrowserState.network_logs if keep(l)]
     selected = logs[-limit:] if limit else []
-    if not reveal_values:
-        selected = [mask_request_entry(l) for l in selected]
-    return ok(json.dumps(selected, indent=2, default=str))
+    if reveal != "all":
+        selected = [mask_request_entry(l, body_mode=body_mode) for l in selected]
+    selected = [cut_url(l, max_url_len) for l in selected]
+    return ok(_bounded_entries(selected, extra))
+
+
+_NETWORK_GET_MAX_CHARS = 50000
+
+
+# What a reveal_values="body" reply of network_get and auth_capture carries beside its entries.
+# reveal_note, not note: the note of a reply cut for size replaced the warning.
+_BODY_MODE_EXTRA = {"reveal_values": "body", "reveal_note": BODY_REVEAL_NOTE}
+
+
+def _lost_body_text(exc: Exception, entry: dict, tid: str) -> str:
+    """What network_get says for a body Chrome could not give. A body whose document is gone
+    says so, and how to keep one, instead of the raw "No resource with given identifier"."""
+    text = str(exc)
+    loader = entry.get("_loader")
+    current = _NETWORK_DOC_LOADER.get(tid)
+    if "No resource with given identifier" in text and loader and current and loader != current:
+        if tid in _NETWORK_KEPT_BODIES:
+            return ("<body lost although bodies are kept: the page navigated and Chrome no longer "
+                    "has it (over CAPTURE_BODY_MAX_BYTES, or pushed out of CAPTURE_BODY_BUFFER_BYTES)>")
+        return ("<body lost: the page navigated after this response and Chrome drops a body with "
+                "its document; network_start(keep_bodies=True) keeps bodies past a navigation>")
+    return f"<getResponseBody error: {text}>"
+
+
+def _bounded_entries(entries: list, extra: Optional[dict] = None) -> str:
+    """The entries as a JSON list, or, past _NETWORK_GET_MAX_CHARS, an object naming how many
+    of the oldest were left out. A plain slice of the text cut a body in half and returned
+    JSON that no longer parsed, with nothing saying so. With `extra` (reveal_values="body")
+    the reply is always an object holding those keys and `entries`."""
+    if extra:
+        text = json.dumps({**extra, "entries": entries}, indent=2, default=str)
+    else:
+        text = json.dumps(entries, indent=2, default=str)
+    if len(text) <= _NETWORK_GET_MAX_CHARS:
+        return text
+    kept = list(entries)
+    while kept:
+        kept = kept[max(1, len(kept) // 10):] if len(kept) > 10 else kept[1:]
+        text = json.dumps({**(extra or {}), "entries": kept}, indent=2, default=str)
+        if len(text) <= _NETWORK_GET_MAX_CHARS - 400:
+            break
+    left_out = len(entries) - len(kept)
+    return json.dumps({
+        **(extra or {}),
+        "entries": kept,
+        "omitted": left_out,
+        "note": (f"{left_out} of {len(entries)} entries, the oldest, were left out to stay under "
+                 f"{_NETWORK_GET_MAX_CHARS} chars; ask with a smaller limit, filter_url, "
+                 "resource_type, max_body_bytes or max_url_len"),
+    }, indent=2, default=str)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -7765,7 +7981,7 @@ async def export_curl(
     url_contains: Optional[str] = None,
     method: Optional[str] = None,
     include_cookies: bool = True,
-    reveal_values: bool = False,
+    reveal_values: Union[bool, Literal["body"]] = False,
 ) -> str:
     """Turn a captured browser request into a runnable curl AND an http_request call.
 
@@ -7790,10 +8006,18 @@ async def export_curl(
         include_cookies: attach the browser's current cookies for that URL.
             Turn off to produce a shareable command with no session in it.
         reveal_values: put real cookie and credential values in the output, which makes
-            the curl string runnable as shown.
+            the curl string runnable as shown. "body" shows the request body's values under
+            a secret-named parent; headers, cookies, URL secrets and body values whose own
+            key is secret-named stay hidden.
 
     Returns the matched request, a `curl` string, and an `http_request` call.
     """
+    try:
+        body_mode = reveal_mode(reveal_values) == "body"
+    except ValueError as exc:
+        return err(f"export_curl: {exc}; nothing was built")
+    # From here on reveal_values means "everything": "body" only changes the body's masking.
+    reveal_values = reveal_values is True
     try:
         index = BrowserState.network_index or {}
         if not index:
@@ -7861,7 +8085,7 @@ async def export_curl(
 
         shown_url = target_url if reveal_values else mask_url(target_url)
         shown_headers = headers if reveal_values else mask_headers(headers)
-        shown_body = body if reveal_values else mask_body(body)
+        shown_body = body if reveal_values else mask_body(body, own_keys_only=body_mode)
         shown_cookie = cookie_header
         if cookie_header and not reveal_values:
             shown_cookie = masked_value(cookie_header)
@@ -7899,6 +8123,7 @@ async def export_curl(
             hidden.append("(query parameters)")
 
         return ok(json.dumps({
+            **({"reveal_values": "body", "reveal_note": BODY_REVEAL_NOTE} if body_mode else {}),
             "request_id": entry.get("request_id"),
             "url": shown_url,
             "method": http_method,
@@ -10648,6 +10873,9 @@ async def workflow_run(
         return err("steps must be a list of dicts")
 
     async def dispatch(tool: str, args: dict) -> Any:
+        refused = _inner_arguments_error(tool, args)
+        if refused:
+            return refused
         return await _WORKFLOW_TOOLS[tool](**args)
 
     try:
@@ -10889,7 +11117,7 @@ async def auth_capture(
     count: int = 1,
     timeout: float = 10.0,
     include_response_headers: bool = False,
-    reveal_values: bool = False,
+    reveal_values: Union[bool, Literal["body"]] = False,
 ) -> str:
     """Intercept the next N requests matching a URL pattern and return
     their headers (Authorization, X-CSRF-*, etc.) — useful for
@@ -10907,11 +11135,18 @@ async def auth_capture(
         count: stop capturing after this many matches (default 1)
         timeout: max seconds to wait (default 10)
         include_response_headers: also wait for + return response headers
-        reveal_values: return credential values as they are
+        reveal_values: return credential values as they are. "body" shows request body
+            values under a secret-named parent and keeps headers, URL secrets and body
+            values whose own key is secret-named hidden; the reply is then
+            {reveal_values, note, entries}.
 
     Returns JSON array of {url, method, request_headers, request_body,
     [response_headers, status]}.
     """
+    try:
+        reveal = reveal_mode(reveal_values)
+    except ValueError as exc:
+        return err(f"auth_capture: {exc}; nothing was captured")
     try:
         tab = BrowserState.active_tab()
         from nodriver.cdp import network as cdp_network
@@ -10988,9 +11223,9 @@ async def auth_capture(
             return err(
                 f"auth_capture: no requests matched {filter_url_pattern!r} within {timeout}s"
             )
-        if not reveal_values:
-            captured = [mask_request_entry(c) for c in captured]
-        return ok(json.dumps(captured, indent=2, default=str)[:30000])
+        if reveal != "all":
+            captured = [mask_request_entry(c, body_mode=reveal == "body") for c in captured]
+        return ok(_bounded_entries(captured, _BODY_MODE_EXTRA if reveal == "body" else None))
     except Exception as e:
         return err(str(e))
 
@@ -11171,8 +11406,9 @@ def _add_all_handlers(tab: Any, handlers: list) -> None:
 
 async def _await_request_watch(
     watch: dict, url_pattern: str, method: Optional[str], timeout: float,
-    reveal_values: bool = False,
+    reveal_values: Union[bool, str] = False,
 ) -> str:
+    reveal = reveal_mode(reveal_values)
     try:
         await asyncio.wait_for(watch["done"].wait(), timeout=timeout)
     except asyncio.TimeoutError:
@@ -11180,7 +11416,10 @@ async def _await_request_watch(
         what = (f"{len(pending)} request(s) matched {url_pattern!r} but none got a response"
                 if pending else f"no request matched {url_pattern!r}")
         return err(what + (f" method={method}" if method else "") + f" within {timeout}s")
-    match = watch["match"] if reveal_values else mask_request_entry(watch["match"])
+    match = (watch["match"] if reveal == "all"
+             else mask_request_entry(watch["match"], body_mode=reveal == "body"))
+    if reveal == "body":
+        match = {"reveal_values": "body", "reveal_note": BODY_REVEAL_NOTE, **match}
     return ok(json.dumps(match, indent=2, default=str))
 
 
@@ -11190,7 +11429,7 @@ async def wait_for_request(
     method: Optional[str] = None,
     timeout: float = 15.0,
     require_response: bool = True,
-    reveal_values: bool = False,
+    reveal_values: Union[bool, Literal["body"]] = False,
 ) -> str:
     """Block until a network request matching url_pattern is observed.
     Replaces the setTimeout(2000)+poll anti-pattern.
@@ -11200,11 +11439,17 @@ async def wait_for_request(
         method: optional HTTP verb filter (GET/POST/...)
         timeout: max seconds to wait
         require_response: also wait for the response phase (default True)
-        reveal_values: return credential headers and fields as they are, not "*** (N chars)"
+        reveal_values: return credential headers and fields as they are, not "*** (N chars)".
+            "body" shows request body values under a secret-named parent and keeps headers,
+            URL secrets and body values whose own key is secret-named hidden.
 
     Returns JSON of the matching entry (url/method/status/request_headers/
     response_headers).
     """
+    try:
+        reveal_mode(reveal_values)
+    except ValueError as exc:
+        return err(f"wait_for_request: {exc}; nothing was waited for")
     try:
         tab = BrowserState.active_tab()
         watch = await _arm_request_watch(tab, url_pattern, method, require_response)

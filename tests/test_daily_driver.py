@@ -90,7 +90,9 @@ e2e = pytest.mark.skipif(not os.environ.get("MCP_E2E"), reason="needs a real Chr
 
 PAGES = {
     "/plain": "<title>plain</title><p id=p>plain</p>",
-    "/person": "<title>person</title><p>the person's page</p>",
+    "/person": ("<title>person</title><p>the person's page</p><iframe src='/plain?inner'></iframe>"
+                "<script>window.clicks = 0; document.addEventListener('mousedown', () => window.clicks++)"
+                "</script>"),
     "/alert": "<title>alerting</title><script>setTimeout(() => alert('a person'), 300)</script>",
     "/opener": ("<title>opener</title>"
                 "<button id=pop onclick=\"window.open('/plain?popup', '_blank')\">popup</button>"
@@ -263,6 +265,26 @@ def test_tools_never_slide_onto_a_persons_tab(loop, person, site):
     picked = call(loop, "tab_select", index=_index_of(loop, "/person"))
     assert "not opened by this server" in picked, picked
     assert call(loop, "get_url").endswith("/person")
+
+
+@e2e
+def test_the_field_feedback_tools_never_act_on_a_persons_tab(loop, person, site):
+    """mouse_click_xy (with its hit read), wait_for(frame_url=), network_start and screenshot
+    go through active_tab(), so they refuse the person's tab the agent slid onto, unread."""
+    target, session = person.open_tab(site + "/person")
+    assert call(loop, "tab_close").startswith("closed")  # the agent's own, last tab
+    for name, kw in (("mouse_click_xy", {"x": 20, "y": 20}),
+                     ("wait_for", {"frame_url": "inner", "timeout": 1}),
+                     ("network_start", {"keep_bodies": True}),
+                     ("screenshot", {"quality": 40})):
+        out = call(loop, name, **kw)
+        assert out.startswith("Error") and "opened outside this server" in out, (name, out)
+        assert "/person" not in out.split("opened outside")[0], (name, out)
+    clicks = person.send("Runtime.evaluate", {"expression": "window.clicks"}, session=session)
+    assert clicks["result"]["value"] == 0, clicks  # nothing reached the person's page
+    # Picked on purpose, the same tools work there and name the frame.
+    assert "not opened by this server" in call(loop, "tab_select", index=_index_of(loop, "/person"))
+    assert "appeared" in call(loop, "wait_for", frame_url="inner", timeout=5)
 
 
 @e2e
