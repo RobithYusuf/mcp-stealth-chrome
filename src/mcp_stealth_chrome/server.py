@@ -4207,6 +4207,7 @@ async def browser_launch(
         ads_pending = _adblock_module().begin(block_ads, config.browser_executable_path) if block_ads else None
         try:
             browser = await _start_chrome(config)
+            _mark_allow_origins(browser, config)
             brave_mode.mark(browser, product)
             if not headless:
                 await _open_background_window(browser, window_width, window_height)
@@ -4355,6 +4356,7 @@ async def browser_launch(
                 _keep_note += (f" [it runs on the fallback profile {final_udd}, which no later default "
                                f"launch asks for: reattach with user_data_dir={final_udd!r}]")
         suffix += _keep_note
+        suffix += _allow_origins_note(browser)
 
         # Post-launch health check — degenerate window detection.
         # After a macOS sleep/wake cycle (or some persistent-profile state
@@ -5588,6 +5590,58 @@ def _browser_process_pid(browser: Any) -> Optional[int]:
     process = getattr(browser, "_process", None)
     pid = getattr(process, "pid", None) or getattr(browser, "_process_pid", None)
     return pid if isinstance(pid, int) and pid > 0 else None
+
+
+# The --remote-allow-origins a browser was started with, recorded at launch. Without one Chrome
+# refuses every websocket that carries an Origin, so no web page can reach the debugging port;
+# a caller can still ask for it in extra_args, and then results and server_status say so.
+_ALLOW_ORIGINS_ATTR = "_mcp_remote_allow_origins"
+_ALLOW_ORIGINS_FLAG = re.compile(r"--remote-allow-origins=(\S+)")
+
+
+def _allow_origins_by_instance() -> dict:
+    """Per instance of this session: the --remote-allow-origins its browser runs with."""
+    found = {}
+    if BrowserState.browser is not None:
+        found[BrowserState.current_instance_id] = _allow_origins_of(BrowserState.browser)
+    for iid, snap in BrowserState.instances.items():
+        if snap.browser is not None:
+            found[iid] = _allow_origins_of(snap.browser)
+    return found
+
+
+def _mark_allow_origins(browser: Any, config: Any) -> None:
+    asked = [str(a).split("=", 1)[1] for a in (getattr(config, "_browser_args", None) or [])
+             if str(a).startswith("--remote-allow-origins=")]
+    with contextlib.suppress(Exception):
+        setattr(browser, _ALLOW_ORIGINS_ATTR, asked[-1] if asked else "off")
+
+
+def _allow_origins_of(browser: Any) -> str:
+    """"off", the origins a caller allowed, "unknown", or why there is no answer."""
+    recorded = getattr(browser, _ALLOW_ORIGINS_ATTR, None)
+    if recorded:
+        return recorded
+    pid = _browser_process_pid(browser)
+    if pid is None:
+        return "not started by this server"
+    command = _process_command(pid)
+    if command is None:
+        return "unknown"
+    found = _ALLOW_ORIGINS_FLAG.findall(command)
+    value = found[-1] if found else "off"
+    with contextlib.suppress(Exception):
+        setattr(browser, _ALLOW_ORIGINS_ATTR, value)
+    return value
+
+
+def _allow_origins_note(browser: Any) -> str:
+    value = getattr(browser, _ALLOW_ORIGINS_ATTR, None)
+    if not value or value == "off":
+        return ""
+    who = "any web page" if value == "*" else f"a page from {value}"
+    return (f" [remote_allow_origins={value}: kept because extra_args asked for it; {who} that learns "
+            f"this browser's websocket URL can drive it]")
 
 
 _BACKGROUND_TASKS: set[asyncio.Future] = set()
@@ -7210,6 +7264,7 @@ async def server_status() -> str:
         "intercepting": bool(_capture._INTERCEPT.get("active")),
         "profile_dir": _status_profile(),
         "compat_patches": _patches.status(),
+        "remote_allow_origins": await asyncio.to_thread(_allow_origins_by_instance),
         "os_cursor": await _os_cursor_status(),
         "dock_icon": await _dock_icon_status(),
         "dock_icon_brave": await _brave_beta_status(),
@@ -8208,6 +8263,7 @@ async def _launch_browser_instance(
     ads_pending = _adblock_module().begin(block_ads, config.browser_executable_path) if block_ads else None
     try:
         browser = await _start_chrome(config)
+        _mark_allow_origins(browser, config)
         brave_mode.mark(browser, product)
         if not headless:
             await _open_background_window(browser, window_width, window_height)
@@ -8330,6 +8386,7 @@ async def _launch_browser_instance(
         _keep_note = _arm_keep_alive(browser, profile_path, instance_id, headless,
                                      effective_fingerprint) or _keep_note
     dock_note += _keep_note
+    dock_note += _allow_origins_note(browser)
     await _give_focus_back(previous_app)
     return True, (
         f"instance {instance_id!r} launched (headless={headless}, "

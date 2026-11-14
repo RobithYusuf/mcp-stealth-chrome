@@ -752,8 +752,12 @@ the person (the same target events as Cmd+T, a followed link, a closed tab).
   page whose `openerId` is one of those (`_own_pages_opened_by_ours`, in `_refresh_tabs`; Chrome sets an opener for
   `rel=noopener` and keyboard-opened popups too). A browser never counted (owned set empty) takes every tab it holds
   as its own on the first look (`own_untracked`), so a single-user browser behaves exactly as before. `active_tab()`
-  refuses any other tab by name (`not_ours_note`). `tab_select` is the explicit request: it adopts the tab
-  (`adopted_targets`) and its result says the server did not open it. `tab_list` marks such rows.
+  refuses any other tab by name (`not_ours_note`), and so do the two ways around it: `helpers.select_tab` (every
+  `tab=` argument: evaluate, wait_for_function, get_text, screenshot, screenshot_element, inspect_image, and the
+  same through batch_actions and workflow_run) and `tab_close(index=)`. Without them `evaluate(tab=N)` changed a
+  person's page and `tab_close(index=N)` closed it. `tab_select` is the explicit request: it adopts the tab
+  (`adopted_targets`) and its result says the server did not open it. `tab_list` marks such rows. A new tool that
+  takes a tab index resolves it through `select_tab`, never `BrowserState.tabs[i]`.
 - An active tab closed outside the tools leaves no tab selected (`active_tab_index = -1`, `active_lost`), and the
   next tool says so. Before, the index stayed where it was and the next tool acted on whichever tab slid there, a
   person's included; a stale Tab answered "server rejected WebSocket connection: HTTP 500". `_check_active_tab_alive`
@@ -768,7 +772,10 @@ the person (the same target events as Cmd+T, a followed link, a closed tab).
   It sits in `_RUNS_DESPITE_DIALOG` yet evaluates in every tab, so one alert in a tab no tool had touched hung it for
   ever. The server cannot answer a dialog in a tab it never armed (`dialog_handle` times out); the person can.
 - nodriver adds `--remote-allow-origins=*`; `patches._patch_no_remote_allow_origins` removes it unless the caller
-  passes it. With it, a page on a local origin (a dev server, `file://`) that knows the browser websocket URL could
+  passes it. A caller's value is honoured and named: in the `browser_launch` and `spawn_browser` result
+  (`remote_allow_origins=*: kept because extra_args asked for it`) and per instance in
+  `server_status.remote_allow_origins` (`off`, the value, read from the command line for a reattached browser, or
+  "not started by this server" for an attached one). With it, a page on a local origin (a dev server, `file://`) that knows the browser websocket URL could
   drive the browser; without it Chrome answers 403 to any websocket with an Origin header. No client here sends one
   (nodriver, the quit watcher, keep_alive's close, block_ads, the Turnstile sidecar). Public pages are blocked by
   Local Network Access either way, and DNS rebinding by Chrome's Host check. Any local process still owns the port:

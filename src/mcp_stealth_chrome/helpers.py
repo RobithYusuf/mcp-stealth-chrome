@@ -294,7 +294,12 @@ def select_tab(index: int | None = None) -> Tab:
         return active
     if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < len(BrowserState.tabs):
         raise ValueError(f"tab index {index!r} out of range (0..{len(BrowserState.tabs) - 1})")
-    return BrowserState.tabs[index]
+    chosen = BrowserState.tabs[index]
+    # An index is not the explicit request tab_select is: without this, tab= ran scripts in,
+    # read and captured a tab a person opened, which active_tab() refuses.
+    if not BrowserState.acts_on(chosen):
+        raise RuntimeError(BrowserState.not_ours_note(index, chosen))
+    return chosen
 
 
 def transport_lost(text: str) -> bool:

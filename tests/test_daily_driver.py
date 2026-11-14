@@ -296,3 +296,81 @@ def test_upload_file_drops_on_a_drop_zone(loop, browser, site, tmp_path):
     assert call(loop, "evaluate", expression="document.getElementById('got').textContent") == "clip.bin:4096"
     ignored = call(loop, "upload_file", file_path=str(payload), selector="#none", drop=True)
     assert "NO page change detected" in ignored and "may not take drops there" in ignored, ignored
+
+
+def _person_title(person, target):
+    session = person.send("Target.attachToTarget", {"targetId": target, "flatten": True})["sessionId"]
+    return person.send("Runtime.evaluate", {"expression": "document.title", "returnByValue": True},
+                       session=session)["result"]["value"]
+
+
+@e2e
+def test_a_tab_argument_never_reaches_a_persons_tab(loop, person, site):
+    target, _session = person.open_tab(site + "/person")
+    idx = _index_of(loop, "/person")
+    calls = {
+        "evaluate": dict(expression="document.title = 'changed by the agent'; 1", tab=idx),
+        "wait_for_function": dict(expression="true", tab=idx, timeout_ms=1000),
+        "get_text": dict(tab=idx),
+        "screenshot": dict(tab=idx),
+        "screenshot_element": dict(selector="p", tab=idx),
+        "inspect_image": dict(selector="p", tab=idx),
+    }
+    for name, kw in calls.items():
+        out = call(loop, name, **kw)
+        assert "not opened by this server" in out and "Nothing was done" in out, (name, out)
+    batch = call(loop, "batch_actions", actions=[{"type": "evaluate", "tab": idx,
+                                                   "expression": "document.title = 'batch'; 1"}])
+    assert "not opened by this server" in batch, batch
+    flow = call(loop, "workflow_run", steps=[{"tool": "evaluate", "args": {
+        "tab": idx, "expression": "document.title = 'workflow'; 1"}}])
+    assert "not opened by this server" in flow, flow
+    assert _person_title(person, target) == "person"
+    # tab_select is the one explicit way in; afterwards the index works.
+    assert "not opened by this server" in call(loop, "tab_select", index=idx)
+    call(loop, "tab_select", index=_index_of(loop, "/plain"))
+    assert call(loop, "evaluate", expression="document.title", tab=idx) == "person"
+
+
+@e2e
+def test_tab_close_by_index_never_closes_a_persons_tab(loop, person, site):
+    target, _session = person.open_tab(site + "/person")
+    idx = _index_of(loop, "/person")
+    refused = call(loop, "tab_close", index=idx)
+    assert refused.startswith("Error") and "not opened by this server" in refused, refused
+    targets = person.send("Target.getTargets")["targetInfos"]
+    assert any(t["targetId"] == target for t in targets), "the person's tab was closed"
+    assert "/person" in call(loop, "tab_list")
+    call(loop, "tab_select", index=idx)
+    call(loop, "tab_select", index=_index_of(loop, "/plain"))
+    assert call(loop, "tab_close", index=_index_of(loop, "/person")).startswith("closed")
+
+
+@e2e
+def test_a_caller_requested_allow_origins_is_named_and_honoured(loop, site):
+    launched = call(loop, "browser_launch", url=site + "/plain", headless=True, persistent=False,
+                    extra_args=["--remote-allow-origins=*"])
+    try:
+        assert "remote_allow_origins=*" in launched and "any web page" in launched, launched
+        status = json.loads(call(loop, "server_status"))
+        assert status["remote_allow_origins"] == {"main": "*"}, status["remote_allow_origins"]
+        ws = _browser_ws()
+        opened = call(loop, "evaluate", expression=f"""new Promise(r => {{ const s = new WebSocket({json.dumps(ws)});
+            const t = setTimeout(() => r('timeout'), 5000);
+            s.onopen = () => {{ clearTimeout(t); r('OPEN'); s.close(); }};
+            s.onerror = () => {{ clearTimeout(t); r('refused'); }}; }})""")
+        assert opened == "OPEN", opened
+        spawned = call(loop, "spawn_browser", instance_id="dd-origins", headless=True,
+                       extra_args=["--remote-allow-origins=http://localhost:9"])
+        assert "remote_allow_origins=http://localhost:9" in spawned, spawned
+        status = json.loads(call(loop, "server_status"))
+        assert status["remote_allow_origins"] == {"main": "*", "dd-origins": "http://localhost:9"}, status
+    finally:
+        call(loop, "close_instance", instance_id="dd-origins")
+        call(loop, "browser_close")
+    launched = call(loop, "browser_launch", url=site + "/plain", headless=True, persistent=False)
+    try:
+        assert "remote_allow_origins" not in launched, launched
+        assert json.loads(call(loop, "server_status"))["remote_allow_origins"] == {"main": "off"}
+    finally:
+        call(loop, "browser_close")

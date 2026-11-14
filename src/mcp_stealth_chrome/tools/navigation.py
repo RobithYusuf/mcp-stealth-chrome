@@ -550,6 +550,10 @@ async def tab_close(index: Optional[int] = None) -> str:
             return err(f"tab {idx} out of range: {len(BrowserState.tabs)} tab(s), "
                        f"0..{len(BrowserState.tabs) - 1}")
         closed_tab = BrowserState.tabs[idx]
+        if not BrowserState.acts_on(closed_tab):
+            # Closing is the most destructive thing a tool does to a tab; a person's tab is closed
+            # only after tab_select picked it.
+            return err(f"tab {idx} not closed: {BrowserState.not_ours_note(idx, closed_tab)}")
         closing_active = idx == BrowserState.active_tab_index
         browser = BrowserState.browser
         marked = len(BrowserState.tabs) == 1

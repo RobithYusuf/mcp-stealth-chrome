@@ -659,7 +659,8 @@ Results describe what was observed. A tool that reports success when nothing hap
 - ✅ A person can use the same visible browser. Tools act only on tabs the server opened or took over
   (the launch, `tab_new`, reopened tabs, a kept browser on reattach, every tab on `attach_to_chrome`, and any
   page one of those opened). A tab a person opens is marked `[not opened by this server]` in `tab_list`, and
-  tools act on it only after `tab_select` picks it, whose result says so. When a person closes the tab tools
+  tools act on it only after `tab_select` picks it, whose result says so: a `tab=` index and `tab_close(index=)`
+  refuse it before that. When a person closes the tab tools
   were using, the next tool says so and no other tab is picked in its place. `tab_list` waits at most 2 s per
   tab, so a dialog left open in some tab cannot hang it; the row names the reason. A browser whose tabs the
   server opened behaves as before. Measured hazards that remain: keys typed by a person and by `type_text` in
@@ -885,7 +886,7 @@ These run without a browser and without a search API key, and use the stealth br
 - Headless is easier to detect, so keep `headless=false` on difficult sites.
 - A Chrome profile can only be open once at a time. A second browser on the same profile moves to a separate one and says so.
 - Closed shadow roots cannot be read.
-- The browser is driven through a DevTools port on 127.0.0.1. Any program running on the same computer, under any account, can find that port (a scan of every local port took 8.3 s) and read the browser's cookies in plain text through it, without the Keychain prompt that guards the cookie file. Web pages cannot: Chrome refuses a page's connection to it (the server no longer passes nodriver's `--remote-allow-origins=*`) and blocks public pages from local addresses. Do not keep accounts in a browser this server drives whose loss you could not undo, such as your main email, banking, crypto wallets or a password manager.
+- The browser is driven through a DevTools port on 127.0.0.1. Any program running on the same computer, under any account, can find that port (a scan of every local port took 8.3 s) and read the browser's cookies in plain text through it, without the Keychain prompt that guards the cookie file. Web pages cannot: Chrome refuses a page's connection to it (the server no longer passes nodriver's `--remote-allow-origins=*`) and blocks public pages from local addresses. If you pass `--remote-allow-origins` in `extra_args` it is kept, and the launch result and `server_status.remote_allow_origins` say so. Do not keep accounts in a browser this server drives whose loss you could not undo, such as your main email, banking, crypto wallets or a password manager.
 - On Windows, tests saw Google Chrome read back none of a profile's cookies after a relaunch, so a login may not survive a restart there. Linux and macOS keep them. This is being looked into.
 
 ## Configuration
