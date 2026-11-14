@@ -269,7 +269,38 @@ def _patch_background_target_refresh() -> None:
         _STATUS["background_target_refresh"] = f"{type(e).__name__}: {e}"
 
 
+def _patch_no_remote_allow_origins() -> None:
+    """Drop the --remote-allow-origins=* nodriver adds to every launch.
+
+    Measured on Chrome 157 and Brave 157: with it, a page on a local origin (another dev server,
+    a file:// page) that learns the browser's websocket URL can open it and drive the browser;
+    without it Chrome answers 403 to any websocket carrying an Origin header. No CDP client of this
+    package (nodriver, the quit watcher, keep_alive's close, block_ads, the Turnstile sidecar) sends
+    an Origin, and Chrome accepts those. It does nothing against a local process, which sends no
+    Origin either. A caller who passes --remote-allow-origins in extra_args keeps it.
+    """
+    try:
+        from nodriver.core.config import Config
+        original = Config.__call__
+        if getattr(original, "_mcp_no_allow_origins", False):
+            _STATUS["no_remote_allow_origins"] = True
+            return
+
+        def __call__(self):
+            args = original(self)
+            if "--remote-allow-origins=*" in (self._browser_args or []):
+                return args  # asked for by the caller (nodriver lists it once)
+            return [a for a in args if a != "--remote-allow-origins=*"]
+
+        __call__._mcp_no_allow_origins = True
+        Config.__call__ = __call__
+        _STATUS["no_remote_allow_origins"] = True
+    except Exception as e:  # never block server startup on patch failure
+        _STATUS["no_remote_allow_origins"] = f"{type(e).__name__}: {e}"
+
+
 def apply_all() -> None:
+    _patch_no_remote_allow_origins()
     _patch_fastmcp_keeps_text()
     _patch_background_target_refresh()
     _patch_transaction_late_reply()

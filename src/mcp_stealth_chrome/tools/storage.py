@@ -75,9 +75,10 @@ def _active_tab_host() -> Optional[str]:
     """Best-effort hostname of the active tab — used as default cookie domain
     when raw_text doesn't include one."""
     try:
-        if not BrowserState.browser or not BrowserState.tabs:
+        index = BrowserState.active_tab_index
+        if not BrowserState.browser or not 0 <= index < len(BrowserState.tabs):
             return None
-        url = getattr(BrowserState.tabs[BrowserState.active_tab_index], "url", "")
+        url = getattr(BrowserState.tabs[index], "url", "")
         if not url:
             return None
         from urllib.parse import urlparse

@@ -71,6 +71,24 @@ async def storage_state_save(filename: Optional[str] = None) -> str:
         return err(str(e))
 
 
+def _storage_tab():
+    """The page storage_state_load navigates to each origin and writes localStorage in.
+
+    The first tab when the server opened it, as always (so a browser whose tabs are all the
+    server's is unchanged); else the active tab if tools may act on it (a person's tab picked with
+    tab_select); else the first tab the server opened; else None. Never a person's tab the agent
+    did not pick, and never an adopted one the agent is not on.
+    """
+    BrowserState.own_untracked()
+    tabs, owned = BrowserState.tabs, BrowserState.owned_targets
+    if tabs and BrowserState.tab_key(tabs[0]) in owned:
+        return tabs[0]
+    index = BrowserState.active_tab_index
+    if 0 <= index < len(tabs) and BrowserState.acts_on(tabs[index]):
+        return tabs[index]
+    return next((t for t in tabs if BrowserState.tab_key(t) in owned), None)
+
+
 @mcp.tool()
 async def storage_state_load(file_path: str) -> str:
     """Load cookies + localStorage from a saved JSON file.
@@ -80,7 +98,12 @@ async def storage_state_load(file_path: str) -> str:
     try:
         if not BrowserState.browser:
             return err("browser not running — launch first")
-        report = await _srv._apply_storage_state(BrowserState.browser, file_path)
+        tab = _storage_tab()
+        if tab is None:
+            return err("storage_state_load: nothing was loaded. It navigates a tab to each saved origin, "
+                       "and no tab here was opened by this server (they are a person's). tab_new opens "
+                       "one of the agent's own; tab_select adopts one of theirs on purpose.")
+        report = await _srv._apply_storage_state(BrowserState.browser, file_path, tab=tab)
         line = (f"storage state from {file_path}: {report['cookies_set']} cookies set, "
                 f"{report['origins_set']} origins restored")
         if report["cookies_failed"] or report["origins_failed"]:

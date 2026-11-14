@@ -333,8 +333,19 @@ async def uncheck(ref: Optional[str] = None, selector: Optional[str] = None,
 async def upload_file(
     file_path: str,
     ref: Optional[str] = None, selector: Optional[str] = None,
+    drop: bool = False,
 ) -> str:
-    """Upload a file via <input type=file>."""
+    """Upload a file via <input type=file>, or drop it on a drop zone.
+
+    The file is handed over by its path, so its size does not matter (2.2 GB took 0.09 s and no
+    memory). An input inside a shadow root is reached through its ref from browser_snapshot.
+
+    Args:
+        drop: False (default) sets the file on the <input type=file> named by ref or selector,
+            hidden or not. True drops it on the element instead, as a file dragged from Finder:
+            dragenter, dragover and drop at its centre, after the same hit test a click gets. For
+            pages that take files only by dropping. The result says whether the page reacted.
+    """
     try:
         tab = BrowserState.active_tab()
         el = await resolve_ref(ref) if ref else (await tab.query_selector(selector) if selector else None)
@@ -344,6 +355,8 @@ async def upload_file(
         path = Path(file_path).expanduser()
         if not path.is_file():
             return err(f"upload_file: {file_path} is not a file on this machine; nothing was set")
+        if drop:
+            return await _drop_file(tab, el, path.resolve())
         await el.send_file(str(path.resolve()))
         count = await el.apply("function() { return this.files ? this.files.length : 0; }")
         if count != 1:
@@ -351,6 +364,37 @@ async def upload_file(
         return ok(f"uploaded {path}")
     except Exception as e:
         return err(str(e))
+
+
+async def _drop_file(tab, el, path: Path) -> str:
+    """Drop one file on el the way a drag from Finder does, and report what the page did."""
+    from nodriver.cdp import input_ as cdp_input
+    label = f"upload_file drop {path.name!r}"
+    pos, probe, reason, scrolled = await _srv._prepare_target(el)
+    target = f"target=<{probe.get('target') or 'unknown'}>"
+    if reason is not None:
+        return err(f"{label}: NOT dropped: {reason}. {target} rect={probe.get('rect')}. "
+                   f"Nothing was handed to the page.")
+    x, y = pos.left + pos.width / 2, pos.top + pos.height / 2
+    data = cdp_input.DragData(items=[], drag_operations_mask=1 | 2 | 16, files=[str(path)])
+    before = await _srv._page_sig(tab, el, pages=True)
+    for kind in ("dragEnter", "dragOver", "drop"):
+        await _srv._dispatch_input(tab, tab.send(cdp_input.dispatch_drag_event(
+            type_=kind, x=x, y=y, data=data)))
+        note = _srv._dialog_note(tab)
+        if note:
+            return ok(f"{label}: {kind} sent at ({int(x)},{int(y)}){note}")
+    detail = (f"method=cdp_drag {target} at ({int(x)},{int(y)})"
+              + (" (scrolled into view)" if scrolled else ""))
+    after = await _srv._sig_after_action(tab, before, el, pages=True)
+    note = _srv._dialog_note(tab)
+    if note:
+        return ok(f"{label}: dropped, {detail}{note}")
+    result = _srv._click_outcome(f"{label}: dropped", detail, before, after)
+    return result.replace("the page did not react (handler not bound, click swallowed, or the "
+                          "change is purely visual)",
+                          "the page did not react: it may not take drops there (it needs "
+                          "dragover with preventDefault), or it reads the file later")
 
 
 # ══════════════════════════════════════════════════════════════════════════

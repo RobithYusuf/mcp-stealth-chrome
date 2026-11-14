@@ -690,6 +690,16 @@ conclusions. Each rule below replaced a real lie.
   = this server): if that write fails, or the previous watcher cannot be ended or proved to be it, the reattach stops
   (`_ReattachAborted`) and the claim is given back. A record still naming the dead server after the lock went let a third
   server take the same browser, and a second watcher beside a live one made two closers.
+- The record is no integrity boundary, and `owned` is not signed: any process running as this user can write the file,
+  and that process can already drive the debugging port and read every cookie (see the port facts under Sharing a
+  browser). So `owned` fails safe instead (`_owned_before`): an entry counts only when the record's `owned_for`
+  equals its own generation (`keep_alive.generation`: pid, pid_start, port, which `check` proved against the live
+  browser) and the target is a page that exists now; anything else is dropped and named in the result. Residual: a
+  same-user process that writes a matching `owned_for` can make a person's tab count as the agent's.
+- `opened_by` came with the launcher, in the same release (0.20.0, 49e521a); before it there was no launcher, and
+  `write` merges, so a later reattach by any server keeps the field. A record without it is a pre-0.20.0 agent
+  launch and is taken over whole. Measured: 0.20.0's own `launcher.cold_launch` leaves `opened_by: launcher` and no
+  `owned`, which takes none of the tabs.
 - The record never holds the proxy (a proxy URL can carry a password); `write` drops the key even from an old record, and a
   reattach reads `--proxy-server` from the running Chrome's command line (`proxy_from_command`).
 - `profile_gc` asks `still_running`, not "is the PID alive": a PID is handed out again. A record whose Chrome is positively gone
@@ -741,6 +751,72 @@ conclusions. Each rule below replaced a real lie.
 - `tests/test_keep_alive_e2e.py` proves it on real Chrome with a temporary data folder: EOF, reattach with the typed value,
   the tab list at exit, `spawn_browser`, the time cap, a forged record over a foreign Chrome, a browser a live server holds,
   and (`MCP_HEADED=1`) reattach without taking focus, then Quit with no server.
+
+### Sharing a browser with a person
+
+A kept, headed browser may be the person's everyday browser too. Measured with a second CDP client standing in for
+the person (the same target events as Cmd+T, a followed link, a closed tab).
+
+- Tools act on the active tab only when the server opened or took it over (`BrowserState.owned_targets`): the
+  launch's tabs, `tab_new`, reopened tabs, every tab of a kept browser on reattach and of an attached browser, and any
+  page whose `openerId` is one of those (`_own_pages_opened_by_ours`, in `_refresh_tabs`; Chrome sets an opener for
+  `rel=noopener` and keyboard-opened popups too). A browser never counted (owned set empty) takes every tab it holds
+  as its own on the first look (`own_untracked`), so a single-user browser behaves exactly as before. `active_tab()`
+  refuses any other tab by name (`not_ours_note`), and so do the two ways around it: `helpers.select_tab` (every
+  `tab=` argument: evaluate, wait_for_function, get_text, screenshot, screenshot_element, inspect_image, and the
+  same through batch_actions and workflow_run) and `tab_close(index=)`. Without them `evaluate(tab=N)` changed a
+  person's page and `tab_close(index=N)` closed it. `tab_select` is the explicit request: it adopts the tab
+  (`adopted_targets`) and its result says the server did not open it. `tab_list` marks such rows. A new tool that
+  takes a tab index resolves it through `select_tab`, never `BrowserState.tabs[i]`.
+- A browser the person opened from the launcher (`mcp-stealth-chrome open`, the Dock app; record `opened_by:
+  launcher`) holds the person's tabs. A reattach takes over only the tabs it opens itself (url=, or the window it
+  opens when there is none) and those an earlier agent session owned, saved at exit as the record's `owned`
+  (`mark_kept(owned=)`; the launcher's own process saves none). It never reuses a person's tab for url=, selects an
+  agent tab when there is one, and says how many tabs are the person's. `BrowserState.COUNTED` in `owned_targets`
+  means "counted, none ours": an empty set would mean never counted and the first look would take every tab. A kept
+  browser an agent launched is taken over whole, as before. On such a person's browser (`_persons_browser`) nothing of
+  the agent's acts on every tab or ends it: `storage_state_load` navigates only the first tab when the server opened
+  it, else the active tab the tools may use, else a server tab, else refuses naming `tab_new` (it used `browser.tabs[0]`,
+  a person's tab); the record's identity is reapplied to the agent's tabs only; `block_ads` is not attached; the idle
+  timeout is 0 (the reuse path and `spawn_browser` too). Browser-wide cookie reads stay: one cookie jar per profile is
+  what sharing a browser means, and the reattach result says so. Every other `browser.tabs`, `browser.targets`,
+  `tabs[0]`, `main_tab` and `_first_live_tab` use is bookkeeping (tab lists, target counts, window bounds, the tab
+  record) or acts on a browser the launch just started.
+  Measured with the real `open` command
+  (`test_launcher_tabs_e2e.py`).
+- An ownership refusal is `state.TabNotUsable` (a RuntimeError), raised by `active_tab()` and `select_tab` when the
+  tab is not the server's or none is selected. The browser is fine then, and code tells it from a lost connection by
+  its type, never its text: the reuse path of `browser_launch` treated it as a stale handle and ended the browser,
+  the person's own on a launcher browser. Now it leaves the browser as it is and names tab_new and tab_select, or
+  opens the caller's url in a new agent tab. `browser_recover` does not end a person's browser that answers CDP.
+  Nothing else that closes or resets a browser (idle reaper, window sweep, close tools, failed launches) reacts to
+  an `active_tab()` failure; `_tab_list_problem` only reports its text.
+- An active tab closed outside the tools leaves no tab selected (`active_tab_index = -1`, `active_lost`), and the
+  next tool says so. Before, the index stayed where it was and the next tool acted on whichever tab slid there, a
+  person's included; a stale Tab answered "server rejected WebSocket connection: HTTP 500". `_check_active_tab_alive`
+  runs before every tool outside `_RUNS_DESPITE_DIALOG` (`_app.BEFORE_TOOL_HOOKS`): one `Target.getTargetInfo`,
+  which needs no renderer, so 0.50 notices a close before `update_targets`. Code reading
+  `tabs[active_tab_index]` directly must bound-check it: -1 reads the last tab.
+- `tab_close` of the active tab keeps its old choice (the tab now at its place, or the last) but only among tabs the
+  tools may use (`_next_own_tab`). It waits up to 3 s for Chrome to stop listing the closed target and drops it from
+  the list: `Target.closeTarget` answers first, and a list read in between made the next tool talk to a closing page
+  and hang (1 in 3 runs).
+- `tab_list` reads each tab with a 2 s limit and falls back to the target list's URL and title, naming the reason.
+  It sits in `_RUNS_DESPITE_DIALOG` yet evaluates in every tab, so one alert in a tab no tool had touched hung it for
+  ever. The server cannot answer a dialog in a tab it never armed (`dialog_handle` times out); the person can.
+- nodriver adds `--remote-allow-origins=*`; `patches._patch_no_remote_allow_origins` removes it unless the caller
+  passes it. A caller's value is honoured and named: in the `browser_launch` and `spawn_browser` result
+  (`remote_allow_origins=*: kept because extra_args asked for it`) and per instance in
+  `server_status.remote_allow_origins` (`off`, the value, read from the command line for a reattached browser, or
+  "not started by this server" for an attached one). With it, a page on a local origin (a dev server, `file://`) that knows the browser websocket URL could
+  drive the browser; without it Chrome answers 403 to any websocket with an Origin header. No client here sends one
+  (nodriver, the quit watcher, keep_alive's close, block_ads, the Turnstile sidecar). Public pages are blocked by
+  Local Network Access either way, and DNS rebinding by Chrome's Host check. Any local process still owns the port:
+  a scan of every loopback port took 8.3 s and `Storage.getCookies` then returns plain text without a Keychain prompt.
+  Only `--remote-debugging-pipe` held by a broker closes that; Chrome exits within 0.1 s of the pipe's holder dying,
+  so the broker, not the server, would have to hold it for keep_alive to work.
+- Typing interleaves: `type_text` while the person types in the same field gave `PagentEwritesRSONTYPING`. Overrides
+  (`lang`, `fingerprint`) are per tab, so a tab the person opens shows the real identity.
 
 ### Refs, snapshots and paths
 
@@ -984,6 +1060,12 @@ Platform truths, not preferences. Each one cost a release.
   stays, and what stays is made 0600. Under a test it refuses the person's own folder, and `tests/conftest.py` points
   `server.STORAGE_STATE_DIR` at a temporary folder for every in-process test: a fake Chrome 158 in
   `test_profile_version` once left six database copies in the real `~/.mcp-stealth/storage-states`.
+- Saved passwords are not moved. Measured with `--use-mock-keychain` only (the real Keychain was not used): a profile
+  Brave 157 wrote outside Brave's default folder, holding one `v10` login and one `v10` cookie, opened by Brave Beta
+  158.1.101.47: `passwordsPrivate.getSavedPasswordList` lists 0 (Brave 157 on a copy: 1), the `Login Data` row stays
+  `v10` and unread, and the cookie row is deleted. With `--disable-features=KeychainKeyProviderUserDataDirProtection`
+  both read. `cookie_migration` moves cookies only, so a cloned or server profile loses its saved passwords to
+  Chrome or Brave 158 unless they are moved too. Mock-keychain rows prove the mechanism, not real Keychain behaviour.
 - The flag is not a safe default. Measured on Beta 159 with the real Keychain: three `v11` cookies, opened with the flag,
   read 0 and left 0 rows. A store holding both kinds is worse: 5 `v10` and 2 `v11` cookies of one host read 0 and left 0
   rows with the flag and without it, while the `v10` rows alone read 5 with the flag and the `v11` rows alone 2 without.
@@ -1076,8 +1158,16 @@ Platform truths, not preferences. Each one cost a release.
 - `solve_turnstile_oscursor` runs about 16 to 20 s standalone and 45 to 50 s inside the MCP server, where its native
   steps run slower. 35 s timed out during scoring, hence the default of 50.
 - Chrome honours only the last `--disable-features`, and nodriver puts its own (`IsolateOrigins,site-per-process`)
-  before ours, so a second one silently drops nodriver's list: `testing_mode` ran with site isolation back on.
-  Build one flag with `_disable_features_arg`. Every launch adds `--disable-default-apps`: a new profile otherwise
+  before ours, so a second one silently drops nodriver's list. Build one flag with `_disable_features_arg`.
+- Site isolation is on in every browser this server starts. nodriver 0.48 and 0.50 both pass
+  `--disable-features=IsolateOrigins,site-per-process`, and `site-per-process` is a switch name, not a feature name
+  (the feature is `SitePerProcess`), so Chrome ignores it. Measured on Chrome 157 and Brave 157, fresh profiles, a
+  page with a cross-site and a same-site iframe: with the flag and without it, the cross-site iframe is its own
+  `iframe` target and the renderer count is the same (Chrome 10, Brave 4); only `--disable-site-isolation-trials` or
+  `--disable-features=SitePerProcess` put it in process (8 and 2). The full E2E suite with the flag removed passed on
+  Chrome and Brave with no failure caused by it. The flag stays: `IsolateOrigins` with an origin list can come from
+  a field trial on a profile that has a variations seed, which a headless test profile never fetched, so removing
+  it is not proven to change nothing there. Refs, the frame walk and hit tests are built for out-of-process frames. Every launch adds `--disable-default-apps`: a new profile otherwise
   installs Google Docs Offline and Web Store Payments, two more renderers and about 0.2 GB, and `persistent=False`
   pays that on every launch. `--disable-background-networking` saved the same but also stops Safe Browsing and
   variations updates, so it stays in light mode only.

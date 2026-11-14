@@ -109,6 +109,7 @@ from .state import (
     STORAGE_STATE_DIR,
     BrowserState,
     InstanceSnapshot,
+    TabNotUsable,
     chrome_install_hint,
     chrome_lock_holder_pid,
     chrome_user_data_root,
@@ -1579,14 +1580,67 @@ async def _refresh_tabs() -> bool:
         answered = True
     if BrowserState.browser is not browser:
         return False  # closed or switched while it was asked; its tabs are not this state's
+    BrowserState.own_untracked()  # tabs counted before the list changes: a first look owns them
     BrowserState.tabs = list(browser.tabs)
+    _own_pages_opened_by_ours()
     if current is not None:
         wanted = _target_key(current)
         for position, tab in enumerate(BrowserState.tabs):
             if _target_key(tab) == wanted:
                 BrowserState.active_tab_index = position
                 break
+        else:
+            if answered:
+                # The active tab is gone and no tool closed it. Keeping the index would make the
+                # next tool act on whichever tab now sits there, possibly a person's.
+                BrowserState.active_tab_index = -1
+                BrowserState.active_lost = _active_lost_note(current)
     return answered
+
+
+def _active_lost_note(tab: Any) -> str:
+    return (f"The active tab ({BrowserState.tab_label(tab)}) was closed outside this server's tools, "
+            f"by a person or by its own page. No other tab was picked in its place: tab_list shows "
+            f"the tabs, tab_select picks the one to act on, and tab_new opens a new one.")
+
+
+def _own_pages_opened_by_ours() -> None:
+    """A page that one of ours opened (window.open, a target=_blank link) is ours too."""
+    if not BrowserState.owned_targets:
+        return
+    for tab in BrowserState.tabs:
+        key = _target_key(tab)
+        if key in BrowserState.owned_targets:
+            continue
+        opener = getattr(getattr(tab, "target", None), "opener_id", None)
+        if opener and str(opener) in BrowserState.owned_targets:
+            BrowserState.owned_targets.add(key)
+
+
+async def _check_active_tab_alive() -> None:
+    """Before a tool runs: notice an active tab that was closed outside the tools.
+
+    nodriver 0.48 drops a closed target by itself, 0.50 only on update_targets, and a Tab whose
+    target is gone answered "server rejected WebSocket connection: HTTP 500". One browser-level
+    call (no renderer needed, so an open dialog does not block it) says whether it still exists.
+    """
+    browser = BrowserState.browser
+    index = BrowserState.active_tab_index
+    if browser is None or not 0 <= index < len(BrowserState.tabs):
+        return
+    tab = BrowserState.tabs[index]
+    from nodriver.cdp import target as cdp_target
+    connection = getattr(browser, "connection", None) or browser
+    try:
+        await asyncio.wait_for(connection.send(cdp_target.get_target_info(
+            target_id=cdp_target.TargetID(_target_key(tab)))), timeout=2)
+        return
+    except asyncio.TimeoutError:
+        return
+    except Exception as exc:
+        if "no target" not in str(exc).lower():
+            return
+    await _refresh_tabs()
 
 
 async def _tab_list_problem() -> Optional[str]:
@@ -3034,6 +3088,55 @@ async def _reattach_connected(browser: Any, instance_id: str, profile: Path, rec
         raise
 
 
+# On a Browser reattached from a record the launcher wrote: the person's browser. Nothing of the
+# agent's ends it (idle timeout) or acts on all of its tabs (block_ads).
+_PERSONS_ATTR = "_mcp_persons_browser"
+
+
+def _persons_browser(browser: Any) -> bool:
+    return bool(getattr(browser, _PERSONS_ATTR, False))
+
+
+async def _reuse_without_an_agent_tab(refusal: str, url: str, expect_url: Optional[str],
+                                      expect_status: Optional[int], keep_alive: Optional[bool]) -> str:
+    """browser_launch on a running browser whose active tab the tools may not use.
+
+    With a url it opens in a new tab of the agent's, as a reattach does; without one the browser
+    is left exactly as it is and the result says what the agent can do. Nothing is ended.
+    """
+    head = f"reusing the running browser ({len(BrowserState.tabs)} tab(s)), left as it was"
+    keep_note = _keep_alive_on_reuse(keep_alive)
+    if url and url != "about:blank":
+        from .tools import navigation as _navigation
+        opened = await _navigation.tab_new(url=url, expect_url=expect_url, expect_status=expect_status)
+        if opened.startswith("Error"):
+            return err(f"{head}; {url} could not be opened in a new tab of the agent's: "
+                       f"{opened[len('Error: '):]}")
+        return ok(f"{head}; none of its tabs is the agent's to use, so {url} {opened} "
+                  f"(a new tab of the agent's){keep_note}")
+    return ok(f"{head}: {refusal} Or pass url= to open a page in a new tab of the agent's.{keep_note}")
+
+
+def _owned_before(record: dict, tabs: list) -> tuple[set, list]:
+    """The tabs an earlier agent session owned, as far as they can count, and notes on any dropped.
+
+    The record is a file any process running as this user can write, so it is no proof (such a
+    process can drive the debugging port anyway). It fails safe instead: an entry counts only for
+    the browser generation it was written for and only while that page target exists.
+    """
+    claimed = {str(k) for k in (record.get("owned") or [])}
+    if not claimed:
+        return set(), []
+    if record.get("owned_for") != _keep_alive.generation(record):
+        return set(), [f"{len(claimed)} tab(s) the record lists as an agent's were claimed for another "
+                       f"browser (or by an older record), so they were not taken over"]
+    present = {_target_key(t) for t in tabs}
+    gone = claimed - present
+    notes = [f"{len(gone)} tab(s) the record lists as an agent's are no longer open, so they were "
+             f"dropped"] if gone else []
+    return claimed & present, notes
+
+
 async def _reattach_claimed(browser: Any, instance_id: str, profile: Path, record: dict,
                             watcher_note: str, *, url: str, keep_alive: Optional[bool],
                             ignored: list[str]) -> tuple[Any, list, int, dict, str, str]:
@@ -3049,19 +3152,35 @@ async def _reattach_claimed(browser: Any, instance_id: str, profile: Path, recor
         browser.targets.sort(key=lambda t: rank.get(str(t.target.target_id), len(rank)))
     tabs = list(browser.tabs)
     opened_note = ""
+    # A browser the person opened from the launcher holds the person's tabs: a reattach takes
+    # over only what an agent opened there before (saved at its exit) and what it opens now.
+    # Any other kept browser was an agent's, and every tab it holds is taken over as before.
+    from_launcher = record.get("opened_by") == _keep_alive.LAUNCHER
+    with contextlib.suppress(Exception):
+        setattr(browser, _PERSONS_ATTR, from_launcher)
+    agents_before, owned_notes = _owned_before(record, tabs)
+    opened_now: set[str] = set()
     if not tabs:
         tabs = [await (_open_background_window(browser) if not headless
                        else browser.get("about:blank", new_tab=True))]
         opened_note = "; it had no page, so one was opened"
+        opened_now.add(_target_key(tabs[0]))
     for tab in tabs:
+        if from_launcher and _target_key(tab) not in agents_before | opened_now:
+            continue  # the person's tab keeps the person's identity
         with contextlib.suppress(Exception):
             await _wait(_apply_fingerprint_to_tab(tab, fingerprint), timeout=5, what="identity")
     active_key = record.get("active")
     select = next((i for i, t in enumerate(tabs) if _target_key(t) == active_key), 0)
     observed: dict[str, Any] = {}
+    if from_launcher and _target_key(tabs[select]) not in (agents_before | opened_now):
+        # Not the person's tab they were last on: an agent's own one, if there is any.
+        select = next((i for i, t in enumerate(tabs)
+                       if _target_key(t) in (agents_before | opened_now)), select)
     if url and url != "about:blank":
         match = next((i for i, t in enumerate(tabs)
-                      if str(getattr(t.target, "url", "") or "") == url), None)
+                      if str(getattr(t.target, "url", "") or "") == url
+                      and (not from_launcher or _target_key(t) in agents_before)), None)
         if match is not None:
             select = match
             observed = await _observe_navigation(tabs[match], url, {"armed": False})
@@ -3080,6 +3199,7 @@ async def _reattach_claimed(browser: Any, instance_id: str, profile: Path, recor
             finally:
                 disarm()
             tabs.append(tab)
+            opened_now.add(_target_key(tab))
             select = len(tabs) - 1
             observed["note"] = "opened in a new tab; the kept tabs were left as they were"
     else:
@@ -3116,7 +3236,23 @@ async def _reattach_claimed(browser: Any, instance_id: str, profile: Path, recor
         notes.append(lean_note)
     if ignored:
         notes.append("not applied, the running browser keeps its own: " + ", ".join(ignored))
+    keys = [_target_key(t) for t in tabs]
+    owned = set(keys) if not from_launcher else {k for k in keys if k in agents_before | opened_now}
+    notes.extend(owned_notes)
+    if from_launcher:
+        theirs = len(keys) - len(owned)
+        notes.append("the agent shares this browser's cookie jar with the person: cookie_list, "
+                     "cookie_export, storage_state_save and http_request_with_session read the person's "
+                     "logins, and a cookie the agent sets is theirs too")
+        notes.append(f"the person opened this browser from the launcher, so its tabs are theirs: tools "
+                     f"act on the {len(owned)} tab(s) an agent opened (now or in an earlier session) and "
+                     f"not on the person's {theirs} until tab_select picks one; tab_new or url= opens one "
+                     f"of the agent's own")
+        if keys[select] not in owned:
+            notes.append("the selected tab is the person's, so the next tool refuses it until "
+                         "tab_select or tab_new")
     details["reattached"]["notes"] = notes
+    details["_owned"] = owned
     summary = f"reattached to the running browser (pid {pid}, {len(tabs)} tab(s){opened_note})"
     return browser, tabs, select, {**observed, **details}, summary, keep_text
 
@@ -3126,6 +3262,9 @@ async def _block_ads_on_reattach(block_ads: bool, browser: Any, instance_id: str
     the server that kept it ended at that server's exit, so nothing blocks until a launch asks."""
     if not block_ads:
         return ""
+    if _persons_browser(browser):
+        return (" [block_ads: not attached: the person opened this browser from the launcher, and "
+                "blocking acts on every one of their tabs too]")
     module = _adblock_module()
     # A reattached Brave's Config names nodriver's Chrome; its mark says what it is. Shields
     # blocks there, so block_ads stays a no-op that says so, as on a new Brave launch.
@@ -3156,15 +3295,22 @@ async def _launch_by_reattach(profile: Path, verdict: dict, *, url: str, keep_al
         return err(f"a browser kept alive on {profile} ({_keep_alive.describe(record)}) is ours and "
                    f"free, but connecting to it failed: {_exc_text(e)}. It was left running as it "
                    f"was; browser_launch again to retry, or end it with Quit")
+    owned = observed.pop("_owned", None)
     BrowserState.browser = browser
     BrowserState.tabs = tabs
+    BrowserState.owned_targets = ({BrowserState.COUNTED, *owned} if owned is not None
+                                  else {_target_key(t) for t in tabs})
+    BrowserState.adopted_targets = set()
+    BrowserState.active_lost = ""
     BrowserState.active_tab_index = select
     BrowserState.current_profile_dir = Path(_keep_alive.profile_key(profile))
     BrowserState.current_headless = bool(record.get("headless"))
     BrowserState.current_privacy = False
     BrowserState.current_fingerprint = dict(record.get("fingerprint") or {})
     BrowserState.current_proxy = verdict.get("proxy")
-    BrowserState.current_idle_timeout = DEFAULT_IDLE_TIMEOUT if BrowserState.http_mode() else 0
+    # Never ended for the agent's idleness: the person's browser is theirs to Quit.
+    BrowserState.current_idle_timeout = (DEFAULT_IDLE_TIMEOUT if BrowserState.http_mode()
+                                         and not _persons_browser(browser) else 0)
     BrowserState.current_last_active = time.time()
     BrowserState.current_created_at = time.time()
     if BrowserState.http_mode():
@@ -3400,6 +3546,15 @@ from . import _app as _app_module  # noqa: E402
 _app_module.AFTER_TOOL_HOOKS[:] = [
     hook for hook in _app_module.AFTER_TOOL_HOOKS
     if getattr(hook, "__name__", "") != "_mark_tabs_changed"] + [_mark_tabs_changed]
+
+
+async def _active_tab_closed_check(_name: str) -> None:
+    await _check_active_tab_alive()
+
+
+_app_module.BEFORE_TOOL_HOOKS[:] = [
+    hook for hook in _app_module.BEFORE_TOOL_HOOKS
+    if getattr(hook, "__name__", "") != "_active_tab_closed_check"] + [_active_tab_closed_check]
 
 
 def _adblock_module() -> Any:
@@ -3833,6 +3988,12 @@ async def browser_launch(
                     reuse_head, _observed,
                     expect_url=expect_url, expect_status=expect_status, suffix=_reuse_keep_note,
                 )
+            except TabNotUsable as refusal:
+                # The browser is fine; only its active tab is not one the tools may use (the
+                # person's, or none is selected). Never the stale-handle path below: that ends
+                # the browser, and on one the person opened it is theirs.
+                return await _reuse_without_an_agent_tab(str(refusal), url, expect_url,
+                                                         expect_status, keep_alive)
             except Exception as e:
                 # The browser answered, so what failed was the navigation: a bad or slow
                 # URL. Ending it here would lose every tab over a typo.
@@ -4144,6 +4305,7 @@ async def browser_launch(
         ads_pending = _adblock_module().begin(block_ads, config.browser_executable_path) if block_ads else None
         try:
             browser = await _start_chrome(config)
+            _mark_allow_origins(browser, config)
             brave_mode.mark(browser, product)
             if not headless:
                 await _open_background_window(browser, window_width, window_height)
@@ -4260,6 +4422,7 @@ async def browser_launch(
             await _remove_privacy_profile(privacy_profile)
             return err(f"initial nav failed: {e}")
         BrowserState.tabs = [main]
+        BrowserState.own(BrowserState.tabs)  # opened or taken over by this server
         BrowserState.active_tab_index = 0
         BrowserState.current_profile_dir = profile_path
         BrowserState.current_headless = headless
@@ -4271,7 +4434,8 @@ async def browser_launch(
         # merely the reaper left off, because any spawn_browser starts the reaper, which
         # then closed this browser too. Over HTTP a client can vanish, so the reaper is what
         # eventually ends its browser.
-        BrowserState.current_idle_timeout = DEFAULT_IDLE_TIMEOUT if BrowserState.http_mode() else 0
+        BrowserState.current_idle_timeout = (DEFAULT_IDLE_TIMEOUT if BrowserState.http_mode()
+                                             and not _persons_browser(BrowserState.browser) else 0)
         if BrowserState.http_mode():
             _ensure_idle_reaper_running()
         BrowserState.window_closed.pop(BrowserState.current_instance_id, None)
@@ -4291,6 +4455,7 @@ async def browser_launch(
                 _keep_note += (f" [it runs on the fallback profile {final_udd}, which no later default "
                                f"launch asks for: reattach with user_data_dir={final_udd!r}]")
         suffix += _keep_note
+        suffix += _allow_origins_note(browser)
 
         # Post-launch health check — degenerate window detection.
         # After a macOS sleep/wake cycle (or some persistent-profile state
@@ -4362,6 +4527,7 @@ async def browser_launch(
                     BrowserState.current_instance_id, browser, main, profile_path, privacy,
                     headless, effective_fingerprint, url, window_width, window_height)
                 BrowserState.tabs = _all_tabs
+                BrowserState.own(BrowserState.tabs)  # opened or taken over by this server
                 BrowserState.active_tab_index = _select
                 _launch_observed = {**_launch_observed, "restore_tabs": _report}
             except Exception as e:
@@ -4503,6 +4669,16 @@ async def browser_recover() -> str:
     again to start fresh.
     """
     steps: list[str] = []
+    # A browser the person opened from the launcher that still answers is not stuck: whatever
+    # the agent could not do (a tab that is not its own, most likely) is no reason to end it.
+    if BrowserState.browser is not None and _persons_browser(BrowserState.browser):
+        from nodriver.cdp import browser as cdp_browser
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for((getattr(BrowserState.browser, "connection", None)
+                                    or BrowserState.browser).send(cdp_browser.get_version()), timeout=3)
+            return err("browser_recover did not end this browser: the person opened it from the "
+                       "launcher and it answers, so it is not stuck. tab_new opens a tab of the "
+                       "agent's; tab_select picks one of the person's on purpose; the person quits it.")
 
     # 1. Best-effort stop. Capture profile dir BEFORE reset so step 2 can
     #    target only Chrome PIDs that belong to this profile.
@@ -5523,6 +5699,58 @@ def _browser_process_pid(browser: Any) -> Optional[int]:
     process = getattr(browser, "_process", None)
     pid = getattr(process, "pid", None) or getattr(browser, "_process_pid", None)
     return pid if isinstance(pid, int) and pid > 0 else None
+
+
+# The --remote-allow-origins a browser was started with, recorded at launch. Without one Chrome
+# refuses every websocket that carries an Origin, so no web page can reach the debugging port;
+# a caller can still ask for it in extra_args, and then results and server_status say so.
+_ALLOW_ORIGINS_ATTR = "_mcp_remote_allow_origins"
+_ALLOW_ORIGINS_FLAG = re.compile(r"--remote-allow-origins=(\S+)")
+
+
+def _allow_origins_by_instance() -> dict:
+    """Per instance of this session: the --remote-allow-origins its browser runs with."""
+    found = {}
+    if BrowserState.browser is not None:
+        found[BrowserState.current_instance_id] = _allow_origins_of(BrowserState.browser)
+    for iid, snap in BrowserState.instances.items():
+        if snap.browser is not None:
+            found[iid] = _allow_origins_of(snap.browser)
+    return found
+
+
+def _mark_allow_origins(browser: Any, config: Any) -> None:
+    asked = [str(a).split("=", 1)[1] for a in (getattr(config, "_browser_args", None) or [])
+             if str(a).startswith("--remote-allow-origins=")]
+    with contextlib.suppress(Exception):
+        setattr(browser, _ALLOW_ORIGINS_ATTR, asked[-1] if asked else "off")
+
+
+def _allow_origins_of(browser: Any) -> str:
+    """"off", the origins a caller allowed, "unknown", or why there is no answer."""
+    recorded = getattr(browser, _ALLOW_ORIGINS_ATTR, None)
+    if recorded:
+        return recorded
+    pid = _browser_process_pid(browser)
+    if pid is None:
+        return "not started by this server"
+    command = _process_command(pid)
+    if command is None:
+        return "unknown"
+    found = _ALLOW_ORIGINS_FLAG.findall(command)
+    value = found[-1] if found else "off"
+    with contextlib.suppress(Exception):
+        setattr(browser, _ALLOW_ORIGINS_ATTR, value)
+    return value
+
+
+def _allow_origins_note(browser: Any) -> str:
+    value = getattr(browser, _ALLOW_ORIGINS_ATTR, None)
+    if not value or value == "off":
+        return ""
+    who = "any web page" if value == "*" else f"a page from {value}"
+    return (f" [remote_allow_origins={value}: kept because extra_args asked for it; {who} that learns "
+            f"this browser's websocket URL can drive it]")
 
 
 _BACKGROUND_TASKS: set[asyncio.Future] = set()
@@ -7145,6 +7373,7 @@ async def server_status() -> str:
         "intercepting": bool(_capture._INTERCEPT.get("active")),
         "profile_dir": _status_profile(),
         "compat_patches": _patches.status(),
+        "remote_allow_origins": await asyncio.to_thread(_allow_origins_by_instance),
         "os_cursor": await _os_cursor_status(),
         "dock_icon": await _dock_icon_status(),
         "dock_icon_brave": await _brave_beta_status(),
@@ -7713,17 +7942,19 @@ def _drop_handlers(tab: Any, pairs: Any) -> None:
 # here because launch paths and the os-cursor solver share it.
 
 
-async def _apply_storage_state(browser: Browser, path: str) -> dict:
+async def _apply_storage_state(browser: Browser, path: str, tab: Any = None) -> dict:
     """Load cookies+localStorage from a JSON file into browser. Returns what happened.
 
     Raises when the file had cookies and none could be set: a session that did not
-    load must not read as one that did.
+    load must not read as one that did. `tab` is the page navigated to each origin; left out
+    (a browser this launch just started) it is the first one.
     """
     data = json.loads(Path(path).read_text())
     if not isinstance(data, dict):
         raise ValueError(f"{path} holds a JSON {type(data).__name__}, not a storage state object")
     from nodriver.cdp import network as cdp_network
-    tab = browser.tabs[0] if browser.tabs else await browser.get("about:blank")
+    if tab is None:
+        tab = browser.tabs[0] if browser.tabs else await browser.get("about:blank")
     report: dict[str, Any] = {"cookies_set": 0, "cookies_failed": 0,
                               "origins_set": 0, "origins_failed": 0, "first_error": None}
     for c in data.get("cookies", []):
@@ -8143,6 +8374,7 @@ async def _launch_browser_instance(
     ads_pending = _adblock_module().begin(block_ads, config.browser_executable_path) if block_ads else None
     try:
         browser = await _start_chrome(config)
+        _mark_allow_origins(browser, config)
         brave_mode.mark(browser, product)
         if not headless:
             await _open_background_window(browser, window_width, window_height)
@@ -8223,6 +8455,7 @@ async def _launch_browser_instance(
     if instance_id == BrowserState.current_instance_id:
         BrowserState.browser = browser
         BrowserState.tabs = slot_tabs
+        BrowserState.own(BrowserState.tabs)  # opened or taken over by this server
         BrowserState.active_tab_index = slot_active
         BrowserState.current_profile_dir = profile_path
         BrowserState.current_desc = desc
@@ -8240,6 +8473,7 @@ async def _launch_browser_instance(
             browser=browser,
             tabs=slot_tabs,
             active_tab_index=slot_active,
+            owned_targets={_target_key(t) for t in slot_tabs},
             profile_dir=profile_path,
             desc=desc,
             headless=headless,
@@ -8263,6 +8497,7 @@ async def _launch_browser_instance(
         _keep_note = _arm_keep_alive(browser, profile_path, instance_id, headless,
                                      effective_fingerprint) or _keep_note
     dock_note += _keep_note
+    dock_note += _allow_origins_note(browser)
     await _give_focus_back(previous_app)
     return True, (
         f"instance {instance_id!r} launched (headless={headless}, "
@@ -8290,7 +8525,14 @@ async def _spawn_by_reattach(instance_id: str, profile: Path, verdict: dict, *, 
         return False, (f"a browser kept alive on {profile} ({_keep_alive.describe(record)}) is "
                        f"ours and free, but connecting to it failed: {_exc_text(e)}. It was left "
                        f"running as it was")
+    owned = observed.pop("_owned", None)
+    owned = {BrowserState.COUNTED, *owned} if owned is not None else {_target_key(t) for t in tabs}
+    if _persons_browser(browser) and idle_timeout:
+        # The person's browser is theirs to Quit: never ended for the agent's idleness.
+        idle_timeout = 0
+        keep_text += " [idle_timeout: 0, since the person opened this browser from the launcher]"
     fields = dict(browser=browser, tabs=tabs, active_tab_index=select,
+                  owned_targets=owned,
                   profile_dir=Path(_keep_alive.profile_key(profile)), desc=desc,
                   headless=bool(record.get("headless")), privacy=False,
                   fingerprint=dict(record.get("fingerprint") or {}), proxy=verdict.get("proxy"),
@@ -8298,6 +8540,8 @@ async def _spawn_by_reattach(instance_id: str, profile: Path, verdict: dict, *, 
     if instance_id == BrowserState.current_instance_id:
         BrowserState.browser = browser
         BrowserState.tabs = tabs
+        BrowserState.owned_targets, BrowserState.adopted_targets = set(owned), set()
+        BrowserState.active_lost = ""
         BrowserState.active_tab_index = select
         BrowserState.current_profile_dir = fields["profile_dir"]
         BrowserState.current_desc = desc
@@ -9277,6 +9521,7 @@ async def clone_chrome_profile(
     overwrite: bool = False,
     browser: Optional[str] = None,
     allow_running: bool = False,
+    keep_site_data: bool = False,
 ) -> str:
     """Clone a profile from ANY Chrome-family browser into an isolated MCP location.
 
@@ -9288,8 +9533,10 @@ async def clone_chrome_profile(
 
     The source browser MUST be closed (we check SingletonLock).
     Preserves: cookies, history, bookmarks, saved passwords, extensions state.
-    Skips (if skip_cache=True): Cache, Code Cache, GPUCache, Media Cache,
-    Service Worker, IndexedDB (regenerable, saves 500MB+).
+    Skips (if skip_cache=True): Cache, Code Cache, GPUCache, Media Cache (regenerable), and
+    also the site data folders IndexedDB, Service Worker and File System (saves 500MB+). Those
+    are not caches: web apps that keep their login or offline data there (WhatsApp Web,
+    Telegram Web, many PWAs) ask to sign in again. The result lists them under not_copied.
 
     Args:
         source_profile: profile dir name ("Default", "Profile 1", ...).
@@ -9297,6 +9544,9 @@ async def clone_chrome_profile(
         target_instance_id: Name for the cloned instance (becomes folder name).
         skip_cache: Exclude cache dirs for fast + smaller copy (default True).
         overwrite: Delete target if exists before copying (default False).
+        keep_site_data: copy IndexedDB, Service Worker and File System even with
+            skip_cache=True, for a profile that will be used every day. Larger copy. With
+            allow_running these LevelDB folders are copied as they lie, unchecked.
         allow_running: clone even while the browser is open. Each SQLite
             database is copied with its -wal/-shm companions and then
             integrity-checked; any that fail come back under `sqlite_suspect`
@@ -9390,6 +9640,12 @@ async def clone_chrome_profile(
         "safe browsing", "componentupdater", "extensions_crx_cache",
         "component_crx_cache", "gpupersistentcache", "shared dictionary",
     }
+    # Not caches: what a site stored for itself. Skipped with the caches by default (size), so the
+    # result names each one and what leaving it out means; keep_site_data copies them.
+    site_data_dirs = {"indexeddb", "service worker", "file system"}
+    if keep_site_data:
+        cache_dirs = cache_dirs - site_data_dirs
+    not_copied: dict[str, float] = {}
     # Files that might cause issues if copied (locks, logs)
     skip_files = {
         "singletonlock", "singletoncookie", "singletonsocket",
@@ -9425,12 +9681,15 @@ async def clone_chrome_profile(
                 copied_count += 1
             elif item.is_dir():
                 if skip_cache and name_lower in cache_dirs:
+                    size = 0
                     try:
-                        skipped_cache_bytes += sum(
-                            f.stat().st_size for f in item.rglob("*") if f.is_file()
-                        )
+                        size = sum(f.stat().st_size for f in item.rglob("*") if f.is_file())
                     except Exception:
                         pass
+                    if name_lower in site_data_dirs:
+                        not_copied[item.name] = round(size / 1024 / 1024, 1)
+                    else:
+                        skipped_cache_bytes += size
                     continue
                 shutil.copytree(
                     item, target_default / item.name,
@@ -9474,6 +9733,20 @@ async def clone_chrome_profile(
             "transaction committed mid-copy can be missing."
         ),
     }
+    if not_copied:
+        # Left out with the caches: say so, or a login lost with them looks like a broken clone.
+        result["not_copied"] = {name: f"{mb} MB" for name, mb in sorted(not_copied.items())}
+        result["not_copied_means"] = (
+            "Site data left out with the caches (skip_cache=True): IndexedDB holds what web apps "
+            "keep for themselves, often their login (WhatsApp Web, Telegram Web, many PWAs); "
+            "Service Worker holds their offline copies and push registrations; File System their "
+            "files. Those sites ask to sign in again in the clone. For a profile used every day, "
+            "clone again with keep_site_data=True (overwrite=True replaces this copy)."
+        )
+    elif keep_site_data and skip_cache:
+        result["site_data"] = ("IndexedDB, Service Worker and File System were copied "
+                               "(keep_site_data=True)" + (", as they lay while the browser ran, "
+                               "unchecked" if running else ""))
     # A clone with a corrupt cookie jar looks identical to a good one until a
     # login silently fails hours later, so a suspect database is an error here
     # rather than a field somebody has to notice. The copy is left in place to
@@ -11490,7 +11763,10 @@ async def attach_to_chrome(
     BrowserState.current_last_active = time.time()
     BrowserState.current_created_at = time.time()
     _ATTACHED_BROWSERS.add(instance_id)
+    BrowserState.owned_targets, BrowserState.adopted_targets = set(), set()
+    BrowserState.active_lost = ""
     await _refresh_tabs()
+    BrowserState.own(BrowserState.tabs)  # attaching takes over every tab open now
     return ok(
         f"Attached to existing Chrome at {host}:{port} as {instance_id!r}. "
         f"Browser: {info.get('Browser', '?')} ({brave_mode.name(attached_product)}), "
@@ -11583,15 +11859,18 @@ def _stop_all_browsers() -> None:
             for view in views:
                 with contextlib.suppress(Exception):
                     _record_tabs_at_exit(*view)
+            owned = {BrowserState.current_instance_id: set(BrowserState.owned_targets)}
+            owned.update({iid: set(s.owned_targets) for iid, s in BrowserState.instances.items()})
             for iid, browser, tabs, active_index, profile, privacy in views:
                 with contextlib.suppress(Exception):
-                    _leave_or_end_at_exit(browser, tabs, active_index, profile, privacy)
+                    _leave_or_end_at_exit(browser, tabs, active_index, profile, privacy,
+                                          owned=owned.get(iid))
         finally:
             BrowserState.unbind_session(token)
 
 
 def _leave_or_end_at_exit(browser: Any, tabs: list, active_index: int, profile: Any,
-                          privacy: bool) -> str:
+                          privacy: bool, owned: Optional[set] = None) -> str:
     """At exit, with no event loop: leave a browser kept alive running, end every other one."""
     if browser is None:
         return "none"
@@ -11600,7 +11879,11 @@ def _leave_or_end_at_exit(browser: Any, tabs: list, active_index: int, profile: 
             and isinstance(pid, int) and _process_exists(pid)):
         keys = [_target_key(t) for t in tabs]
         active = keys[active_index] if 0 <= active_index < len(keys) else None
-        if _keep_alive.mark_kept(profile, pid, keys, active) is None:
+        # The launcher's own process opened this browser for the person: none of its tabs is an
+        # agent's, so a later reattach takes over none of them.
+        mine = [] if _keep_alive.OPENED_BY == _keep_alive.LAUNCHER else [
+            k for k in keys if owned is None or not owned or k in owned]
+        if _keep_alive.mark_kept(profile, pid, keys, active, owned=mine) is None:
             _keep_alive.release(browser)
             return "kept"
     config = getattr(browser, "config", None)
