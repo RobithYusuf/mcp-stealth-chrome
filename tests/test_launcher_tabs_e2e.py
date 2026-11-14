@@ -348,3 +348,96 @@ def test_launching_again_on_a_persons_browser_never_ends_it(world):
         assert state._pid_alive(pid), "browser_recover ended the person's browser"
     finally:
         agent.close()
+
+
+def _pages(world) -> list:
+    from urllib.request import urlopen
+    port = _record(world)["port"]
+    rows = json.loads(urlopen(f"http://127.0.0.1:{port}/json/list", timeout=5).read())
+    return [row for row in rows if row.get("type") == "page"]
+
+
+def _wait_for(check, seconds, what):
+    import time
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        found = check()
+        if found:
+            return found
+        time.sleep(0.25)
+    raise AssertionError(f"timed out waiting for {what}")
+
+
+@pytest.mark.skipif(not os.environ.get("MCP_HEADED"), reason="opens a visible browser: MCP_HEADED=1")
+def test_a_browser_from_the_launcher_comes_back_with_the_tabs_the_person_had(world):
+    """No agent runs: the quit watcher is the only thing that saw the tabs. The person opens
+    two pages, every window is closed (a Quit), and the next start from the launcher has them."""
+    from urllib.request import urlopen
+    cli = str(pathlib.Path(sys.executable).parent / "mcp-stealth-chrome")
+    env = {**os.environ, **world.env, "PYTHONPATH": str(pathlib.Path(__file__).parent.parent / "src")}
+
+    def start():
+        done = subprocess.run([cli, "open", "--browser", "chrome"], env=env, capture_output=True,
+                              text=True, timeout=120)
+        assert done.returncode == 0, done.stdout + done.stderr
+        return done.stdout
+
+    start()
+    first_pid = _record(world)["pid"]
+    _person_opens(world, world.base + "?person=1")
+    _person_opens(world, world.base + "?person=2")
+    tabs_file = _wait_for(lambda: next(iter((world.root / "keep").glob("*.tabs")), None), 15,
+                          "the watcher's tab list")
+    _wait_for(lambda: len(json.loads(tabs_file.read_text())["urls"]) == 2, 15, "both pages in it")
+    assert oct(tabs_file.stat().st_mode & 0o777) == "0o600"
+    # Quit: every window goes, one after another, and the watcher then ends the browser.
+    port = _record(world)["port"]
+    for page in _pages(world):
+        urlopen(f"http://127.0.0.1:{port}/json/close/{page['id']}", timeout=5).read()
+    def ended():
+        try:
+            os.kill(first_pid, 0)  # POSIX only, as this whole file is
+        except OSError:
+            return True
+        return False
+
+    _wait_for(ended, 30, "the browser to end after its last window")
+    assert len(json.loads(tabs_file.read_text())["urls"]) == 2  # the Quit did not empty the list
+
+    text = start()
+    assert "restore_tabs" in text, text
+    assert _record(world)["pid"] != first_pid
+    urls = _wait_for(lambda: (lambda u: u if sum("person=" in x for x in u) == 2 else None)(
+        [p["url"] for p in _pages(world)]), 30, "both pages to come back")
+    assert any("person=1" in u for u in urls) and any("person=2" in u for u in urls), urls
+    assert len(urls) == 2, urls
+    # One window with its tabs, not a window per page as an agent's restore opens them.
+    from mcp_stealth_chrome import _quit_watcher as qw
+    port = _record(world)["port"]
+    windows = {(qw.browser_call("127.0.0.1", port, "Browser.getWindowForTarget",
+                                params={"targetId": page["id"]}) or {}).get("windowId")
+               for page in _pages(world)}
+    assert len(windows) == 1 and None not in windows, windows
+
+
+@pytest.mark.skipif(not os.environ.get("MCP_HEADED"), reason="opens a visible browser: MCP_HEADED=1")
+def test_open_with_lean_starts_brave_without_its_extras(world):
+    """The Dock launcher never passed brave_lean, so a person's agent Brave kept Leo, the VPN
+    button and the rest. `open --lean` (or install-launcher --lean) turns them off."""
+    from mcp_stealth_chrome import brave
+    if brave.find_brave() is None:
+        pytest.skip("Brave is not installed")
+    cli = str(pathlib.Path(sys.executable).parent / "mcp-stealth-chrome")
+    env = {**os.environ, **world.env, "PYTHONPATH": str(pathlib.Path(__file__).parent.parent / "src")}
+    done = subprocess.run([cli, "open", "--browser", "brave", "--lean"], env=env,
+                          capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "brave_lean" in done.stdout, done.stdout
+    pid = _record(world)["pid"]
+    command = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True,
+                             text=True).stdout
+    # Chrome honours the last --disable-features; nodriver's own comes first on the line.
+    features = [part for part in command.split() if part.startswith("--disable-features=")][-1]
+    assert "AIChat" in features and "BraveVPN" in features, features
+    prefs = json.loads(next((world.root / "data").glob("brave-profile/Default/Preferences")).read_text())
+    assert prefs["brave"]["ai_chat"]["show_toolbar_button"] is False, prefs["brave"].get("ai_chat")

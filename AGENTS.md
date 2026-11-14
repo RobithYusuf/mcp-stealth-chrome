@@ -793,6 +793,18 @@ conclusions. Each rule below replaced a real lie.
   counted from when `getppid()` stopped being its server. Headless (`pages_matter=False`) skips the window logic: nobody can
   quit it, and an empty headless browser may still be reattached. It removes the record once Chrome is gone, only if the
   record names that PID. `profile_gc` refuses a profile whose record names a live PID.
+- A browser a person opened from the launcher has no server while they use it, so nothing saved its tabs: every
+  start from the Dock came back with one blank tab. The quit watcher, which reads `/json/list` anyway, keeps the last
+  list of a kept visible browser in `<keep-alive>/<hash>.tabs` (`_quit_watcher.TabKeeper`, 0600, written beside and
+  renamed in). A list counts only after it stood still for `TABS_SETTLE` (3 s): a Quit closes the windows one after
+  another in well under that, so a half-closed browser never replaces the full list, and blank or internal pages are
+  not a list. `launcher.adopt_watched_tabs` makes it the saved list when it is newer than the one a server recorded,
+  and `cold_launch` passes `restore_tabs=True` with `server.RESTORE_AS_TABS`: tabs in one window for a person, where
+  an agent's restore keeps a window per page so each reads as visible. The suffix is `.tabs`, not `.json`, because
+  `live_profiles` reads every `.json` there as a record. `_forget_tabs_note` drops it with the saved list.
+- The launcher did not pass `brave_lean`, and a profile older than lean is not one "the server made empty", so a
+  person's agent Brave kept Leo and the rest. `install-launcher --lean` stores the choice in
+  `<data>/launcher-lean-<browser>` and `open` reads it (`lean_choice`); unset, the server's own rule decides.
 - `tests/test_keep_alive_e2e.py` proves it on real Chrome with a temporary data folder: EOF, reattach with the typed value,
   the tab list at exit, `spawn_browser`, the time cap, a forged record over a foreign Chrome, a browser a live server holds,
   and (`MCP_HEADED=1`) reattach without taking focus, then Quit with no server.

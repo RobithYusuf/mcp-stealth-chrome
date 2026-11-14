@@ -85,6 +85,9 @@ def _err(text: str) -> None:
 
 # ── which profile, and who holds it ───────────────────────────────────────────
 
+INSTANCE = "main"  # the instance a launcher browser is, as browser_launch names it
+
+
 def profile_for(browser: str) -> Path:
     """The main instance's profile, as browser_launch(browser=...) resolves it with nothing held."""
     root = _state.data_root()
@@ -272,10 +275,17 @@ def cold_launch(browser: str, url: Optional[str], move_to_beta: bool) -> tuple[i
     _keep_alive.OPENED_BY = _keep_alive.LAUNCHER
     logging.getLogger("nodriver").setLevel(logging.WARNING)
 
+    # A person's browser comes back with the tabs it had, in one window. With no agent running
+    # nothing but the quit watcher saw them, so its list becomes the saved one first.
+    tabs_note = adopt_watched_tabs(browser)
+    server.RESTORE_AS_TABS = True
+    lean = lean_choice(browser) if browser == brave_mode.BRAVE else None
+
     async def launch() -> str:
         return await server.browser_launch(
             url=url or "about:blank", headless=False, keep_alive=True, browser=browser,
-            profile_conflict="fail", extra_args=_extra_args() or None)
+            profile_conflict="fail", extra_args=_extra_args() or None,
+            restore_tabs=True, brave_lean=lean)
 
     try:
         text = asyncio.run(launch())
@@ -286,6 +296,7 @@ def cold_launch(browser: str, url: Optional[str], move_to_beta: bool) -> tuple[i
         dock_icon.wait(30)
     if text.startswith("Error"):
         return EXIT_FAILED, text, None
+    text += tabs_note
     record = _keep_alive.read(profile_for(browser)) or {}
     if record.get("state") != "kept":
         return EXIT_FAILED, (f"the browser started but was not left running for later: {text}"), None
@@ -305,6 +316,58 @@ def _extra_args() -> list[str]:
 
 
 # ── the open command ──────────────────────────────────────────────────────────────
+
+def adopt_watched_tabs(browser: str) -> str:
+    """Make the quit watcher's last tab list the saved one when it is the newer of the two, so
+    restore_tabs reopens what the person had. Returns a note for the result; never raises."""
+    from . import tab_record
+    profile = profile_for(browser)
+    try:
+        watched = _keep_alive.last_tabs(profile)
+        if watched is None:
+            return ""
+        saved, _why = tab_record.load(INSTANCE, profile)
+        try:
+            newer = saved is None or watched["at"] > float(saved.get("saved_at") or 0)
+        except (TypeError, ValueError):
+            newer = True
+        if not newer:
+            return ""
+        keys = [str(n) for n in range(len(watched["urls"]))]
+        outcome = tab_record.save(INSTANCE, profile, list(zip(keys, watched["urls"])), keys,
+                                  keys[0], "the quit watcher's last look", force=True)
+        return f" [tabs from the last time it was open: {outcome}]"
+    except Exception as exc:
+        return f" [tabs from the last time could not be read: {type(exc).__name__}]"
+
+
+def _lean_path(browser: str) -> Path:
+    return _state.data_root() / f"launcher-lean-{browser}"
+
+
+def lean_choice(browser: str) -> Optional[bool]:
+    """What `--lean` or `--no-lean` last set for this browser's launcher, or None: then the
+    server's own rule decides (lean only on a profile it made empty)."""
+    if LEAN_OVERRIDE is not None:
+        return LEAN_OVERRIDE
+    try:
+        text = _lean_path(browser).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return {"1": True, "0": False}.get(text)
+
+
+def set_lean(browser: str, value: bool) -> None:
+    path = _lean_path(browser)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(fd, "w") as handle:
+        handle.write("1\n" if value else "0\n")
+
+
+# `open --lean` / `--no-lean` for this run only; None leaves it to what install-launcher stored.
+LEAN_OVERRIDE: Optional[bool] = None
+
 
 def _ack_path(browser: str) -> Path:
     return _state.data_root() / f"launcher-acknowledged-{browser}"
@@ -393,6 +456,9 @@ def _open_command(args: argparse.Namespace) -> int:
         return EXIT_ACKNOWLEDGE
     if args.dock_icon:
         os.environ["MCP_STEALTH_DOCK_ICON"] = "1"
+    if args.lean is not None:
+        global LEAN_OVERRIDE
+        LEAN_OVERRIDE = args.lean
     if args.from_app:
         from . import dock_icon
         dock_icon.ICON_WRITES = False  # an app may not modify another app's bundle (App Management)
@@ -633,6 +699,10 @@ def _install_command(args: argparse.Namespace) -> int:
     except Exception as exc:
         _err(f"the launcher could not be built: {exc}")
         return EXIT_NOT_HERE if sys.platform != "darwin" else EXIT_FAILED
+    if args.lean is not None and args.browser == brave_mode.BRAVE:
+        set_lean(args.browser, args.lean)
+        _out("Starts from the launcher will " + ("turn off Brave's extras (lean)." if args.lean
+                                                else "keep Brave as it ships."))
     name = "Brave" if args.browser == brave_mode.BRAVE else "Chrome"
     _out(INSTALL_NOTE.format(app=app, folder=app.parent, name=name, title=TITLES[args.browser]))
     if not (app / "Contents" / "Resources" / "cli-path").read_text().strip():
@@ -651,6 +721,11 @@ def cli(argv: list[str]) -> int:
                         help="run from the Beta channel with the project icon (MCP_STEALTH_DOCK_ICON=1)")
     opener.add_argument("--move-to-beta", action="store_true",
                         help="let Brave Beta take a profile Brave made (one way; its cookies are moved)")
+    opener.add_argument("--lean", dest="lean", action="store_true", default=None,
+                        help="Brave only: turn off Leo, VPN, Rewards buttons and the other extras "
+                             "(brave_lean=True) for this start")
+    opener.add_argument("--no-lean", dest="lean", action="store_false",
+                        help="Brave only: keep Brave as it ships, and put back what lean changed")
     opener.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
     opener.add_argument("--acknowledge", action="store_true", help=argparse.SUPPRESS)
     installer = sub.add_parser("install-launcher", help="build the Dock launcher app (macOS)")
@@ -658,6 +733,11 @@ def cli(argv: list[str]) -> int:
     installer.add_argument("--dir", type=Path, default=None,
                            help=f"where to put it (default ~/Applications, or ${ENV_DIR})")
     installer.add_argument("--remove", action="store_true", help="remove the launcher this built")
+    installer.add_argument("--lean", dest="lean", action="store_true", default=None,
+                           help="Brave only: every start from the launcher turns off Leo, VPN, "
+                                "Rewards buttons and the other extras (brave_lean=True)")
+    installer.add_argument("--no-lean", dest="lean", action="store_false",
+                           help="Brave only: starts from the launcher keep Brave as it ships")
     args = parser.parse_args(argv)
     if args.command == "open":
         return _open_command(args)

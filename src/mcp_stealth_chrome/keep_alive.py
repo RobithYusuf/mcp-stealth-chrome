@@ -145,6 +145,41 @@ def lock_path(profile: Any) -> Path:
     return record_path(profile).with_suffix(".lock")
 
 
+def tabs_path(profile: Any) -> Path:
+    """The last tab list the quit watcher saw on this profile (see _quit_watcher.TabKeeper)."""
+    return record_path(profile).with_suffix(".tabs")
+
+
+def last_tabs(profile: Any) -> Optional[dict]:
+    """{"at": when, "urls": [...]} as the watcher left it, or None when there is none to use.
+    Never through a link, and only a file of ours that names this profile."""
+    path = tabs_path(profile)
+    try:
+        if path.is_symlink() or path.stat().st_uid != os.getuid():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    urls = data.get("urls") if isinstance(data, dict) else None
+    if not isinstance(urls, list) or not all(isinstance(u, str) for u in urls) or not urls:
+        return None
+    if profile_key(data.get("user_data_dir") or "") != profile_key(profile):
+        return None
+    try:
+        at = float(data.get("at"))
+    except (TypeError, ValueError):
+        return None
+    return {"at": at, "urls": urls}
+
+
+def drop_last_tabs(profile: Any) -> bool:
+    try:
+        tabs_path(profile).unlink()
+        return True
+    except OSError:
+        return False
+
+
 def _take_lock(profile: Any) -> Optional[int]:
     """A lock on reattaching to this profile, across processes, or None when another holds it.
 

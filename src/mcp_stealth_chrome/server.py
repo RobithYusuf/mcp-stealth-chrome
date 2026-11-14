@@ -2905,7 +2905,8 @@ def _arm_keep_alive(browser: Any, profile: Any, instance_id: str, headless: bool
     else:
         _WINDOW_WATCH[id(browser)] = {"browser": browser, "zero_since": None, "tool_closed": False}
         proc = quit_watch.start(browser, _WINDOWLESS_GRACE, _CLOSE_WAIT, max_orphan_seconds=cap,
-                                keep_alive_record=path)
+                                keep_alive_record=path,
+                                tabs_file=str(_keep_alive.tabs_path(profile)))
         _ensure_window_watcher_running()
     if proc is None:
         return (" [keep_alive not armed: its watcher could not start, and nothing could end the "
@@ -3103,7 +3104,8 @@ async def _reattach_connected(browser: Any, instance_id: str, profile: Path, rec
             proc = quit_watch.start(
                 browser, _WINDOWLESS_GRACE, _CLOSE_WAIT,
                 max_orphan_seconds=_keep_alive.cap_hours(record.get("opened_by")) * 3600,
-                pages_matter=not headless, keep_alive_record=str(_keep_alive.record_path(profile)))
+                pages_matter=not headless, keep_alive_record=str(_keep_alive.record_path(profile)),
+                tabs_file=str(_keep_alive.tabs_path(profile)))
             if proc is not None:
                 fields.update(watcher_pid=proc.pid,
                               watcher_start=_keep_alive._watcher.process_start(proc.pid))
@@ -3616,6 +3618,11 @@ async def _load_saved_tab(tab: Any, url: str) -> dict:
         disarm()
 
 
+# The Dock launcher sets this: a person's browser comes back as one window with its tabs, not as
+# one window per page. An agent's launch keeps a window per page, so each one reads as visible.
+RESTORE_AS_TABS = False
+
+
 async def _reopen_saved_tabs(
     instance_id: str, browser: Any, main_tab: Any, profile: Any, privacy: bool, headless: bool,
     fingerprint: dict, launch_url: Optional[str], window_width: Optional[int] = None,
@@ -3676,10 +3683,14 @@ async def _reopen_saved_tabs(
             slot["tab"] = main_tab
             continue
         try:
-            opened = (await _wait(browser.get("about:blank", new_tab=True), timeout=10,
-                                  what="open a tab") if headless
-                      else await _wait(_open_background_window(browser, window_width, window_height),
-                                       timeout=10, what="open a window"))
+            if headless:
+                opened = await _wait(browser.get("about:blank", new_tab=True), timeout=10,
+                                     what="open a tab")
+            elif RESTORE_AS_TABS:
+                opened = await _wait(_open_background_tab(browser), timeout=10, what="open a tab")
+            else:
+                opened = await _wait(_open_background_window(browser, window_width, window_height),
+                                     timeout=10, what="open a window")
             await _apply_fingerprint_to_tab(opened, fingerprint)
             slot["tab"] = opened
         except Exception as exc:
@@ -4579,7 +4590,10 @@ def _forget_tabs_note(instance_id: str, profile: Any, privacy: bool) -> str:
     scope = _tab_record_scope(instance_id, profile, privacy)
     if scope is None:
         return " No tab list is kept for this profile."
-    if tab_record.forget(instance_id, scope):
+    # The list the quit watcher keeps for a kept browser goes too, or a later start from the
+    # Dock would bring back tabs the caller asked to forget.
+    watched = _keep_alive.drop_last_tabs(scope)
+    if tab_record.forget(instance_id, scope) or watched:
         return " Its saved tab list was removed."
     return " It had no saved tab list."
 

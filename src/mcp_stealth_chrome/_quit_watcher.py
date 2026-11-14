@@ -220,8 +220,9 @@ def http_get(host, port, path, timeout=2.0):
         return None
 
 
-def page_count(host, port):
-    """Page targets the browser has, or None when the endpoint did not answer."""
+def pages_of(host, port):
+    """The URL of every page target, in the order /json/list gives them, or None when the
+    endpoint did not answer."""
     body = http_get(host, port, "/json/list")
     if body is None:
         return None
@@ -231,7 +232,49 @@ def page_count(host, port):
         return None
     if not isinstance(targets, list):
         return None
-    return sum(1 for target in targets if isinstance(target, dict) and target.get("type") == "page")
+    return [str(target.get("url") or "") for target in targets
+            if isinstance(target, dict) and target.get("type") == "page"]
+
+
+def page_count(host, port):
+    """Page targets the browser has, or None when the endpoint did not answer."""
+    listed = pages_of(host, port)
+    return None if listed is None else len(listed)
+
+
+# A browser a person opened from the Dock has no server to save its tabs, and a Quit closes
+# every window before anything could read them. So the watcher, which reads the page list
+# anyway, keeps the last one. A list counts once it has stood still for TABS_SETTLE seconds:
+# the windows of a Quit go one after another in well under that, so a half-closed browser is
+# never written over the full list.
+TABS_SETTLE = 3.0
+TABS_MAX = 60
+TABS_SCHEMES = ("http://", "https://", "file://")
+
+
+class TabKeeper:
+    """Writes cfg["tabs_file"] when the reopenable pages changed and then stood still."""
+
+    def __init__(self, cfg, clock):
+        self.cfg, self.clock = cfg, clock
+        self.path = cfg.get("tabs_file")
+        self.seen, self.since, self.saved = None, 0.0, None
+
+    def look(self, urls):
+        if not self.path or not urls:
+            return
+        now = [url for url in urls if url.startswith(TABS_SCHEMES)][:TABS_MAX]
+        if not now:
+            return  # only blank or internal pages: nothing worth reopening, keep what is saved
+        if now != self.seen:
+            self.seen, self.since = now, self.clock()
+            return
+        if now == self.saved or self.clock() - self.since < float(self.cfg.get("tabs_settle", TABS_SETTLE)):
+            return
+        write_private(self.path, {"pid": self.cfg["pid"], "pid_start": self.cfg.get("pid_start"),
+                                  "user_data_dir": self.cfg["user_data_dir"], "at": time.time(),
+                                  "urls": now})
+        self.saved = now
 
 
 def request_browser_close(host, port, timeout=2.0):
@@ -378,12 +421,16 @@ def remove(path):
 
 
 def write_private(path, data):
+    """The whole file or the old one: written beside it and renamed in, readable by its owner."""
+    staging = "%s.%d.tmp" % (path, os.getpid())
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        fd = os.open(staging, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0),
+                     0o600)
         with os.fdopen(fd, "w") as handle:
             json.dump(data, handle)
+        os.replace(staging, path)
     except OSError:
-        pass
+        remove(staging)
 
 
 def gone(pid, user_data_dir, start=None):
@@ -456,6 +503,7 @@ def watch(cfg, sleep=time.sleep, clock=time.monotonic):
     zero_since = None
     orphan_since = None
     unidentified = 0
+    tabs = TabKeeper(cfg, clock)
 
     def give_up():
         write_private(quit_file, {"pid": pid, "port": cfg["port"], "user_data_dir": data_dir,
@@ -492,7 +540,9 @@ def watch(cfg, sleep=time.sleep, clock=time.monotonic):
         if cfg.get("pages_matter", True) is False:
             sleep(interval)
             continue
-        pages = page_count(cfg["host"], cfg["port"])
+        listed = pages_of(cfg["host"], cfg["port"]) if tabs.path else None
+        pages = len(listed) if listed is not None else page_count(cfg["host"], cfg["port"])
+        tabs.look(listed)
         if pages is None or pages > 0:
             zero_since = None  # unanswered is not "no windows"
             if pages:

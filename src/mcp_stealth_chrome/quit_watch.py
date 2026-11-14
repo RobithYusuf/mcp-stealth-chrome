@@ -97,8 +97,8 @@ def _prune(folder: Path) -> None:
 
 
 def start(browser: Any, grace: float, close_wait: float, *, max_orphan_seconds: Optional[float] = None,
-          pages_matter: bool = True, keep_alive_record: Optional[str] = None
-          ) -> Optional[subprocess.Popen]:
+          pages_matter: bool = True, keep_alive_record: Optional[str] = None,
+          tabs_file: Optional[str] = None) -> Optional[subprocess.Popen]:
     """Start the watcher for a headed browser. None when it cannot run here; the server's own
     sweep then covers that browser.
 
@@ -143,6 +143,8 @@ def start(browser: Any, grace: float, close_wait: float, *, max_orphan_seconds: 
         cfg["pages_matter"] = False
     if keep_alive_record:
         cfg["keep_alive_record"] = str(keep_alive_record)
+    if tabs_file and pages_matter:
+        cfg["tabs_file"] = str(tabs_file)  # the last tab list of a kept, visible browser
     try:
         proc = subprocess.Popen(
             [_interpreter(), "-I", "-", "mcp-stealth-quit-watcher", json.dumps(cfg)],
