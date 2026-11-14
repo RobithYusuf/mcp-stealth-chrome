@@ -33,6 +33,10 @@ _RUNS_DESPITE_DIALOG = frozenset({
 # Called with the tool's name after every tool call, inside the caller's session. server.py adds
 # the saved-tabs writer here. Each must be cheap and must not await; one that raises is ignored.
 AFTER_TOOL_HOOKS: list = []
+# Awaited with the tool's name before a tool that may act on the active tab (anything not in
+# _RUNS_DESPITE_DIALOG), inside the caller's session. server.py adds the check that notices an
+# active tab closed outside the tools. Each must be quick and bounded; one that raises is ignored.
+BEFORE_TOOL_HOOKS: list = []
 # Called with (session key, result) on every text result, returning the text to give. block_ads
 # adds one that says, once, that it stopped and why. Each must be cheap; one that raises is skipped.
 RESULT_FILTERS: list = []
@@ -137,6 +141,12 @@ class StealthMCP(FastMCP):
             if still:
                 return tool.fn_metadata.convert_result(still)
             _touch_current()
+            if name not in _RUNS_DESPITE_DIALOG:
+                for hook in BEFORE_TOOL_HOOKS:
+                    try:
+                        await hook(name)
+                    except Exception:
+                        pass
             return await self._call_bound(name, arguments, context, tool)
         finally:
             _touch_current()  # the instance current now: switch_instance may have changed it
@@ -159,7 +169,10 @@ class StealthMCP(FastMCP):
             if isinstance(index, int) and not isinstance(index, bool) and 0 <= index < len(BrowserState.tabs):
                 target = BrowserState.tabs[index]
             else:
-                target = BrowserState.active_tab()
+                try:
+                    target = BrowserState.active_tab()
+                except Exception as exc:  # no tab selected, or not one of ours: say why
+                    return tool.fn_metadata.convert_result(f"Error: {exc}")
             key = target_key(target)
             lock = _TAB_LOCKS.setdefault(key, asyncio.Lock())
             if lock.locked():

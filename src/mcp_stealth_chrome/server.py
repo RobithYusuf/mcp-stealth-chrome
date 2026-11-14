@@ -1579,14 +1579,67 @@ async def _refresh_tabs() -> bool:
         answered = True
     if BrowserState.browser is not browser:
         return False  # closed or switched while it was asked; its tabs are not this state's
+    BrowserState.own_untracked()  # tabs counted before the list changes: a first look owns them
     BrowserState.tabs = list(browser.tabs)
+    _own_pages_opened_by_ours()
     if current is not None:
         wanted = _target_key(current)
         for position, tab in enumerate(BrowserState.tabs):
             if _target_key(tab) == wanted:
                 BrowserState.active_tab_index = position
                 break
+        else:
+            if answered:
+                # The active tab is gone and no tool closed it. Keeping the index would make the
+                # next tool act on whichever tab now sits there, possibly a person's.
+                BrowserState.active_tab_index = -1
+                BrowserState.active_lost = _active_lost_note(current)
     return answered
+
+
+def _active_lost_note(tab: Any) -> str:
+    return (f"The active tab ({BrowserState.tab_label(tab)}) was closed outside this server's tools, "
+            f"by a person or by its own page. No other tab was picked in its place: tab_list shows "
+            f"the tabs, and tab_select picks the one to act on.")
+
+
+def _own_pages_opened_by_ours() -> None:
+    """A page that one of ours opened (window.open, a target=_blank link) is ours too."""
+    if not BrowserState.owned_targets:
+        return
+    for tab in BrowserState.tabs:
+        key = _target_key(tab)
+        if key in BrowserState.owned_targets:
+            continue
+        opener = getattr(getattr(tab, "target", None), "opener_id", None)
+        if opener and str(opener) in BrowserState.owned_targets:
+            BrowserState.owned_targets.add(key)
+
+
+async def _check_active_tab_alive() -> None:
+    """Before a tool runs: notice an active tab that was closed outside the tools.
+
+    nodriver 0.48 drops a closed target by itself, 0.50 only on update_targets, and a Tab whose
+    target is gone answered "server rejected WebSocket connection: HTTP 500". One browser-level
+    call (no renderer needed, so an open dialog does not block it) says whether it still exists.
+    """
+    browser = BrowserState.browser
+    index = BrowserState.active_tab_index
+    if browser is None or not 0 <= index < len(BrowserState.tabs):
+        return
+    tab = BrowserState.tabs[index]
+    from nodriver.cdp import target as cdp_target
+    connection = getattr(browser, "connection", None) or browser
+    try:
+        await asyncio.wait_for(connection.send(cdp_target.get_target_info(
+            target_id=cdp_target.TargetID(_target_key(tab)))), timeout=2)
+        return
+    except asyncio.TimeoutError:
+        return
+    except Exception as exc:
+        if "no target" not in str(exc).lower():
+            return
+    await _refresh_tabs()
 
 
 async def _tab_list_problem() -> Optional[str]:
@@ -3158,6 +3211,7 @@ async def _launch_by_reattach(profile: Path, verdict: dict, *, url: str, keep_al
                    f"was; browser_launch again to retry, or end it with Quit")
     BrowserState.browser = browser
     BrowserState.tabs = tabs
+    BrowserState.own(BrowserState.tabs)  # opened or taken over by this server
     BrowserState.active_tab_index = select
     BrowserState.current_profile_dir = Path(_keep_alive.profile_key(profile))
     BrowserState.current_headless = bool(record.get("headless"))
@@ -3400,6 +3454,15 @@ from . import _app as _app_module  # noqa: E402
 _app_module.AFTER_TOOL_HOOKS[:] = [
     hook for hook in _app_module.AFTER_TOOL_HOOKS
     if getattr(hook, "__name__", "") != "_mark_tabs_changed"] + [_mark_tabs_changed]
+
+
+async def _active_tab_closed_check(_name: str) -> None:
+    await _check_active_tab_alive()
+
+
+_app_module.BEFORE_TOOL_HOOKS[:] = [
+    hook for hook in _app_module.BEFORE_TOOL_HOOKS
+    if getattr(hook, "__name__", "") != "_active_tab_closed_check"] + [_active_tab_closed_check]
 
 
 def _adblock_module() -> Any:
@@ -4260,6 +4323,7 @@ async def browser_launch(
             await _remove_privacy_profile(privacy_profile)
             return err(f"initial nav failed: {e}")
         BrowserState.tabs = [main]
+        BrowserState.own(BrowserState.tabs)  # opened or taken over by this server
         BrowserState.active_tab_index = 0
         BrowserState.current_profile_dir = profile_path
         BrowserState.current_headless = headless
@@ -4362,6 +4426,7 @@ async def browser_launch(
                     BrowserState.current_instance_id, browser, main, profile_path, privacy,
                     headless, effective_fingerprint, url, window_width, window_height)
                 BrowserState.tabs = _all_tabs
+                BrowserState.own(BrowserState.tabs)  # opened or taken over by this server
                 BrowserState.active_tab_index = _select
                 _launch_observed = {**_launch_observed, "restore_tabs": _report}
             except Exception as e:
@@ -8223,6 +8288,7 @@ async def _launch_browser_instance(
     if instance_id == BrowserState.current_instance_id:
         BrowserState.browser = browser
         BrowserState.tabs = slot_tabs
+        BrowserState.own(BrowserState.tabs)  # opened or taken over by this server
         BrowserState.active_tab_index = slot_active
         BrowserState.current_profile_dir = profile_path
         BrowserState.current_desc = desc
@@ -8240,6 +8306,7 @@ async def _launch_browser_instance(
             browser=browser,
             tabs=slot_tabs,
             active_tab_index=slot_active,
+            owned_targets={_target_key(t) for t in slot_tabs},
             profile_dir=profile_path,
             desc=desc,
             headless=headless,
@@ -8291,6 +8358,7 @@ async def _spawn_by_reattach(instance_id: str, profile: Path, verdict: dict, *, 
                        f"ours and free, but connecting to it failed: {_exc_text(e)}. It was left "
                        f"running as it was")
     fields = dict(browser=browser, tabs=tabs, active_tab_index=select,
+                  owned_targets={_target_key(t) for t in tabs},
                   profile_dir=Path(_keep_alive.profile_key(profile)), desc=desc,
                   headless=bool(record.get("headless")), privacy=False,
                   fingerprint=dict(record.get("fingerprint") or {}), proxy=verdict.get("proxy"),
@@ -8298,6 +8366,7 @@ async def _spawn_by_reattach(instance_id: str, profile: Path, verdict: dict, *, 
     if instance_id == BrowserState.current_instance_id:
         BrowserState.browser = browser
         BrowserState.tabs = tabs
+        BrowserState.own(BrowserState.tabs)  # opened or taken over by this server
         BrowserState.active_tab_index = select
         BrowserState.current_profile_dir = fields["profile_dir"]
         BrowserState.current_desc = desc
@@ -9277,6 +9346,7 @@ async def clone_chrome_profile(
     overwrite: bool = False,
     browser: Optional[str] = None,
     allow_running: bool = False,
+    keep_site_data: bool = False,
 ) -> str:
     """Clone a profile from ANY Chrome-family browser into an isolated MCP location.
 
@@ -9288,8 +9358,10 @@ async def clone_chrome_profile(
 
     The source browser MUST be closed (we check SingletonLock).
     Preserves: cookies, history, bookmarks, saved passwords, extensions state.
-    Skips (if skip_cache=True): Cache, Code Cache, GPUCache, Media Cache,
-    Service Worker, IndexedDB (regenerable, saves 500MB+).
+    Skips (if skip_cache=True): Cache, Code Cache, GPUCache, Media Cache (regenerable), and
+    also the site data folders IndexedDB, Service Worker and File System (saves 500MB+). Those
+    are not caches: web apps that keep their login or offline data there (WhatsApp Web,
+    Telegram Web, many PWAs) ask to sign in again. The result lists them under not_copied.
 
     Args:
         source_profile: profile dir name ("Default", "Profile 1", ...).
@@ -9297,6 +9369,9 @@ async def clone_chrome_profile(
         target_instance_id: Name for the cloned instance (becomes folder name).
         skip_cache: Exclude cache dirs for fast + smaller copy (default True).
         overwrite: Delete target if exists before copying (default False).
+        keep_site_data: copy IndexedDB, Service Worker and File System even with
+            skip_cache=True, for a profile that will be used every day. Larger copy. With
+            allow_running these LevelDB folders are copied as they lie, unchecked.
         allow_running: clone even while the browser is open. Each SQLite
             database is copied with its -wal/-shm companions and then
             integrity-checked; any that fail come back under `sqlite_suspect`
@@ -9390,6 +9465,12 @@ async def clone_chrome_profile(
         "safe browsing", "componentupdater", "extensions_crx_cache",
         "component_crx_cache", "gpupersistentcache", "shared dictionary",
     }
+    # Not caches: what a site stored for itself. Skipped with the caches by default (size), so the
+    # result names each one and what leaving it out means; keep_site_data copies them.
+    site_data_dirs = {"indexeddb", "service worker", "file system"}
+    if keep_site_data:
+        cache_dirs = cache_dirs - site_data_dirs
+    not_copied: dict[str, float] = {}
     # Files that might cause issues if copied (locks, logs)
     skip_files = {
         "singletonlock", "singletoncookie", "singletonsocket",
@@ -9425,12 +9506,15 @@ async def clone_chrome_profile(
                 copied_count += 1
             elif item.is_dir():
                 if skip_cache and name_lower in cache_dirs:
+                    size = 0
                     try:
-                        skipped_cache_bytes += sum(
-                            f.stat().st_size for f in item.rglob("*") if f.is_file()
-                        )
+                        size = sum(f.stat().st_size for f in item.rglob("*") if f.is_file())
                     except Exception:
                         pass
+                    if name_lower in site_data_dirs:
+                        not_copied[item.name] = round(size / 1024 / 1024, 1)
+                    else:
+                        skipped_cache_bytes += size
                     continue
                 shutil.copytree(
                     item, target_default / item.name,
@@ -9474,6 +9558,20 @@ async def clone_chrome_profile(
             "transaction committed mid-copy can be missing."
         ),
     }
+    if not_copied:
+        # Left out with the caches: say so, or a login lost with them looks like a broken clone.
+        result["not_copied"] = {name: f"{mb} MB" for name, mb in sorted(not_copied.items())}
+        result["not_copied_means"] = (
+            "Site data left out with the caches (skip_cache=True): IndexedDB holds what web apps "
+            "keep for themselves, often their login (WhatsApp Web, Telegram Web, many PWAs); "
+            "Service Worker holds their offline copies and push registrations; File System their "
+            "files. Those sites ask to sign in again in the clone. For a profile used every day, "
+            "clone again with keep_site_data=True (overwrite=True replaces this copy)."
+        )
+    elif keep_site_data and skip_cache:
+        result["site_data"] = ("IndexedDB, Service Worker and File System were copied "
+                               "(keep_site_data=True)" + (", as they lay while the browser ran, "
+                               "unchecked" if running else ""))
     # A clone with a corrupt cookie jar looks identical to a good one until a
     # login silently fails hours later, so a suspect database is an error here
     # rather than a field somebody has to notice. The copy is left in place to
@@ -11490,7 +11588,10 @@ async def attach_to_chrome(
     BrowserState.current_last_active = time.time()
     BrowserState.current_created_at = time.time()
     _ATTACHED_BROWSERS.add(instance_id)
+    BrowserState.owned_targets, BrowserState.adopted_targets = set(), set()
+    BrowserState.active_lost = ""
     await _refresh_tabs()
+    BrowserState.own(BrowserState.tabs)  # attaching takes over every tab open now
     return ok(
         f"Attached to existing Chrome at {host}:{port} as {instance_id!r}. "
         f"Browser: {info.get('Browser', '?')} ({brave_mode.name(attached_product)}), "

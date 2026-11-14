@@ -830,6 +830,9 @@ class InstanceSnapshot:
     browser: Optional[Browser] = None
     tabs: list[Tab] = field(default_factory=list)
     active_tab_index: int = 0
+    owned_targets: set = field(default_factory=set)
+    adopted_targets: set = field(default_factory=set)
+    active_lost: str = ""
     profile_dir: Optional[Path] = None
     desc: str = ""
     headless: bool = False
@@ -887,6 +890,15 @@ class _SessionState:
     browser: Optional[Browser] = None
     tabs: list[Tab] = field(default_factory=list)
     active_tab_index: int = 0
+    # Page targets this server opened or took over (launch, tab_new, restore, reattach, attach,
+    # a page one of them opened). Tools act on the active tab only when it is one of these, or
+    # was picked by name with tab_select (adopted). A tab a person opens is neither, so an index
+    # that slides onto it after a close is refused rather than acted on. Empty means a browser
+    # whose tabs have not been counted yet: the first look takes every tab it holds as its own.
+    owned_targets: set = field(default_factory=set)
+    adopted_targets: set = field(default_factory=set)
+    # Why no tab is selected (active_tab_index == -1): the active tab was closed outside the tools.
+    active_lost: str = ""
     console_logs: list[dict] = field(default_factory=list)
     network_logs: list[dict] = field(default_factory=list)
     # Per-request map: request_id → full entry with headers/body. Populated by
@@ -1155,9 +1167,56 @@ class BrowserState(metaclass=_SessionRouted):
                     raise RuntimeError(f"Browser has no window: {stuck}")
             raise RuntimeError("Browser not running. Call browser_launch first.")
         cls.current_last_active = time.time()
-        if cls.active_tab_index >= len(cls.tabs):
-            cls.active_tab_index = 0
-        return cls.tabs[cls.active_tab_index]
+        index = cls.active_tab_index
+        if index < 0:
+            raise RuntimeError(cls.active_lost or
+                               "No tab is selected. tab_list shows the tabs; tab_select picks one.")
+        if index >= len(cls.tabs):
+            index = cls.active_tab_index = 0  # as before; the ownership check below still applies
+        cls.own_untracked()
+        tab = cls.tabs[index]
+        if not cls.acts_on(tab):
+            raise RuntimeError(cls.not_ours_note(index, tab))
+        return tab
+
+    @staticmethod
+    def tab_key(tab: Any) -> str:
+        target = getattr(tab, "target", None)
+        return str(getattr(target, "target_id", None) or id(tab))
+
+    @classmethod
+    def own_untracked(cls) -> None:
+        """A browser whose tabs were never counted takes every tab it holds as its own."""
+        if not cls.owned_targets and cls.tabs:
+            cls.owned_targets.update(cls.tab_key(t) for t in cls.tabs)
+
+    @classmethod
+    def own(cls, tabs_or_keys) -> None:
+        cls.own_untracked()
+        for item in tabs_or_keys:
+            cls.owned_targets.add(item if isinstance(item, str) else cls.tab_key(item))
+
+    @classmethod
+    def acts_on(cls, tab: Any) -> bool:
+        key = cls.tab_key(tab)
+        return not cls.owned_targets or key in cls.owned_targets or key in cls.adopted_targets
+
+    @classmethod
+    def opened_outside(cls, tab: Any) -> bool:
+        """Not opened or taken over by this server (a person's tab, or one with no known opener)."""
+        return bool(cls.owned_targets) and cls.tab_key(tab) not in cls.owned_targets
+
+    @staticmethod
+    def tab_label(tab: Any) -> str:
+        target = getattr(tab, "target", None)
+        url = str(getattr(target, "url", "") or "")
+        return url or "(no URL)"
+
+    @classmethod
+    def not_ours_note(cls, index: int, tab: Any) -> str:
+        return (f"tab {index} ({cls.tab_label(tab)}) was not opened by this server: a person opened "
+                f"it, or a page with no opener did. Nothing was done to it. tab_select({index}) acts "
+                f"on it on purpose; tab_list shows the tabs this server opened.")
 
     @classmethod
     def reset(cls) -> None:
@@ -1165,6 +1224,9 @@ class BrowserState(metaclass=_SessionRouted):
         cls.browser = None
         cls.tabs = []
         cls.active_tab_index = 0
+        cls.owned_targets = set()
+        cls.adopted_targets = set()
+        cls.active_lost = ""
         cls.console_logs = []
         cls.network_logs = []
         cls.network_index = {}
@@ -1182,6 +1244,9 @@ class BrowserState(metaclass=_SessionRouted):
             browser=cls.browser,
             tabs=list(cls.tabs),
             active_tab_index=cls.active_tab_index,
+            owned_targets=cls.owned_targets,
+            adopted_targets=cls.adopted_targets,
+            active_lost=cls.active_lost,
             profile_dir=cls.current_profile_dir,
             desc=cls.current_desc,
             headless=cls.current_headless,
@@ -1211,6 +1276,9 @@ class BrowserState(metaclass=_SessionRouted):
         cls.browser = snap.browser
         cls.tabs = list(snap.tabs)
         cls.active_tab_index = snap.active_tab_index
+        cls.owned_targets = snap.owned_targets
+        cls.adopted_targets = snap.adopted_targets
+        cls.active_lost = snap.active_lost
         cls.current_profile_dir = snap.profile_dir
         cls.current_desc = snap.desc
         cls.current_headless = snap.headless

@@ -448,7 +448,7 @@ dry_run(enable=false)
 
 You can override identity for one launch: `fingerprint={"user_agent": ..., "accept_language": ..., "platform": ..., "timezone": ...}`. Fields you leave out stay real. Client hints and a missing `navigator.platform` are derived from the user agent so they agree with it, and `navigator.languages` comes from `accept_language` without the `;q=` weights.
 
-To use logins from your own browser, `list_chrome_profiles` shows every Chromium-family browser on the machine and `clone_chrome_profile` copies one into an isolated profile. The source is only ever opened read-only.
+To use logins from your own browser, `list_chrome_profiles` shows every Chromium-family browser on the machine and `clone_chrome_profile` copies one into an isolated profile. The source is only ever opened read-only. Caches are left out, and so are a profile's IndexedDB, Service Worker and File System folders, which some web apps use for their login (WhatsApp Web, Telegram Web): the result lists them under `not_copied`. For a profile you will use every day, pass `keep_site_data=True` to copy them too.
 
 A browser started with `browser_launch` over stdio stays open until you close it, or until the server exits when its client goes away. `keep_alive=True` keeps it past that (see below). Instances from `spawn_browser` and browsers in HTTP mode close after `BROWSER_IDLE_TIMEOUT`.
 
@@ -653,9 +653,17 @@ Results describe what was observed. A tool that reports success when nothing hap
   - It needs macOS with the copy on the same APFS volume as Chrome. If the copy cannot be made, launches use Chrome itself and the result says why. Headless launches and `attach_to_chrome` are not affected.
 - ✅ `evaluate`, `frame_evaluate` and `wait_for_function` report a JavaScript exception as an error, and promises are awaited. Objects and arrays come back as JSON.
 - ✅ `type_text`, `humanize_type` and `fill` send a keydown and keyup per character. `type_text` refuses when no field has focus, and refuses a newline in a single-line field.
-- ✅ `upload_file` refuses a path that is not a file. `paste_text` refuses a field that cannot take text and reports what landed, contenteditable included.
+- ✅ `upload_file` refuses a path that is not a file. It hands the file over by its path, so size does not matter (2.2 GB took 0.09 s and no memory), and an input inside a shadow root is reached by its snapshot ref. `upload_file(..., drop=True)` drops the file on a drop zone instead, as a drag from Finder does, after the same hit test as a click, and says when the page did not react. `paste_text` refuses a field that cannot take text and reports what landed, contenteditable included.
 - ✅ `click_turnstile`, `verify_cf` and `auto_verify` report what the page shows after the click: whether the token filled, the title, and whether the challenge is still there. A click alone is not a pass, and no click happens when no checkbox matched. A challenge still present names `solve_turnstile_oscursor` as the next step.
 - ✅ `press_key` reports what the key did: navigation, page change, focus, or nothing.
+- ✅ A person can use the same visible browser. Tools act only on tabs the server opened or took over
+  (the launch, `tab_new`, reopened tabs, a kept browser on reattach, every tab on `attach_to_chrome`, and any
+  page one of those opened). A tab a person opens is marked `[not opened by this server]` in `tab_list`, and
+  tools act on it only after `tab_select` picks it, whose result says so. When a person closes the tab tools
+  were using, the next tool says so and no other tab is picked in its place. `tab_list` waits at most 2 s per
+  tab, so a dialog left open in some tab cannot hang it; the row names the reason. A browser whose tabs the
+  server opened behaves as before. Measured hazards that remain: keys typed by a person and by `type_text` in
+  the same field interleave, and the server cannot answer a dialog in a tab no tool has used.
 - ✅ `fill_form` fails when a field fails and then does not submit. `batch_actions` counts it as failed. `batch_actions` refuses input that is not a list of actions, or an empty list, and counts an item that is not an action object as failed.
 - ✅ Empty results say whether anything was measured. `console_get`, `intercept_log` and `storage_snapshot` report that state, and `network_get` is an error before `network_start`.
 - ✅ `assert_clickable` tells you what would block a click without clicking.
@@ -877,6 +885,7 @@ These run without a browser and without a search API key, and use the stealth br
 - Headless is easier to detect, so keep `headless=false` on difficult sites.
 - A Chrome profile can only be open once at a time. A second browser on the same profile moves to a separate one and says so.
 - Closed shadow roots cannot be read.
+- The browser is driven through a DevTools port on 127.0.0.1. Any program running on the same computer, under any account, can find that port (a scan of every local port took 8.3 s) and read the browser's cookies in plain text through it, without the Keychain prompt that guards the cookie file. Web pages cannot: Chrome refuses a page's connection to it (the server no longer passes nodriver's `--remote-allow-origins=*`) and blocks public pages from local addresses. Do not keep accounts in a browser this server drives whose loss you could not undo, such as your main email, banking, crypto wallets or a password manager.
 - On Windows, tests saw Google Chrome read back none of a profile's cookies after a relaunch, so a login may not survive a restart there. Linux and macOS keep them. This is being looked into.
 
 ## Configuration
