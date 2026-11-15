@@ -461,26 +461,45 @@ async def localstorage_get(key: Optional[str] = None) -> str:
         return err(str(e))
 
 
+_STORES = {"local": "localStorage", "session": "sessionStorage"}
+
+
 @mcp.tool()
-async def localstorage_set(key: str, value: str) -> str:
-    """Set a localStorage entry."""
+async def localstorage_set(key: Optional[str] = None, value: Optional[str] = None,
+                           area: str = "local", clear: bool = False) -> str:
+    """Set or clear entries in localStorage, or sessionStorage with area="session", for the
+    current origin.
+
+    key and value set one entry. clear=True removes every entry of that store first; alone it
+    only clears. The store is read back, so the result says what it holds now.
+    """
+    store = _STORES.get(area)
+    if store is None:
+        return err(f"area must be \"local\" or \"session\", not {area!r}; nothing was changed")
+    if key is None and not clear:
+        return err("pass key and value, clear=True, or both; nothing was changed")
+    if key is not None and value is None:
+        return err(f"key {key!r} needs a value; nothing was changed")
     try:
         tab = BrowserState.active_tab()
-        await _eval_checked(tab, f"localStorage.setItem({json.dumps(key)}, {json.dumps(value)})")
-        return ok("set")
+        script = (("%s.clear();" % store) if clear else "") + (
+            "%s.setItem(%s, %s);" % (store, json.dumps(key), json.dumps(value)) if key is not None else "")
+        await _eval_checked(tab, "(() => {%s return %s.length; })()" % (script, store))
+        left = await _eval_checked(tab, f"{store}.length")
+        done = []
+        if clear:
+            done.append("cleared")
+        if key is not None:
+            done.append(f"set {key!r}")
+        return ok(f"{store}: {' and '.join(done)}; it now holds {left} entr{'y' if left == 1 else 'ies'}")
     except Exception as e:
         return err(str(e))
 
 
 @mcp.tool()
 async def localstorage_clear() -> str:
-    """Clear all localStorage for current origin."""
-    try:
-        tab = BrowserState.active_tab()
-        await _eval_checked(tab, "localStorage.clear()")
-        return ok("cleared")
-    except Exception as e:
-        return err(str(e))
+    """Deprecated, removed in 0.25.0: use localstorage_set(clear=True)."""
+    return await localstorage_set(clear=True)
 
 
 @mcp.tool()
@@ -503,24 +522,14 @@ async def sessionstorage_get(key: Optional[str] = None) -> str:
 
 @mcp.tool()
 async def sessionstorage_set(key: str, value: str) -> str:
-    """Set a sessionStorage entry."""
-    try:
-        tab = BrowserState.active_tab()
-        await _eval_checked(tab, f"sessionStorage.setItem({json.dumps(key)}, {json.dumps(value)})")
-        return ok("set")
-    except Exception as e:
-        return err(str(e))
+    """Deprecated, removed in 0.25.0: use localstorage_set(key, value, area="session")."""
+    return await localstorage_set(key=key, value=value, area="session")
 
 
 @mcp.tool()
 async def sessionstorage_clear() -> str:
-    """Clear all sessionStorage for current origin (parity with localstorage_clear)."""
-    try:
-        tab = BrowserState.active_tab()
-        await _eval_checked(tab, "sessionStorage.clear()")
-        return ok("cleared")
-    except Exception as e:
-        return err(str(e))
+    """Deprecated, removed in 0.25.0: use localstorage_set(area="session", clear=True)."""
+    return await localstorage_set(area="session", clear=True)
 
 
 @mcp.tool()

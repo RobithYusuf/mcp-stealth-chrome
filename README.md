@@ -727,6 +727,8 @@ Open a group to see its tools.
 <summary><b>Mouse and behaviour</b> (8)</summary>
 
 `mouse_click_xy`, `mouse_move`, `mouse_drift`, `mouse_record`, `mouse_replay`, `humanize_click`, `humanize_type`, `find_by_image`
+
+`click(humanize=True)` and `mouse_click_xy(humanize=True)` approach along a curved path. `humanize_click` does the same and is removed in 0.25.0.
 </details>
 
 <details>
@@ -781,6 +783,8 @@ Open a group to see its tools.
 <summary><b>Cookies and storage</b> (18)</summary>
 
 `cookie_list`, `cookie_set`, `cookie_delete`, `cookie_import`, `cookie_export`, `localstorage_get`, `localstorage_set`, `localstorage_clear`, `sessionstorage_get`, `sessionstorage_set`, `sessionstorage_clear`, `cache_clear`, `indexeddb_list`, `indexeddb_delete`, `storage_state_save`, `storage_state_load`, `storage_snapshot`, `storage_diff`
+
+`localstorage_set` sets or clears either store: `area="session"` for sessionStorage, `clear=True` to empty it. `localstorage_clear`, `sessionstorage_set` and `sessionstorage_clear` still work and are removed in 0.25.0.
 </details>
 
 <details>

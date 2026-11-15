@@ -6,10 +6,9 @@ os-cursor solver share it; code here reaches shared helpers as _srv.<name> at ca
 """
 from __future__ import annotations
 
-import asyncio
 import json
+import sys
 import os
-import random
 import time
 from typing import Literal, Optional
 
@@ -17,7 +16,6 @@ from .. import server as _srv
 from .._app import mcp
 from ..captcha import CapSolverError, solve as capsolver_solve
 from ..helpers import PageReadError, confined_output_path, err, get_url, ok, ts_filename
-from ..humanize import humanized_move
 from ..state import STORAGE_STATE_DIR, BrowserState, ensure_dirs
 
 
@@ -251,6 +249,44 @@ async def identity_show(instance_id: Optional[str] = None, reveal_values: bool =
         return err(str(e))
 
 
+def _claimed_os(user_agent: Optional[str], platform: Optional[str]) -> Optional[str]:
+    """The operating system a UA or navigator.platform claims, or None when it claims none."""
+    text = f"{user_agent or ''} {platform or ''}"
+    if "Windows" in text or (platform or "").startswith("Win"):
+        return "windows"
+    if "Mac" in text:
+        return "macos"
+    if "Android" in text:
+        return "android"
+    if "iPhone" in text or "iPad" in text:
+        return "ios"
+    if "Linux" in text or "X11" in text or "CrOS" in text:
+        return "linux"
+    return None
+
+
+def _real_os() -> str:
+    return {"darwin": "macos", "win32": "windows"}.get(sys.platform, "linux")
+
+
+def _os_mismatch_note(user_agent: Optional[str], platform: Optional[str]) -> str:
+    """Words for an identity that claims another OS than the machine Chrome runs on.
+
+    Only the strings change. WebGL still names the real GPU, and fonts, screen and audio stay
+    this machine's: measured, a Windows UA on a Mac read "ANGLE Metal Renderer: Apple M4 Pro"
+    beside platform "Win32", a pair no real computer shows, and the tool said only "applied".
+    """
+    claimed = _claimed_os(user_agent, platform)
+    real = _real_os()
+    if claimed is None or claimed == real:
+        return ""
+    return (f". WARNING: this tab now claims {claimed} while Chrome runs on {real}: only the "
+            f"user agent, client hints and navigator.platform changed. WebGL still names this "
+            f"machine's GPU, and fonts, screen and audio are still {real}'s, so a site that "
+            f"compares them sees a combination no real computer has. fingerprint_audit lists "
+            f"what disagrees. An identity of the machine's own OS does not have this problem")
+
+
 @mcp.tool()
 async def fingerprint_rotate(
     user_agent: Optional[str] = None,
@@ -262,7 +298,9 @@ async def fingerprint_rotate(
     platform (Win32/MacIntel/Linux x86_64), timezone (Asia/Jakarta, etc).
     Applied via CDP. Persists until next tab creation. Client hints
     (navigator.userAgentData) are derived from the UA so they agree with it, and a UA
-    without a platform gets the matching navigator.platform.
+    without a platform gets the matching navigator.platform. Only these strings change:
+    an OS other than the machine's leaves its GPU, fonts and screen visible, and the result
+    warns when that happens.
     """
     if not any((user_agent, accept_language, platform, timezone)):
         return err("fingerprint_rotate: pass at least one of user_agent, accept_language, "
@@ -279,7 +317,7 @@ async def fingerprint_rotate(
             seen = await _srv._eval_checked(tab, "Intl.DateTimeFormat().resolvedOptions().timeZone")
             if seen != timezone:
                 return err(f"timezone {timezone!r} was not applied; the page reads {seen!r}")
-        return ok("fingerprint overrides applied")
+        return ok("fingerprint overrides applied" + _os_mismatch_note(user_agent, platform))
     except Exception as e:
         return err(str(e))
 
@@ -289,28 +327,11 @@ async def humanize_click(ref: Optional[str] = None,
                           selector: Optional[str] = None,
                           x: Optional[int] = None,
                           y: Optional[int] = None) -> str:
-    """Click with Bezier-curve mouse approach + randomized dwell.
-
-    Targets an element (ref/selector) OR a raw viewport point (x/y, CSS px).
-    The coordinate form approaches the point along a Bezier path before pressing,
-    which also renders hover-only overlays on the way in.
-    """
+    """Deprecated, removed in 0.25.0: use click(humanize=True) for an element, or
+    mouse_click_xy(x, y, humanize=True) for a point."""
     if x is not None and y is not None:
-        try:
-            tab = BrowserState.active_tab()
-            outside = await _srv._outside_viewport(tab, x, y)
-            if outside:
-                return err(f"humanize_click: NOT clicked — {outside}")
-            # Approach from an offset so the path has a direction, like a hand does.
-            await _srv._dispatch_input(tab, humanized_move(tab, x + 120, y + 90, x, y))
-            if _srv._dialog_note(tab):
-                return err(f"humanize_click: NOT clicked — moving the pointer there opened a "
-                           f"dialog{_srv._dialog_note(tab)}")
-            await asyncio.sleep(random.uniform(0.05, 0.18))
-            await _srv._dispatch_input(tab, tab.mouse_click(x, y))
-            return ok(f"clicked ({x},{y}) via Bezier approach{_srv._dialog_note(tab)}")
-        except Exception as e:
-            return err(str(e))
+        from .interaction import mouse_click_xy
+        return await mouse_click_xy(x=x, y=y, humanize=True)
     if ref is None and selector is None:
         return err("pass ref=, selector=, or both x= and y=")
     return await _srv.click(ref=ref, selector=selector, humanize=True)

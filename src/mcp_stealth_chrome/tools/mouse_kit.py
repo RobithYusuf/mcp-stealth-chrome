@@ -289,12 +289,14 @@ async def click_at_image(
     template_path: str,
     threshold: float = 0.85,
     humanize: bool = True,
+    verify: bool = True,
 ) -> str:
     """Find image via template matching, then click its center.
 
     Combines find_by_image + humanize_move + mouse_click. Useful for visual
     CAPTCHAs, custom buttons without reliable selectors, or interacting with
-    canvas-based UIs.
+    canvas-based UIs. verify compares the page before and after, as click does, and says
+    so when nothing changed: a match on the wrong spot otherwise read as a click that worked.
     """
     raw = await find_by_image(template_path=template_path, threshold=threshold)
     data = parse_json(raw, {})
@@ -303,6 +305,7 @@ async def click_at_image(
     x, y = int(data["x"]), int(data["y"])
     try:
         tab = BrowserState.active_tab()
+        before = await _srv._page_sig(tab, pages=True) if verify else {}
         if humanize:
             await _srv._dispatch_input(tab, humanized_move(tab, x + 150, y - 70, x, y))
             if _srv._dialog_note(tab):
@@ -310,7 +313,11 @@ async def click_at_image(
                            f"dialog{_srv._dialog_note(tab)}")
             await asyncio.sleep(0.1)
         await _srv._dispatch_input(tab, tab.mouse_click(x, y))
-        return ok(f"clicked image match at ({x},{y}) score={data['score']:.3f}{_srv._dialog_note(tab)}")
+        head = f"clicked image match at ({x},{y}) score={data['score']:.3f}"
+        if _srv._dialog_note(tab) or not verify:
+            return ok(f"{head}{_srv._dialog_note(tab)}")
+        return _srv._click_outcome(head, "method=cdp_mouse at the image match", before,
+                                   await _srv._sig_after_action(tab, before, pages=True))
     except Exception as e:
         return err(str(e))
 

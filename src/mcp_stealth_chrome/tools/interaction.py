@@ -9,6 +9,7 @@ _srv.<name> at call time, so a test that patches server.<name> still reaches it.
 from __future__ import annotations
 
 import asyncio
+import random
 import contextlib
 import json
 import re
@@ -490,7 +491,7 @@ async def _what_is_at(tab: Any, x: int, y: int) -> str:
 
 @mcp.tool()
 async def mouse_click_xy(x: int, y: int, button: str = "left",
-                         move_first: bool = True) -> str:
+                         move_first: bool = True, humanize: bool = False) -> str:
     """Click at raw viewport coordinates (CSS px, relative to the viewport).
 
     Args:
@@ -501,6 +502,8 @@ async def mouse_click_xy(x: int, y: int, button: str = "left",
             Real users hover before clicking, and menus/overlays that only render
             on hover (Canva, Figma, Notion) are unreachable without it. Set False
             only if a hover handler would interfere.
+        humanize: approach the point along a curved path with a short random pause before
+            the press, as a hand does, instead of jumping to it.
     """
     if button not in ("left", "right", "middle"):
         return err(f"mouse_click_xy: button must be left, right or middle, not {button!r}")
@@ -509,7 +512,14 @@ async def mouse_click_xy(x: int, y: int, button: str = "left",
         outside = await _srv._outside_viewport(tab, x, y)
         if outside:
             return err(f"mouse_click_xy: NOT clicked — {outside}")
-        if move_first:
+        if humanize:
+            # From an offset, so the path has a direction like a hand's.
+            await _srv._dispatch_input(tab, humanized_move(tab, x + 120, y + 90, x, y))
+            if _srv._dialog_note(tab):
+                return err(f"mouse_click_xy: NOT clicked — moving the pointer there opened a "
+                           f"dialog{_srv._dialog_note(tab)}")
+            await asyncio.sleep(random.uniform(0.05, 0.18))
+        elif move_first:
             # Hover first so hover-rendered targets exist before mousedown.
             try:
                 await _srv._dispatch_input(tab, move_pointer(tab, x, y))
@@ -525,7 +535,8 @@ async def mouse_click_xy(x: int, y: int, button: str = "left",
         except Exception:
             target = "what is there could not be read in time"
         await _srv._dispatch_input(tab, tab.mouse_click(x, y, button=_mouse_button(button)))
-        return ok(f"clicked ({x},{y}){' after hover' if move_first else ''}, {target} "
+        how = " via a curved approach" if humanize else (" after hover" if move_first else "")
+        return ok(f"clicked ({x},{y}){how}, {target} "
                   f"(read before the press){_srv._dialog_note(tab)}")
     except Exception as e:
         return err(str(e))

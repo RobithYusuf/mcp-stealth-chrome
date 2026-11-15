@@ -827,7 +827,9 @@ async def extract_structured(
     """Extract structured data from repeating containers.
 
     fields: [{name: "title", selector: ".job-title", attribute: "text|href|src|..."}]
-    Only direct text nodes of element are captured for "text" (prevents child-field mixing).
+    "text" is the element's visible text; "direct_text_only" only its own text nodes (no
+    child fields mixed in). href, src and other URL attributes come back absolute, resolved
+    against the page; "raw:href" returns the attribute exactly as written.
     """
     if not isinstance(fields, list):
         fields = parse_json(fields, [])
@@ -839,6 +841,7 @@ async def extract_structured(
           var SELECT = """ + json.dumps(container_selector) + r""";
           var FIELDS = """ + fields_json + r""";
           var LIMIT = """ + str(limit) + r""";
+          var URL_ATTRS = ['href', 'src', 'action', 'formaction', 'poster', 'cite', 'data'];
 
           // Filter top-level — skip containers nested inside another same-selector match
           var all = Array.from(document.querySelectorAll(SELECT));
@@ -863,7 +866,16 @@ async def extract_structured(
               if (attr === 'text') row[f.name] = (target.innerText || '').trim();
               else if (attr === 'direct_text_only') row[f.name] = directText(target);
               else if (attr === 'html') row[f.name] = target.innerHTML;
-              else row[f.name] = target.getAttribute(attr);
+              else {
+                var raw = target.getAttribute(attr);
+                // href="/p/1" is useless outside the page: resolve URL attributes against it,
+                // as evaluate's el.href does. "raw:href" keeps the attribute as written.
+                if (attr.indexOf('raw:') === 0) row[f.name] = target.getAttribute(attr.slice(4));
+                else if (raw !== null && URL_ATTRS.indexOf(attr) >= 0) {
+                  try { row[f.name] = new URL(raw, document.baseURI).href; }
+                  catch (e) { row[f.name] = raw; }
+                } else row[f.name] = raw;
+              }
             }
             return row;
           });

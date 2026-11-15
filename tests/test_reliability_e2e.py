@@ -218,8 +218,10 @@ def test_humanize_click_by_coordinates(loop):
         "JSON.stringify((()=>{const r=document.getElementById('freebtn')"
         ".getBoundingClientRect();return{x:Math.round(r.left+r.width/2),"
         "y:Math.round(r.top+r.height/2)};})())")))
+    # humanize_click is mouse_click_xy(humanize=True) now (removed in 0.25.0), which also says
+    # what the point was before the press.
     out = loop.run_until_complete(tool("humanize_click")(x=box["x"], y=box["y"]))
-    assert "Bezier" in out
+    assert "curved approach" in out and "freebtn" in out, out
     state = loop.run_until_complete(tool("evaluate")(
         "document.getElementById('out').textContent"))
     assert "FREE CLICK" in state

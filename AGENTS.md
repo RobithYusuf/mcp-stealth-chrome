@@ -817,6 +817,15 @@ conclusions. Each rule below replaced a real lie.
   (300, `MCP_STEALTH_RESTORE_TABS_MAX_PERSON`) through `_tab_limit`, the watcher keeps as many, and a restore
   loads `_RESTORE_PARALLEL` pages at a time. Every `tab_record.save` in the server passes `limit=_tab_limit(...)`:
   one that did not would write 30 over the full list, and being newer it would win over the watcher's.
+- Tools that did the same thing were folded into one, the old name kept for one release (removed in 0.25.0):
+  `humanize_click` is `click(humanize=True)` or `mouse_click_xy(humanize=True)`; `localstorage_clear`,
+  `sessionstorage_set` and `sessionstorage_clear` are `localstorage_set(area=, clear=)`. Measured first: each pair gave
+  the same result on a local page. `inspect_element` reads a whole element and `get_attribute` one value, so they stay
+  apart. The tool count is unchanged until the old names go.
+- `click_at_image` reports the page change as every click does (it said only "clicked image match"), `extract_structured`
+  resolves href/src against the page (`raw:href` keeps the attribute as written), and `fingerprint_rotate` warns when the
+  identity claims another OS than the machine: measured, a Windows UA on a Mac read the Apple GPU through WebGL beside
+  platform Win32, and the tool said only "applied".
 - The launcher did not pass `brave_lean`, and a profile older than lean is not one "the server made empty", so a
   person's agent Brave kept Leo and the rest. `install-launcher --lean` stores the choice in
   `<data>/launcher-lean-<browser>` and `open` reads it (`lean_choice`); unset, the server's own rule decides.
