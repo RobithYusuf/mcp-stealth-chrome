@@ -1192,3 +1192,55 @@ def test_r3_the_server_identifies_a_browser_recorded_in_the_old_format(srv, linu
     old = linux_with_an_old_record
     browser = _CloseBrowser(old.proc.pid, old.profile, start=old.legacy)
     assert srv._identify(old.proc.pid, browser) == "same"
+
+
+def test_flag_values_are_read_from_a_ps_line_with_spaces_and_a_url():
+    """ps drops quoting: a value ends where the next flag or a URL starts."""
+    from mcp_stealth_chrome import keep_alive
+    line = ("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=50328 "
+            "--user-data-dir=/Users/x/My Profiles/p --hide-crash-restore-bubble https://example.com")
+    assert keep_alive._flag_value(line, "--user-data-dir") == "/Users/x/My Profiles/p"
+    assert keep_alive._flag_value(line, "--remote-debugging-port") == "50328"
+    assert keep_alive._flag_value(line, "--proxy-server") is None
+
+
+def test_only_pid_1_or_a_known_subreaper_counts_as_an_orphan_parent():
+    from mcp_stealth_chrome import keep_alive
+    table = [(10, 1, "/usr/lib/systemd/systemd --user"), (20, 1, "/usr/bin/python -m pytest"),
+             (30, 1, "uv run mcp-stealth-chrome")]
+    assert keep_alive._reaped(1, table)
+    assert keep_alive._reaped(10, table)
+    assert not keep_alive._reaped(20, table)  # a test or tool that started it is still there
+    assert not keep_alive._reaped(30, table)  # a live server
+    assert not keep_alive._reaped(99, table)  # unknown parent
+    # This server, even as PID 1 in a container: its own live Chrome is no orphan.
+    assert not keep_alive._reaped(os.getpid(), table + [(os.getpid(), 0, "python server")])
+
+
+def test_no_orphan_record_where_a_record_already_exists(tmp_path, monkeypatch):
+    """A kept browser's record is never replaced by an orphan one."""
+    from mcp_stealth_chrome import keep_alive
+    monkeypatch.setenv("MCP_STEALTH_KEEP_ALIVE_DIR", str(tmp_path / "ka"))
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    assert keep_alive.write(profile, pid=4242, port=5555, user_data_dir=str(profile), state="kept") is None
+    assert keep_alive.orphan_record(profile, "main") is None
+    assert keep_alive.read(profile)["state"] == "kept"
+
+
+def test_a_reattach_left_unset_keeps_what_the_browser_had_and_always_keeps_the_persons():
+    from mcp_stealth_chrome import keep_alive, server
+    kept = {"state": "kept"}  # older records have no "keep": they were kept
+    orphan = {"state": keep_alive.ORPHAN, "keep": False}
+    persons = {"state": "held", "keep": False, "opened_by": keep_alive.LAUNCHER}
+    assert server._keep_on_reattach(None, kept) is True
+    assert server._keep_on_reattach(None, orphan) is False
+    # An earlier agent's one-off keep_alive=False must not close the person's browser later.
+    assert server._keep_on_reattach(None, persons) is True
+    assert server._keep_on_reattach(False, persons) is False  # asked now: as asked
+    assert server._keep_on_reattach(True, orphan) is True
+
+
+def test_this_process_counts_as_a_live_server_whatever_its_command_line():
+    from mcp_stealth_chrome import keep_alive
+    assert keep_alive._server_holding({"server_pid": os.getpid()}) == os.getpid()

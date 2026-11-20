@@ -710,6 +710,41 @@ conclusions. Each rule below replaced a real lie.
 
 ### Kept browsers (keep_alive)
 
+- A browser of ours whose server went without closing it (killed, crashed, an older version) and that was never kept has
+  no record, so every later launch on its profile fell back to an empty one and every login read as gone: on 20 Nov 2026
+  Chrome PID 37250 held the main profile for five hours with parent PID 1, no watcher and no record. A launch on a
+  profile the server chose itself (`_kept_candidates`, spawn without `profile_dir`) describes such a holder into a
+  record of state `orphan` (`keep_alive.orphan_record`): only with no record already, a parent that is PID 1 or a
+  subreaper (`systemd`, `init`; `_reaped`), a browser main process naming exactly that `--user-data-dir`, a debugging
+  port, every `OUR_FLAGS` flag, and DevTools on that port naming the PID. `check` then proves it like a kept browser
+  (lock, start time, version, no live server) and the takeover is the keep_alive reattach. Its plain quit watcher, found
+  by its command line, is ended as a kept one's. `keep=False` in the record: left unset, keep_alive stays off and it
+  closes with the server that took it; `_arm_keep_alive` writes `keep=True`, so keep_alive=True is not undone by the
+  next reattach. A record made for a holder that does not pass is removed again, and a takeover that fails after the
+  check gives the record back and lets the launch fall back as before (`_orphan_given_back`), rather than erroring on
+  every launch until that Chrome ends. Only the folder the server chose itself (`_server_profile_for`): a
+  `user_data_dir`, `--user-data-dir`, `profile_dir`, or a caller's folder that became main's affinity, is never taken.
+- A browser this server took over (an orphan, or a kept browser reattached with keep_alive off) keeps a record naming
+  this server (`state: held`, `keep: False`) for as long as it drives it (`_disarm_keep_alive`). Its parent stays PID 1,
+  so without the record a third launch read it as an orphan and took it from under the server driving it (found in
+  review before release, `test_a_browser_left_by_a_killed_server_is_taken_over_not_fallen_back` checks a third server).
+  The record goes once Chrome is gone (close paths, exit). The server's own child removes it as before.
+- `_reaped` refuses this server and a live server as an orphan's parent: a server running as PID 1 in a container is
+  the parent of its own Chrome.
+- `_orphan_given_back` falls back only when the takeover never completed (the record still names no server). A
+  takeover that completed and whose url then failed (did not load, `expect_url`/`expect_status`) keeps the browser:
+  falling back overwrote the handle and left the orphan driven by nobody.
+- `_keep_on_reattach`: asked is as asked; left unset is as it was (no `keep` field: kept; an orphan: not), and the
+  person's browser (`opened_by: launcher`) always stays, whatever `keep: False` an earlier agent's one-off
+  `keep_alive=False` left in its record. `_server_holding` counts this very process as a live server whatever its
+  command line (in-process tests, an embedded server).
+- Known limit: a held record of a taken-over browser outlives a Quit after its server was killed (the plain watcher
+  carries no record path), and the next orphan on that profile falls back once while `check` removes the dead record.
+- A fallback leads the launch result: `WARNING: EMPTY FALLBACK PROFILE, your saved logins are NOT here (<who holds it>)`,
+  and says not to log in again there. As a suffix after the URL and status it was missed, and a login made on the
+  fallback splits the logins over two folders. `_holder_story` reads the profile's record first (a kept or taken-over
+  browser has parent PID 1 whoever drives it), then the process table: this server, another stealth server, a leftover
+  of ours, or a Chrome this server did not start. `profile_conflict='clone'` carries the logins and gets no warning.
 - Per launch, never a setting: many agents share the machine. `keep_alive=True` on `browser_launch` or `spawn_browser`
   leaves that browser running at stdin EOF; every other one still closes there. Left unset on a reattach it stays as it
   was (whoever kept it wanted it kept); `False` then means it closes with this server.

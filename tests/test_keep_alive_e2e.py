@@ -173,10 +173,18 @@ def test_a_kept_browser_survives_eof_and_the_next_server_reattaches(world):
     try:
         out = _launch(client, "about:blank", keep_alive=False)
         assert f"(pid {pid}, 4 tab(s))" in out.text and "now closes when this server exits" in out.text, out.text
-        assert world.no_record()
+        # The record stays while this server drives it, naming this server: the browser's parent
+        # is PID 1, and without it another launch took it over as an orphan (review of 0.25.2).
+        now = world.record()
+        assert now["keep"] is False and now["state"] == "held" and now["pid"] == pid, now
+        assert now["server_pid"] != record["server_pid"], now
     finally:
         client.close()
     assert _wait_gone(pid, 15), "a reattached browser without keep_alive outlived its server"
+    deadline = time.time() + 5
+    while time.time() < deadline and not world.no_record():
+        time.sleep(0.2)
+    assert world.no_record(), "the record outlived the browser it named"
 
 
 def test_spawn_browser_keeps_and_reattaches_a_named_instance(world):
@@ -340,6 +348,10 @@ def test_a_browser_a_live_server_holds_is_not_taken(world):
             out = _launch(other, world.urls[0])
             assert "Reattached" not in out.text, out.text
             assert "is still running and holds it" in out.text, out.text
+            # The fallback leads the result and says who holds the profile: an agent read
+            # "Browser launched ... Loaded" and logged in again on the empty profile.
+            assert out.text.startswith("WARNING: EMPTY FALLBACK PROFILE"), out.text
+            assert "another stealth server" in out.text and "do not log in again here" in out.text, out.text
         finally:
             other.call("browser_close", _timeout=40)
             other.close()
@@ -482,3 +494,143 @@ def test_closing_a_reattached_browser_asks_it_to_quit_and_keeps_its_cookies(worl
         assert not client.call("close_instance", instance_id="acct", _timeout=40).failed
     finally:
         client.close()
+
+
+def test_a_browser_left_by_a_killed_server_is_taken_over_not_fallen_back(world):
+    """A browser a server left running when it was killed, never kept: no record, its parent
+    PID 1. Every later launch on its profile fell back to an empty profile and every login read
+    as gone (Chrome PID 37250 held the main profile for five hours on 20 Nov 2026). It is taken
+    over through the keep_alive checks, its cookies are there, and it closes with the new server."""
+    first = Client(env=world.env())
+    launched = _launch(first, world.urls[0])
+    assert not launched.failed, launched.text
+    first.evaluate("document.cookie = 'orphan=kept; max-age=3600'")
+    chrome = state.chrome_lock_holder_pid(world.profile)
+    assert chrome, "no Chrome holds the profile"
+    server = int(subprocess.run(["ps", "-o", "ppid=", "-p", str(chrome)],
+                                capture_output=True, text=True).stdout.strip())
+    server_parent = int(subprocess.run(["ps", "-o", "ppid=", "-p", str(server)],
+                                       capture_output=True, text=True).stdout.strip())
+    command = subprocess.run(["ps", "-o", "command=", "-p", str(server)],
+                             capture_output=True, text=True).stdout
+    # Only the server this test started: its parent is this process, it runs our main().
+    assert server_parent == os.getpid() and "mcp_stealth_chrome.server import main" in command, command
+    os.kill(server, signal.SIGKILL)
+    assert _wait_gone(server, 10)
+    first.close()
+    deadline = time.time() + 10
+    parent = server
+    while time.time() < deadline and parent == server:
+        parent = int(subprocess.run(["ps", "-o", "ppid=", "-p", str(chrome)],
+                                    capture_output=True, text=True).stdout.strip() or 0)
+        time.sleep(0.1)
+    from mcp_stealth_chrome import keep_alive
+    if not keep_alive._reaped(parent, state.process_table() or []):
+        pytest.skip(f"the orphan went to PID {parent}, a subreaper this check does not know")
+    assert _alive(chrome) and world.no_record()
+    second = Client(env=world.env())
+    try:
+        out = _launch(second, world.urls[1])
+        assert not out.failed, out.text
+        assert "took over a browser of ours left running when its server went" in out.text.lower(), out.text
+        assert "taken over: a browser of ours left running when its server went" in out.text, out.text
+        assert "FALLBACK" not in out.text, out.text
+        assert "it was never kept, so it now closes when this server exits" in out.text, out.text
+        assert "orphan=kept" in second.evaluate("document.cookie")
+        # While the second server drives it, its parent is still PID 1: the record must name that
+        # server, or a third launch read it as an orphan and took it from under the second.
+        record = world.record()
+        assert record["server_pid"] != os.getpid() and record["keep"] is False, record
+        third = Client(env=world.env())
+        try:
+            out3 = _launch(third, world.urls[2])
+            assert "took over" not in out3.text.lower(), out3.text
+            assert out3.text.startswith("WARNING: EMPTY FALLBACK PROFILE"), out3.text
+            assert f"which another stealth server (PID {record['server_pid']}) drives" in out3.text, out3.text
+        finally:
+            third.call("browser_close", _timeout=40)
+            third.close()
+        assert "orphan=kept" in second.evaluate("document.cookie"), "the second server lost its browser"
+    finally:
+        second.call("browser_close", _timeout=40)
+        second.close()
+    assert _wait_gone(chrome, 15)
+    assert world.no_record()
+
+
+def test_an_orphan_taken_over_with_keep_alive_stays_kept_on_the_next_reattach(world):
+    """The orphan record says keep False; keep_alive=True on the takeover must replace it, or the
+    next reattach with keep_alive unset read False and closed a browser someone kept."""
+    first = Client(env=world.env())
+    assert not _launch(first, world.urls[0]).failed
+    chrome = state.chrome_lock_holder_pid(world.profile)
+    server = int(subprocess.run(["ps", "-o", "ppid=", "-p", str(chrome)],
+                                capture_output=True, text=True).stdout.strip())
+    command = subprocess.run(["ps", "-o", "command=", "-p", str(server)],
+                             capture_output=True, text=True).stdout
+    assert "mcp_stealth_chrome.server import main" in command, command
+    assert int(subprocess.run(["ps", "-o", "ppid=", "-p", str(server)], capture_output=True,
+                              text=True).stdout.strip()) == os.getpid()
+    os.kill(server, signal.SIGKILL)
+    assert _wait_gone(server, 10)
+    first.close()
+    time.sleep(0.5)
+    from mcp_stealth_chrome import keep_alive
+    parent = int(subprocess.run(["ps", "-o", "ppid=", "-p", str(chrome)], capture_output=True,
+                                text=True).stdout.strip() or 0)
+    if not keep_alive._reaped(parent, state.process_table() or []):
+        pytest.skip(f"the orphan went to PID {parent}, a subreaper this check does not know")
+    second = Client(env=world.env())
+    try:
+        out = _launch(second, world.urls[1], keep_alive=True)
+        assert "took over" in out.text.lower(), out.text
+        assert world.record()["keep"] is True, world.record()
+    finally:
+        second.close()  # stdin EOF: kept
+    assert _alive(chrome)
+    third = Client(env=world.env())
+    try:
+        out = _launch(third, world.urls[2])
+        assert "reattached to the running browser" in out.text.lower(), out.text
+        assert "keep_alive: still on" in out.text, out.text
+    finally:
+        third.call("browser_close", _timeout=40)
+        third.close()
+    assert _wait_gone(chrome, 15)
+
+
+def test_a_takeover_whose_page_fails_keeps_the_browser_it_took(world):
+    """The takeover completed and only the url failed its check: the browser is this session's.
+    Falling back then overwrote the handle and left the orphan driven by nobody (review of 0.25.2)."""
+    first = Client(env=world.env())
+    assert not _launch(first, world.urls[0]).failed
+    first.evaluate("document.cookie = 'orphan=kept; max-age=3600'")
+    chrome = state.chrome_lock_holder_pid(world.profile)
+    server = int(subprocess.run(["ps", "-o", "ppid=", "-p", str(chrome)],
+                                capture_output=True, text=True).stdout.strip())
+    command = subprocess.run(["ps", "-o", "command=", "-p", str(server)],
+                             capture_output=True, text=True).stdout
+    assert "mcp_stealth_chrome.server import main" in command, command
+    assert int(subprocess.run(["ps", "-o", "ppid=", "-p", str(server)], capture_output=True,
+                              text=True).stdout.strip()) == os.getpid()
+    os.kill(server, signal.SIGKILL)
+    assert _wait_gone(server, 10)
+    first.close()
+    time.sleep(0.5)
+    from mcp_stealth_chrome import keep_alive
+    parent = int(subprocess.run(["ps", "-o", "ppid=", "-p", str(chrome)], capture_output=True,
+                                text=True).stdout.strip() or 0)
+    if not keep_alive._reaped(parent, state.process_table() or []):
+        pytest.skip(f"the orphan went to PID {parent}, a subreaper this check does not know")
+    second = Client(env=world.env())
+    try:
+        out = _launch(second, world.urls[1], expect_status=404)  # the page answers 200
+        assert out.failed and "FALLBACK" not in out.text, out.text
+        record = world.record()
+        assert record["pid"] == chrome and record["server_pid"] not in (None, server), record
+        assert "orphan=kept" in second.evaluate("document.cookie"), "the session lost the browser it took"
+    finally:
+        second.call("browser_close", _timeout=40)
+        second.close()
+    assert _wait_gone(chrome, 15)
+    assert world.no_record()

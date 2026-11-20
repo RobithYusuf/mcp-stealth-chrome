@@ -345,6 +345,8 @@ def _server_holding(record: dict) -> Optional[int]:
     """The PID of a live server of ours that wrote this record, or None when it is gone."""
     from .profile_gc import is_server_command
     pid = record.get("server_pid")
+    if pid == os.getpid():
+        return pid  # this process, embedded or under a test runner, whatever its command line
     if not _alive(pid):
         return None
     command = _watcher.process_command(pid)
@@ -504,6 +506,87 @@ def end_old_watcher(record: dict) -> str:
     return "still running"
 
 
+# A browser of ours whose server went without closing it (killed, crashed, or an older version
+# that left it) and that was never kept: nothing records it, so every later launch on its profile
+# fell back to an empty one and every login read as gone (20 Nov 2026: Chrome PID 37250 held the
+# main profile for five hours with parent PID 1, no watcher and no record). Such a browser is
+# described from the running process into a record of state "orphan" and goes through the same
+# checks as a kept one; it is taken over and still closes with the server that takes it.
+ORPHAN = "orphan"
+
+
+def _flag_value(command: str, flag: str) -> Optional[str]:
+    """A flag's value on a ps command line: it ends where the next flag or a URL starts, since
+    ps drops the quoting (a path may hold spaces)."""
+    match = re.search(re.escape(flag) + r"=(.*?)(?=\s+--|\s+[a-z]+://|$)", command)
+    return match.group(1).strip() if match else None
+
+
+def _reaped(parent: int, table: list) -> bool:
+    """Whether a process's parent is what an orphan is handed to: PID 1, or on Linux a subreaper
+    such as `systemd --user`. A live server, a launcher or a test that started it is not."""
+    from .profile_gc import is_server_command
+    if parent == os.getpid():
+        return False  # this server: a server running as PID 1 in a container is a parent too
+    command = next((cmd for p, _pp, cmd in table if p == parent), "")
+    if command and is_server_command(command):
+        return False
+    if parent == 1:
+        return True
+    head = command.split()[0] if command.split() else ""
+    return os.path.basename(head) in ("systemd", "init")
+
+
+def orphan_record(profile: Any, instance_id: str) -> Optional[dict]:
+    """Write and return an "orphan" record for the browser holding `profile`, or None.
+
+    Only for a holder that is positively one of ours with nobody behind it: no record exists, its
+    parent is PID 1 (the server that spawned it is gone; a live server is its parent), its command
+    line is a browser main process naming exactly this --user-data-dir with a debugging port and
+    every flag only this server passes, and DevTools on that port names this PID. The caller still
+    runs check() on it, which proves the rest (lock, start time, version) as for a kept browser."""
+    if os.name != "posix":
+        return None
+    key = profile_key(profile)
+    if read(key) is not None:
+        return None
+    pid = _state.chrome_lock_holder_pid(Path(key))
+    if not _alive(pid):
+        return None
+    table = _state.process_table()
+    row = next((r for r in table or [] if r[0] == pid), None)
+    if row is None or not _reaped(row[1], table or []):
+        return None
+    command = _watcher.process_command(pid)
+    if not command or not _state._is_browser_main_process(command):
+        return None
+    given = _flag_value(command, "--user-data-dir")
+    port_text = _flag_value(command, "--remote-debugging-port") or ""
+    if not given or profile_key(given) != key or not port_text.isdigit():
+        return None
+    port = int(port_text)
+    if not _watcher.names_profile(command, given) or not _watcher.has_flag(
+            command, "--remote-debugging-port", port):
+        return None
+    if any(not re.search(re.escape(flag) + r"(?=\s|$)", command) for flag in OUR_FLAGS):
+        return None
+    start = _watcher.process_start(pid)
+    version = (_json_version("127.0.0.1", port) or {}).get("Browser")
+    if not start or not version or _browser_pid("127.0.0.1", port) != pid:
+        return None
+    # Its plain quit watcher, if one still runs, is ended by the takeover like a kept one's.
+    watcher = next((p for p, _parent, cmd in table or []
+                    if _watcher.NAME in cmd and f'"pid": {pid},' in cmd and f'"port": {port},' in cmd),
+                   None)
+    failed = write(key, pid=pid, pid_start=start, host="127.0.0.1", port=port, user_data_dir=given,
+                   instance_id=instance_id, chrome_version=version, headless="--headless" in command,
+                   fingerprint={}, server_pid=None, watcher_pid=watcher,
+                   watcher_start=_watcher.process_start(watcher) if watcher else None,
+                   state=ORPHAN, keep=False, launched_at=None, kept_at=None, tab_order=[],
+                   active=None, max_hours=cap_hours(), opened_by=OPENED_BY)
+    return None if failed else read(key)
+
+
 def mark_kept(profile: Any, pid: int, tab_order: list[str], active: Optional[str],
               owned: Optional[list[str]] = None) -> Optional[str]:
     """At exit: the browser stays, and a later server may take it. None, or why not written.
@@ -565,4 +648,6 @@ def describe(record: dict) -> str:
     if isinstance(when, (int, float)):
         minutes = max(0, int((time.time() - when) / 60))
         age = f", left running {minutes} min ago" if record.get("kept_at") else ""
+    if record.get("state") == ORPHAN:
+        return f"pid {record['pid']}, port {record['port']}, left running by a server that is gone"
     return f"pid {record['pid']}, port {record['port']}{age}"

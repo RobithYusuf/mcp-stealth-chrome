@@ -1790,6 +1790,35 @@ def _safe_profile_clone(source: Path, instance_id: str,
     return target, report
 
 
+def _holder_story(holder: int, profile: Path) -> str:
+    """Who the Chrome holding a profile is, for the fallback warning: the caller's next move
+    differs (wait for another session, close a leftover, or leave the person's browser alone)."""
+    from .profile_gc import is_server_command
+    from .state import process_table
+    record = _keep_alive.read(profile) or {}
+    if record.get("pid") == holder:
+        # A kept or taken-over browser: its parent is PID 1 whoever drives it; the record says who.
+        server = _keep_alive._server_holding(record)
+        if server == os.getpid():
+            return f"Chrome PID {holder}, which this server already drives (another session or instance)"
+        if server is not None:
+            return f"Chrome PID {holder}, which another stealth server (PID {server}) drives"
+        return f"Chrome PID {holder}, a browser of ours whose server is gone ({_keep_alive.describe(record)})"
+    table = process_table() or []
+    row = next((r for r in table if r[0] == holder), None)
+    if row is None:
+        return f"Chrome PID {holder}"
+    ours = all(flag in row[2] for flag in _keep_alive.OUR_FLAGS)
+    if ours and row[1] == os.getpid():
+        return f"Chrome PID {holder}, which this server already drives (another session or instance)"
+    parent = next((r for r in table if r[0] == row[1]), None)
+    if ours and parent is not None and is_server_command(parent[2]):
+        return f"Chrome PID {holder}, which another stealth server (PID {row[1]}) drives"
+    if ours:
+        return f"Chrome PID {holder}, started by this server's code (parent PID {row[1]})"
+    return f"Chrome PID {holder}, which this server did not start (your own Chrome, or another tool's)"
+
+
 def _resolve_launch_profile(
     instance_id: str,
     *,
@@ -1893,8 +1922,13 @@ def _resolve_launch_profile(
         )
     fallback.mkdir(parents=True, exist_ok=True)
     info["actual_profile"] = str(fallback)
+    try:
+        story = _holder_story(holder, desired)
+    except Exception:
+        story = f"Chrome PID {holder}"
+    info["holder"] = story
     info["session_state_source"] = (
-        f"FALLBACK profile {fallback.name} — {desired} is held by Chrome PID {holder}. "
+        f"FALLBACK profile {fallback.name} — {desired} is held by {story}. "
         f"Logins saved in {desired.name} are NOT visible here. Use "
         f"profile_conflict='clone' to carry them over, or 'fail' to refuse instead."
     )
@@ -2923,7 +2957,7 @@ def _arm_keep_alive(browser: Any, profile: Any, instance_id: str, headless: bool
         pid_start=started, watcher_pid=proc.pid,
         watcher_start=_keep_alive._watcher.process_start(proc.pid), state="held", launched_at=(previous or {}).get("launched_at", now),
         attached_at=now if previous else None, kept_at=None, max_hours=cap / 3600,
-        opened_by=opened_by)
+        opened_by=opened_by, keep=True)
     if failed:
         # A plain watcher, as any headed browser has; none for headless.
         if headless:
@@ -2937,15 +2971,36 @@ def _arm_keep_alive(browser: Any, profile: Any, instance_id: str, headless: bool
 
 
 def _disarm_keep_alive(browser: Any, profile: Any, headless: bool) -> None:
-    """keep_alive off for a browser that had it: plain watcher, no record."""
+    """keep_alive off for a browser that had it: plain watcher; for a browser this server took
+    over, a record that names this server as the one driving it, with keep False.
+
+    Not removed: a Chrome taken over (an orphan, or a kept browser reattached) is not this
+    server's child, so its parent stays PID 1, and with no record another launch read it as an
+    orphan and took it from under this server (review of 0.25.2). The record makes keep_alive.check
+    refuse it while this server lives; a close removes it once Chrome is gone, and if this server
+    is killed the next launch finds a record whose server is gone and takes it over as before."""
     with contextlib.suppress(Exception):
         setattr(browser, _keep_alive.ATTR, False)
     if headless:
         quit_watch.stop(browser)
     else:
         quit_watch.start(browser, _WINDOWLESS_GRACE, _CLOSE_WAIT)
-    if profile is not None:
-        _keep_alive.remove(profile, _browser_process_pid(browser))
+    if profile is None:
+        return
+    pid = _browser_process_pid(browser)
+    if getattr(browser, "_process", None) is not None:
+        # This server's own child: its parent is this server, so no launch reads it as an orphan
+        # while this server lives, and the record goes as before.
+        _keep_alive.remove(profile, pid)
+        return
+    record = _keep_alive.read(profile)
+    if record is None or record.get("pid") != pid:
+        return
+    proc = quit_watch.watcher(browser)
+    live = proc is not None and proc.poll() is None
+    _keep_alive.write(profile, server_pid=os.getpid(), state="held", keep=False,
+                      watcher_pid=proc.pid if live else None,
+                      watcher_start=_keep_alive._watcher.process_start(proc.pid) if live else None)
 
 
 def _kept_candidates(instance_id: str, browser: str = "chrome") -> list[Path]:
@@ -2964,22 +3019,61 @@ def _kept_candidates(instance_id: str, browser: str = "chrome") -> list[Path]:
     return found
 
 
-def _kept_verdict(profile: Path, browser: str = "chrome") -> Optional[dict]:
+def _server_profile_for(instance_id: str, browser: str = "chrome") -> str:
+    """The profile folder this server chooses for an instance (no affinity), as a record key."""
+    if browser == brave_mode.BRAVE:
+        return _keep_alive.profile_key(brave_mode.instance_profile(_brave_data_root(), instance_id))
+    return _keep_alive.profile_key(PROFILE_DIR if instance_id == "main" else PROFILES_ROOT / instance_id)
+
+
+def _orphan_given_back(profile: Path, verdict: dict) -> bool:
+    """After a takeover of an orphan answered an error: True when it never completed (its record
+    still names no server), and then the record is dropped so the next launch looks afresh and
+    this one may fall back. False when the takeover completed and only the page failed (a url
+    that did not load, expect_url): the browser is this session's now, and falling back would
+    replace the handle and leave it driven by nobody (review of 0.25.2)."""
+    record = verdict.get("record") or {}
+    if record.get("state") != _keep_alive.ORPHAN:
+        return False
+    now = _keep_alive.read(profile) or {}
+    if now.get("pid") == record.get("pid") and now.get("server_pid"):
+        return False
+    if now.get("pid") == record.get("pid"):
+        _keep_alive.remove(profile, record.get("pid"))
+    return True
+
+
+def _kept_verdict(profile: Path, browser: str = "chrome",
+                  adopt_orphan_for: Optional[str] = None) -> Optional[dict]:
     """keep_alive.check for a profile some Chrome holds, or None when nothing was kept there.
 
     An ok verdict holds the profile's reattach lock: the caller reattaches at once, and
     _reattach_kept lets it go when done. A profile the other browser made (brave_mode binding)
-    is not reattached for this launch: it would hand a Brave launch a Chrome, or the reverse."""
+    is not reattached for this launch: it would hand a Brave launch a Chrome, or the reverse.
+
+    adopt_orphan_for (an instance id, for a profile the server chose itself): with no record, a
+    browser of ours whose server is gone is described into an "orphan" record and checked like
+    a kept one, rather than leaving the launch to an empty fallback profile. A record made here
+    that does not pass is removed again."""
     if not profile.exists() or chrome_lock_holder_pid(profile) is None:
         return None
     record = _keep_alive.read(profile)
+    made = False
+    if record is None and adopt_orphan_for is not None:
+        record = _keep_alive.orphan_record(profile, adopt_orphan_for)
+        made = record is not None
     if record is None:
         return None
     bound = brave_mode.binding_refusal(profile, browser)
     if bound:
+        if made:
+            _keep_alive.remove(profile, record["pid"])
         return {"ok": False, "record": record, "holder": None,
                 "reason": f"browser={browser!r} was asked for and {bound}"}
-    return _keep_alive.check(profile, hold=True)
+    verdict = _keep_alive.check(profile, hold=True)
+    if made and not verdict.get("ok"):
+        _keep_alive.remove(profile, record["pid"])
+    return verdict
 
 
 def _reattached_product(profile: Path) -> str:
@@ -3168,6 +3262,16 @@ def _owned_before(record: dict, tabs: list) -> tuple[set, list]:
     return claimed & present, notes
 
 
+def _keep_on_reattach(keep_alive: Optional[bool], record: dict) -> bool:
+    """Whether a reattached browser stays at this server's exit. Asked: as asked. Left unset: as
+    it was, where a record without "keep" was kept and an orphan was not; the person's browser
+    (opened from the launcher) always stays, whatever keep False an earlier agent's one-off
+    keep_alive=False left in its record (review of 0.25.2)."""
+    if keep_alive is not None:
+        return bool(keep_alive)
+    return bool(record.get("keep", True)) or record.get("opened_by") == _keep_alive.LAUNCHER
+
+
 async def _reattach_claimed(browser: Any, instance_id: str, profile: Path, record: dict,
                             watcher_note: str, *, url: str, keep_alive: Optional[bool],
                             ignored: list[str]) -> tuple[Any, list, int, dict, str, str]:
@@ -3251,14 +3355,18 @@ async def _reattach_claimed(browser: Any, instance_id: str, profile: Path, recor
         observed = await _observe_navigation(tabs[select], None, {"armed": False})
     if not headless:
         _watch_windows(browser)  # replaced below when keep_alive stays on
-    # Left unset, a reattach keeps what the browser had: whoever kept it wanted it kept.
-    if keep_alive is None or keep_alive:
+    # Left unset, a reattach keeps what the browser had: whoever kept it wanted it kept. An
+    # orphan was never kept, so it closes with this server unless keep_alive=True asks otherwise.
+    orphan = record.get("state") == _keep_alive.ORPHAN
+    if _keep_on_reattach(keep_alive, record):
         failed = _arm_keep_alive(browser, profile, instance_id, headless, fingerprint,
                                  previous=record)
         keep_text = failed or " [keep_alive: still on, so it stays open when this server exits too]"
     else:
         _disarm_keep_alive(browser, profile, headless)
-        keep_text = " [keep_alive=False: it now closes when this server exits]"
+        keep_text = (" [keep_alive=False: it was never kept, so it now closes when this server exits]"
+                     if orphan and keep_alive is None else
+                     " [keep_alive=False: it now closes when this server exits]")
     pages = [{"index": i, "url": tab_record.shown_url(str(getattr(t.target, "url", "") or "")),
               "title": str(getattr(t.target, "title", "") or "")[:120]} for i, t in enumerate(tabs)]
     details = {
@@ -3298,6 +3406,10 @@ async def _reattach_claimed(browser: Any, instance_id: str, profile: Path, recor
     details["reattached"]["notes"] = notes
     details["_owned"] = owned
     summary = f"reattached to the running browser (pid {pid}, {len(tabs)} tab(s){opened_note})"
+    if orphan:
+        summary = (f"took over a browser of ours left running when its server went (pid {pid}, "
+                   f"{len(tabs)} tab(s){opened_note}): its logins and tabs are used, instead of an "
+                   f"empty fallback profile")
     return browser, tabs, select, {**observed, **details}, summary, keep_text
 
 
@@ -3366,7 +3478,10 @@ async def _launch_by_reattach(profile: Path, verdict: dict, *, url: str, keep_al
         from .state import set_profile_affinity
         set_profile_affinity(BrowserState.current_profile_dir)
     observed["profile"] = {"actual_profile": str(BrowserState.current_profile_dir),
-                           "session_state_source": "reattached to the browser kept alive on it"}
+                           "session_state_source": (
+                               "taken over: a browser of ours left running when its server went"
+                               if (verdict.get("record") or {}).get("state") == _keep_alive.ORPHAN
+                               else "reattached to the browser kept alive on it")}
     ads_note = await _block_ads_on_reattach(block_ads, browser, iid)
     ads_note += await presence.attach(browser, _browser_process_pid(browser), ask=agent_overlay,
                                 headless=bool(record.get("headless")),
@@ -4257,14 +4372,27 @@ async def browser_launch(
             # A browser a previous server of ours kept alive on the profile this launch asks
             # for is taken over, not raced: falling back would hide its tabs and logins.
             if persistent and custom_udd is None:
+                _own_folder = _server_profile_for(BrowserState.current_instance_id, product)
                 for _candidate in _kept_candidates(BrowserState.current_instance_id, product):
-                    _kept = _kept_verdict(_candidate, product)
+                    # Only the folder the server chose itself: a caller's --user-data-dir that
+                    # became main's affinity after a custom reattach is never taken as an orphan.
+                    _adopt = (BrowserState.current_instance_id
+                              if _keep_alive.profile_key(_candidate) == _own_folder else None)
+                    _kept = _kept_verdict(_candidate, product, adopt_orphan_for=_adopt)
                     if _kept and _kept.get("ok"):
-                        return await _launch_by_reattach(
+                        _taken = await _launch_by_reattach(
                             _candidate, _kept, url=url, keep_alive=keep_alive,
                             ignored=_reattach_ignored(locals()), expect_url=expect_url,
                             expect_status=expect_status,
                             block_ads=block_ads, agent_overlay=agent_overlay)
+                        if not (_taken.startswith("Error") and _orphan_given_back(_candidate, _kept)):
+                            return _taken
+                        # An orphan that could not be taken over: the launch goes on as it did
+                        # before the takeover existed (a fallback, saying so), not an error on
+                        # every launch until that Chrome ends.
+                        kept_note += (f" [a browser of ours left running on {_candidate} could not "
+                                      f"be taken over: {_taken[len('Error: '):][:300]}]")
+                        continue
                     kept_note += _not_reattached_note(_candidate, _kept)
             # Each instance has one deterministic profile, and a conflict over it is
             # settled by the caller's profile_conflict. Only "main" takes part in
@@ -4665,6 +4793,12 @@ async def browser_launch(
 
         await _give_focus_back(previous_app)
         return _nav_result(
+            (f"WARNING: EMPTY FALLBACK PROFILE, your saved logins are NOT here "
+             f"({profile_info.get('holder') or 'another Chrome'} holds "
+             f"{profile_info.get('desired_profile')}); do not log in again here, that splits the "
+             f"logins over two folders. "
+             if used_fallback and str(profile_info.get("session_state_source") or "").startswith("FALLBACK")
+             else "") +
             f"Browser launched (headless={headless}, persistent={persistent}, "
             f"privacy={privacy}, identity={identity_source}). Loaded",
             _launch_observed,
@@ -8652,12 +8786,19 @@ async def _launch_browser_instance(
         if profile_path.exists():
             holder = chrome_lock_holder_pid(profile_path)
             if holder is not None:
-                kept = None if privacy else _kept_verdict(profile_path, product)
+                kept = None if privacy else _kept_verdict(
+                    profile_path, product,
+                    adopt_orphan_for=instance_id if profile_dir_override is None else None)
                 if kept and kept.get("ok"):
-                    return await _spawn_by_reattach(instance_id, profile_path, kept, url=url,
-                                                    keep_alive=keep_alive, ignored=ignored or [],
-                                                    idle_timeout=idle_timeout, desc=desc,
-                                                    block_ads=block_ads, agent_overlay=agent_overlay)
+                    taken = await _spawn_by_reattach(instance_id, profile_path, kept, url=url,
+                                                     keep_alive=keep_alive, ignored=ignored or [],
+                                                     idle_timeout=idle_timeout, desc=desc,
+                                                     block_ads=block_ads, agent_overlay=agent_overlay)
+                    if taken[0] or not _orphan_given_back(profile_path, kept):
+                        return taken
+                    return False, (f"profile {profile_path} is locked by Chrome PID {holder}, a "
+                                   f"browser of ours left running when its server went, which could "
+                                   f"not be taken over: {taken[1]}")
                 return False, (
                     f"profile {profile_path} is locked by Chrome PID {holder}; "
                     "close that browser or clone the profile first"
