@@ -537,3 +537,59 @@ def test_a_call_marks_its_overlay_busy_until_it_ends_whatever_is_current_by_then
         asyncio.run(two_at_once())
     finally:
         overlay.proc.kill()
+
+
+def _overlay_functions(*names, **constants):
+    """Plain functions of the overlay, taken from its source (it imports AppKit at the top)."""
+    import ast
+    import math
+    from pathlib import Path
+    source = (Path(presence.__file__).with_name("_agent_overlay.py")).read_text()
+    tree = ast.parse(source)
+    found = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names}
+    values = {}
+    for node in tree.body:  # the module's own constants, so the test checks what ships
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            if node.targets[0].id in constants:
+                values[node.targets[0].id] = ast.literal_eval(node.value)
+    assert set(found) == set(names) and set(values) == set(constants)
+    space = {"math": math, **values}
+    exec(compile(ast.Module(body=list(found.values()), type_ignores=[]), "_agent_overlay.py", "exec"), space)
+    return space
+
+
+def test_the_light_breathes_between_a_thin_ring_and_the_full_one():
+    """Asked for on 21 Nov 2026: the light thickens and thins. The mask is the thin ring plus what
+    the full light adds over it, faded in and out on the GPU, so at full strength it is exactly
+    the 64 pt light that shipped, and faded out exactly the thin one."""
+    f = _overlay_functions("light_at", "thin_at", "extra_at", "bands", DEPTH=1, THIN=1)
+    assert f["THIN"] < f["DEPTH"]
+    depths = [i * 0.25 for i in range(int(f["DEPTH"] * 4) + 1)]
+    for d in depths:
+        thin, extra, full = f["thin_at"](d), f["extra_at"](d), f["light_at"](d)
+        assert thin <= full + 1e-12
+        assert abs(thin + extra * (1 - thin) - full) < 1e-9, d
+    assert f["thin_at"](f["THIN"]) == 0.0 and f["light_at"](f["THIN"]) > 0.1
+    # Nested bands draw a profile with one peak exactly: extra_at rises from the edge, then falls.
+    extra = [f["extra_at"](d) for d in depths]
+    peak = extra.index(max(extra))
+    assert 0 < peak < len(extra) - 1
+    assert all(a <= b for a, b in zip(extra[:peak], extra[1:peak + 1]))
+    assert all(a >= b for a, b in zip(extra[peak:], extra[peak + 1:]))
+    bands = f["bands"](f["extra_at"], 0.5)
+    for (lo, hi, _add), (lo2, hi2, _add2) in zip(bands, bands[1:]):
+        assert lo <= lo2 and hi2 <= hi  # nested, widest first: no two meet edge to edge
+    assert f["bands"](f["light_at"], 0.5)[0][0] == 0.0  # the full light starts at the edge
+
+
+def test_the_overlay_floats_only_where_no_app_switch_can_leave_it_above_another_app():
+    """With the browser in front, the floating level held the light over the app a Cmd+Tab went
+    to for 163 and 179 ms (measured), until a window scan saw that app over the browser."""
+    f = _overlay_functions("wants_floating", SWITCH_SETTLE=1)
+    floats = f["wants_floating"]
+    settled = f["SWITCH_SETTLE"] + 1
+    assert floats(False, False, False, settled)            # behind another app, uncovered
+    assert not floats(True, False, False, settled)         # covered: sit just above the browser
+    assert not floats(False, True, False, settled)         # the browser in front: just above it
+    assert not floats(False, False, True, settled)         # Command held: a Cmd+Tab may follow
+    assert not floats(False, False, False, 0.0)            # an app has just come to the front

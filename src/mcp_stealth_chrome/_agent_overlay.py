@@ -70,11 +70,13 @@ from Quartz import (CAAnimationGroup, CABasicAnimation, CACurrentMediaTime, CAGr
                     CGContextEOFillPath, CGContextSaveGState, CGContextScaleCTM,
                     CGContextSetLineWidth, CGContextSetRGBFillColor,
                     CGContextSetRGBStrokeColor, CGContextSetShadowWithColor, CGContextStrokePath,
-                    CGEventSourceSecondsSinceLastEventType, CGPathAddLineToPoint,
+                    CGEventSourceFlagsState, CGEventSourceSecondsSinceLastEventType,
+                    CGPathAddLineToPoint,
                     CGPathCloseSubpath, CGPathCreateMutable, CGPathCreateWithEllipseInRect,
                     CGPathMoveToPoint, CGRectMake,
                     CGWindowListCopyWindowInfo, kCAMediaTimingFunctionEaseInEaseOut,
-                    kCATransitionFade, kCGEventKeyDown, kCGEventSourceStateHIDSystemState,
+                    kCATransitionFade, kCGEventFlagMaskCommand, kCGEventKeyDown,
+                    kCGEventSourceStateHIDSystemState,
                     kCGImageAlphaPremultipliedLast, kCGNullWindowID,
                     kCGWindowListExcludeDesktopElements, kCGWindowListOptionIncludingWindow,
                     kCGWindowListOptionOnScreenAboveWindow, kCGWindowListOptionOnScreenOnly)
@@ -128,7 +130,10 @@ CORNER = corner_shape()
 TURN = 16.0         # seconds per turn of the light: at 30 fps a corner moves about 9 points a
                     # frame (9 s at 20 fps moved it 25, and the soft colours stepped visibly)
 DEPTH = 64.0        # how far the light reaches into the window (34 read as too faint, 20 Nov 2026)
+THIN = 32.0         # and at its thinnest: it breathes between the two (asked for, 21 Nov 2026)
+BREATHE = 4.0       # seconds from thick to thin, and as long back
 STRIP = DEPTH + 8   # thickness of the edge windows that carry it: the light is 0 past DEPTH
+SWITCH_SETTLE = 0.3  # after another app comes to the front, stay out of the floating level this long
 TICK = 1 / 20       # the glow's own pace: every update lands on a frame drawn anyway
 TICK_MOVING = 1 / 60  # while the browser window moves: at 20 a second the light trailed a drag
 CALM_EVERY = 2      # with nothing moving, do a tick's work every 2nd tick
@@ -432,8 +437,25 @@ def near(b, want, slack=4.0):
     return all(abs(float(p) - float(q)) <= slack for p, q in zip(b, want))
 
 
+def command_held():
+    """Command is down (no permission needed: the modifier state, not the key events)."""
+    return bool(CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState) & kCGEventFlagMaskCommand)
+
+
 def contains(b, x, y):
     return b[0] <= x < b[0] + b[2] and b[1] <= y < b[1] + b[3]
+
+
+def wants_floating(covered_now, browser_front, command_held, since_switch):
+    """The floating level keeps the browser, brought to the front by a click, from covering the
+    overlay for a frame. It also holds the overlay over whatever app comes to the front next,
+    until a scan sees it: 163 and 179 ms of light over the app a Cmd+Tab went to, measured. So
+    float only while that cannot happen: nothing covers the browser, another app is in front
+    (with the browser in front, sitting just above its window looks the same, and the next app
+    covers both at once), Command is not held (Cmd+Tab, Cmd+H, Cmd+`) and no app has just come
+    to the front, which the window list may not show yet."""
+    return (not covered_now and not browser_front and not command_held
+            and since_switch >= SWITCH_SETTLE)
 
 
 def directly_above(wins, ours, target):
@@ -577,27 +599,52 @@ def corner_path(x, y, w, h, box, n, steps=20):
     return path
 
 
-def light_at(d):
+def light_at(d, depth=DEPTH):
     """How bright the light is `d` points in from the window's edge: a crisp line on the edge, a
-    short bright halo, and a long soft body that reaches exactly 0 at DEPTH, so nothing is cut
+    short bright halo, and a long soft body that reaches exactly 0 at `depth`, so nothing is cut
     off at the strips' inner edges. One smooth curve: the blurred layers it replaces showed as
     separate bands, and their blur ran past the strips and ended in a straight line."""
     if d < 1.5:
         return 1.0
-    t = min(1.0, (d - 1.5) / (DEPTH - 1.5))
+    t = min(1.0, (d - 1.5) / (depth - 1.5))
     halo = 0.85 * math.exp(-(d - 1.5) / 3.0)
     body = 0.55 * (1.0 - t) ** 2.2 if t < 1.0 else 0.0
     return 1.0 - (1.0 - halo) * (1.0 - body) if t < 1.0 else 0.0
 
 
-def ring_image(scale, corner=None):
-    """The glow's shape, drawn once: light_at's curve inward from an edge whose corners follow
-    the window's (`corner`, see corner_shape; (0, 2) draws square ones), as a nine-slice whose
-    middle stretches over any window size without drawing again.
+def thin_at(d):
+    return light_at(d, THIN)
 
-    Drawn as nested frames, each from the edge to one depth, from the deepest out, every frame
-    adding just enough alpha that the total at each depth is light_at: the frames share their
-    outer edge and their inner edges never coincide, so no seam appears between steps."""
+
+def extra_at(d):
+    """What the light adds over the thin one: shown at full strength over thin_at it is exactly
+    light_at, so fading it out thins the light smoothly (a over b = a + b(1 - a))."""
+    thin = thin_at(d)
+    return 0.0 if thin >= 1.0 else max(0.0, (light_at(d) - thin) / (1.0 - thin))
+
+
+def bands(profile, step):
+    """The profile as nested bands [lo, hi] of depth, each with the alpha it adds, widest first.
+    A profile with one peak (light_at, thin_at, extra_at) is exact this way: each band holds every
+    depth at or above one level, and no two bands meet edge to edge, so no seam shows."""
+    depths = [i * step for i in range(int(DEPTH / step) + 2)]
+    values = [profile(d) for d in depths]
+    out, below = [], 0.0
+    for level in sorted({v for v in values if v > 0.0}):
+        held = [i for i, v in enumerate(values) if v >= level]
+        add = (level - below) / (1.0 - below) if below < 1.0 else 0.0
+        below = level
+        # A pixel takes the value of the first grid depth at or below it, on both flanks.
+        lo = 0.0 if held[0] == 0 else depths[held[0] - 1]
+        out.append((lo, depths[held[-1]], add))
+    return out
+
+
+def ring_image(scale, corner=None, profile=light_at):
+    """The glow's shape, drawn once: `profile` inward from an edge whose corners follow the
+    window's (`corner`, see corner_shape; (0, 2) draws square ones), as a nine-slice whose middle
+    stretches over any window size without drawing again. Every profile shares the margin, so
+    the layers carrying them line up."""
     box, n = corner or CORNER
     margin = math.ceil(box + DEPTH + 4)
     side = 2 * margin + 1
@@ -605,36 +652,38 @@ def ring_image(scale, corner=None):
     ctx = CGBitmapContextCreate(None, px, px, 8, px * 4, CGColorSpaceCreateDeviceRGB(),
                                 kCGImageAlphaPremultipliedLast)
     CGContextScaleCTM(ctx, scale, scale)
-    step = 1.0 / scale  # one device pixel
-    depths = [DEPTH - i * step for i in range(int(DEPTH / step) + 1)]
-    below = 0.0  # the alpha already laid at the previous, deeper frame
-    for d in depths:
-        want = light_at(max(d, 0.0))
-        if want <= below:
-            continue
-        add = (want - below) / (1.0 - below) if below < 1.0 else 0.0
-        below = want
-        path = corner_path(0, 0, side, side, box, n)
-        inner = corner_path(d, d, side - 2 * d, side - 2 * d, max(box - d, 0.0), n)
-        CGContextAddPath(ctx, path)
+    for lo, hi, add in bands(profile, 1.0 / scale):  # one device pixel per step
+        outer = corner_path(lo, lo, side - 2 * lo, side - 2 * lo, max(box - lo, 0.0), n)
+        inner = corner_path(hi, hi, side - 2 * hi, side - 2 * hi, max(box - hi, 0.0), n)
+        CGContextAddPath(ctx, outer)
         CGContextAddPath(ctx, inner)
         CGContextSetRGBFillColor(ctx, 0, 0, 0, add)
         CGContextEOFillPath(ctx)
     return CGBitmapContextCreateImage(ctx), margin, side
 
 
+def ring_masks(scale, corner=None):
+    """The thin ring and what the full light adds over it, drawn once."""
+    thin, margin, side = ring_image(scale, corner, thin_at)
+    extra, _margin, _side = ring_image(scale, corner, extra_at)
+    return thin, extra, margin, side
+
+
 class Glow:
     """One slowly turning conic gradient seen through the ring mask, carried by four thin
     windows along the browser window's edges. Each strip shows its part of the same gradient,
-    turning in step, so the light reads as one ring."""
+    turning in step, so the light reads as one ring. The mask is the thin ring plus what the
+    full one adds; fading that in and out lets the light breathe between THIN and DEPTH, on the
+    GPU, without drawing again."""
 
     def __init__(self, still, scale):
-        # Two masks drawn once: the window's own corners, and square ones for a full-screen window.
-        self.masks = {"round": ring_image(scale), "square": ring_image(scale, (0.0, 2.0))}
+        # Masks drawn once: the window's own corners, and square ones for a full-screen window.
+        self.masks = {"round": ring_masks(scale), "square": ring_masks(scale, (0.0, 2.0))}
         self.shape = "round"
         self.out = False   # faded out and ordered off the screen
         self.back = False  # turned on again after that: the overlay must order it back in
-        image, margin, side = self.masks["round"]
+        thin_image, extra_image, margin, side = self.masks["round"]
+        center = ((margin / side, margin / side), (1 / side, 1 / side))
         self.strips = []
         CATransaction.begin()  # one transaction: every strip's animation starts at the same time
         for _ in range(4):
@@ -648,10 +697,13 @@ class Glow:
             grad.setStartPoint_((0.5, 0.5))
             grad.setEndPoint_((0.5, 1.0))
             motion.addSublayer_(grad)
-            mask = CALayer.layer()
-            mask.setContents_(image)
-            mask.setContentsScale_(scale)
-            mask.setContentsCenter_(((margin / side, margin / side), (1 / side, 1 / side)))
+            mask = CALayer.layer()  # carries the two rings; paused with `motion`, measured
+            thin, extra = CALayer.layer(), CALayer.layer()
+            for layer, image in ((thin, thin_image), (extra, extra_image)):
+                layer.setContents_(image)
+                layer.setContentsScale_(scale)
+                layer.setContentsCenter_(center)
+                mask.addSublayer_(layer)
             motion.setMask_(mask)
             group.addSublayer_(motion)
             root.addSublayer_(group)
@@ -663,14 +715,14 @@ class Glow:
                 spin.setRepeatCount_(1e9)
                 grad.addAnimation_forKey_(paced(spin), "spin")
                 breathe = CABasicAnimation.animationWithKeyPath_("opacity")
-                breathe.setFromValue_(0.82)
-                breathe.setToValue_(1.0)
-                breathe.setDuration_(2.6)
+                breathe.setFromValue_(1.0)
+                breathe.setToValue_(0.0)
+                breathe.setDuration_(BREATHE)
                 breathe.setAutoreverses_(True)
                 breathe.setRepeatCount_(1e9)
                 breathe.setTimingFunction_(ease())
-                motion.addAnimation_forKey_(paced(breathe), "breathe")
-            self.strips.append((p, group, motion, grad, mask))
+                extra.addAnimation_forKey_(paced(breathe), "breathe")
+            self.strips.append((p, group, motion, grad, mask, thin, extra))
         CATransaction.commit()
         for strip in self.strips:
             pause(strip[2])
@@ -684,12 +736,14 @@ class Glow:
         if shape == self.shape:
             return
         self.shape = shape
-        image, margin, side = self.masks[shape]
+        thin_image, extra_image, margin, side = self.masks[shape]
+        center = ((margin / side, margin / side), (1 / side, 1 / side))
         CATransaction.begin()
         CATransaction.setDisableActions_(True)
         for strip in self.strips:
-            strip[4].setContents_(image)
-            strip[4].setContentsCenter_(((margin / side, margin / side), (1 / side, 1 / side)))
+            for layer, image in ((strip[5], thin_image), (strip[6], extra_image)):
+                layer.setContents_(image)
+                layer.setContentsCenter_(center)
         CATransaction.commit()
 
     def layout(self, x, y_ns, w, h):
@@ -700,11 +754,13 @@ class Glow:
         side = math.hypot(w, h)
         CATransaction.begin()
         CATransaction.setDisableActions_(True)
-        for (p, group, motion, grad, mask), (sx, sy, sw, sh) in zip(self.strips, rects):
+        for (p, group, motion, grad, mask, thin, extra), (sx, sy, sw, sh) in zip(self.strips, rects):
             p.setFrame_display_(NSMakeRect(x + sx, y_ns + sy, sw, max(sh, 1)), False)
             group.setFrame_(((0, 0), (sw, max(sh, 1))))
             motion.setFrame_(((-sx, -sy), (w, h)))
             mask.setFrame_(((0, 0), (w, h)))
+            thin.setFrame_(((0, 0), (w, h)))
+            extra.setFrame_(((0, 0), (w, h)))
             grad.setBounds_(((0, 0), (side, side)))
             grad.setPosition_((w / 2, h / 2))
         CATransaction.commit()
@@ -1137,6 +1193,9 @@ class Overlay:
         self.above = None
         self.level = NORMAL_LEVEL
         self.floating = False
+        self.covered = True         # until a scan says otherwise
+        self.browser_front = False
+        self.switched_at = 0.0      # when another app last came to the front
         self.wins = []
         self.scanned_at = 0.0
         self.ticks = 0
@@ -1311,8 +1370,9 @@ class Overlay:
         now = time.time()
         self.ticks += 1
         calm = not (self.pointer.want or self.ripples.visible or now < self.moved_until)
-        if calm and not force and self.ticks % CALM_EVERY:
-            return  # nothing moves: 10 ticks a second are enough
+        if calm and not force and self.ticks % CALM_EVERY and not (self.floating and command_held()):
+            return  # nothing moves: 10 ticks a second are enough (Command held while floating
+            # may be a Cmd+Tab under way: leave the floating level now)
         a = self.read_agent()
         self.check_settings(now)
         if self.closing is not None:
@@ -1421,7 +1481,11 @@ class Overlay:
             self.frame = b
             self.moved_until = now + MOVING_FOR  # follow a dragged window at the full rate
         if scan:
-            self.floating = not covered(self.wins, wid, b, pid)
+            self.covered = covered(self.wins, wid, b, pid)
+            front = NSWorkspace.sharedWorkspace().frontmostApplication()
+            self.browser_front = front is not None and front.processIdentifier() == pid
+        self.floating = wants_floating(self.covered, self.browser_front, command_held(),
+                                       now - self.switched_at)
 
         loc = NSEvent.mouseLocation()
         key = CGEventSourceSecondsSinceLastEventType(kCGEventSourceStateHIDSystemState, kCGEventKeyDown)
@@ -1732,6 +1796,8 @@ class Target(NSObject):
         try:
             if note is not None and note.name() == NSWorkspaceActiveSpaceDidChangeNotification:
                 OVERLAY.space_changed_at = time.time()
+            else:
+                OVERLAY.switched_at = time.time()
             OVERLAY.tick(force=True)
         except Exception:
             traceback.print_exc()

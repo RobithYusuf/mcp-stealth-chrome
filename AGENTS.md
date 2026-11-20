@@ -1244,6 +1244,13 @@ the person (the same target events as Cmd+T, a followed link, a closed tab).
   covers the browser the overlay sits in the floating level (3). At level 0 just above Chrome, clicking an inactive Chrome
   brought its windows over the overlay until the next tick. Covered, it drops to level 0 just above Chrome. App switches
   and Space changes run a tick at once (NSWorkspace notifications).
+- The floating level also held the overlay over the app a Cmd+Tab went to until a window scan saw it: 182 to 257 ms with
+  the browser in front, 199 to 231 ms (once 1003) from another app, measured with an app window activated over the
+  browser. So it floats only when no switch can leave it there (`wants_floating`): nothing covers the browser, another
+  app is in front (the browser in front: level 0 just above its window looks the same, and the next app covers both
+  at once), Command is not held (`command_held`, the modifier state, no permission; read on calm ticks too while
+  floating) and no app came to the front in the last `SWITCH_SETTLE` (0.3 s, before the window list shows it).
+  Measured after: 0 ms in 16 of 16 switches.
 - Cost, measured with a benchmark against no overlay at all (macOS 26, 120 Hz display, 15 s runs alternated): WindowServer
   +35 points and the overlay 8 to 9% CPU for the first design, about +10 points and 3% after. What mattered: the light in
   four edge windows under a nine-slice mask drawn once (no live blur, which three blurred rings were), animations asked
@@ -1270,6 +1277,14 @@ the person (the same target events as Cmd+T, a followed link, a closed tab).
   the 96 pt strips and ended in a straight line with a square corner inside the window. STRIP is DEPTH + 8. Cost,
   measured against the 34 pt light for 15 s with the light on: the overlay process 1.7 to 2.0% either way,
   WindowServer within its own noise.
+- The light breathes between THIN (32 pt) and DEPTH, BREATHE (4 s) each way (asked for, 21 Nov 2026; it replaced an
+  opacity pulse of 0.82 to 1). The mask is two layers drawn once: the thin ring (`thin_at`) and what the full light adds
+  over it (`extra_at`, so thin over extra at full strength is exactly `light_at`), and only the extra layer's opacity is
+  animated, on the GPU. `extra_at` rises from the edge and falls, so `bands` draws every profile as nested bands, one
+  per level, none meeting another edge to edge (no seam); the 64 pt image is identical to the one before, and thin
+  over extra differs by at most 3% alpha at a pixel (8-bit rounding of two images). Animations inside a mask stop
+  with the masked layer's pause (measured), so a faded light costs nothing. Cost against the old light, 3 runs each,
+  alternated: WindowServer 26.7% against 27.2% (noise), the overlay process 2.2 to 2.4% against 2.0 to 2.3%.
 - The overlay goes when the window goes. Each tick reads the browser window's alpha (`window_alpha`): gone (a Quit)
   or under 0.5 (macOS fading it out as it closes, about 0.3 s, still listed meanwhile) hides at once; MISSING_FOR stays
   for a window still there but unseen (another Space, a minimize). Panels have no system animation
