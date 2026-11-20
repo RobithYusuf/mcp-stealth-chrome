@@ -719,7 +719,7 @@ def cli(argv: list[str]) -> int:
     opener.add_argument("--browser", choices=brave_mode.BROWSERS, default=brave_mode.CHROME)
     opener.add_argument("--url", help="open this URL (a new tab when the browser is running)")
     opener.add_argument("--dock-icon", action="store_true",
-                        help="run from the Beta channel with the project icon (MCP_STEALTH_DOCK_ICON=1)")
+                        help="run from the Beta channel (MCP_STEALTH_DOCK_ICON=1): Chrome Beta with the project icon, Brave Beta with its own")
     opener.add_argument("--move-to-beta", action="store_true",
                         help="let Brave Beta take a profile Brave made (one way; its cookies are moved)")
     opener.add_argument("--lean", dest="lean", action="store_true", default=None,

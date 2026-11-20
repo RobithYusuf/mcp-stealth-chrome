@@ -178,16 +178,14 @@ def missing_note() -> str:
 
 def start_in_background(root: Optional[Path] = None) -> bool:
     """Called when the server starts, on a thread so it costs the caller nothing: removes an
-    old Chrome copy when nothing runs from it, and puts the icon on Beta when that is turned
-    on and an update took it off. True when a thread was started."""
+    old Chrome copy when nothing runs from it, and puts the icon on Chrome Beta when that is
+    turned on and an update took it off. Never on Brave Beta, which keeps its own icon
+    (brave_beta.py). True when a thread was started."""
     if sys.platform != "darwin":
         return False
     old_copy = (root or app_dir()).is_dir()
     wants_icon = enabled() and beta_binary() is not None and not _icon_current(BETA_APP)
-    from . import brave_beta  # here: it imports this module
-    wants_brave = (enabled() and brave_beta.beta_binary() is not None
-                   and not _icon_current(brave_beta.BETA_APP))
-    if not old_copy and not wants_icon and not wants_brave:
+    if not old_copy and not wants_icon:
         return False
 
     def job() -> None:
@@ -196,12 +194,11 @@ def start_in_background(root: Optional[Path] = None) -> bool:
             outcome = discard_copy(root)
             if outcome != "removed" and outcome != "nothing to remove":
                 notes.append(f"old Chrome copy {outcome}")
-        for wanted, app in ((wants_icon, BETA_APP), (wants_brave, brave_beta.BETA_APP)):
-            if wanted:
-                try:
-                    put_icon_on(app)
-                except _Note as why:
-                    notes.append(f"{app.name}: {why}")
+        if wants_icon:
+            try:
+                put_icon_on(BETA_APP)
+            except _Note as why:
+                notes.append(f"{BETA_APP.name}: {why}")
         if notes:
             raise _Note("; ".join(notes))
 

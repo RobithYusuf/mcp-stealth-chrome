@@ -2195,7 +2195,7 @@ def _launch_choice(profile_path: Optional[Path], headless: bool,
     and would make a new one look used. `executable` is a browser the caller chose (Brave),
     which the Dock icon never replaces."""
     if executable:
-        # A visible Brave runs from Brave Beta with the project icon on the same terms.
+        # A visible Brave runs from Brave Beta, with Beta's own icon, on the same terms.
         picked, on_beta, note = brave_beta.choose(profile_path, headless=headless,
                                                   brave=executable, extra_args=extra_args)
         return _LaunchChoice(picked, beta=on_beta, note=note, product=brave_mode.BRAVE)

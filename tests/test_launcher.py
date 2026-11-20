@@ -185,6 +185,13 @@ def _app(apps: Path, name: str, binary: str, version: str) -> Path:
     return app
 
 
+@pytest.fixture(autouse=True)
+def _icon_writes_restored(monkeypatch):
+    """`open --from-app` turns dock_icon.ICON_WRITES off for its whole one-shot process, which is
+    right there and leaked here: test_dock_icon.py run after this file then failed 8 tests."""
+    monkeypatch.setattr(dock_icon, "ICON_WRITES", dock_icon.ICON_WRITES)
+
+
 @pytest.fixture
 def betas(tmp_path, monkeypatch):
     apps = tmp_path / "Applications"
@@ -251,14 +258,22 @@ def test_the_icon_goes_on_brave_beta_and_never_on_brave(tmp_path, monkeypatch):
     assert put == [] and list(brave.iterdir()) == []
 
 
-def test_no_icon_job_from_a_process_the_app_started(betas, monkeypatch):
-    monkeypatch.setattr(dock_icon, "ICON_WRITES", False)
+@pytest.mark.parametrize("icon_writes", [True, False])
+def test_brave_beta_keeps_its_own_icon_and_nothing_is_written_into_it(betas, monkeypatch, icon_writes):
+    """The project icon is Chrome's. On Brave Beta it made the pinned launcher and the running
+    browser look the same (20 Nov 2026); Brave Beta's own icon is what tells it from the person's
+    Brave. No icon job, no flag clearing, no mark, from a server or from the launcher app."""
+    monkeypatch.setattr(dock_icon, "ICON_WRITES", icon_writes)
     monkeypatch.setattr(dock_icon, "_icon_failed", {})
-    started = []
-    monkeypatch.setattr(dock_icon, "_start", lambda job: started.append(job) or True)
+    writes = []
+    monkeypatch.setattr(dock_icon, "_start", lambda job: writes.append(("job", job)) or True)
+    monkeypatch.setattr(dock_icon, "_clear_dangling_flag", lambda app: writes.append(("clear", app)))
+    monkeypatch.setattr(dock_icon, "_write_mark", lambda *a: writes.append(("mark", a)))
+    monkeypatch.setattr(dock_icon, "_set_icon", lambda *a: writes.append(("icon", a)))
     choice = brave_beta.prepare(headless=False)
-    assert choice.executable == betas.beta and "does not modify other apps" in choice.note
-    assert started == []
+    assert choice.executable == betas.beta and choice.note == "", choice
+    assert writes == []
+    assert brave_beta.status()["state"] == "beta-ready" and "own icon" in brave_beta.status()["detail"]
 
 
 def test_the_cookie_reader_keeps_the_launch_keychain(monkeypatch, tmp_path):
@@ -455,7 +470,8 @@ def test_f5_a_process_the_app_started_writes_nothing_into_another_app(which, bet
         monkeypatch.setattr(dock_icon, "BETA_APP", chrome_beta)
         monkeypatch.setattr(dock_icon.sys, "platform", "darwin")
         choice = _REAL_CHROME_PREPARE(headless=False)
-    assert choice.executable and "does not modify other apps" in choice.note
+    # Chrome Beta says why its icon is not put on from the app; Brave Beta never gets one.
+    assert choice.executable and ("does not modify other apps" in choice.note) == (which == "chrome")
     assert writes == []
 
 

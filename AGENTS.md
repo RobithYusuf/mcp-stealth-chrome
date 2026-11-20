@@ -33,7 +33,7 @@ uvx mcp-stealth-chrome → Python 3.11+ → FastMCP → nodriver → Chrome/Chro
 - `src/mcp_stealth_chrome/quit_watch.py` — starts the per-browser quit watcher and keeps its state files; `_quit_watcher.py` is that watcher, a standalone script.
 - `src/mcp_stealth_chrome/cookie_migration.py` — moving a profile's `v10` cookies to Chrome 158's `v11` before it loses them.
   `cookie_db.py` reads a cookie database for such a decision: a private copy with its journal rolled back.
-- `src/mcp_stealth_chrome/brave_beta.py`: a headed Brave from Brave Beta with the project icon (`MCP_STEALTH_DOCK_ICON=1`). `launcher.py`: `mcp-stealth-chrome open` and the Dock launcher app (`install-launcher`).
+- `src/mcp_stealth_chrome/brave_beta.py`: a headed Brave from Brave Beta, with Beta's own icon (`MCP_STEALTH_DOCK_ICON=1`). `launcher.py`: `mcp-stealth-chrome open` and the Dock launcher app (`install-launcher`).
 - `src/mcp_stealth_chrome/brave.py`: `browser="brave"`: finding Brave, its profiles, the profile binding, vertical tabs.
 - `src/mcp_stealth_chrome/tab_record.py`: the saved tab list behind `restore_tabs`: the file, its order, masking, `/json/list` at exit.
 - `src/mcp_stealth_chrome/keep_alive.py`: browsers left running at exit (`keep_alive=True`): the record, the "is it ours" check, leaving one running at exit.
@@ -558,8 +558,12 @@ conclusions. Each rule below replaced a real lie.
 
 - `brave_beta.py` is Chrome Beta's rule for Brave: headed, `MCP_STEALTH_DOCK_ICON=1`, macOS, `/Applications/Brave Browser Beta.app`
   (`com.brave.Browser.beta`). `profile_version.beta_verdict(names=("Brave", "Brave Beta"))` decides, before anything writes
-  to the profile; the icon goes on through `dock_icon.put_icon_on`, which only accepts `Google Chrome Beta.app` and
-  `Brave Browser Beta.app` and refuses anything resolving to `/Applications/Google Chrome.app` or `/Applications/Brave Browser.app`.
+  to the profile. Brave Beta keeps its own icon and nothing is written into it (`brave_beta.prepare` starts no icon job, and
+  neither does `dock_icon.start_in_background` at server start, which still put it on in the first draft):
+  the project icon is Chrome's, and on Brave Beta it made the pinned launcher and the running browser look the same, so
+  the person pinned Brave Beta itself, which opens plain Beta (20 Nov 2026). An icon an older version put there goes with
+  Beta's next update. `dock_icon.put_icon_on` still only accepts `Google Chrome Beta.app` and `Brave Browser Beta.app` and
+  refuses anything resolving to `/Applications/Google Chrome.app` or `/Applications/Brave Browser.app`.
   The person's Brave is never written to, attached to or read. `brave.is_brave_executable` knows "Brave Browser Beta", or
   block_ads would run beside Shields.
 - Brave on macOS keeps its updater state in Sparkle's defaults domain of each bundle id: `com.brave.Browser`

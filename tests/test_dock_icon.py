@@ -663,3 +663,24 @@ def test_a_profile_beta_must_not_open_means_google_chrome_and_no_icon_work(mac):
     choice = dock_icon.prepare(headless=False, profile_refusal="this profile already holds data")
     assert choice == dock_icon.DockChrome(note="Google Chrome, because this profile already holds data")
     assert not dock_icon.building() and mac.icon == [] and mac.cleared == []
+
+
+def test_the_server_start_job_never_puts_the_icon_on_brave_beta(tmp_path, monkeypatch):
+    """Brave Beta keeps its own icon. The job a server starts with put the project icon on it
+    anyway, beside brave_beta.prepare, which no longer did (found on a real Brave Beta install,
+    20 Nov 2026)."""
+    from mcp_stealth_chrome import brave_beta
+    apps = tmp_path / "Applications"
+    brave = apps / "Brave Browser Beta.app" / "Contents" / "MacOS"
+    brave.mkdir(parents=True)
+    (brave / "Brave Browser Beta").write_text("#!/bin/sh\n")
+    (brave / "Brave Browser Beta").chmod(0o755)
+    monkeypatch.setattr(brave_beta, "BETA_APP", apps / "Brave Browser Beta.app")
+    monkeypatch.setattr(dock_icon, "BETA_APP", apps / "Google Chrome Beta.app")  # not installed
+    monkeypatch.setattr(dock_icon.sys, "platform", "darwin")
+    monkeypatch.setenv(dock_icon.ENV_SWITCH, "1")
+    monkeypatch.setenv(dock_icon.ENV_APP_DIR, str(tmp_path / "no-old-copy"))
+    put = []
+    monkeypatch.setattr(dock_icon, "put_icon_on", lambda app: put.append(app))
+    assert dock_icon.start_in_background() is False, "nothing to do: Chrome Beta absent, Brave Beta keeps its icon"
+    assert put == []

@@ -1,10 +1,12 @@
-"""A visible Brave with the project icon: Brave Beta, as Chrome Beta is for Chrome.
+"""A visible Brave told apart from the person's: Brave Beta, with Brave Beta's own icon.
 
-Opt-in with the same switch, MCP_STEALTH_DOCK_ICON=1, on macOS, for a headed launch with
-browser="brave". The person's own Brave is `/Applications/Brave Browser.app`; the agent's runs
-from `/Applications/Brave Browser Beta.app`, which carries the project icon as a custom Finder
-icon (`Icon\\r` and the FinderInfo flag at the bundle root, dock_icon.put_icon_on). Nothing
-under `Contents/` is written, so `codesign --verify --deep` still passes. Brave Beta has its own
+Opt-in with the same switch as Chrome Beta, MCP_STEALTH_DOCK_ICON=1, on macOS, for a headed launch
+with browser="brave". The person's own Brave is `/Applications/Brave Browser.app`; the agent's runs
+from `/Applications/Brave Browser Beta.app`, whose own Beta icon is what tells the two apart in the
+Dock and the app switcher. Nothing is written into Brave Beta: the project icon belongs to Chrome
+(stealth chrome); on Brave Beta it made the pinned launcher and the running browser look the same,
+and the person could not tell which to pin (20 Nov 2026). An icon an older version put on Brave
+Beta goes with Beta's next update, which replaces the bundle. Brave Beta has its own
 bundle id (com.brave.Browser.beta) and its own Sparkle settings domain, which is where Brave on
 macOS keeps what its updater knows (`SULastCheckTime`, `LastRunAppBundlePath`): running Beta
 never touches com.brave.Browser.
@@ -44,8 +46,6 @@ KEYCHAIN_NOTE = ("the first time, macOS may ask whether Brave Browser Beta may u
                  "Storage' in your Keychain: Always Allow keeps its logins, Deny makes it drop the "
                  "cookies it cannot read")
 
-PENDING_NOTE = ("the project icon is being put back on Brave Beta (an update removes it), so "
-                "this window may show Beta's own icon")
 
 
 def beta_binary() -> Optional[Path]:
@@ -121,31 +121,20 @@ def choose(profile: Optional[Path], *, headless: bool, brave: str,
 
 
 def prepare(*, headless: bool) -> dock_icon.DockChrome:
-    """Brave Beta for this headed launch, answered at once: the icon check is a stat and an xattr
-    read, and a missing icon goes back on in a background thread. Never raises."""
+    """Brave Beta for this headed launch, with its own icon: nothing is written into the bundle,
+    so this is a stat and a plist read. Never raises."""
     try:
         binary = chosen(headless=headless)
         if binary is None:
             return dock_icon.DockChrome(note=missing_note() if wanted(headless=headless) else "")
         version = (dock_icon._bundle_version(BETA_APP) or ("",))[0]
-        if dock_icon._icon_current(BETA_APP):
-            return dock_icon.DockChrome(executable=binary, version=version)
-        if not dock_icon.ICON_WRITES:  # before any write, the dangling flag's clearing included
-            return dock_icon.DockChrome(executable=binary, version=version,
-                                        note=dock_icon.NO_WRITES_NOTE)
-        dock_icon._clear_dangling_flag(BETA_APP)
-        key = dock_icon._icon_key(BETA_APP)
-        if key in dock_icon._icon_failed:
-            return dock_icon.DockChrome(executable=binary, version=version,
-                                        note=f"Brave Beta shows its own icon: {dock_icon._icon_failed[key]}")
-        dock_icon._start(lambda: dock_icon.put_icon_on(BETA_APP))
-        return dock_icon.DockChrome(executable=binary, version=version, note=PENDING_NOTE)
+        return dock_icon.DockChrome(executable=binary, version=version)
     except Exception as exc:
         return dock_icon.DockChrome(note=f"{type(exc).__name__}: {exc}")
 
 
 def status() -> dict:
-    """For server_status: off, unavailable, beta-missing, beta-ready or icon-missing. Reads only."""
+    """For server_status: off, unavailable, beta-missing or beta-ready. Reads only."""
     try:
         if sys.platform != "darwin":
             return {"state": "unavailable", "detail": "only on macOS"}
@@ -154,16 +143,11 @@ def status() -> dict:
         if not dock_icon.enabled():
             return {"state": "off", "detail": (
                 f"off. {dock_icon.ENV_SWITCH}=1 runs visible Brave from Brave Beta"
-                + (f" {version} with the project icon" if binary else
+                + (f" {version} with its own icon" if binary else
                    f"; Brave Beta is not installed in {BETA_APP.parent}"))}
         if binary is None:
             return {"state": "beta-missing", "detail": missing_note()}
-        if dock_icon._icon_current(BETA_APP):
-            return {"state": "beta-ready",
-                    "detail": f"visible Brave runs from {BETA_APP} ({version}) with the project icon"}
-        failed = dock_icon._icon_failed.get(dock_icon._icon_key(BETA_APP))
-        return {"state": "icon-missing", "detail": (
-            f"Brave Beta {version} is used with its own icon: {failed}" if failed else
-            f"Brave Beta {version} has no project icon yet; it is put on at the next visible launch")}
+        return {"state": "beta-ready",
+                "detail": f"visible Brave runs from {BETA_APP} ({version}) with Brave Beta's own icon"}
     except Exception as exc:
         return {"state": "unavailable", "detail": f"{type(exc).__name__}: {exc}"}
