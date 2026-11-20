@@ -2,7 +2,7 @@
 
 humanize_click is click(humanize=True) or mouse_click_xy(humanize=True); localstorage_clear,
 sessionstorage_set and sessionstorage_clear are localstorage_set(area=, clear=). The old names
-still work for one release. click_at_image says whether the page changed, extract_structured
+were kept for one release and removed in 0.25.0. click_at_image says whether the page changed, extract_structured
 returns absolute links, and fingerprint_rotate warns when it claims another OS.
 
 The unit tests run always; the browser tests need MCP_E2E=1 (headless, ephemeral, loopback).
@@ -112,19 +112,19 @@ def test_extract_structured_returns_absolute_links_and_raw_on_request(mcp):
 
 
 @e2e
-def test_the_merged_click_and_its_old_name_both_click(mcp):
+def test_the_merged_click_clicks_and_the_old_name_is_gone(mcp):
     start = _n(mcp)
     curved = mcp.call("mouse_click_xy", x=50, y=290, humanize=True)
     assert not curved.failed and "curved approach" in curved.text and "button" in curved.text, curved.text
-    old = mcp.call("humanize_click", x=50, y=290)
-    assert not old.failed and "curved approach" in old.text, old.text
-    by_selector = mcp.call("humanize_click", selector="#b")
+    by_selector = mcp.call("click", selector="#b", humanize=True)
     assert not by_selector.failed and "page changed" in by_selector.text, by_selector.text
-    assert _n(mcp) == start + 3
+    old = mcp.call("humanize_click", x=50, y=290)
+    assert old.failed and "humanize_click" in old.text, old.text
+    assert _n(mcp) == start + 2  # the refused old name clicked nothing
 
 
 @e2e
-def test_one_storage_setter_for_both_stores_and_the_old_names_still_work(mcp):
+def test_one_storage_setter_for_both_stores_and_the_old_names_are_gone(mcp):
     assert "it now holds 1 entry" in mcp.call("localstorage_set", key="a", value="1").text
     assert "it now holds 2 entries" in mcp.call("localstorage_set", key="b", value="2").text
     cleared = mcp.call("localstorage_set", clear=True, key="c", value="3")
@@ -132,10 +132,12 @@ def test_one_storage_setter_for_both_stores_and_the_old_names_still_work(mcp):
     assert json.loads(mcp.call("localstorage_get").text) == {"c": "3"}
     assert "sessionStorage" in mcp.call("localstorage_set", key="s", value="9", area="session").text
     assert json.loads(mcp.call("sessionstorage_get").text) == {"s": "9"}
-    # The old names, for one release.
-    assert "sessionStorage" in mcp.call("sessionstorage_set", key="t", value="8").text
-    assert "0 entries" in mcp.call("sessionstorage_clear").text
-    assert "0 entries" in mcp.call("localstorage_clear").text
+    assert "0 entries" in mcp.call("localstorage_set", area="session", clear=True).text
+    assert "0 entries" in mcp.call("localstorage_set", clear=True).text
+    # The old names were removed in 0.25.0.
+    for old in ("sessionstorage_set", "sessionstorage_clear", "localstorage_clear"):
+        reply = mcp.call(old)
+        assert reply.failed and old in reply.text, (old, reply.text)
     # What it refuses changes nothing.
     for bad in ({"area": "cookie", "clear": True}, {}, {"key": "k"}):
         reply = mcp.call("localstorage_set", **bad)

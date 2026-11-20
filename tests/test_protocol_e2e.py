@@ -240,8 +240,8 @@ def test_a_click_that_opens_an_alert_returns_and_can_be_answered(page):
 @pytest.mark.parametrize("tool,kw", [
     ("click", {"selector": "#b"}),
     ("mouse_click_xy", {"x": 50, "y": 30}),
-    ("humanize_click", {"x": 50, "y": 30}),
-    ("humanize_click", {"selector": "#b"}),
+    ("mouse_click_xy", {"x": 50, "y": 30, "humanize": True}),
+    ("click", {"selector": "#b", "humanize": True}),
     ("click_element_offset", {"selector": "#b"}),
     ("click_at_corner", {"selector": "#b"}),
     ("hover", {"selector": "#b"}),
@@ -268,14 +268,14 @@ def test_a_dialog_opened_by_the_pointer_moving_is_reported(mcp, base, tool, kw):
 
 
 @pytest.mark.parametrize("tool,kw", [
-    ("humanize_click", {"selector": "#b"}),
-    ("humanize_click", {"x": 50, "y": 30}),
+    ("click", {"selector": "#b", "humanize": True}),
+    ("mouse_click_xy", {"x": 50, "y": 30, "humanize": True}),
     ("click_element_offset", {"selector": "#b"}),
     ("mouse_move", {"x": 50, "y": 30, "humanize": True}),
 ])
 def test_a_path_cut_short_by_a_dialog_sends_nothing_after_the_tool_returns(mcp, base, tool, kw):
     """The move that opened the dialog was answered by dialog_handle, and the rest of the path,
-    with humanize_click's press after it, then went out into whatever page was open."""
+    with the humanized click's press after it, then went out into whatever page was open."""
     mcp.call("navigate", url=f"{base}/movecount.html")
     reply = mcp.call(tool, _timeout=25, **kw)
     answered = mcp.call("dialog_handle", action="accept", _timeout=10)
@@ -386,7 +386,7 @@ def test_inject_init_script_runs_on_a_fresh_tab(base):
 
 def test_same_length_text_change_is_a_page_change(page):
     for reply in (page.call("click", selector="#inc"), page.call("click", selector="#swap"),
-                  page.call("click_text", text="Increment"), page.call("humanize_click", selector="#inc")):
+                  page.call("click_text", text="Increment"), page.call("click", selector="#inc", humanize=True)):
         assert "NO page change" not in reply.text, reply.text
     assert page.evaluate("document.getElementById('count').textContent") == "3"
 
@@ -465,7 +465,7 @@ def test_point_clicks_land_and_report_the_outcome(page):
 
 
 def test_raw_points_outside_the_viewport_are_refused(page):
-    for reply in (page.call("mouse_click_xy", x=-5, y=99999), page.call("humanize_click", x=-50, y=-50),
+    for reply in (page.call("mouse_click_xy", x=-5, y=99999), page.call("mouse_click_xy", x=-50, y=-50, humanize=True),
                   page.call("mouse_move", x=-50, y=-60)):
         assert reply.failed and "viewport" in reply.text, reply.text
 
@@ -653,8 +653,9 @@ def test_image_blocking_covers_the_first_page(base, option):
 
 def test_storage_tools_report_a_refused_write(page):
     page.call("navigate", url="about:blank")
-    for reply in (page.call("localstorage_set", key="a", value="1"), page.call("localstorage_clear"),
-                  page.call("sessionstorage_set", key="a", value="1"), page.call("sessionstorage_clear"),
+    for reply in (page.call("localstorage_set", key="a", value="1"), page.call("localstorage_set", clear=True),
+                  page.call("localstorage_set", key="a", value="1", area="session"),
+                  page.call("localstorage_set", area="session", clear=True),
                   page.call("sessionstorage_get")):
         assert reply.failed, reply.text
 

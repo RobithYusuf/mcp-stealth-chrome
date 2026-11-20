@@ -36,7 +36,7 @@ class GestureStopped(Exception):
 
 # _dispatch_input stops waiting once a native dialog blocks a gesture, and returns while the
 # gesture's task still runs: the step that opened the dialog only finishes once it is answered.
-# Every later step then went out into whatever page was open by then. A humanize_click whose
+# Every later step then went out into whatever page was open by then. A humanized click whose
 # path opened an alert sent the rest of its path and its click after dialog_handle, into the
 # next page, and opened that page's alert while another tool was running. Bound in the task
 # _dispatch_input starts, so it reaches that gesture and no other.

@@ -497,12 +497,6 @@ async def localstorage_set(key: Optional[str] = None, value: Optional[str] = Non
 
 
 @mcp.tool()
-async def localstorage_clear() -> str:
-    """Deprecated, removed in 0.25.0: use localstorage_set(clear=True)."""
-    return await localstorage_set(clear=True)
-
-
-@mcp.tool()
 async def sessionstorage_get(key: Optional[str] = None) -> str:
     """Get sessionStorage — all keys or one."""
     try:
@@ -518,18 +512,6 @@ async def sessionstorage_get(key: Optional[str] = None) -> str:
         return ok(str(result or "{}"))
     except Exception as e:
         return err(str(e))
-
-
-@mcp.tool()
-async def sessionstorage_set(key: str, value: str) -> str:
-    """Deprecated, removed in 0.25.0: use localstorage_set(key, value, area="session")."""
-    return await localstorage_set(key=key, value=value, area="session")
-
-
-@mcp.tool()
-async def sessionstorage_clear() -> str:
-    """Deprecated, removed in 0.25.0: use localstorage_set(area="session", clear=True)."""
-    return await localstorage_set(area="session", clear=True)
 
 
 @mcp.tool()

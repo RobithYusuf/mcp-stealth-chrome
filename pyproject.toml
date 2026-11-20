@@ -1,7 +1,7 @@
 [project]
 name = "mcp-stealth-chrome"
-version = "0.24.2"
-description = "MCP server with 173 tools: a real Chrome browser over CDP with nodriver, HTTP with Chrome's TLS fingerprint, Cloudflare Turnstile handling, session reuse, and web research without API keys"
+version = "0.25.0"
+description = "MCP server with 169 tools: a real Chrome browser over CDP with nodriver, HTTP with Chrome's TLS fingerprint, Cloudflare Turnstile handling, session reuse, and web research without API keys"
 readme = "README.md"
 license = { text = "MIT" }
 authors = [

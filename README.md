@@ -4,7 +4,7 @@
 
 # MCP Stealth Chrome
 
-An MCP server with 173 tools that gives an AI agent a real Chrome browser and an HTTP client with Chrome's TLS fingerprint.
+An MCP server with 169 tools that gives an AI agent a real Chrome browser and an HTTP client with Chrome's TLS fingerprint.
 
 [![PyPI version](https://img.shields.io/pypi/v/mcp-stealth-chrome.svg)](https://pypi.org/project/mcp-stealth-chrome/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -304,7 +304,7 @@ Measured in November 2026 on one Mac (M4 Pro, Chrome 157, headless, a throwaway 
 | Snapshot of the Wikipedia page | 2,405 tokens for the first 100 elements, 100,127 for all | 225,658 tokens |
 | Start the browser and load the first page | 1.07 s | 0.66 s |
 | Memory with one page open | 941 MB in 10 processes | 585 MB in 6 processes |
-| Tool definitions sent to the client | 39,877 tokens for 173 tools | 7,300 tokens for 32 tools |
+| Tool definitions sent to the client | about 39,500 tokens for 169 tools | 7,300 tokens for 32 tools |
 
 - ✅ Faster at opening pages, clicking, filling and reading, and smaller snapshots. A snapshot here lists what can be acted on; the other server's lists the whole accessibility tree including text, so the two are not the same content.
 - ❌ Slower to start, heavier in memory, and its tool list costs a client that loads every definition about five times as much. `profile_mode="light"` brought one page to about 630 MB in 7 processes, at the cost described under Speed, memory and disk.
@@ -749,11 +749,11 @@ Open a group to see its tools.
 </details>
 
 <details>
-<summary><b>Mouse and behaviour</b> (8)</summary>
+<summary><b>Mouse and behaviour</b> (7)</summary>
 
-`mouse_click_xy`, `mouse_move`, `mouse_drift`, `mouse_record`, `mouse_replay`, `humanize_click`, `humanize_type`, `find_by_image`
+`mouse_click_xy`, `mouse_move`, `mouse_drift`, `mouse_record`, `mouse_replay`, `humanize_type`, `find_by_image`
 
-`click(humanize=True)` and `mouse_click_xy(humanize=True)` approach along a curved path. `humanize_click` does the same and is removed in 0.25.0.
+`click(humanize=True)` and `mouse_click_xy(humanize=True)` approach along a curved path. The older humanize_click was removed in 0.25.0: use these.
 </details>
 
 <details>
@@ -805,11 +805,11 @@ Open a group to see its tools.
 </details>
 
 <details>
-<summary><b>Cookies and storage</b> (18)</summary>
+<summary><b>Cookies and storage</b> (15)</summary>
 
-`cookie_list`, `cookie_set`, `cookie_delete`, `cookie_import`, `cookie_export`, `localstorage_get`, `localstorage_set`, `localstorage_clear`, `sessionstorage_get`, `sessionstorage_set`, `sessionstorage_clear`, `cache_clear`, `indexeddb_list`, `indexeddb_delete`, `storage_state_save`, `storage_state_load`, `storage_snapshot`, `storage_diff`
+`cookie_list`, `cookie_set`, `cookie_delete`, `cookie_import`, `cookie_export`, `localstorage_get`, `localstorage_set`, `sessionstorage_get`, `cache_clear`, `indexeddb_list`, `indexeddb_delete`, `storage_state_save`, `storage_state_load`, `storage_snapshot`, `storage_diff`
 
-`localstorage_set` sets or clears either store: `area="session"` for sessionStorage, `clear=True` to empty it. `localstorage_clear`, `sessionstorage_set` and `sessionstorage_clear` still work and are removed in 0.25.0.
+`localstorage_set` sets or clears either store: `area="session"` for sessionStorage, `clear=True` to empty it. The older localstorage_clear, sessionstorage_set and sessionstorage_clear were removed in 0.25.0: use this.
 </details>
 
 <details>
@@ -883,7 +883,7 @@ These run without a browser and without a search API key, and use the stealth br
 <details>
 <summary><b>Anti-bot</b></summary>
 
-`detect_anti_bot` identifies Cloudflare, DataDome, PerimeterX, Akamai, Kasada and Imperva on the current page. `detect_and_bypass` also applies the best approach this server has. `click_turnstile` and `verify_cf` click a Turnstile checkbox, with template matching as a fallback. `fingerprint_audit` checks this browser's own fingerprint for inconsistencies, and states what it cannot see from inside a page, such as TLS or IP against timezone. `identity_pin` keeps a stable identity and proxy per instance. `mouse_drift`, `mouse_record`, `mouse_replay`, `humanize_click` and `humanize_type` add natural movement.
+`detect_anti_bot` identifies Cloudflare, DataDome, PerimeterX, Akamai, Kasada and Imperva on the current page. `detect_and_bypass` also applies the best approach this server has. `click_turnstile` and `verify_cf` click a Turnstile checkbox, with template matching as a fallback. `fingerprint_audit` checks this browser's own fingerprint for inconsistencies, and states what it cannot see from inside a page, such as TLS or IP against timezone. `identity_pin` keeps a stable identity and proxy per instance. `mouse_drift`, `mouse_record`, `mouse_replay`, `click(humanize=True)` and `humanize_type` add natural movement.
 
 `solve_turnstile_oscursor(url=None, timeout_s=50.0)` tries a different path for an interactive full-page challenge. It opens a fresh headed Chrome without a CDP client, locates the checkbox in an OS screenshot, clicks with the real desktop cursor, then waits eight seconds before attaching CDP to read cookies. It transfers only site cookies through the storage-state loader and reports success only after the main browser returns HTTP 200 with no detected challenge. A click or a clearance cookie alone is not proof of access. An unsuccessful challenge is reported, not retried automatically.
 
@@ -933,7 +933,7 @@ These run without a browser and without a search API key, and use the stealth br
 
 ### API keys
 
-✅ 167 of the 173 tools need no key. These six do:
+✅ 163 of the 169 tools need no key. These six do:
 
 | Tools | Key | Approximate cost |
 |-------|-----|------------------|

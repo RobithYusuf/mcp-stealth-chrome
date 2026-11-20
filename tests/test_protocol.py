@@ -209,7 +209,8 @@ def test_every_tool_still_takes_every_argument_it_advertises(mcp):
     import asyncio
     from mcp_stealth_chrome._app import unknown_arguments_error
     tools = asyncio.run_coroutine_threadsafe(mcp.session.list_tools(), mcp._loop).result(30).tools
-    assert len(tools) >= 170
+    from test_registry import EXPECTED_COUNT
+    assert len(tools) == EXPECTED_COUNT  # every registered tool came over the protocol
     from mcp_stealth_chrome.server import mcp as server
     for listed in tools:
         tool = server._tool_manager.get_tool(listed.name)

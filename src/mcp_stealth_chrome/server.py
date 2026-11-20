@@ -8292,7 +8292,7 @@ def _drop_handlers(tab: Any, pairs: Any) -> None:
             tab.handlers[event_type].remove(handler)
 
 
-# fingerprint_rotate, the identity tools, humanize_click and humanize_type, storage_state_save and
+# fingerprint_rotate, the identity tools, humanize_type, storage_state_save and
 # storage_state_load, solve_captcha and verify_cf live in tools/stealth.py. _apply_storage_state stays
 # here because launch paths and the os-cursor solver share it.
 
@@ -11112,7 +11112,7 @@ async def detect_and_bypass() -> str:
         if "perimeterx" in det_lower:
             result["next_steps"].append(
                 "PerimeterX/HUMAN: storage_state_load is most reliable. New sessions need "
-                "mobile proxy + humanize_click."
+                "mobile proxy + click(humanize=True)."
             )
         if "akamai" in det_lower:
             result["next_steps"].append(

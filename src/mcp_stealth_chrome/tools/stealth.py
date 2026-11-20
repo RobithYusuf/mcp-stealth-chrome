@@ -323,21 +323,6 @@ async def fingerprint_rotate(
 
 
 @mcp.tool()
-async def humanize_click(ref: Optional[str] = None,
-                          selector: Optional[str] = None,
-                          x: Optional[int] = None,
-                          y: Optional[int] = None) -> str:
-    """Deprecated, removed in 0.25.0: use click(humanize=True) for an element, or
-    mouse_click_xy(x, y, humanize=True) for a point."""
-    if x is not None and y is not None:
-        from .interaction import mouse_click_xy
-        return await mouse_click_xy(x=x, y=y, humanize=True)
-    if ref is None and selector is None:
-        return err("pass ref=, selector=, or both x= and y=")
-    return await _srv.click(ref=ref, selector=selector, humanize=True)
-
-
-@mcp.tool()
 async def humanize_type(text: str, mean_delay: float = 0.12) -> str:
     """Type with Gaussian-distributed keystroke delays. See type_text."""
     return await _srv.type_text(text=text, humanize=True, mean_delay=mean_delay)

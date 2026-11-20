@@ -11,7 +11,7 @@ both surfaced by the registry gate).
 """
 import sys
 
-EXPECTED_COUNT = 173
+EXPECTED_COUNT = 169
 EXPECTED_TOOLS = {
     # Lifecycle
     "browser_launch", "browser_close", "browser_recover",
@@ -36,8 +36,8 @@ EXPECTED_TOOLS = {
     "tab_list", "tab_new", "tab_select", "tab_close",
     # Storage
     "cookie_list", "cookie_set", "cookie_delete", "cookie_import", "cookie_export",
-    "localstorage_get", "localstorage_set", "localstorage_clear",
-    "sessionstorage_get", "sessionstorage_set", "sessionstorage_clear",
+    "localstorage_get", "localstorage_set",
+    "sessionstorage_get",
     "cache_clear", "indexeddb_list", "indexeddb_delete",
     "storage_state_save", "storage_state_load",
     "storage_snapshot", "storage_diff",
@@ -60,7 +60,7 @@ EXPECTED_TOOLS = {
     # Stealth / captcha
     "solve_captcha", "verify_cf", "fingerprint_rotate", "fingerprint_audit",
     "identity_pin", "identity_show",
-    "humanize_click", "humanize_type",
+    "humanize_type",
     "click_turnstile", "click_element_offset", "click_at_corner",
     "find_by_image", "click_at_image",
     "mouse_drift", "mouse_record", "mouse_replay",

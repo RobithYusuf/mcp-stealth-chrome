@@ -211,16 +211,16 @@ def test_mouse_click_xy_hovers_first(loop):
     assert "after hover" in out
 
 
-def test_humanize_click_by_coordinates(loop):
+def test_humanized_click_by_coordinates(loop):
     loop.run_until_complete(tool("evaluate")(
         "document.getElementById('out').textContent='idle'"))
     box = json.loads(loop.run_until_complete(tool("evaluate")(
         "JSON.stringify((()=>{const r=document.getElementById('freebtn')"
         ".getBoundingClientRect();return{x:Math.round(r.left+r.width/2),"
         "y:Math.round(r.top+r.height/2)};})())")))
-    # humanize_click is mouse_click_xy(humanize=True) now (removed in 0.25.0), which also says
-    # what the point was before the press.
-    out = loop.run_until_complete(tool("humanize_click")(x=box["x"], y=box["y"]))
+    # mouse_click_xy(humanize=True), which replaced humanize_click, also says what the point was
+    # before the press.
+    out = loop.run_until_complete(tool("mouse_click_xy")(x=box["x"], y=box["y"], humanize=True))
     assert "curved approach" in out and "freebtn" in out, out
     state = loop.run_until_complete(tool("evaluate")(
         "document.getElementById('out').textContent"))
