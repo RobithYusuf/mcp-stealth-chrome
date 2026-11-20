@@ -210,7 +210,9 @@ def cli(argv: list[str]) -> int:
     action = argv[0] if argv else "list"
     if action in ("list", "show"):
         info = report()
-        print(f"Settings file: {info['file']}  (an environment variable wins over it)\n")
+        print(f"Settings file: {info['file']}  (an environment variable wins over it)")
+        print("Values as this terminal sees them. A server's MCP config can set the same variables")
+        print("for that server only; its server_status.settings shows what it uses.\n")
         width = max(len(s.key) for s in SETTINGS)
         for s in SETTINGS:
             r = info[s.key]

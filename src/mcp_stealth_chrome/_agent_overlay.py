@@ -915,7 +915,9 @@ class Bar:
         # of the light moving under it.
         self.fx = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, 400, self.H))
         self.fx.setWantsLayer_(True)
-        self.fx.layer().setBackgroundColor_(cg((0.07, 0.08, 0.11, 0.92)))
+        # Opaque: at 0.92 the white text of a page behind the bar read through it, and at 0.98
+        # it still showed when looked at closely (5 levels of 255 over the bar's colour).
+        self.fx.layer().setBackgroundColor_(cg((0.07, 0.08, 0.11, 1.0)))
         self.fx.layer().setCornerRadius_(self.H / 2)
         self.fx.layer().setBorderWidth_(0.5)
         self.fx.layer().setBorderColor_(cg((1, 1, 1, 0.16)))
