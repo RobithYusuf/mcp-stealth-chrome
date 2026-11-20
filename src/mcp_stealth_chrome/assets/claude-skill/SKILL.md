@@ -33,6 +33,22 @@ A real Chrome (or Brave) driven over CDP, with a browserless HTTP client that ha
 - `select_option`, `check`, `type_text`, `press_key`, `scroll` (real wheel events), `fill_form`.
 - Add `humanize=True` on bot-sensitive pages.
 
+## Research across many pages
+
+Read a whole page per call, not one element per call. On a marketplace price check, agents that clicked and read one step at a time needed 34 to 82 calls where a scripted browser needed 11 to 19, and read a fraction of the listings.
+
+- `extract_structured(container_selector, fields)` reads every card on a search or list page in one call: title, price, link (absolute) per card. Look at one card with `browser_snapshot` or `get_text` first to pick the selectors.
+- `scrape_page(return_mode="markdown")` reads the open page's main content; `get_links()` lists its links.
+- `smart_fetch(url)` reads a URL over HTTP with a Chrome fingerprint, without moving the tab, and uses the browser only when the site blocks it. `scrape_markdown(url)` is the HTTP-only form; `scrape_markdown(url, use_browser=True)` renders a JavaScript-heavy page in the tab.
+- `workflow_run(steps)` runs many tool steps in one call, with `foreach` loops and earlier results (`save_as`, `${name}`): navigate to each search URL and `extract_structured` it, in one call. `batch_actions(actions)` runs a flat list.
+- Sort a search by price where the site allows it, read the cards in one call, and open only the few listings you need to verify (variant, seller, stock).
+- `web_search(query)` searches without a browser first; when that comes back empty it retries through the browser only if one is running. An empty result's `browser_escalation` says whether that happened. With no browser running, `browser_launch` first. `engine="brave"` needs a running browser.
+
+## Login walls and warm profiles
+
+- A site can lock its search behind a login while its product or article pages stay open. Find those pages with `web_search(...)` and read them directly. Do not log in to get around a wall unless the user asked you to.
+- The default profile keeps its cookies between sessions, and a site that walled a fresh profile may open for it later (seen with a marketplace search). `persistent=False` starts cold every time.
+
 ## What results mean
 
 | Result says | Do this |

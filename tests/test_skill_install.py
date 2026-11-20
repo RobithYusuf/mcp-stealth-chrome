@@ -70,3 +70,45 @@ def test_the_command_is_reached_from_the_entry_point(tmp_path, capsys):
     assert launcher.cli(["install-skill", "--dir", str(tmp_path)]) == 0
     assert "/stealth-chrome" in capsys.readouterr().out
     assert launcher.cli(["install-skill", "--dir"]) == 2
+
+
+def test_an_unedited_earlier_version_is_updated_without_force(tmp_path):
+    import subprocess
+    old = subprocess.run(["git", "show", "v0.25.11:src/mcp_stealth_chrome/assets/claude-skill/SKILL.md"],
+                         capture_output=True, text=True, cwd=str(skill_install.bundled().parents[4]))
+    if old.returncode != 0:
+        pytest.skip("no git history for v0.25.11 here")
+    target = tmp_path / "stealth-chrome" / "SKILL.md"
+    target.parent.mkdir(parents=True)
+    target.write_text(old.stdout)
+    code, msg = skill_install.install(directory=str(tmp_path))
+    assert code == 0 and "updated" in msg and target.read_text() == TEXT
+    assert not (target.parent / "SKILL.md.bak").exists()
+
+
+def test_the_current_skill_is_not_listed_as_an_earlier_one():
+    """SHIPPED holds earlier versions only; the current text must never count as 'unedited old'."""
+    import hashlib
+    assert hashlib.sha256(TEXT.encode("utf-8")).hexdigest() not in skill_install.SHIPPED
+
+
+def test_every_released_skill_that_differs_is_listed_as_shipped():
+    """When SKILL.md changes, the outgoing version's hash must go into SHIPPED, or every user who
+    never edited it would need --force to upgrade."""
+    import hashlib
+    import subprocess
+    root = str(skill_install.bundled().parents[4])
+    tags = subprocess.run(["git", "tag", "--list", "v*"], capture_output=True, text=True, cwd=root)
+    if tags.returncode != 0:
+        pytest.skip("no git here")
+    path = "src/mcp_stealth_chrome/assets/claude-skill/SKILL.md"
+    current = hashlib.sha256(TEXT.encode("utf-8")).hexdigest()
+    missing = []
+    for tag in tags.stdout.split():
+        shown = subprocess.run(["git", "show", f"{tag}:{path}"], capture_output=True, text=True, cwd=root)
+        if shown.returncode != 0:
+            continue  # this release had no skill
+        digest = hashlib.sha256(shown.stdout.encode("utf-8")).hexdigest()
+        if digest != current and digest not in skill_install.SHIPPED:
+            missing.append(tag)
+    assert not missing, f"add these releases' SKILL.md sha256 to skill_install.SHIPPED: {missing}"

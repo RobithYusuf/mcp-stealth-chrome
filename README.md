@@ -870,7 +870,7 @@ These run without a browser and without a search API key, and use the stealth br
 
 | Tool | What it does |
 |------|--------------|
-| `web_search` | Search results as title, URL and snippet. Bing by default, with Brave, DuckDuckGo and Exa as options |
+| `web_search` | Search results as title, URL and snippet. Bing by default, with Brave, DuckDuckGo and Exa as options. Without a browser first; an empty result retries through the browser when one runs, and `browser_escalation` says whether it did |
 | `scrape_markdown` | One URL as clean markdown, 70 to 98% smaller than the raw HTML |
 | `smart_fetch` | Tries HTTP first and moves to the browser only when blocked |
 | `deep_research` | Searches, fetches the top sources and returns markdown with citations |

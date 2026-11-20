@@ -15,12 +15,20 @@ as SKILL.md.bak.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import secrets
 from pathlib import Path
 from typing import Optional
 
 NAME = "stealth-chrome"
+
+# sha256 of every SKILL.md an earlier release shipped. A copy that still matches one was never
+# edited, so an upgrade replaces it without --force and keeps no .bak. Add the outgoing version's
+# hash here whenever SKILL.md changes (tests/test_skill_install.py checks it is listed).
+SHIPPED = {
+    "11cef8e6829d86f2659cb40b7f7939404f1aa49e607bdc3a8d1a5e1475ed9472",  # 0.25.11
+}
 
 
 def bundled() -> Path:
@@ -55,6 +63,9 @@ def install(project: bool = False, directory: Optional[str] = None, force: bool 
         current = target.read_text(encoding="utf-8", errors="replace")
         if current == text:
             return 0, f"already installed and current: {target}"
+        if hashlib.sha256(current.encode("utf-8")).hexdigest() in SHIPPED:
+            _write(target, text)
+            return 0, f"updated {target} from an earlier version (it had not been edited)"
         if not force:
             return 2, (f"refused: {target} differs from this version's skill (edited, or from another "
                        "version). Run again with --force to replace it; the old file is kept as SKILL.md.bak.")

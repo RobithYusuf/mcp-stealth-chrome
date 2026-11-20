@@ -43,6 +43,8 @@ uvx mcp-stealth-chrome → Python 3.11+ → FastMCP → nodriver → Chrome/Chro
 - `src/mcp_stealth_chrome/assets/claude-skill/SKILL.md`: the Claude Code skill (`/stealth-chrome`); `skill_install.py` installs it
   (`mcp-stealth-chrome install-skill`). `tests/test_skill_install.py` fails when it names a tool that is not registered,
   names an AI model, or carries a key: the vision provider is the user's own (BYOK). Update it when a tool it names changes.
+  When SKILL.md changes, add the outgoing version's sha256 to `skill_install.SHIPPED`: a copy matching an earlier release
+  was never edited and is replaced without `--force`; a test lists every tagged release whose skill is missing there.
   hCaptcha is handed to the person there (`request_human_help`): its terms forbid bots and AI that bypass its challenges.
 - `src/mcp_stealth_chrome/settings.py`: the person's settings (`~/.mcp-stealth/settings.json`, the environment over it) and
   `mcp-stealth-chrome settings`.
@@ -1014,6 +1016,10 @@ the person (the same target events as Cmd+T, a followed link, a closed tab).
 - `curl_cffi` presents a real Chrome JA3/JA4, matching the browser this server drives. `http_request`,
   `scrape_markdown` and `smart_fetch` never launch a browser; `smart_fetch` escalates only when the
   page looks blocked or SPA-empty.
+- `web_search` retries an empty HTTP search through the browser SERP only when a browser already runs (nothing but
+  `browser_launch`/`spawn_browser` starts one). An empty result carries `browser_escalation`: tried and empty, not tried
+  because no browser runs, or `use_browser='off'`. Without it, two empty searches right after a `/mcp` reconnect (no
+  browser yet) read as "the browser SERP failed too".
 - `export_curl` emits both a `curl` string and an `http_request(impersonate='chrome')` call, and
   recommends the second. Replaying a captured request with plain curl sends a curl TLS fingerprint —
   the request that worked in the browser then fails on the command line for reasons no header diff

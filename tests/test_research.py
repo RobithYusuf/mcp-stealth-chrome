@@ -221,3 +221,27 @@ if __name__ == "__main__":
             print(f"  FAIL: {type(e).__name__}: {e}")
             sys.exit(1)
     print("\nALL PASS")
+
+
+def test_an_empty_search_says_whether_the_browser_was_tried(monkeypatch):
+    """Two empty searches read as 'the browser failed too' when no browser was running to try."""
+    import asyncio
+    import json
+    from mcp_stealth_chrome.tools import research
+
+    async def empty(*_a, **_k):
+        return []
+
+    monkeypatch.setattr(research, "_search", empty)
+    monkeypatch.setattr(research, "_browser_search", empty)
+
+    def run(**kw):
+        out = asyncio.run(research.web_search("nvme ssd 1tb price", **kw))
+        return json.loads(out.split("\n", 1)[-1] if not out.lstrip().startswith("{") else out)
+
+    monkeypatch.setattr(research.BrowserState, "is_up", staticmethod(lambda: False))
+    r = run()
+    assert r["count"] == 0 and r["browser_escalation"].startswith("browser SERP not tried: no browser is running")
+    monkeypatch.setattr(research.BrowserState, "is_up", staticmethod(lambda: True))
+    assert run()["browser_escalation"] == "browser SERP tried: it returned nothing usable either"
+    assert run(use_browser="off")["browser_escalation"] == "browser SERP not tried: use_browser='off'"

@@ -770,17 +770,29 @@ async def web_search(
     results = await _search(q, engine, count, proxy=proxy)
     if _looks_decoy(q, results):
         results = []  # soft-block decoy (off-topic) — discard, treat as no-results
-    # Escalate to the browser SERP when HTTP is degraded (auto) or forced (on).
-    if ((use_browser == "on") or (use_browser == "auto" and not results)) \
-            and BrowserState.is_up():
+    # Escalate to the browser SERP when HTTP is degraded (auto) or forced (on). Nothing here
+    # starts a browser (only browser_launch and spawn_browser do), so with none running the
+    # result says the browser was not tried: two empty searches in a row read as "the browser
+    # failed too" when it had never been asked.
+    wants_browser = (use_browser == "on") or (use_browser == "auto" and not results)
+    escalation = None
+    if wants_browser and BrowserState.is_up():
         br = await _browser_search(q, engine, count)
         if br and not _looks_decoy(q, br):
             results, via = br, "browser"
+        else:
+            escalation = "browser SERP tried: it returned nothing usable either"
+    elif wants_browser:
+        escalation = ("browser SERP not tried: no browser is running. browser_launch, then search "
+                      "again and it escalates to a real-Chrome SERP")
+    elif use_browser == "off" and not results:
+        escalation = "browser SERP not tried: use_browser='off'"
 
     if not results:
         return ok(json.dumps({
             "query": q, "engine": engine, "count": 0, "results": [],
             "degraded": True,
+            "browser_escalation": escalation,
             "note": "no results — the SERP is likely rate-limiting/IP-blocking this "
                     "host (rapid queries trigger soft-blocks that return 0 or decoy "
                     "results). Options: wait & retry; browser_launch then retry "
