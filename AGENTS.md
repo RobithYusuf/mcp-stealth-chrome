@@ -1103,18 +1103,22 @@ the person (the same target events as Cmd+T, a followed link, a closed tab).
 - Clicks reach the overlay's click ring through one wrapper on nodriver's `Tab.mouse_click` (`patches.
   _patch_mouse_click_reports_pointer`), since sixteen places press through it; it also runs `before_input`. So do every
   step of a drag (the button is still let go in its `finally`), every chunk of `humanized_scroll` (outside its retry, which
-  would send the wheel event again), every JS click fallback, and each step of `batch_actions` and `workflow_run`
+  would send the wheel event again, and once more before the retry and the JS `scrollBy` fallback), `scroll`'s instant
+  wheel and its top and bottom, `scroll_to`, every JS click fallback, and each step of `batch_actions` and `workflow_run`
   (`presence.refusal`). `fill`'s fallback to a JS value re-raises `PersonHasBrowser` instead of writing the value anyway.
 - Fails closed (from a review of the first version): `refusal` and `before_input` act on the overlay's handle whether its
-  process runs or not. A dead one is started again (`revive`, at most `RESTARTS` 3, only while Chrome's PID lives) and
+  process runs or not. A dead one is started again (`revive`, at most `RESTARTS` 3, only while Chrome's PID still runs the process
+  with the start time recorded at attach: a PID is handed out again) and
   keeps who held the browser, since the new process reads `control.json` first. Held with no overlay to show Resume agent,
   every tool is refused except `browser_launch(agent_overlay=False)`, which stops it: the one way out, said in the refusal.
   `attach` is async and says on only once the process wrote its own PID into `control.json` after its windows exist
-  (`READY_WAIT` 3 s), else OFF with the last line of `overlay.log`. `agent_overlay=False` on a browser that has one stops it.
+  (`READY_WAIT` 3 s); otherwise it stops the process and says OFF, naming the last line of `overlay.log` when it died. `agent_overlay=False` on a browser that has one stops it.
 - Stopping: the stdio server ignores SIGTERM and children inherit that, so `_agent_overlay.py` resets it to the default,
   and `Overlay.stop` follows `ended` with terminate and then kill, removing the folder only once the process is gone.
   `_safe_stop_browser` stops it too, for launches that fail after it started. A process left by a killed server removes
-  its own folder when it sees the browser or the server gone; `attach` prunes folders whose Chrome PID is gone. State files
+  its own folder when it sees the browser or the server gone, on `ended`, or when its PID's start time is no longer the
+  one it was given. Folder names carry the PID and its generation (`chrome-<pid>-<generation>-*`); `attach` prunes those
+  whose PID is gone or runs a process of another generation. A process whose code could not be written to it is killed. State files
   are read with `O_NOFOLLOW` and only as regular files, the log is created 0600, and a state root that is a link is refused.
 - The handoff bar outlives quiet: help and the person's hold are chosen before `HIDE_AFTER`, so Done and Resume agent never
   fade out while they are the only way back. `MCP_STEALTH_OVERLAY_HIDE_AFTER` sets the quiet time (tests use 3 s).
@@ -1130,12 +1134,15 @@ the person (the same target events as Cmd+T, a followed link, a closed tab).
   brought its windows over the overlay until the next tick. Covered, it drops to level 0 just above Chrome. App switches
   and Space changes run a tick at once (NSWorkspace notifications).
 - Cost, measured with a benchmark against no overlay at all (macOS 26, 120 Hz display, 15 s runs alternated): WindowServer
-  +35 points and the overlay 8 to 9% CPU for the first design, +10 to 11 points and 3% after. What mattered: the light in
+  +35 points and the overlay 8 to 9% CPU for the first design, about +10 points and 3% after. What mattered: the light in
   four edge windows under a nine-slice mask drawn once (no live blur, which three blurred rings were), animations asked
-  for 20 fps (`preferredFrameRateRange`), the bar without a behind-window blur (it re-blurred the moving light every frame),
+  for a capped rate (`preferredFrameRateRange`), the bar without a behind-window blur (it re-blurred the moving light every frame),
   reading only the windows above the browser's four times a second (each value read from a CGWindowList dictionary goes
-  through the PyObjC bridge: the full list was 1.2 ms and the per-tick scan most of the CPU), and updating at the glow's own
-  20 Hz (WindowServer's cost follows the number of distinct frames more than their area). The agent's cursor costs about
+  through the PyObjC bridge: the full list was 1.2 ms and the per-tick scan most of the CPU), and updating at 20 Hz (WindowServer's
+  cost follows the number of distinct frames more than their area). The light's rate is a trade, measured against no
+  overlay: about +5 points at 20 fps, +10 at 30 and +19 at 60, the overlay process 2.5 to 3.5% in all three. At 20 fps a
+  9 s turn moved a window corner 25 points a frame and the soft colours stepped visibly, so it runs at 30 fps with a 16 s
+  turn (about 9 points a frame), keeps turning while dimmed and stops only once it has faded out. The agent's cursor costs about
   +18 points while it moves, in a small window or a full one alike, so it is off by default. Pausing the light while other
   windows cover the browser made no difference (WindowServer skips them already) and is not done.
 - `tests/test_agent_overlay.py` (fast) and `tests/test_agent_overlay_e2e.py` (`MCP_HEADED=1`, real Chrome, through the MCP

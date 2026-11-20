@@ -262,7 +262,7 @@ def test_attach_waits_for_the_overlay_and_says_off_when_it_dies_at_start(tmp_pat
     monkeypatch.setenv("MCP_STEALTH_OVERLAY_DIR", str(tmp_path / "root"))
     monkeypatch.setattr(presence, "unavailable", lambda: None)
 
-    def dies(folder, pid, cursor):
+    def dies(folder, pid, cursor, start=None):
         (folder / "overlay.log").write_text("ImportError: no AppKit here\n")
         return subprocess.Popen([sys.executable, "-c", "raise SystemExit(1)"])
     monkeypatch.setattr(presence, "_spawn", dies)
@@ -272,7 +272,7 @@ def test_attach_waits_for_the_overlay_and_says_off_when_it_dies_at_start(tmp_pat
     assert presence.of(browser) is None
     assert not any((tmp_path / "root").iterdir())  # its folder went with it
 
-    def comes_up(folder, pid, cursor):
+    def comes_up(folder, pid, cursor, start=None):
         code = ("import json, os, time; "
                 f"json.dump({{'holder': 'agent', 'overlay_pid': os.getpid()}}, open({str(folder / 'control.json')!r}, 'w')); "
                 "time.sleep(60)")
@@ -322,3 +322,82 @@ def test_each_batch_step_meets_the_take_over_refusal(monkeypatch):
     assert "held by the person" in result
     result = asyncio.run(server.workflow_run(steps=[{"tool": "get_url"}]))
     assert "held by the person" in result
+
+
+# The second review: what was left.
+
+def test_take_over_stops_a_scroll_under_way(made, monkeypatch):
+    from mcp_stealth_chrome import humanize
+    browser, overlay = made({"holder": "agent"})
+    monkeypatch.setattr(humanize.asyncio, "sleep", _no_sleep)
+
+    class Tab:
+        def __init__(self):
+            self.browser = browser
+            self.sent = 0
+
+        async def send(self, _command):
+            self.sent += 1
+            overlay.control_file.write_text(json.dumps({"holder": "person"}))  # Take over now
+
+    tab = Tab()
+    with pytest.raises(presence.PersonHasBrowser):
+        asyncio.run(humanize.humanized_scroll(tab, 900, position=(10, 10)))
+    assert tab.sent == 1  # not one wheel event after the hand-over, nor a JS scroll
+
+
+async def _no_sleep(*_args, **_kw):
+    return None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the overlay is macOS only")
+def test_an_overlay_that_never_says_it_is_up_is_off(tmp_path, monkeypatch):
+    monkeypatch.setenv("MCP_STEALTH_OVERLAY_DIR", str(tmp_path / "root"))
+    monkeypatch.setattr(presence, "unavailable", lambda: None)
+    monkeypatch.setattr(presence, "READY_WAIT", 0.4)
+    procs = []
+    monkeypatch.setattr(presence, "_spawn", lambda *a: procs.append(subprocess.Popen(SLEEPER)) or procs[-1])
+    browser = _Browser()
+    note = asyncio.run(presence.attach(browser, os.getpid(), ask=True, headless=False))
+    assert "OFF" in note and "did not confirm" in note, note
+    assert procs[0].poll() is not None, "the silent process was left running"
+    assert presence._handle(browser) is None
+
+
+def test_a_process_that_never_got_its_code_is_ended(tmp_path, monkeypatch):
+    started = []
+    real_popen = subprocess.Popen
+
+    def popen(*a, **kw):
+        started.append(real_popen(*a, **kw))
+        return started[-1]
+    monkeypatch.setattr(presence.subprocess, "Popen", popen)
+    monkeypatch.setattr(presence, "_script", lambda: (_ for _ in ()).throw(OSError("unreadable")))
+    with pytest.raises(OSError):
+        presence._spawn(tmp_path, 4242, False)
+    assert started and started[0].poll() is not None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="start times come from ps")
+def test_prune_tells_a_reused_pid_from_the_browser(tmp_path):
+    from mcp_stealth_chrome import _quit_watcher
+    me = os.getpid()
+    mine = _quit_watcher.generation(_quit_watcher.process_start(me))
+    kept = tmp_path / f"chrome-{me}-{mine}-a"
+    reused = tmp_path / f"chrome-{me}-0123456789-b"
+    gone = tmp_path / "chrome-999999-0123456789-c"
+    for folder in (kept, reused, gone):
+        folder.mkdir()
+    presence._prune(tmp_path)
+    assert kept.exists() and not reused.exists() and not gone.exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="start times come from ps")
+def test_no_restart_for_a_pid_that_now_runs_something_else(made, monkeypatch):
+    browser, overlay = made({"holder": "person"})
+    overlay.pid, overlay.start = os.getpid(), "Mon Jan  1 00:00:00 2001"
+    overlay.proc.kill()
+    overlay.proc.wait()
+    monkeypatch.setattr(presence, "_spawn", lambda *a: pytest.fail("restarted for another process"))
+    assert presence.refusal("click", browser)  # still refused: the hold stands
+    assert overlay.restarts == 0

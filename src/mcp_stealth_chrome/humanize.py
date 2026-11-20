@@ -252,13 +252,17 @@ async def humanized_scroll(
             # persistently unavailable.
             try:
                 await asyncio.sleep(0.05)
+                await presence.before_input(tab)  # the person may have taken over meanwhile
                 await tab.send(cdp_input.dispatch_mouse_event(
                     type_="mouseWheel",
                     x=position[0], y=position[1],
                     delta_x=0, delta_y=chunk * direction,
                 ))
+            except presence.PersonHasBrowser:
+                raise
             except Exception:
                 # LAST-RESORT, INTENTIONALLY NON-STEALTH fallback.
+                await presence.before_input(tab)
                 await tab.evaluate(
                     f"window.scrollBy(0, {chunk * direction})",
                     return_by_value=True,

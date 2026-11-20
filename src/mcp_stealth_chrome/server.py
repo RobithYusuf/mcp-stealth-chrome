@@ -6762,6 +6762,7 @@ async def scroll(
     try:
         tab = BrowserState.active_tab()
         before = await _eval_checked(tab, "window.scrollY")
+        await presence.before_input(tab)  # refuses once the person took over
         if direction == "top":
             await _eval_checked(tab, "window.scrollTo(0,0)")
             how = "to top"
@@ -6825,6 +6826,7 @@ async def scroll_to(
             return err(f"element not found: {selector}")
         if await el.apply("function() { return this.getClientRects().length === 0; }") is True:
             return err(f"{ref or selector} is not rendered, so it cannot be scrolled into view")
+        await presence.before_input(el.tab)  # refuses once the person took over
         await el.apply(
             f"function() {{ this.scrollIntoView("
             f"{{block:{json.dumps(block)}, behavior:{json.dumps(behavior)}}}); }}"

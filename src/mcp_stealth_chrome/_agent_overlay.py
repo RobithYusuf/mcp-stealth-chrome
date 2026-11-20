@@ -20,7 +20,8 @@ Cheap, measured against no overlay at all (WindowServer +10 points instead of +3
 3% CPU instead of 8 to 9%):
 - The glow lives in four thin windows along the edges, so only those strips change each frame;
   it is one turning gradient under a nine-slice mask drawn once (no live blur), asked for at
-  20 fps (displays run at up to 120) and paused whenever it is dim or hidden.
+  30 fps (displays run at up to 120: about +10 points against +5 at 20 fps, whose 9 s turn
+  stepped visibly, and +19 at 60), turning once in 16 s, and stopped once it has faded out.
 - The agent's cursor and click rings are small windows of their own, on screen only while there
   is something to show. A full-window layer for them cost WindowServer as much as the rest.
 - The bar has a plain tinted background: a live blur over moving light is redrawn every frame.
@@ -29,7 +30,7 @@ Cheap, measured against no overlay at all (WindowServer +10 points instead of +3
   windows above the browser's, four times a second and at every app switch, converted once to
   plain tuples. The browser window's own bounds are read every tick only while it moves.
 - WindowServer's cost follows the number of distinct frames more than their size, so the overlay
-  updates at the glow's own pace, 20 times a second (10 with nothing moving).
+  updates 20 times a second (10 with nothing moving).
 - Pausing the light while other windows cover the browser was measured: no difference
   (WindowServer already skips windows nobody can see), so it is not done.
 
@@ -81,7 +82,7 @@ except ImportError:  # older PyObjC
     kCAGradientLayerConic = "conic"
 try:
     from Quartz import CAFrameRateRangeMake
-    RATE = CAFrameRateRangeMake(10.0, 20.0, 20.0)  # a slow glow needs no 60 or 120 fps
+    RATE = CAFrameRateRangeMake(24.0, 30.0, 30.0)  # a slow glow needs no 60 or 120 fps
     RING_RATE = CAFrameRateRangeMake(15.0, 30.0, 30.0)
 except ImportError:
     RATE = RING_RATE = None
@@ -94,6 +95,8 @@ TRACK = 0x01 | 0x80 | 0x200  # entered/exited, always, in visible rect
 IMAGE_ONLY = 1
 TRUNCATE_TAIL = 4
 RADIUS = 12.0
+TURN = 16.0         # seconds per turn of the light: at 30 fps a corner moves about 9 points a
+                    # frame (9 s at 20 fps moved it 25, and the soft colours stepped visibly)
 DEPTH = 34.0        # how far the light reaches into the window
 STRIP = 56.0        # thickness of the edge windows that carry it
 TICK = 1 / 20       # the glow's own pace: every update lands on a frame drawn anyway
@@ -157,6 +160,19 @@ def read(path):
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
+
+
+def chrome_start(pid):
+    """Start time of the process on this PID as ps prints it (lstart, UTC, C locale): the format
+    the server recorded. None when nothing runs there, "" when ps cannot answer."""
+    try:
+        import subprocess
+        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
+                             timeout=5, env={**os.environ, "LC_ALL": "C", "TZ": "UTC"})
+    except Exception:
+        return ""
+    text = " ".join(out.stdout.split())
+    return text or (None if out.returncode == 1 else "")
 
 
 def leave(remove_files):
@@ -388,7 +404,7 @@ class Glow:
                 spin = CABasicAnimation.animationWithKeyPath_("transform.rotation.z")
                 spin.setFromValue_(0.0)
                 spin.setToValue_(-2 * math.pi)
-                spin.setDuration_(9.0)
+                spin.setDuration_(TURN)
                 spin.setRepeatCount_(1e9)
                 grad.addAnimation_forKey_(paced(spin), "spin")
                 breathe = CABasicAnimation.animationWithKeyPath_("opacity")
@@ -406,6 +422,7 @@ class Glow:
         self.panels = [strip[0] for strip in self.strips]
         self.palette = None
         self.level = "off"
+        self.pause_at = None
 
     def layout(self, x, y_ns, w, h):
         """Place the strips on the window's edges; each one's layers keep the whole window's
@@ -434,22 +451,32 @@ class Glow:
             strip[3].setColors_([cg(c) for c in palette])
         CATransaction.commit()
 
-    def motion(self):
-        for strip in self.strips:
-            (resume if self.level == "on" else pause)(strip[2])
-
     def set(self, level):
-        """on: full and moving; dim: between steps, still; off: hidden, still."""
+        """on: full; dim: between steps, half as bright; off: hidden. The light keeps turning
+        through on and dim, so a change of step never stops it with a jolt; it stops only once
+        it has faded out (settle), and starts turning before it fades in."""
         if level == self.level:
             return
         self.level = level
-        self.motion()
+        if level == "off":
+            self.pause_at = time.time() + 0.8
+        else:
+            self.pause_at = None
+            for strip in self.strips:
+                resume(strip[2])
         CATransaction.begin()
-        CATransaction.setAnimationDuration_({"on": 0.5, "dim": 0.6, "off": 0.7}[level])
+        CATransaction.setAnimationDuration_({"on": 0.6, "dim": 0.9, "off": 0.7}[level])
         CATransaction.setAnimationTimingFunction_(ease())
         for strip in self.strips:
             strip[1].setOpacity_({"on": 1.0, "dim": 0.5, "off": 0.0}[level])
         CATransaction.commit()
+
+    def settle(self, now):
+        """Stop the turning once the light has faded out: frames nobody can see still cost."""
+        if self.pause_at is not None and self.level == "off" and now >= self.pause_at:
+            self.pause_at = None
+            for strip in self.strips:
+                pause(strip[2])
 
 
 class Pointer:
@@ -827,6 +854,7 @@ class Overlay:
         self.nudge_until = 0.0
         self.nudge_why = None
         self.moved_until = 0.0
+        self.start_checked = 0.0
 
         # Ready: the windows exist. The server waits for this before it says the overlay is on.
         self.control["overlay_pid"] = ME
@@ -941,7 +969,7 @@ class Overlay:
             return  # nothing moves: 10 ticks a second are enough
         a = self.read_agent()
         if a.get("ended"):
-            NSApplication.sharedApplication().terminate_(None)
+            leave(True)  # the server removes the folder too; whichever comes first
             return
         if os.getppid() != SERVER:
             leave(True)  # the server is gone
@@ -965,6 +993,15 @@ class Overlay:
                 try:
                     os.kill(pid, 0)
                     self.gone_since = None
+                    # A window missing for a while on a PID that runs: that PID may now be
+                    # another process's. Its start time says.
+                    start = CONFIG.get("start")
+                    if start and now - self.missing_since > 3 and now - self.start_checked > 5:
+                        self.start_checked = now
+                        current = chrome_start(pid)
+                        if current is None or (current and current != start):
+                            leave(True)
+                            return
                 except OSError:
                     self.gone_since = self.gone_since or now
                     if now - self.gone_since > 3:
@@ -1019,6 +1056,7 @@ class Overlay:
         show_cursor = bool(self.control.get("show_cursor"))
         self.glow.colors(HELP_GLOW if mode == "help" else AGENT_GLOW)
         self.glow.set("on" if mode in ("agent", "help") else "dim" if mode in WORKING else "off")
+        self.glow.settle(now)
         cursor, vp = a.get("cursor"), a.get("viewport")
         if cursor and vp:
             cx, cy = x + vp[0] + cursor[0], y + vp[1] + cursor[1]  # screen, top-left origin

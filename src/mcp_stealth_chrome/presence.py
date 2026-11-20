@@ -122,6 +122,18 @@ def _pid_alive(pid: int) -> bool:
         return True  # exists, not ours to signal
 
 
+def _same_chrome(pid: int, start: Optional[str]) -> Optional[bool]:
+    """Is the process on this PID still the Chrome the overlay was started for? A PID is handed
+    out again, so its start time decides; None when that cannot be read."""
+    if not start:
+        return _pid_alive(pid)
+    from . import _quit_watcher as _watcher
+    now = _watcher.process_start(pid, like=start)
+    if now is None:
+        return False if not _pid_alive(pid) else None
+    return now == start
+
+
 def _call_args() -> dict:
     from . import _app
     return _app.CALL_ARGUMENTS.get() or {}
@@ -151,21 +163,28 @@ def _script() -> str:
     return (Path(__file__).with_name("_agent_overlay.py")).read_text(encoding="utf-8")
 
 
-def _spawn(folder: Path, pid: int, cursor: bool) -> subprocess.Popen:
+def _spawn(folder: Path, pid: int, cursor: bool, start: Optional[str] = None) -> subprocess.Popen:
     try:
         hide_after = float(os.environ.get("MCP_STEALTH_OVERLAY_HIDE_AFTER") or HIDE_AFTER)
     except ValueError:
         hide_after = HIDE_AFTER
-    cfg = {"state": str(folder), "pid": pid, "server": os.getpid(), "cursor": cursor,
+    cfg = {"state": str(folder), "pid": pid, "start": start, "server": os.getpid(), "cursor": cursor,
            "hide_after": hide_after if hide_after > 0 else HIDE_AFTER}
     log_fd = os.open(folder / "overlay.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND | NOFOLLOW, 0o600)
     with os.fdopen(log_fd, "ab") as log:
         proc = subprocess.Popen(
             [sys.executable, "-I", "-", "mcp-stealth-agent-overlay", json.dumps(cfg)],
             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=log, start_new_session=True)
-    assert proc.stdin is not None
-    proc.stdin.write(_script().encode("utf-8"))
-    proc.stdin.close()
+    try:
+        assert proc.stdin is not None
+        proc.stdin.write(_script().encode("utf-8"))
+        proc.stdin.close()
+    except BaseException:
+        # Started but never given its code: end it, or it outlives every handle on it.
+        with contextlib.suppress(Exception):
+            proc.kill()
+            proc.wait(timeout=2.0)
+        raise
     return proc
 
 
@@ -180,9 +199,11 @@ def _last_log_line(folder: Path) -> str:
 class Overlay:
     """This server's side of one overlay: the files it shares with the overlay process."""
 
-    def __init__(self, browser: Any, pid: int, folder: Path, proc: subprocess.Popen, cursor: bool):
+    def __init__(self, browser: Any, pid: int, folder: Path, proc: subprocess.Popen, cursor: bool,
+                 start: Optional[str] = None):
         self.browser = browser
         self.pid = pid
+        self.start = start
         self.folder = folder
         self.proc = proc
         self.cursor = cursor
@@ -233,10 +254,12 @@ class Overlay:
         the browser. At most RESTARTS times; True when one runs."""
         if self.alive():
             return True
-        if self.restarts >= RESTARTS or not _pid_alive(self.pid) or not self.folder.is_dir():
+        if self.restarts >= RESTARTS or not self.folder.is_dir():
             return False
+        if _same_chrome(self.pid, self.start) is not True:
+            return False  # its browser is gone, or its PID now runs something else
         try:
-            self.proc = _spawn(self.folder, self.pid, self.cursor)
+            self.proc = _spawn(self.folder, self.pid, self.cursor, self.start)
         except Exception:
             return False
         self.restarts += 1
@@ -279,14 +302,23 @@ def of_tab(tab: Any) -> Optional[Overlay]:
 
 
 def _prune(root: Path) -> None:
-    """Folders of overlays whose browser is gone (a server killed before it cleaned up)."""
+    """Folders of overlays whose browser is gone (a server killed before it cleaned up). The
+    name carries the PID and its generation (start time), so a reused PID does not keep one."""
+    from . import _quit_watcher as _watcher
     with contextlib.suppress(OSError):
         for entry in root.iterdir():
             parts = entry.name.split("-")
-            if (len(parts) >= 3 and parts[0] == "chrome" and parts[1].isdigit()
-                    and not entry.is_symlink() and entry.is_dir() and not _pid_alive(int(parts[1]))):
-                with contextlib.suppress(OSError):
-                    shutil.rmtree(entry)
+            if not (len(parts) >= 4 and parts[0] == "chrome" and parts[1].isdigit()):
+                continue
+            if entry.is_symlink() or not entry.is_dir():
+                continue
+            pid = int(parts[1])
+            if _pid_alive(pid):
+                now = _watcher.process_start(pid)
+                if now is None or _watcher.generation(now) == parts[2]:
+                    continue  # the same browser, or not known: kept
+            with contextlib.suppress(OSError):
+                shutil.rmtree(entry)
 
 
 async def attach(browser: Any, pid: Optional[int], *, ask: Optional[bool], headless: bool,
@@ -321,27 +353,35 @@ async def attach(browser: Any, pid: Optional[int], *, ask: Optional[bool], headl
     if root.is_symlink():
         return f" [agent_overlay: OFF, its state folder {root} is a link]"
     cursor = os.environ.get("MCP_STEALTH_AGENT_CURSOR", "").strip().lower() in TRUE
+    from . import _quit_watcher as _watcher
+    from . import quit_watch
+    start = await asyncio.to_thread(quit_watch.pid_start, browser, pid)
+    folder = None
     try:
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(root, 0o700)
-        _prune(root)
-        folder = Path(tempfile.mkdtemp(prefix=f"chrome-{pid}-", dir=root))
-        proc = _spawn(folder, pid, cursor)
+        await asyncio.to_thread(_prune, root)
+        folder = Path(tempfile.mkdtemp(prefix=f"chrome-{pid}-{_watcher.generation(start)}-", dir=root))
+        proc = _spawn(folder, pid, cursor, start)
     except Exception as exc:
+        if folder is not None:
+            with contextlib.suppress(OSError):
+                shutil.rmtree(folder)
         return f" [agent_overlay: OFF, it could not start ({type(exc).__name__}: {exc})]"
-    overlay = Overlay(browser, pid, folder, proc, cursor)
+    overlay = Overlay(browser, pid, folder, proc, cursor, start)
     setattr(browser, ATTR, overlay)
     _LIVE.append(overlay)
     # Up when it says so: a process that started is not yet an overlay on the screen.
     end = time.time() + READY_WAIT
     while time.time() < end and overlay.alive() and not overlay.ready():
         await asyncio.sleep(0.05)
-    if not overlay.alive():
-        why = _last_log_line(folder)
+    if not overlay.ready():
+        # Not up is not on: a process that never drew its windows protects nothing.
+        why = (f"the overlay ended as it started: {_last_log_line(folder)}" if not overlay.alive()
+               else f"the overlay did not confirm it was up within {READY_WAIT:.0f}s")
         stop(browser)
-        return f" [agent_overlay: OFF, the overlay ended as it started: {why}]"
-    confirmed = "" if overlay.ready() else f" (started; it had not confirmed within {READY_WAIT:.0f}s)"
-    return (f" [agent_overlay: on{confirmed}: a light around the window while the agent acts and "
+        return f" [agent_overlay: OFF, {why}]"
+    return (" [agent_overlay: on: a light around the window while the agent acts and "
             "a bar with Take over; while the person holds the browser the tools that act on or "
             "read the page are refused]")
 
