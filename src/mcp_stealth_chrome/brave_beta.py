@@ -142,7 +142,7 @@ def status() -> dict:
         version = (dock_icon._bundle_version(BETA_APP) or ("",))[0] if binary else ""
         if not dock_icon.enabled():
             return {"state": "off", "detail": (
-                f"off. {dock_icon.ENV_SWITCH}=1 runs visible Brave from Brave Beta"
+                f"off. dock_icon on ({dock_icon.SWITCH_HOW}) runs visible Brave from Brave Beta"
                 + (f" {version} with its own icon" if binary else
                    f"; Brave Beta is not installed in {BETA_APP.parent}"))}
         if binary is None:

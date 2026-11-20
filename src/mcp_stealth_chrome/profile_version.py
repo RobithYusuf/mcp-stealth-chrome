@@ -110,7 +110,8 @@ def refusal(user_data_dir: Optional[Path], executable: Optional[str], *, beta: b
     if brave:
         advice = (
             f"Launch it with a Brave of version {text(recorded)} or newer. If Brave Beta opened it "
-            "(MCP_STEALTH_DOCK_ICON=1 runs visible Brave from Brave Beta), open it the same way, "
+            "(the dock_icon setting, MCP_STEALTH_DOCK_ICON=1 or `mcp-stealth-chrome settings set dock_icon on`, "
+            "runs visible Brave from Brave Beta), open it the same way, "
             "visible and with the switch on, or wait until Brave reaches that version. "
             "persistent=False, or another instance_id, starts on a profile of its own.")
         return (
@@ -120,7 +121,8 @@ def refusal(user_data_dir: Optional[Path], executable: Optional[str], *, beta: b
             f"changed. {advice}")
     advice = (
         f"Launch it with a Chrome of version {text(recorded)} or newer. If Chrome Beta opened it "
-        "(MCP_STEALTH_DOCK_ICON=1 runs visible browsers from Beta), open it the same way, "
+        "(the dock_icon setting, MCP_STEALTH_DOCK_ICON=1 or `mcp-stealth-chrome settings set dock_icon on`, "
+        "runs visible browsers from Beta), open it the same way, "
         "visible and with the switch on, or wait until Google Chrome reaches that version. "
         "persistent=False, or another instance_id, starts on a profile of its own.")
     return (

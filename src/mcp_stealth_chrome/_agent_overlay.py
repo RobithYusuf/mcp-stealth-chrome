@@ -55,12 +55,13 @@ import traceback
 import objc
 from AppKit import (NSApplication, NSAttributedString, NSButton, NSColor, NSEvent, NSFont,
                     NSFontAttributeName, NSForegroundColorAttributeName, NSImage,
-                    NSImageSymbolConfiguration, NSMakeRect, NSMutableAttributedString,
+                    NSImageSymbolConfiguration, NSMakeRect, NSMenu, NSMenuItem,
+                    NSMutableAttributedString,
                     NSMutableParagraphStyle, NSPanel, NSParagraphStyleAttributeName, NSScreen,
                     NSTextField, NSTrackingArea, NSView, NSWorkspace,
                     NSWorkspaceActiveSpaceDidChangeNotification,
                     NSWorkspaceDidActivateApplicationNotification)
-from Foundation import NSObject, NSTimer
+from Foundation import NSObject, NSRunLoop, NSRunLoopCommonModes, NSTimer
 from Quartz import (CAAnimationGroup, CABasicAnimation, CACurrentMediaTime, CAGradientLayer,
                     CALayer, CAMediaTimingFunction, CAShapeLayer, CATextLayer, CATransaction,
                     CATransition, CGBitmapContextCreate, CGBitmapContextCreateImage,
@@ -144,9 +145,17 @@ CONTROL = os.path.join(STATE, "control.json")
 SERVER = int(CONFIG["server"])
 HIDE_AFTER = float(CONFIG.get("hide_after", 90.0))  # no word for this long: everything fades out
 STYLE = CONFIG.get("style") or {}  # presence.style(): the person's choice of bar, light and lock
-BAR_MODE = STYLE.get("bar", "full") if STYLE.get("bar") in ("full", "compact", "hover", "off") else "full"
+BAR_MODES = ("full", "compact", "hover", "off")
+BAR_MODE = STYLE.get("bar", "full") if STYLE.get("bar") in BAR_MODES else "full"
 LIGHT_ON = STYLE.get("light", True) is not False
-LOCK_ON = STYLE.get("lock", True) is not False and BAR_MODE != "off"
+LOCK_SETTING = STYLE.get("lock", True) is not False  # the person's choice; off anyway with no bar
+LOCK_ON = LOCK_SETTING and BAR_MODE != "off"
+# The settings file (settings.py) is read again while this runs, so a choice from the bar's menu,
+# from `mcp-stealth-chrome settings` or from another overlay applies at once. A setting the
+# server's environment fixed (`fixed`) wins over the file here too, and its menu item is disabled.
+SETTINGS_FILE = CONFIG.get("settings_file") or ""
+FIXED = CONFIG.get("fixed") or {}
+SETTINGS_EVERY = 1.0
 HOVER_LINGER = 1.2  # hover: the bar stays this long after the pointer left the window
 ME = os.getpid()
 
@@ -222,6 +231,73 @@ def write(path, data):
     with os.fdopen(fd, "w") as f:
         json.dump(data, f)
     os.replace(tmp, path)
+
+
+def read_settings():
+    """The settings file as a dict, {} when missing, a link, not ours or not a JSON object."""
+    if not SETTINGS_FILE:
+        return {}
+    try:
+        fd = os.open(SETTINGS_FILE, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return {}
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            return {}
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            fd = -1
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    return data if isinstance(data, dict) else {}
+
+
+def write_settings(changes):
+    """Merge into the settings file as settings.write does: a fresh 0600 file, then a rename."""
+    if not SETTINGS_FILE:
+        return
+    data = read_settings()
+    data.update(changes)
+    folder = os.path.dirname(SETTINGS_FILE)
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    if os.path.islink(SETTINGS_FILE):
+        return
+    tmp = os.path.join(folder, f".settings.{os.getpid()}.{time.time_ns()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, SETTINGS_FILE)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _flag(value, default):
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    return True if text in ("1", "true", "yes", "on") else False if text in ("0", "false", "no", "off") else default
+
+
+def chosen_style(data):
+    """(bar, light, lock setting) from the environment's fixed values, then the file, then the
+    defaults: settings.resolve's order."""
+    bar = FIXED.get("overlay_bar", data.get("overlay_bar", "full"))
+    bar = str(bar).strip().lower() if str(bar).strip().lower() in BAR_MODES else "full"
+    light = _flag(FIXED.get("overlay_light", data.get("overlay_light", True)), True)
+    lock = _flag(FIXED.get("overlay_lock", data.get("overlay_lock", True)), True)
+    return bar, light, lock
 
 
 def screen_height():
@@ -859,16 +935,19 @@ class Bar:
         self.label.setWantsLayer_(True)
         self.toggle = PillButton.alloc().initWithFrame_(NSMakeRect(0, 0, 30, self.bh))
         self.toggle.setup(target, "onCursor:")
+        self.more = PillButton.alloc().initWithFrame_(NSMakeRect(0, 0, 30, self.bh))
+        self.more.setup(target, "onMenu:")
+        self.more.icon("ellipsis", "quiet", "Overlay settings")
         self.button = PillButton.alloc().initWithFrame_(NSMakeRect(0, 0, 100, self.bh))
         self.button.setup(target, "onButton:")
-        for b in (self.toggle, self.button):
+        for b in (self.toggle, self.button, self.more):
             b.layer().setCornerRadius_(self.bh / 2)
         self.bw = max(math.ceil(attributed([(t, 12.5, 0.3, WHITE)]).size().width) for t in self.TITLES) + 28
         self.tw = 30 if SYMBOLS else math.ceil(attributed([("Cursor", 12.5, 0.3, WHITE)]).size().width) + 24
         if self.compact:
             self.tw = 0  # no cursor switch in the small bar (SIGUSR1 still toggles it)
             self.toggle.setHidden_(True)
-        for v in (self.dot, self.label, self.toggle, self.button):
+        for v in (self.dot, self.label, self.toggle, self.more, self.button):
             self.fx.addSubview_(v)
         self.width = None
         self.origin = None
@@ -884,9 +963,11 @@ class Bar:
         pad = (self.H - self.bh) / 2
         bx = width - pad - self.bw
         tx = bx - (6 if self.tw else 0) - self.tw
+        mx = tx - 6 - 30
         self.button.setFrame_(NSMakeRect(bx, pad, self.bw, self.bh))
         self.toggle.setFrame_(NSMakeRect(tx, pad, self.tw, self.bh))
-        self.label.setFrame_(NSMakeRect(34, (self.H - 17) / 2, tx - 12 - 34, 17))
+        self.more.setFrame_(NSMakeRect(mx, pad, 30, self.bh))
+        self.label.setFrame_(NSMakeRect(34, (self.H - 17) / 2, mx - 12 - 34, 17))
         f = self.panel.frame()
         self.panel.setFrame_display_(NSMakeRect(f.origin.x, f.origin.y, width, self.H), True)
         self.fx.setFrame_(NSMakeRect(0, 0, width, self.H))
@@ -962,6 +1043,8 @@ class Overlay:
                     self.control[key] = before[key]
         scale = NSScreen.mainScreen().backingScaleFactor()
         still = bool(NSWorkspace.sharedWorkspace().accessibilityDisplayShouldReduceMotion())
+        self.target, self.still = target, still
+        self.settings_at, self.settings_seen = 0.0, None
         self.glow = Glow(still, scale)
         self.pointer = Pointer(scale)
         self.ripples = Ripples()
@@ -1109,6 +1192,7 @@ class Overlay:
         if calm and not force and self.ticks % CALM_EVERY:
             return  # nothing moves: 10 ticks a second are enough
         a = self.read_agent()
+        self.check_settings(now)
         alpha = window_alpha(self.win) if self.shown and self.win is not None else 1.0
         if alpha is None or alpha < 0.5:
             # The browser's window no longer exists (the browser quit), or is fading out as macOS
@@ -1335,6 +1419,92 @@ class Overlay:
         self.control["show_cursor"] = not self.control.get("show_cursor")
         self.save()
 
+    def check_settings(self, now, force=False):
+        """Read the settings file again about once a second (a stat), and apply what changed."""
+        if not force and now - self.settings_at < SETTINGS_EVERY:
+            return
+        self.settings_at = now
+        try:
+            seen = os.stat(SETTINGS_FILE).st_mtime_ns if SETTINGS_FILE else None
+        except OSError:
+            seen = None
+        if seen == self.settings_seen and not force:
+            return
+        self.settings_seen = seen
+        self.apply_style(*chosen_style(read_settings()))
+
+    def apply_style(self, bar, light, lock):
+        global BAR_MODE, LIGHT_ON, LOCK_SETTING, LOCK_ON
+        rebuild = (bar == "compact") != (BAR_MODE == "compact")
+        light_was = LIGHT_ON
+        BAR_MODE, LIGHT_ON, LOCK_SETTING = bar, light, lock
+        LOCK_ON = LOCK_SETTING and BAR_MODE != "off"
+        if rebuild:
+            self.bar.panel.orderOut_(None)
+            self.bar = Bar(self.target, self.still)
+            # The level the others are at: a new panel starts at the normal level, and while the
+            # overlay floats it sat under the (transparent) lock, which then took its clicks.
+            self.bar.panel.setLevel_(self.level)
+            self.panels = (self.shield, *self.glow.panels, self.ripples.panel, self.pointer.panel, self.bar.panel)
+            if self.frame is not None:
+                self.bar.fit(self.frame[2])
+        if light_was and not LIGHT_ON:
+            for p in self.glow.panels:
+                p.orderOut_(None)
+        self.above = None  # restack on the next tick
+
+    def choose(self, key, value):
+        """A choice from the bar's menu: into the settings file, applied now."""
+        if key in FIXED:
+            return
+        try:
+            write_settings({key: value})
+        except OSError:
+            traceback.print_exc()
+        self.check_settings(time.time(), force=True)
+
+    def menu(self, sender):
+        menu = NSMenu.alloc().initWithTitle_("Overlay")
+        menu.setAutoenablesItems_(False)
+
+        def item(title, action, state=None, enabled=True, value=None, tip=None):
+            it = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, action, "")
+            if tip:
+                it.setToolTip_(tip)
+            if action:
+                it.setTarget_(self.target)
+            if state is not None:
+                it.setState_(1 if state else 0)
+            if value is not None:
+                it.setRepresentedObject_(value)
+            it.setEnabled_(enabled)
+            menu.addItem_(it)
+            return it
+
+        fixed_note = "  (fixed by the MCP config)"
+        item("Bar" + (fixed_note if "overlay_bar" in FIXED else ""), None, enabled=False)
+        # Hidden takes this menu away with the bar; it shows again only for a request for help or
+        # the person's hold, so the way back is said where it is chosen.
+        hidden_tip = "The bar and this menu stay hidden while the agent works. To bring them back: mcp-stealth-chrome settings reset overlay_bar"
+        for mode, title in (("full", "Full"), ("compact", "Compact"), ("hover", "Show on hover"), ("off", "Hidden")):
+            item("    " + title, "pickBar:", BAR_MODE == mode, "overlay_bar" not in FIXED, mode,
+                 hidden_tip if mode == "off" else None)
+        menu.addItem_(NSMenuItem.separatorItem())
+        item("Light" + (fixed_note if "overlay_light" in FIXED else ""), "toggleLight:",
+             LIGHT_ON, "overlay_light" not in FIXED)
+        lock_title = ("Lock the page" + (fixed_note if "overlay_lock" in FIXED else "")
+                      + ("  (off while the bar is hidden)" if BAR_MODE == "off" else ""))
+        item(lock_title, "toggleLock:", LOCK_ON, "overlay_lock" not in FIXED and BAR_MODE != "off")
+        item("Agent's cursor", "onCursor:", bool(self.control.get("show_cursor")))
+        menu.addItem_(NSMenuItem.separatorItem())
+        item("Saved for every agent browser", None, enabled=False)
+        # Above the button: the bar sits at the bottom of the window, and a menu opened below it
+        # fell off the window. The location is the menu's top-left corner in the button's view.
+        # Its right edge on the button's, so it opens over the window rather than past its edge.
+        width, height = menu.size().width, menu.size().height
+        y = -(height + 6) if sender.isFlipped() else sender.bounds().size.height + 6 + height
+        menu.popUpMenuPositioningItem_atLocation_inView_(None, (sender.bounds().size.width - width, y), sender)
+
 
 TIMER = None
 FAST = False
@@ -1345,9 +1515,12 @@ def schedule(interval):
     global TIMER
     if TIMER is not None:
         TIMER.invalidate()
-    TIMER = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+    TIMER = NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
         interval, TARGET, "tick:", None, True)
     TIMER.setTolerance_(interval / 4)
+    # Common modes: the default mode alone stops while the bar's menu is open (event tracking),
+    # and a browser closed meanwhile left the overlay standing until the menu closed.
+    NSRunLoop.currentRunLoop().addTimer_forMode_(TIMER, NSRunLoopCommonModes)
 
 
 class Target(NSObject):
@@ -1379,6 +1552,30 @@ class Target(NSObject):
     def onCursor_(self, _sender):
         try:
             OVERLAY.toggle_cursor()
+        except Exception:
+            traceback.print_exc()
+
+    def onMenu_(self, sender):
+        try:
+            OVERLAY.menu(sender)
+        except Exception:
+            traceback.print_exc()
+
+    def pickBar_(self, sender):
+        try:
+            OVERLAY.choose("overlay_bar", str(sender.representedObject()))
+        except Exception:
+            traceback.print_exc()
+
+    def toggleLight_(self, _sender):
+        try:
+            OVERLAY.choose("overlay_light", not LIGHT_ON)
+        except Exception:
+            traceback.print_exc()
+
+    def toggleLock_(self, _sender):
+        try:
+            OVERLAY.choose("overlay_lock", not LOCK_SETTING)
         except Exception:
             traceback.print_exc()
 

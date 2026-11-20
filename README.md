@@ -479,7 +479,7 @@ Options for one launch. Open one for the details:
 - ✅ The page sees Brave: `navigator.brave.isBrave()` is true and `userAgentData` lists Brave and Chromium with versions reduced to `157.0.0.0`, as Brave reports them. The identity override this server applies (headless, `lang`, `fingerprint`) keeps those, and never names Google Chrome there.
 - Brave's profiles are its own: `~/.mcp-stealth/brave-profile` for main, `~/.mcp-stealth/brave-profiles/<id>` for others. A profile belongs to the browser that made it: Brave and Chrome keep cookies and saved passwords under different keys, so opening a Chrome profile with Brave, or a Brave profile with Chrome, is refused and the result names why. `clone_chrome_profile(browser="brave")` copies into `brave-profiles/<id>`, to launch with `browser="brave"`.
 - `keep_alive=True` works for Brave as for Chrome. The next `browser="brave"` launch reattaches to a kept Brave, and a Chrome launch is never handed one (nor the reverse); the result says why a kept browser was not reattached.
-- With `MCP_STEALTH_DOCK_ICON=1` a visible Brave runs from Brave Beta (`/Applications/Brave Browser Beta.app`) with Brave Beta's own icon, which tells it apart from your Brave; the project icon is Chrome's. Otherwise on the same terms as Chrome Beta (see "Own Dock icon" below): only a profile Beta cannot damage, Beta missing means Brave with a note. Nothing is written into Brave Beta. `/Applications/Brave Browser.app` is never changed. Quit, `restore_tabs`, cookies kept across a close, and visible windows that stay behind the app in use work as they do for Chrome.
+- With the `dock_icon` setting on a visible Brave runs from Brave Beta (`/Applications/Brave Browser Beta.app`) with Brave Beta's own icon, which tells it apart from your Brave; the project icon is Chrome's. Otherwise on the same terms as Chrome Beta (see "Own Dock icon" below): only a profile Beta cannot damage, Beta missing means Brave with a note. Nothing is written into Brave Beta. `/Applications/Brave Browser.app` is never changed. Quit, `restore_tabs`, cookies kept across a close, and visible windows that stay behind the app in use work as they do for Chrome.
 - Brave Beta is not on the access list of the "Brave Safe Storage" Keychain item that Brave created, so the first time Brave Beta needs it macOS asks you. Always Allow keeps its logins. Deny, or no answer, leaves it unable to read the profile's cookies, and it drops them (measured on a test profile: 3 cookies, then none). The launch result says this whenever Brave Beta runs.
 - `server_status` reports under `brave` whether Brave is installed, where, and its version, and under `browser` which one is running.
 - A profile whose maker cannot be told (it holds data, and its `Local State` and `Preferences` are missing, any of them is unreadable, or they disagree) is refused to both browsers. A `--user-data-dir` in `extra_args` is treated as the launch's profile folder and gets the same checks; naming two different folders is refused.
@@ -520,7 +520,7 @@ Measured through this server on one macOS machine in November 2026, Brave 157.1.
 - The launcher does not modify other apps: macOS blocks an app from writing into another app's bundle (App Management). Brave Beta keeps its own icon anyway; for Chrome Beta, an update removes the project icon and the next launch from an agent or from `mcp-stealth-chrome open` in a terminal puts it back.
 - `open --move-to-beta` moves a profile Brave made to Brave Beta, once and one way: its cookies go through the cookie move, and Brave older than Beta is refused the profile afterwards. It is only applied when the profile is a folder of its own that Brave made, and both the version that last opened it and Brave Beta's are known; anything unknown is refused. If Brave Beta cannot read the cookies (macOS did not let it use "Brave Safe Storage": answer the Keychain dialog with Always Allow), the launch is refused and the profile is left as it was.
 - `--use-mock-keychain` in `extra_args` is for tests only and refused otherwise: cookies written with it can only be read with it again.
-- An agent that should launch the same Brave Beta when none runs needs `MCP_STEALTH_DOCK_ICON=1` in its server's environment too. Without it, its Brave launch on a profile Brave Beta opened is refused, since Brave 157 is older than the Beta that last opened it.
+- An agent that should launch the same Brave Beta when none runs needs `dock_icon` on too (the settings file is shared by every server; an `MCP_STEALTH_DOCK_ICON=0` in its config would win over it). Without it, its Brave launch on a profile Brave Beta opened is refused, since Brave 157 is older than the Beta that last opened it.
 - On Linux `open` works without the app; on Windows it says why not (keep_alive needs the quit watcher, which does not run there).
 </details>
 
@@ -604,16 +604,16 @@ browser_launch()   # a new agent, same profile
 `browser_launch(agent_overlay=True)` and `spawn_browser(agent_overlay=True)` put three things over a visible browser window, without drawing anything inside the page:
 
 - A light that turns slowly around the window while the agent acts, dims while it thinks between steps, and fades out when it stops. Its corners follow the window's own rounded corners, and turn square in full screen. It leaves with the window: about 0.1 s after a Quit, with the close animation when the window closes.
-- The bar, the light and the lock can each be set: a compact bar, a bar shown only while the pointer is over the window, or none; see `MCP_STEALTH_OVERLAY_BAR`, `MCP_STEALTH_OVERLAY_LIGHT` and `MCP_STEALTH_OVERLAY_LOCK` below.
+- The bar, the light and the lock can each be set from the bar's **⋯** menu, and the change shows at once: a compact bar, a bar shown only while the pointer is over the window, or none. See Settings below.
 - A bar at the bottom saying what the agent does, with **Take over**.
 - A lock over the page: a click or scroll there does not reach the page and the bar says why.
 
 Only **Take over** hands the browser to you. While you hold it, every tool that would act on or read the page is refused and says why, so the agent cannot see what you type there. **Resume agent** hands it back, and `wait_for_human` returns when you press it. A key you press while the agent works does not take over: its input waits until you stop, and the tool's result says your keys reached the page. `request_human_help` shows its request in the bar in amber with **Done**, and `wait_for_human` returns when you press it.
 
-The arrow button in the bar shows where the agent points and clicks, as a cursor labelled Agent. It is off unless `MCP_STEALTH_AGENT_CURSOR=1`.
+The arrow button in the bar shows where the agent points and clicks, as a cursor labelled Agent. It starts off unless the `agent_cursor` setting is on.
 
-- Off by default. `MCP_STEALTH_AGENT_OVERLAY=1` turns it on for every launch, and `agent_overlay=False` on a running browser stops it. It needs the `os-cursor` extra; without it, headless, or on a browser you opened from the Dock launcher, the launch result says it is off and why. The result says on only once the overlay reports it is up.
-- The bar with **Done** or **Resume agent** stays as long as the request or your hold lasts; otherwise everything fades out after 90 seconds without a tool call (`MCP_STEALTH_OVERLAY_HIDE_AFTER`).
+- Off by default. The `agent_overlay` setting turns it on for every launch, and `agent_overlay=False` on a running browser stops it. It needs the `os-cursor` extra; without it, headless, or on a browser you opened from the Dock launcher, the launch result says it is off and why. The result says on only once the overlay reports it is up.
+- The bar with **Done** or **Resume agent** stays as long as the request or your hold lasts; otherwise everything fades out after 90 seconds without a tool call (`overlay_hide_after`).
 - If the overlay process dies, it is started again (three times at most) and keeps who holds the browser. If it cannot be, the tools stay refused while you hold it, and `browser_launch(agent_overlay=False)` is the way to release it once you tell the agent you are done.
 - Take over stops input already under way: a drag, a scroll, typing or a click stops at its next step, a held button is let go, and each step of `batch_actions` and `workflow_run` is refused like a call.
 - Measured on a MacBook with a 120 Hz display, against no overlay at all: the overlay process uses about 3% CPU and WindowServer about 10 points more while the agent works with the cursor off. The light is drawn at 30 frames a second in four thin windows along the edges and turns once every 16 seconds; at 20 frames it costs about 5 points but the colours visibly step, at 60 about 19. With the cursor on, WindowServer uses about 18 points more while it moves.
@@ -646,7 +646,7 @@ Chrome 158 on macOS stops reading the cookies an older Chrome wrote in a profile
 <details>
 <summary><b>Own Dock icon (macOS, opt-in)</b></summary>
 
-With `MCP_STEALTH_DOCK_ICON=1`, a visible browser on a new profile runs from Google Chrome Beta (`/Applications/Google Chrome Beta.app`) with the project icon, so it is not mistaken for your own Chrome. It needs Chrome Beta installed. Measured on Chrome Beta 158:
+With the `dock_icon` setting on, a visible browser on a new profile runs from Google Chrome Beta (`/Applications/Google Chrome Beta.app`) with the project icon, so it is not mistaken for your own Chrome. It needs Chrome Beta installed. Measured on Chrome Beta 158:
 
 - Only a profile nothing has written to goes to Beta: `persistent=False`, `privacy=True`, or a profile folder that does not exist yet or is empty. A profile that already holds data stays on Google Chrome and the result says why. Chrome 158 does not read the `v10` cookies Chrome 157 stores in a profile outside its default folder, and deletes them: a copy of a profile with 1172 cookies had none left after Beta opened it. When in doubt, Google Chrome is used.
 - A profile Beta made stays on Beta, and the result says so. Google Chrome 157 is refused it, headless too, until Google Chrome reaches the version that last opened it.
@@ -986,19 +986,40 @@ The server can act as whoever is logged in to its browsers, so access is restric
 - Request interception and performance tracing work for one session at a time.
 </details>
 
+### Settings
+
+Your own preferences live in one file, `~/.mcp-stealth/settings.json`, shared by every server on the machine. Change them from the overlay bar's **⋯** menu, or with the command:
+
+```bash
+uvx mcp-stealth-chrome settings                          # each setting, its value and where it came from
+uvx mcp-stealth-chrome settings set overlay_bar compact
+uvx mcp-stealth-chrome settings reset overlay_bar        # back to the default (reset alone: all of them)
+```
+
+A change applies to the next launch, and the overlay's bar, light and lock change at once on a browser already open. Choosing **Hidden** for the bar takes the **⋯** menu away with it (the bar still shows for a request for help or while you hold the browser); `settings reset overlay_bar` brings it back. Each setting has an environment variable of its own; one set in an MCP server's config wins over the file for that server (the list and `server_status.settings` show it as `env`), and the **⋯** menu shows it as fixed.
+
+| Setting | Values | Default | What it does | Variable |
+|---------|--------|---------|--------------|----------|
+| `agent_overlay` | on, off | off | The overlay on every visible launch: a light, a bar with **Take over**, a lock (macOS, `os-cursor` extra) | `MCP_STEALTH_AGENT_OVERLAY` |
+| `overlay_bar` | full, compact, hover, off | full | The bar: a small one, one shown only while the pointer is over the window, or none while the agent works (then no lock either, since the bar's button is how you take over). Help requests and your hold always show it | `MCP_STEALTH_OVERLAY_BAR` |
+| `overlay_light` | on, off | on | The light around the window | `MCP_STEALTH_OVERLAY_LIGHT` |
+| `overlay_lock` | on, off | on | Keeps clicks off the page while the agent works | `MCP_STEALTH_OVERLAY_LOCK` |
+| `agent_cursor` | on, off | off | The bar starts with the agent's cursor shown | `MCP_STEALTH_AGENT_CURSOR` |
+| `overlay_hide_after` | seconds, 1 to 86400 | 90 | Quiet time before the overlay fades out (not while a request for help or your hold shows) | `MCP_STEALTH_OVERLAY_HIDE_AFTER` |
+| `dock_icon` | on, off | off | Visible browsers on new profiles run from Google Chrome Beta with the project icon, or Brave Beta with its own (macOS). See "Own Dock icon" under What tool results tell you | `MCP_STEALTH_DOCK_ICON` |
+
 ### Environment variables
 
-The ones most people set:
+Set in the MCP server's config. The ones most people set:
 
 | Variable | Purpose |
 |----------|---------|
 | `BROWSER_IDLE_TIMEOUT` | Seconds before an idle `spawn_browser` instance or HTTP-mode browser closes. Default 600, 0 means never |
 | `MCP_STEALTH_TOKEN` | Token for HTTP mode |
-| `MCP_STEALTH_DOCK_ICON` | Set to `1` to run visible browsers on new profiles from Google Chrome Beta with the project icon, or from Brave Beta with its own icon for `browser="brave"` (macOS). See "Own Dock icon" under What tool results tell you |
 | `MCP_STEALTH_DATA_DIR` | Folder used instead of `~/.mcp-stealth` for profiles, screenshots, exports and the rest. Chrome keeps your real home folder. The HTTP token stays in `~/.mcp-stealth` |
 
 <details>
-<summary><b>All other variables</b> (30)</summary>
+<summary><b>Advanced and internal variables</b> (35): limits, folders, tests and API keys</summary>
 
 | Variable | Purpose |
 |----------|---------|
@@ -1024,13 +1045,8 @@ The ones most people set:
 | `MCP_STEALTH_LAUNCHER_ACTIVATE` | Set to `0` so `open` leaves the browser behind the app in use instead of bringing it forward (tests) |
 | `MCP_STEALTH_LAUNCHER_EXTRA_ARGS` | A JSON list of extra browser flags for `open`, used by tests |
 | `MCP_STEALTH_ADBLOCK_DIR` | Folder for the filter lists and engine of `block_ads`. Default `~/.mcp-stealth/adblock` |
-| `MCP_STEALTH_AGENT_OVERLAY` | Set to `1` to show `agent_overlay` on every headed launch (macOS). Default off |
-| `MCP_STEALTH_AGENT_CURSOR` | Set to `1` so the overlay's bar starts with the agent's cursor shown. Default off |
+| `MCP_STEALTH_SETTINGS` | The settings file. Default `~/.mcp-stealth/settings.json` (in `MCP_STEALTH_DATA_DIR` when that is set) |
 | `MCP_STEALTH_OVERLAY_DIR` | Folder for the files the server shares with the overlay. Default `$TMPDIR/mcp-stealth-overlay` |
-| `MCP_STEALTH_OVERLAY_HIDE_AFTER` | Seconds without a tool call before the overlay fades out (not while a request for help or your hold shows). Default 90 |
-| `MCP_STEALTH_OVERLAY_BAR` | The overlay's bar: `full` (default), `compact` (a small bar), `hover` (shown while the pointer is over the browser window) or `off` (hidden while the agent works; the lock is off too, since the bar's button is how you take over). Help requests and your hold always show it |
-| `MCP_STEALTH_OVERLAY_LIGHT` | `off` hides the light around the window. Default `on` |
-| `MCP_STEALTH_OVERLAY_LOCK` | `off` lets clicks reach the page while the agent works. Default `on` |
 | `MCP_STEALTH_OVERLAY_CORNER` | The window corner the overlay's light follows: `<box>` or `<box>,<n>` (a superellipse; `n=2` is a circle). Default `37,4` on macOS 26 (measured), `10,2` before |
 | `MCP_STEALTH_CLOSED_PROBE_MAX_NODES` | Largest document, in elements, whose closed shadow roots `browser_snapshot` reads through the DOM domain. 0 turns it off. Default 5000 |
 | `MCP_STEALTH_ADBLOCK_DOWNLOAD_TIMEOUT` | Seconds a list download may take in all. Default 20 |

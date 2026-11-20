@@ -108,6 +108,23 @@ def _brave_lean_records_in_a_temp_folder():
 
 
 @pytest.fixture(scope="session", autouse=True)
+def _settings_in_a_temp_file():
+    """The developer's own ~/.mcp-stealth/settings.json never reaches a test: every server and
+    in-process call reads a settings file of the run's own, which starts empty."""
+    previous = os.environ.get("MCP_STEALTH_SETTINGS")
+    folder = tempfile.mkdtemp(prefix="mcp-stealth-settings-")
+    os.environ["MCP_STEALTH_SETTINGS"] = os.path.join(folder, "settings.json")
+    try:
+        yield os.environ["MCP_STEALTH_SETTINGS"]
+    finally:
+        if previous is None:
+            os.environ.pop("MCP_STEALTH_SETTINGS", None)
+        else:
+            os.environ["MCP_STEALTH_SETTINGS"] = previous
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+@pytest.fixture(scope="session", autouse=True)
 def _agent_overlay_off_and_in_a_temp_folder():
     """agent_overlay is off for every server the suite starts, whatever the developer's own
     environment says, and its files go to a temporary folder. A test about it passes

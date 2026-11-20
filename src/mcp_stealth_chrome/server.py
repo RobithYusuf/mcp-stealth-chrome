@@ -2777,6 +2777,14 @@ async def _dock_icon_status() -> dict:
         return {"state": "unavailable", "detail": _exc_text(exc)}
 
 
+def _settings_report() -> dict:
+    from . import settings
+    try:
+        return settings.report()
+    except Exception as exc:  # never fails server_status
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
 async def _brave_beta_status() -> dict:
     try:
         return await asyncio.wait_for(asyncio.to_thread(brave_beta.status), timeout=3)
@@ -4099,9 +4107,9 @@ async def browser_launch(
             hold it every tool that acts on or reads the page is refused, saying so, until they
             press Resume agent (wait_for_human waits for that). A key they press while the agent
             works pauses its input for a moment and the result says so. request_human_help
-            shows the request in the bar with Done. The bar can show the agent's cursor (off
-            unless MCP_STEALTH_AGENT_CURSOR=1). None (default) follows MCP_STEALTH_AGENT_OVERLAY,
-            off unless set. Needs the os-cursor extra (PyObjC); without it, headless, or on a
+            shows the request in the bar with Done. The bar can show the agent's cursor (the
+            agent_cursor setting, off). None (default) follows the agent_overlay setting, off
+            unless set (`mcp-stealth-chrome settings`, or MCP_STEALTH_AGENT_OVERLAY=1). Needs the os-cursor extra (PyObjC); without it, headless, or on a
             browser the person opened from the launcher, the result says it is off and why.
     """
     product, brave_executable, problem = brave_mode.check_request(browser, vertical_tabs)
@@ -7864,6 +7872,9 @@ async def server_status() -> str:
         "os_cursor": await _os_cursor_status(),
         "dock_icon": await _dock_icon_status(),
         "dock_icon_brave": await _brave_beta_status(),
+        # Each personal setting with where its value came from (env, the settings file, the default):
+        # a setting that "does not change" is usually one an environment variable fixes.
+        "settings": _settings_report(),
         "brave": {**(await asyncio.to_thread(_brave_status)), "lean_running": _brave_lean_running()},
         "profile_gc": profile_gc.status(),
         "block_ads": (_adblock_if_loaded().status([BrowserState.browser] + [
@@ -7871,9 +7882,10 @@ async def server_status() -> str:
             else {"browsers": [], "package": adblock_package_note(),
                   "note": "no launch in this process asked for block_ads"}),
         "agent_overlay": {
-            "default": "on" if presence.wanted(None) else "off (MCP_STEALTH_AGENT_OVERLAY)",
+            "default": "on" if presence.wanted(None) else "off (the agent_overlay setting)",
             "available": presence.unavailable() or "yes",
             "style": presence.style(),
+            "change": "the bar's ... menu, or mcp-stealth-chrome settings; see settings",
             "instances": {iid: presence.status(b) for iid, b in [
                 (BrowserState.current_instance_id, BrowserState.browser)] + [
                 (i, snap.browser) for i, snap in BrowserState.instances.items()] if b is not None},
@@ -9440,7 +9452,7 @@ async def spawn_browser(
         brave_lean: Brave only; as in browser_launch (None: lean on a profile this server
             made empty, True: lean, False: as it ships)
         agent_overlay: the light, bar and Take over over this instance's window, as in
-            browser_launch (macOS, headed; None follows MCP_STEALTH_AGENT_OVERLAY)
+            browser_launch (macOS, headed; None follows the agent_overlay setting)
         other args: same as browser_launch
 
     Use switch_instance(id) to route subsequent tool calls to this instance.

@@ -45,7 +45,7 @@ from . import keep_alive as _keep_alive
 from . import launch_lock
 from . import state as _state
 
-COMMANDS = ("open", "install-launcher")
+COMMANDS = ("open", "install-launcher", "settings")
 ENV_DIR = "MCP_STEALTH_LAUNCHER_DIR"
 ENV_EXTRA_ARGS = "MCP_STEALTH_LAUNCHER_EXTRA_ARGS"
 ENV_ACTIVATE = "MCP_STEALTH_LAUNCHER_ACTIVATE"
@@ -713,6 +713,9 @@ def _install_command(args: argparse.Namespace) -> int:
 
 
 def cli(argv: list[str]) -> int:
+    if argv and argv[0] == "settings":
+        from . import settings
+        return settings.cli(argv[1:])
     parser = argparse.ArgumentParser(prog="mcp-stealth-chrome")
     sub = parser.add_subparsers(dest="command", required=True)
     opener = sub.add_parser("open", help="open the agent browser, or bring it forward")

@@ -40,6 +40,8 @@ uvx mcp-stealth-chrome → Python 3.11+ → FastMCP → nodriver → Chrome/Chro
 - `src/mcp_stealth_chrome/adblock.py`: `block_ads`: the filter lists, the stored engine, and the blocker's own CDP connection.
 - `src/mcp_stealth_chrome/presence.py`: `agent_overlay`, the server's side: when it starts, the refusal while the person holds
   the browser, the pause for their typing. `_agent_overlay.py` is the overlay process, a standalone script (PyObjC).
+- `src/mcp_stealth_chrome/settings.py`: the person's settings (`~/.mcp-stealth/settings.json`, the environment over it) and
+  `mcp-stealth-chrome settings`.
 - `src/mcp_stealth_chrome/_app.py` — `StealthMCP`, the FastMCP boundary. `captcha.py`, `image_output.py`, `result_types.py` — their named helpers.
 - `src/mcp_stealth_chrome/tools/` — `research.py`, `devtools.py`, `vision.py`, `network_http.py`, `profiles.py`,
   `storage.py` (cookies, web storage, IndexedDB, cache), `capture.py` (request interception, HAR, dry_run),
@@ -396,7 +398,8 @@ conclusions. Each rule below replaced a real lie.
   this browser's PID is frontmost, about 130 ms measured, so keys typed in that moment still reach Chrome. It compares the
   PID, because a person's own Chrome has the same bundle path. `tests/test_headed_focus.py` measures all this, with
   `MCP_HEADED=1`, and counts this browser's PID so the person's other apps cannot skew it.
-- The Dock icon is opt-in: only `MCP_STEALTH_DOCK_ICON=1` (or true, yes, on) turns it on. Off changes nothing: Google
+- The Dock icon is opt-in: only the `dock_icon` setting turns it on (`MCP_STEALTH_DOCK_ICON=1`, or true, yes, on, or the
+  settings file; see Settings). Off changes nothing: Google
   Chrome as before, nothing in the launch result, nothing written to Chrome Beta, and `dock_icon: off` in `server_status`,
   whose detail only offers the switch as working when Beta is installed.
 - With it on, a headed launch on macOS runs from `/Applications/Google Chrome Beta.app`, which carries the project icon as a
@@ -1133,9 +1136,30 @@ the person (the same target events as Cmd+T, a followed link, a closed tab).
   already settled (the fetch rejected with AbortError); a redirect and a target closed meanwhile give no error.
   Nothing is left held then. `answer_errors` counts every other refusal, with samples (detik.com showed 2 of 399).
 
+### Settings (settings.py)
+
+- The person's preferences are `settings.SETTINGS`: `agent_overlay`, `overlay_bar`, `overlay_light`, `overlay_lock`,
+  `agent_cursor`, `overlay_hide_after`, `dock_icon`. Order: the environment, then `~/.mcp-stealth/settings.json`
+  (`MCP_STEALTH_SETTINGS`, else `data_root()`), then the default, read at call time. An MCP config is the explicit
+  choice of whoever set that server up, so it wins; the file is what the person picks from the overlay's menu or with
+  `mcp-stealth-chrome settings` (list, set, reset). Asked about putting everything in the environment, the developer
+  chose this split (20 Nov 2026): a person should not have to edit an MCP config and restart for a look-and-feel choice.
+- Only settings a person would change go there. Paths, limits, test switches and API keys stay environment variables,
+  in the README's collapsed "Advanced and internal variables". A new personal switch is a `Setting`, read through
+  `settings.get`, never `os.environ` directly, or the file and the menu silently do nothing for it.
+- A value that does not parse is skipped with a note (`resolve`), never applied; the file is read with `O_NOFOLLOW`,
+  only as a regular file owned by this user, and anything else reads as no settings. It is written 0600 in a 0700
+  folder through a fresh `O_EXCL` file and `os.replace`, never through a link.
+- `server_status.settings` lists each value and its source (`default`, `file`, `env <NAME>`): a setting that "does
+  not change" is usually one an environment variable fixes.
+- `_agent_overlay.py` has its own copy of the reader and of the order (it runs with `-I` and imports nothing of the
+  package); `tests/test_settings.py` takes those functions out of its source with `ast` and checks they decide as
+  `presence.style()` does. `tests/conftest.py` points `MCP_STEALTH_SETTINGS` at a file of the run's own, so the
+  developer's own preferences never reach a test.
+
 ### Agent overlay (agent_overlay)
 
-- Per launch (`browser_launch`, `spawn_browser`, both reattaches), off unless asked or `MCP_STEALTH_AGENT_OVERLAY=1`; macOS,
+- Per launch (`browser_launch`, `spawn_browser`, both reattaches), off unless asked or the `agent_overlay` setting is on; macOS,
   headed, PyObjC from the `os-cursor` extra (found with `find_spec`, nothing imported). Headless, a browser the person opened
   from the launcher (a lock over their window would keep them from their own tabs) or no known Chrome PID: the result says
   OFF and why. `tests/conftest.py` sets it off and `MCP_STEALTH_OVERLAY_DIR` to a temporary folder for every server.
@@ -1225,9 +1249,14 @@ the person (the same target events as Cmd+T, a followed link, a closed tab).
   (`setAnimationBehavior_(None)`), which shrank them for a third of a second. Measured: gone 0.13 s after a Quit
   (3.35 s before), 0.31 s after a window close, with the close animation. While the window moves the tick runs at
   TICK_MOVING (60 a second, `schedule`), 20 otherwise: at 20 the light trailed a drag.
-- `presence.style()` reads the person's choice and passes it to the overlay: `MCP_STEALTH_OVERLAY_BAR` full, compact
-  (30 pt bar, first words of the status, no cursor switch), hover (shown while the pointer is over the visible
-  browser window, `HOVER_LINGER` after) or off; `MCP_STEALTH_OVERLAY_LIGHT` and `MCP_STEALTH_OVERLAY_LOCK` on/off.
+- `presence.style()` reads the person's choice (the `overlay_bar`, `overlay_light` and `overlay_lock` settings) and passes
+  it to the overlay: bar full, compact (30 pt bar, first words of the status, no cursor switch), hover (shown while the
+  pointer is over the visible browser window, `HOVER_LINGER` after) or off; light and lock on/off. The overlay reads the
+  settings file again about once a second (a stat) and applies a change at once; compact rebuilds the bar at the
+  overlay's current level (a new panel starts at the normal level, under the floating lock, which then took its clicks).
+  The bar's **⋯** menu writes the file the way `settings.write` does; a setting the server's environment fixed is
+  passed in `fixed`, wins there too, and its menu item is disabled. The tick timer runs in the common run-loop modes,
+  or it stopped while the menu was open and a browser closed meanwhile left the overlay standing.
   The bar's button is the only way to take over, so help (Done) and the person's hold (Resume agent) always show it,
   and a bar that is off turns the lock off: a lock with no Take over in reach would shut the person out of the page.
   `server_status.agent_overlay.style` reports it.

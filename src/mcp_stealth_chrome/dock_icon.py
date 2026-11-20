@@ -40,6 +40,7 @@ except ImportError:  # Windows. Importing it unguarded stopped the server from s
     fcntl = None
 
 ENV_SWITCH = "MCP_STEALTH_DOCK_ICON"
+SWITCH_HOW = f"mcp-stealth-chrome settings set dock_icon on, or {ENV_SWITCH}=1"
 ENV_APP_DIR = "MCP_STEALTH_APP_DIR"
 # Where Google installs it. The person's own Chrome, which this module never writes to.
 BETA_APP = Path("/Applications/Google Chrome Beta.app")
@@ -110,7 +111,9 @@ class DockChrome:
 
 
 def asked_for() -> bool:
-    return os.environ.get(ENV_SWITCH, "").strip().lower() in ("1", "true", "yes", "on")
+    """MCP_STEALTH_DOCK_ICON, or dock_icon in the settings file (settings.py)."""
+    from . import settings
+    return bool(settings.get("dock_icon"))
 
 
 def enabled() -> bool:
@@ -266,11 +269,11 @@ def _status() -> dict:
     if not enabled():
         if binary is None:
             return {"state": "off", "detail": (
-                f"off. {ENV_SWITCH}=1 runs visible browsers from Google Chrome Beta with the "
+                f"off. dock_icon on ({SWITCH_HOW}) runs visible browsers from Google Chrome Beta with the "
                 f"project icon; Beta is not installed in {BETA_APP.parent}, so it would have "
                 "no effect here")}
         return {"state": "off", "detail": (
-            f"off. {ENV_SWITCH}=1 runs visible browsers from Google Chrome Beta {version} "
+            f"off. dock_icon on ({SWITCH_HOW}) runs visible browsers from Google Chrome Beta {version} "
             "with the project icon")}
     if binary is None:
         return {"state": "beta-missing", "detail": missing_note()}

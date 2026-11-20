@@ -4,7 +4,7 @@ A separate process (`_agent_overlay.py`, PyObjC from the os-cursor extra) draws 
 around the browser window while the agent acts, a bar saying what it does, and a lock over the
 page so a stray click or scroll never reaches it. Only the bar's Take over button hands the
 browser to the person, and only Resume agent hands it back. The agent's cursor can be shown
-from the bar; it is off unless MCP_STEALTH_AGENT_CURSOR=1. Nothing is drawn inside the page.
+from the bar; it starts off unless the agent_cursor setting is on. Nothing is drawn inside the page.
 
 This side writes what the agent does into `agent.json` and reads who holds the browser from
 `control.json`, both in a 0700 folder of its own under $TMPDIR. While the person holds it, every
@@ -142,7 +142,8 @@ def _call_args() -> dict:
 def wanted(arg: Optional[bool]) -> bool:
     if arg is not None:
         return bool(arg)
-    return os.environ.get("MCP_STEALTH_AGENT_OVERLAY", "").strip().lower() in TRUE
+    from . import settings
+    return bool(settings.get("agent_overlay"))
 
 
 def unavailable() -> Optional[str]:
@@ -163,13 +164,25 @@ def _script() -> str:
     return (Path(__file__).with_name("_agent_overlay.py")).read_text(encoding="utf-8")
 
 
+LIVE_SETTINGS = ("overlay_bar", "overlay_light", "overlay_lock")
+
+
+def overlay_config(folder: Path, pid: int, cursor: bool, start: Optional[str] = None) -> dict:
+    """What the overlay process starts with. It reads the settings file again while it runs, so
+    a choice from its menu or `mcp-stealth-chrome settings` applies at once; a setting the
+    environment fixed is passed in `fixed`, so the file never overrides it there either."""
+    from . import settings
+    data = settings.read_file()
+    resolved = {key: settings.resolve(key, data) for key in LIVE_SETTINGS}
+    fixed = {key: r["value"] for key, r in resolved.items() if r["source"].startswith("env")}
+    hide_after = float(settings.resolve("overlay_hide_after", data)["value"])
+    return {"state": str(folder), "pid": pid, "start": start, "server": os.getpid(), "cursor": cursor,
+            "hide_after": hide_after if hide_after > 0 else HIDE_AFTER, "style": style(),
+            "settings_file": str(settings.path()), "fixed": fixed}
+
+
 def _spawn(folder: Path, pid: int, cursor: bool, start: Optional[str] = None) -> subprocess.Popen:
-    try:
-        hide_after = float(os.environ.get("MCP_STEALTH_OVERLAY_HIDE_AFTER") or HIDE_AFTER)
-    except ValueError:
-        hide_after = HIDE_AFTER
-    cfg = {"state": str(folder), "pid": pid, "start": start, "server": os.getpid(), "cursor": cursor,
-           "hide_after": hide_after if hide_after > 0 else HIDE_AFTER, "style": style()}
+    cfg = overlay_config(folder, pid, cursor, start)
     log_fd = os.open(folder / "overlay.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND | NOFOLLOW, 0o600)
     with os.fdopen(log_fd, "ab") as log:
         proc = subprocess.Popen(
@@ -352,7 +365,8 @@ async def attach(browser: Any, pid: Optional[int], *, ask: Optional[bool], headl
     root = state_root()
     if root.is_symlink():
         return f" [agent_overlay: OFF, its state folder {root} is a link]"
-    cursor = os.environ.get("MCP_STEALTH_AGENT_CURSOR", "").strip().lower() in TRUE
+    from . import settings
+    cursor = bool(settings.get("agent_cursor"))
     from . import _quit_watcher as _watcher
     from . import quit_watch
     start = await asyncio.to_thread(quit_watch.pid_start, browser, pid)
@@ -595,33 +609,19 @@ def end_help(browser: Any) -> None:
 BAR_MODES = ("full", "compact", "hover", "off")
 
 
-def _switch(name: str, default: bool) -> bool:
-    value = os.environ.get(name, "").strip().lower()
-    if value in ("1", "true", "yes", "on"):
-        return True
-    if value in ("0", "false", "no", "off"):
-        return False
-    return default
-
-
 def style() -> dict:
-    """How the overlay looks, from the environment (set once in the MCP server's config):
-
-    MCP_STEALTH_OVERLAY_BAR   full (default), compact (a small bar: dot, short status, the
-                              button), hover (the bar shows while the pointer is over the
-                              browser window) or off (hidden while the agent works).
-    MCP_STEALTH_OVERLAY_LIGHT on (default) / off: the light around the window.
-    MCP_STEALTH_OVERLAY_LOCK  on (default) / off: the lock that keeps clicks off the page while
-                              the agent works.
+    """How the overlay looks: settings.py's overlay_bar (full, compact, hover, off), overlay_light
+    and overlay_lock, from the environment, the settings file or the default.
 
     The bar's button is the only way to take the browser over, so a request for help (Done) and
     the person's hold (Resume agent) always show it, and with the bar off the lock is off too:
     a lock with no Take over in reach would leave the person shut out of the page."""
-    bar = os.environ.get("MCP_STEALTH_OVERLAY_BAR", "").strip().lower() or "full"
+    from . import settings
+    bar = settings.get("overlay_bar")
     if bar not in BAR_MODES:
         bar = "full"
-    lock = _switch("MCP_STEALTH_OVERLAY_LOCK", True) and bar != "off"
-    return {"bar": bar, "light": _switch("MCP_STEALTH_OVERLAY_LIGHT", True), "lock": lock}
+    lock = bool(settings.get("overlay_lock")) and bar != "off"
+    return {"bar": bar, "light": bool(settings.get("overlay_light")), "lock": lock}
 
 
 def status(browser: Any) -> dict:
