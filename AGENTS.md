@@ -1184,7 +1184,11 @@ the person (the same target events as Cmd+T, a followed link, a closed tab).
   them; a review that called this wrong for other monitors was checked against that.
 - No blinking, each from a cause seen in the prototype: the bar keeps one width per window width (resizing its background
   flashed and moved it on every status change) and cross-fades its text; the light dims between tool calls instead of going
-  out (`QUIET_AFTER` 2.5 s, out after `HIDE_AFTER` 90 s); a missing window must stay missing 0.6 s before anything hides;
+  out (`QUIET_AFTER` 2.5 s, to 70%: half read as switched off; out after `HIDE_AFTER` 90 s); a missing window must
+  stay missing 0.6 s before anything hides, counted from the first scan that missed it: the cached bounds stand in between
+  scans only while the window is there (they used to reset the count every tick, so after a Quit the light and the lock
+  stayed 3.35 s, until the process left; now about 1.1 s). The lock, being invisible, goes at the first missed scan
+  (about 0.5 s), so clicks where the window was are never swallowed;
   the window followed is kept while on screen (a Chrome popup over 300x200 moved the overlay); and while no other window
   covers the browser the overlay sits in the floating level (3). At level 0 just above Chrome, clicking an inactive Chrome
   brought its windows over the overlay until the next tick. Covered, it drops to level 0 just above Chrome. App switches
@@ -1201,6 +1205,10 @@ the person (the same target events as Cmd+T, a followed link, a closed tab).
   turn (about 9 points a frame), keeps turning while dimmed and stops only once it has faded out. The agent's cursor costs about
   +18 points while it moves, in a small window or a full one alike, so it is off by default. Pausing the light while other
   windows cover the browser made no difference (WindowServer skips them already) and is not done.
+- The light reaches 64 pt into the window through four mask layers (widths 30/14/6/2.5, blur 64/30/12/0, drawn once):
+  34 pt in three layers read as too faint. Measured against the old light, 15 s with the light on, two rounds each:
+  the overlay process 1.7 to 2.0% either way, and WindowServer within its own noise (16.6 to 35.6% old, 17.7 to 28.0%
+  new, other apps on screen), as the earlier finding that its cost follows frames, not area, predicts.
 - `tests/test_agent_overlay.py` (fast) and `tests/test_agent_overlay_e2e.py` (`MCP_HEADED=1`, real Chrome, through the MCP
   boundary): the strips on the window's edges, refusals while held, Resume and Done ending `wait_for_human`, the typing
   pause, the overlay still in front after `request_human_help` brings Chrome forward, and the overlay ending with the browser.

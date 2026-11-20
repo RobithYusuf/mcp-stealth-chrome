@@ -97,8 +97,8 @@ TRUNCATE_TAIL = 4
 RADIUS = 12.0
 TURN = 16.0         # seconds per turn of the light: at 30 fps a corner moves about 9 points a
                     # frame (9 s at 20 fps moved it 25, and the soft colours stepped visibly)
-DEPTH = 34.0        # how far the light reaches into the window
-STRIP = 56.0        # thickness of the edge windows that carry it
+DEPTH = 64.0        # how far the light reaches into the window (34 read as too faint, 20 Nov 2026)
+STRIP = 96.0        # thickness of the edge windows that carry it: the softest layer must fit
 TICK = 1 / 20       # the glow's own pace: every update lands on a frame drawn anyway
 CALM_EVERY = 2      # with nothing moving, do a tick's work every 2nd tick
 SCAN_EVERY = 0.25   # seconds between reads of the windows above the browser's
@@ -358,7 +358,9 @@ def ring_image(scale):
     ctx = CGBitmapContextCreate(None, px, px, 8, px * 4, CGColorSpaceCreateDeviceRGB(),
                                 kCGImageAlphaPremultipliedLast)
     CGContextScaleCTM(ctx, scale, scale)
-    for width, alpha, soft in ((10.0, 0.22, 24.0), (4.0, 0.45, 8.0), (2.0, 1.0, 0.0)):
+    # Widest and softest first: four layers so the light falls off in a long, even gradient
+    # instead of a band; drawn once, so the extra layer costs nothing per frame.
+    for width, alpha, soft in ((30.0, 0.14, 64.0), (14.0, 0.26, 30.0), (6.0, 0.5, 12.0), (2.5, 1.0, 0.0)):
         CGContextSaveGState(ctx)
         if soft:
             CGContextSetShadowWithColor(ctx, (0, 0), soft * scale, cg((0, 0, 0, 1.0)))
@@ -452,7 +454,7 @@ class Glow:
         CATransaction.commit()
 
     def set(self, level):
-        """on: full; dim: between steps, half as bright; off: hidden. The light keeps turning
+        """on: full; dim: between steps, at 70% (half read as switched off); off: hidden. The light keeps turning
         through on and dim, so a change of step never stops it with a jolt; it stops only once
         it has faded out (settle), and starts turning before it fades in."""
         if level == self.level:
@@ -468,7 +470,7 @@ class Glow:
         CATransaction.setAnimationDuration_({"on": 0.6, "dim": 0.9, "off": 0.7}[level])
         CATransaction.setAnimationTimingFunction_(ease())
         for strip in self.strips:
-            strip[1].setOpacity_({"on": 1.0, "dim": 0.5, "off": 0.0}[level])
+            strip[1].setOpacity_({"on": 1.0, "dim": 0.7, "off": 0.0}[level])
         CATransaction.commit()
 
     def settle(self, now):
@@ -982,9 +984,19 @@ class Overlay:
             b = self.browser_window(pid, scan, a.get("window"))
             if scan:
                 self.scanned_at = now
-        elif pid and self.frame is not None:
+        elif pid and self.frame is not None and self.missing_since is None:
+            # The last bounds stand in between scans only while the window is there. Once a scan
+            # missed it they must not, or every tick in between reset the missing time and
+            # MISSING_FOR never ran out: after a Quit the light and the lock over the page (which
+            # takes clicks) stayed 3.35 s, until this process left with the browser.
             b = self.frame
         if b is None:
+            # The lock over the page is invisible, so it goes at once: nothing on screen changes,
+            # and clicks where the closed window was are not swallowed during MISSING_FOR. The
+            # light still waits it out (no blinking), and the lock comes back with the window.
+            if self.shield_on:
+                self.shield.orderOut_(None)
+                self.shield_on = False
             self.missing_since = self.missing_since or now
             if now - self.missing_since > MISSING_FOR:
                 self.hide()
