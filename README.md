@@ -614,12 +614,12 @@ browser_launch()   # a new agent, same profile
 
 `browser_launch(agent_overlay=True)` and `spawn_browser(agent_overlay=True)` put three things over a visible browser window, without drawing anything inside the page:
 
-- A light that turns slowly around the window while the agent acts, dims while it thinks between steps, and fades out when it stops. Its corners follow the window's own rounded corners, and turn square in full screen. It leaves with the window: about 0.1 s after a Quit, with the close animation when the window closes.
+- A light that turns slowly around the window and breathes between thin and thick while the agent acts, dims while it thinks between steps, and fades out when it stops. Its corners follow the window's own rounded corners, and turn square in full screen. It leaves with the window: about 0.1 s after a Quit, with the close animation when the window closes.
 - The bar, the light and the lock can each be set from the bar's **⋯** menu, and the change shows at once: a compact bar, a bar shown only while the pointer is over the window, or none. See Settings below.
 - A bar at the bottom saying what the agent does, with **Take over**.
-- A lock over the page: a click or scroll there does not reach the page and the bar says why. It follows the page when you move, resize or zoom the window or go full screen; the tab strip and address bar stay usable.
+- A lock over the page while the agent works: a click or scroll there does not reach the page and the bar says why. It follows the page when you move, resize or zoom the window or go full screen; the tab strip and address bar stay usable. After 20 seconds without a tool call the agent counts as idle: the lock goes and the bar says **Agent idle**, so you can use the page without **Take over**. What you then click, scroll or type is passed to the agent's next tool call, which tells it to read the page again.
 
-Only **Take over** hands the browser to you. While you hold it, every tool that would act on or read the page is refused and says why, so the agent cannot see what you type there. **Resume agent** hands it back, and `wait_for_human` returns when you press it. A key you press while the agent works does not take over: its input waits until you stop, and the tool's result says your keys reached the page. `request_human_help` shows its request in the bar in amber with **Done**, and `wait_for_human` returns when you press it.
+Only **Take over** hands the browser to you. While you hold it, every tool that would act on or read the page is refused and says why, so the agent cannot see what you type there. The agent learns of it at its next tool call, and the bar tells you where it stands: not told yet, told at what time, going on without the browser (`http_request`, `spawn_browser`, whose results say you hold it), or waiting for you. **Resume agent** hands it back, and `wait_for_human` returns when you press it. A line above the bar takes a note for the agent: it goes with **Resume agent** or **Done** (Enter presses the button) and reaches the agent in `wait_for_human`'s answer or its next tool call. A key you press while the agent works does not take over: its input waits until you stop, and the tool's result says your keys reached the page. `request_human_help` shows its request in the bar in amber with **Done**, and `wait_for_human` returns when you press it.
 
 The arrow button in the bar shows where the agent points and clicks, as a cursor labelled Agent. It starts off unless the `agent_cursor` setting is on.
 
@@ -1058,6 +1058,7 @@ Set in the MCP server's config. The ones most people set:
 | `MCP_STEALTH_ADBLOCK_DIR` | Folder for the filter lists and engine of `block_ads`. Default `~/.mcp-stealth/adblock` |
 | `MCP_STEALTH_SETTINGS` | The settings file. Default `~/.mcp-stealth/settings.json` (in `MCP_STEALTH_DATA_DIR` when that is set) |
 | `MCP_STEALTH_OVERLAY_DIR` | Folder for the files the server shares with the overlay. Default `$TMPDIR/mcp-stealth-overlay` |
+| `MCP_STEALTH_OVERLAY_IDLE_AFTER` | Seconds without a tool call after which the agent counts as idle and the overlay's lock goes. Default 20 |
 | `MCP_STEALTH_OVERLAY_CORNER` | The window corner the overlay's light follows: `<box>` or `<box>,<n>` (a superellipse; `n=2` is a circle). Default `37,4` on macOS 26 (measured), `10,2` before |
 | `MCP_STEALTH_CLOSED_PROBE_MAX_NODES` | Largest document, in elements, whose closed shadow roots `browser_snapshot` reads through the DOM domain. 0 turns it off. Default 5000 |
 | `MCP_STEALTH_ADBLOCK_DOWNLOAD_TIMEOUT` | Seconds a list download may take in all. Default 20 |

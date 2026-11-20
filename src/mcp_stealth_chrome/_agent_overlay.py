@@ -76,6 +76,7 @@ from Quartz import (CAAnimationGroup, CABasicAnimation, CACurrentMediaTime, CAGr
                     CGPathMoveToPoint, CGRectMake,
                     CGWindowListCopyWindowInfo, kCAMediaTimingFunctionEaseInEaseOut,
                     kCATransitionFade, kCGEventFlagMaskCommand, kCGEventKeyDown,
+                    kCGEventLeftMouseDown, kCGEventScrollWheel,
                     kCGEventSourceStateHIDSystemState,
                     kCGImageAlphaPremultipliedLast, kCGNullWindowID,
                     kCGWindowListExcludeDesktopElements, kCGWindowListOptionIncludingWindow,
@@ -152,6 +153,11 @@ AGENT = os.path.join(STATE, "agent.json")
 CONTROL = os.path.join(STATE, "control.json")
 SERVER = int(CONFIG["server"])
 HIDE_AFTER = float(CONFIG.get("hide_after", 90.0))  # no word for this long: everything fades out
+# No tool call for this long: the agent is probably done (its steps came at most 14.7 s apart in a
+# measured run, median 4.3 s). The lock goes, so the person can use the page without Take over,
+# and what they do there is passed to the agent's next call.
+IDLE_AFTER = float(CONFIG.get("idle_after", 20.0))
+NOTE_MAX = 500      # characters of a note for the agent
 STYLE = CONFIG.get("style") or {}  # presence.style(): the person's choice of bar, light and lock
 BAR_MODES = ("full", "compact", "hover", "off")
 BAR_MODE = STYLE.get("bar", "full") if STYLE.get("bar") in BAR_MODES else "full"
@@ -177,7 +183,7 @@ def hexc(h, a=1.0):
 AGENT_GLOW = [hexc("#4F46E5"), hexc("#2563EB"), hexc("#06B6D4"), hexc("#8B5CF6"), hexc("#4F46E5")]
 HELP_GLOW = [hexc("#F59E0B"), hexc("#F97316"), hexc("#FBBF24"), hexc("#F59E0B")]
 DOT = {"agent": hexc("#3B82F6"), "thinking": hexc("#3B82F6"), "polite": hexc("#94A3B8"),
-       "person": hexc("#22C55E"), "help": hexc("#F59E0B")}
+       "person": hexc("#22C55E"), "help": hexc("#F59E0B"), "resting": hexc("#64748B")}
 BUTTON = {  # base, hover, pressed
     "primary": (hexc("#2563EB"), hexc("#1D4ED8"), hexc("#1E40AF")),
     "on": (hexc("#4F46E5"), hexc("#4338CA"), hexc("#3730A3")),
@@ -437,6 +443,39 @@ def near(b, want, slack=4.0):
     return all(abs(float(p) - float(q)) <= slack for p, q in zip(b, want))
 
 
+def choose_mode(help_text, holder, quiet, waiting):
+    """help and the person's hold first: their buttons are the only way back, so they outlast any
+    quiet. Then, by the seconds since the agent's last call (0 while one runs): idle past
+    HIDE_AFTER (all faded), resting past IDLE_AFTER (the lock is off, the page is the person's),
+    thinking past QUIET_AFTER, else working."""
+    if help_text:
+        return "help"
+    if holder == "person":
+        return "person"
+    if quiet > HIDE_AFTER:
+        return "idle"
+    if waiting == "polite":
+        return "polite"
+    if quiet > IDLE_AFTER:
+        return "resting"
+    if quiet > QUIET_AFTER:
+        return "thinking"
+    return "agent"
+
+
+def told(agent, control):
+    """What the agent knows of the person's Take over: they see whether it noticed."""
+    since = float(control.get("since") or 0)
+    if agent.get("waiting_human"):
+        return "The agent is waiting for you"
+    if float(agent.get("outside_at") or 0) >= since:
+        return f"The agent went on without the browser ({agent.get('outside_tool') or 'a tool'})"
+    told_at = float(agent.get("told_at") or 0)
+    if told_at >= since:
+        return "The agent was told at " + time.strftime("%H:%M:%S", time.localtime(told_at))
+    return "The agent learns it at its next step"
+
+
 def command_held():
     """Command is down (no permission needed: the modifier state, not the key events)."""
     return bool(CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState) & kCGEventFlagMaskCommand)
@@ -520,6 +559,29 @@ def panel(frame, takes_clicks, shadow=False):
     # for a third of a second after the browser had gone): the overlay goes when the window goes.
     p.setAnimationBehavior_(2)  # NSWindowAnimationBehaviorNone
     return p
+
+
+class KeyPanel(Panel):
+    """A panel that can take the keyboard (a borderless one cannot), without activating this
+    process: only when its text field is clicked (becomesKeyOnlyIfNeeded)."""
+
+    def canBecomeKeyWindow(self):
+        return True
+
+
+def key_panel(frame):
+    k = KeyPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+        frame, BORDERLESS | NONACTIVATING, BUFFERED, False)
+    k.setOpaque_(False)
+    k.setBackgroundColor_(NSColor.clearColor())
+    k.setHasShadow_(True)
+    k.setIgnoresMouseEvents_(False)
+    k.setHidesOnDeactivate_(False)
+    k.setBecomesKeyOnlyIfNeeded_(True)
+    k.setCollectionBehavior_(ALL_SPACES | IGNORES_CYCLE | FULLSCREEN_AUX)
+    k.setReleasedWhenClosed_(False)
+    k.setAnimationBehavior_(2)  # NSWindowAnimationBehaviorNone
+    return k
 
 
 def layered(p, size):
@@ -1161,6 +1223,83 @@ class Bar:
         self.panel.animator().setAlphaValue_(1.0 if on else 0.0)
 
 
+class Note:
+    """A line above the bar for a note to the agent, while the person holds the browser or the
+    agent asked for help. It goes with Resume agent or Done (Enter presses that button), in the
+    result of the agent's wait_for_human or of its next call."""
+
+    H = 32.0
+
+    def __init__(self, target):
+        self.panel = key_panel(NSMakeRect(0, 0, 400, self.H))
+        self.panel.setAlphaValue_(0.0)
+        view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, 400, self.H))
+        view.setWantsLayer_(True)
+        view.layer().setBackgroundColor_(cg((0.07, 0.08, 0.11, 1.0)))
+        view.layer().setCornerRadius_(self.H / 2)
+        view.layer().setBorderWidth_(0.5)
+        view.layer().setBorderColor_(cg((1, 1, 1, 0.16)))
+        self.panel.setContentView_(view)
+        self.view = view
+        self.field = NSTextField.alloc().initWithFrame_(NSMakeRect(16, (self.H - 18) / 2, 360, 18))
+        self.field.setBezeled_(False)
+        self.field.setDrawsBackground_(False)
+        self.field.setEditable_(True)
+        self.field.setSelectable_(True)
+        self.field.setFocusRingType_(1)  # none: the rounded line is the field
+        self.field.setFont_(NSFont.systemFontOfSize_(13))
+        self.field.setTextColor_(ns(WHITE))
+        self.field.cell().setLineBreakMode_(TRUNCATE_TAIL)
+        self.field.cell().setScrollable_(True)
+        self.field.setTarget_(target)
+        self.field.setAction_("onNoteEnter:")
+        view.addSubview_(self.field)
+        self.prompt = None
+        self.width = None
+        self.origin = None
+        self.visible = False
+        self.hide_at = None
+
+    def ask(self, prompt):
+        if prompt == self.prompt:
+            return
+        self.prompt = prompt
+        self.field.setPlaceholderAttributedString_(attributed([(prompt, 13, 0.0, MUTED)]))
+
+    def fit(self, width):
+        if width == self.width:
+            return
+        self.width = width
+        f = self.panel.frame()
+        self.panel.setFrame_display_(NSMakeRect(f.origin.x, f.origin.y, width, self.H), True)
+        self.view.setFrame_(NSMakeRect(0, 0, width, self.H))
+        self.field.setFrame_(NSMakeRect(16, (self.H - 18) / 2, width - 32, 18))
+        self.origin = None
+
+    def place(self, x_ns, y_ns):
+        origin = (round(x_ns), round(y_ns))
+        if origin != self.origin:
+            self.panel.setFrameOrigin_(origin)
+            self.origin = origin
+
+    def take(self):
+        """The note typed, at most NOTE_MAX characters, and an empty line for the next one."""
+        text = " ".join(str(self.field.stringValue() or "").split())[:NOTE_MAX]
+        self.field.setStringValue_("")
+        return text
+
+    def release(self):
+        """Holding the keyboard, the line goes at once rather than fading: ordered out, it hands
+        the keys back to the app in front (measured: the next key reached that app's field)."""
+        if self.panel.isKeyWindow():
+            self.panel.orderOut_(None)
+            return True
+        return False
+
+    def fade(self, on):
+        self.panel.animator().setAlphaValue_(1.0 if on else 0.0)
+
+
 class Overlay:
     def __init__(self, target, show_cursor):
         self.control = {"holder": "agent", "since": time.time(), "reason": "start",
@@ -1180,11 +1319,13 @@ class Overlay:
         self.pointer = Pointer(scale)
         self.ripples = Ripples()
         self.bar = Bar(target, still)
+        self.note = Note(target)
         # Fully transparent, yet it takes every click: ignoresMouseEvents is set to False
         # explicitly (checked with windowNumberAtPoint: such a window is the one a click hits).
         self.shield = panel(NSMakeRect(0, 0, 400, 300), takes_clicks=True)
         self.shield.setContentView_(Shield.alloc().initWithFrame_(NSMakeRect(0, 0, 400, 300)))
-        self.panels = (self.shield, *self.glow.panels, self.ripples.panel, self.pointer.panel, self.bar.panel)
+        self.panels = (self.shield, *self.glow.panels, self.ripples.panel, self.pointer.panel, self.bar.panel,
+                       self.note.panel)
         self.shield_on = False
         self.shield_rect = None
         self.frame = None
@@ -1212,6 +1353,10 @@ class Overlay:
         self.agent = {}
         self.agent_stamp = None
         self.prev_key = CGEventSourceSecondsSinceLastEventType(kCGEventSourceStateHIDSystemState, kCGEventKeyDown)
+        self.prev_click = CGEventSourceSecondsSinceLastEventType(kCGEventSourceStateHIDSystemState,
+                                                                 kCGEventLeftMouseDown)
+        self.prev_wheel = CGEventSourceSecondsSinceLastEventType(kCGEventSourceStateHIDSystemState,
+                                                                 kCGEventScrollWheel)
         self.clicks_seen = 0.0
         self.mode = "idle"
         self.nudge_until = 0.0
@@ -1325,6 +1470,8 @@ class Overlay:
             out.append(self.pointer.panel)
         if self.bar.visible:
             out.append(self.bar.panel)
+        if self.note.visible:
+            out.append(self.note.panel)
         return out
 
     def order(self, stack, wid):
@@ -1491,6 +1638,12 @@ class Overlay:
         key = CGEventSourceSecondsSinceLastEventType(kCGEventSourceStateHIDSystemState, kCGEventKeyDown)
         new_key = key + 0.005 < self.prev_key
         self.prev_key = key
+        click = CGEventSourceSecondsSinceLastEventType(kCGEventSourceStateHIDSystemState, kCGEventLeftMouseDown)
+        new_click = click + 0.005 < self.prev_click
+        self.prev_click = click
+        wheel = CGEventSourceSecondsSinceLastEventType(kCGEventSourceStateHIDSystemState, kCGEventScrollWheel)
+        new_wheel = wheel + 0.005 < self.prev_wheel
+        self.prev_wheel = wheel
         over = not self.bar.contains(loc.x, loc.y) and visible_at(self.wins, wid, loc.x, H - loc.y)
         # A tool call still running is not quiet, however long it takes (a long wait_for): the
         # server marks it busy from before the call to after it.
@@ -1499,18 +1652,7 @@ class Overlay:
 
         # A request for help and the person's hold outlast any quiet: their buttons (Done,
         # Resume agent) are the only way back, so they never fade out.
-        if help_text:
-            mode = "help"
-        elif self.control["holder"] == "person":
-            mode = "person"
-        elif quiet > HIDE_AFTER:
-            mode = "idle"
-        elif a.get("waiting") == "polite":
-            mode = "polite"
-        elif quiet > QUIET_AFTER:
-            mode = "thinking"
-        else:
-            mode = "agent"
+        mode = choose_mode(help_text, self.control["holder"], quiet, a.get("waiting"))
         self.mode = mode
 
         if new_key and mode in WORKING:
@@ -1521,6 +1663,23 @@ class Overlay:
                 self.control["person_last_input"] = now
                 self.save()
                 self.nudge("type")
+        if mode in ("resting", "idle") and (new_key or new_click or new_wheel):
+            # The agent is not working and the page is open to the person: what they do there
+            # goes to the agent's next call, so it reads the page again rather than act on what
+            # it saw before. Keys count only with the browser in front, the pointer only over it.
+            front = NSWorkspace.sharedWorkspace().frontmostApplication()
+            in_front = front is not None and front.processIdentifier() == pid
+            used = [word for word, happened in (("clicked", new_click and over), ("scrolled", new_wheel and over),
+                                                ("typed", new_key and in_front)) if happened]
+            if used:
+                before = self.control.get("person_used") or []
+                if float(self.control.get("person_used_at") or 0) <= float(a.get("active_at") or 0):
+                    before = []  # the agent has acted since: start over
+                self.control["person_used"] = [w for w in ("clicked", "scrolled", "typed") if w in before or w in used]
+                self.control["person_used_at"] = now
+                if "typed" in used:
+                    self.control["person_last_input"] = now
+                self.save()
 
         show_cursor = bool(self.control.get("show_cursor"))
         self.glow.colors(HELP_GLOW if mode == "help" else AGENT_GLOW)
@@ -1563,8 +1722,11 @@ class Overlay:
         elif mode == "polite":
             self.bar.set([("Agent paused", 13, 0.3, WHITE), ("  \u00b7  It goes on in a moment", 13, 0.0, MUTED)],
                          "Take over", "quiet", DOT["polite"], False, show_cursor)
+        elif mode == "resting":
+            self.bar.set([("Agent idle", 13, 0.3, WHITE), ("  \u00b7  The page is yours until its next step", 13, 0.0, MUTED)],
+                         "Take over", "quiet", DOT["resting"], False, show_cursor)
         elif mode == "person":
-            self.bar.set([("You have the browser", 13, 0.3, WHITE), ("  \u00b7  The agent is paused", 13, 0.0, MUTED)],
+            self.bar.set([("You have the browser", 13, 0.3, WHITE), (f"  \u00b7  {told(a, self.control)}", 13, 0.0, MUTED)],
                          "Resume agent", "primary", DOT["person"], False, show_cursor)
         elif mode == "help":
             self.bar.set([("Your help is needed", 13, 0.3, WHITE), (f"  \u00b7  {help_text}", 13, 0.0, MUTED)],
@@ -1619,6 +1781,32 @@ class Overlay:
             self.bar.panel.orderOut_(None)
             self.bar.visible = False
             self.bar.hide_at = None
+        # The note line: over the bar while the person holds the browser or is asked for help.
+        want_note = want_bar and mode in ("person", "help")
+        if want_note:
+            self.note.ask("Note for the agent (optional), sent with " + ("Done" if mode == "help" else "Resume agent"))
+            self.note.fit(self.bar.width)
+            if self.bar.origin is not None:
+                self.note.place(self.bar.origin[0], self.bar.origin[1] + self.bar.H + 6)
+        if want_note and not self.note.visible:
+            self.note.visible = True
+            self.note.hide_at = None
+            self.note.fade(True)
+            restack = True
+        elif not want_note and self.note.visible and self.note.hide_at is None:
+            if self.note.release():
+                self.note.panel.setAlphaValue_(0.0)
+                self.note.visible = False
+            else:
+                self.note.fade(False)
+                self.note.hide_at = now + 0.35
+        if want_note and self.note.hide_at is not None:
+            self.note.hide_at = None
+            self.note.fade(True)
+        if self.note.hide_at is not None and now >= self.note.hide_at:
+            self.note.panel.orderOut_(None)
+            self.note.visible = False
+            self.note.hide_at = None
         # While nothing covers the browser, sit in the floating level: the browser coming to the
         # front then cannot cover the overlay, not even for a frame. Covered, sit just above it.
         level = FLOATING_LEVEL if self.floating else NORMAL_LEVEL
@@ -1638,12 +1826,17 @@ class Overlay:
 
     def button(self):
         now = time.time()
-        if self.mode in WORKING:
+        if self.mode in WORKING or self.mode == "resting":
             self.control.update(holder="person", since=now, reason="button")
-        elif self.mode == "person":
-            self.control.update(holder="agent", since=now, reason="button")
-        elif self.mode == "help":
-            self.control.update(holder="agent", since=now, reason="help done", help_done=now)
+        elif self.mode in ("person", "help"):
+            note = self.note.take()
+            if note:
+                self.control.update(note=note, note_at=now,
+                                    note_with="Done" if self.mode == "help" else "Resume agent")
+            if self.mode == "person":
+                self.control.update(holder="agent", since=now, reason="button")
+            else:
+                self.control.update(holder="agent", since=now, reason="help done", help_done=now)
         self.save()
 
     def toggle_cursor(self):
@@ -1697,7 +1890,8 @@ class Overlay:
             # The level the others are at: a new panel starts at the normal level, and while the
             # overlay floats it sat under the (transparent) lock, which then took its clicks.
             self.bar.panel.setLevel_(self.level)
-            self.panels = (self.shield, *self.glow.panels, self.ripples.panel, self.pointer.panel, self.bar.panel)
+            self.panels = (self.shield, *self.glow.panels, self.ripples.panel, self.pointer.panel, self.bar.panel,
+                       self.note.panel)
             if self.frame is not None:
                 self.bar.fit(self.frame[2])
         if light_was and not LIGHT_ON:
@@ -1805,6 +1999,14 @@ class Target(NSObject):
     def onButton_(self, _sender):
         try:
             OVERLAY.button()
+        except Exception:
+            traceback.print_exc()
+
+    def onNoteEnter_(self, _sender):
+        """Enter in the note line: the same as the bar's button (Resume agent or Done)."""
+        try:
+            if OVERLAY.mode in ("person", "help") and str(OVERLAY.note.field.stringValue() or "").strip():
+                OVERLAY.button()
         except Exception:
             traceback.print_exc()
 

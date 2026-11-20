@@ -209,74 +209,87 @@ async def wait_for_human(
                 else 300.0
             )
         baseline = request.get("baseline") or await _srv._page_sig(tab)
-        loop = asyncio.get_event_loop()
-        started = loop.time()
         # agent_overlay: Done in the bar, or Resume agent after Take over, ends the wait. While
         # the person holds the browser their own clicks change the page, so a change is no answer.
         browser = BrowserState.browser
         asked_since = float(request.get("requested_at") or time.time())
-        selector_expr = (
-            "(() => JSON.stringify({hit: !!document.querySelector(%s)}))()"
-            % json.dumps(done_selector)
-            if done_selector else None
-        )
-        while loop.time() - started < max(0.0, timeout):
-            elapsed = round(loop.time() - started, 2)
-            answer = presence.answered(browser, asked_since)
-            if answer:
-                _srv._HUMAN_HELP.pop(key, None)
-                presence.end_help(browser)
-                return ok(f"human handoff completed after {elapsed}s: the person pressed "
-                          + ("Done in the overlay's bar" if answer == "done"
-                             else "Resume agent in the overlay's bar, handing the browser back"))
-            if presence.holds(browser):
-                await asyncio.sleep(0.25)
-                continue
-            if done_url_contains:
-                current_url = await get_url(tab)
-                if done_url_contains in current_url:
-                    _srv._HUMAN_HELP.pop(key, None)
-                    presence.end_help(browser)
-                    return ok(
-                        f"human handoff completed after {elapsed}s: URL contains "
-                        f"{done_url_contains!r}{unasked}"
-                    )
-            if selector_expr:
-                value = await tab.evaluate(selector_expr, return_by_value=True)
-                value = value.value if hasattr(value, "value") and not isinstance(value, str) else value
-                if value and bool(json.loads(value).get("hit")):
-                    _srv._HUMAN_HELP.pop(key, None)
-                    presence.end_help(browser)
-                    return ok(
-                        f"human handoff completed after {elapsed}s: selector "
-                        f"{done_selector!r} appeared{unasked}"
-                    )
-            if not done_url_contains and not done_selector:
-                current = await _srv._page_sig(tab)
-                if baseline and current and (
-                    current.get("url") != baseline.get("url")
-                    or current.get("nodes") != baseline.get("nodes")
-                    or current.get("len") != baseline.get("len")
-                    or current.get("hash") != baseline.get("hash")
-                ):
-                    _srv._HUMAN_HELP.pop(key, None)
-                    presence.end_help(browser)
-                    return ok(f"human handoff completed after {elapsed}s: page changed{unasked}")
-            await asyncio.sleep(0.25)
-        # Drop the pending handoff so a later wait re-baselines against the page
-        # as it is now, instead of measuring against a stale pre-handoff snapshot.
-        _srv._HUMAN_HELP.pop(key, None)
-        presence.end_help(browser)
-        if presence.holds(browser):
-            return err(f"timeout after {timeout}s: the person still holds the browser (Take over "
-                       "in the overlay's bar) and has not pressed Resume agent.")
-        return err(
-            f"timeout after {timeout}s waiting for human completion — nothing changed "
-            "and no completion signal was observed. Call request_human_help again "
-            f"if the person still needs to act{unasked}."
-        )
+        presence.waiting_for_person(browser, True)  # the bar: "The agent is waiting for you"
+        try:
+            return await _wait_for_human_loop(
+                tab, key, browser, unasked, timeout, baseline, asked_since,
+                done_url_contains, done_selector)
+        finally:
+            presence.waiting_for_person(browser, False)
     except Exception as e:
         return err(str(e))
+
+
+async def _wait_for_human_loop(tab, key, browser, unasked, timeout, baseline, asked_since,
+                               done_url_contains, done_selector) -> str:
+    """wait_for_human's wait, while the bar says the agent is waiting."""
+    loop = asyncio.get_event_loop()
+    started = loop.time()
+    selector_expr = (
+        "(() => JSON.stringify({hit: !!document.querySelector(%s)}))()"
+        % json.dumps(done_selector)
+        if done_selector else None
+    )
+    while loop.time() - started < max(0.0, timeout):
+        elapsed = round(loop.time() - started, 2)
+        answer = presence.answered(browser, asked_since)
+        if answer:
+            _srv._HUMAN_HELP.pop(key, None)
+            presence.end_help(browser)
+            return ok(f"human handoff completed after {elapsed}s: the person pressed "
+                      + ("Done in the overlay's bar" if answer == "done"
+                         else "Resume agent in the overlay's bar, handing the browser back")
+                      + presence.note_for(browser, asked_since))
+        if presence.holds(browser):
+            await asyncio.sleep(0.25)
+            continue
+        if done_url_contains:
+            current_url = await get_url(tab)
+            if done_url_contains in current_url:
+                _srv._HUMAN_HELP.pop(key, None)
+                presence.end_help(browser)
+                return ok(
+                    f"human handoff completed after {elapsed}s: URL contains "
+                    f"{done_url_contains!r}{unasked}"
+                )
+        if selector_expr:
+            value = await tab.evaluate(selector_expr, return_by_value=True)
+            value = value.value if hasattr(value, "value") and not isinstance(value, str) else value
+            if value and bool(json.loads(value).get("hit")):
+                _srv._HUMAN_HELP.pop(key, None)
+                presence.end_help(browser)
+                return ok(
+                    f"human handoff completed after {elapsed}s: selector "
+                    f"{done_selector!r} appeared{unasked}"
+                )
+        if not done_url_contains and not done_selector:
+            current = await _srv._page_sig(tab)
+            if baseline and current and (
+                current.get("url") != baseline.get("url")
+                or current.get("nodes") != baseline.get("nodes")
+                or current.get("len") != baseline.get("len")
+                or current.get("hash") != baseline.get("hash")
+            ):
+                _srv._HUMAN_HELP.pop(key, None)
+                presence.end_help(browser)
+                return ok(f"human handoff completed after {elapsed}s: page changed{unasked}")
+        await asyncio.sleep(0.25)
+    # Drop the pending handoff so a later wait re-baselines against the page
+    # as it is now, instead of measuring against a stale pre-handoff snapshot.
+    _srv._HUMAN_HELP.pop(key, None)
+    presence.end_help(browser)
+    if presence.holds(browser):
+        return err(f"timeout after {timeout}s: the person still holds the browser (Take over "
+                   "in the overlay's bar) and has not pressed Resume agent.")
+    return err(
+        f"timeout after {timeout}s waiting for human completion — nothing changed "
+        "and no completion signal was observed. Call request_human_help again "
+        f"if the person still needs to act{unasked}."
+    )
 
 
 async def _history_navigation(

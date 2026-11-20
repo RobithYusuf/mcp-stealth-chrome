@@ -551,9 +551,14 @@ def _overlay_functions(*names, **constants):
     for node in tree.body:  # the module's own constants, so the test checks what ships
         if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
             if node.targets[0].id in constants:
-                values[node.targets[0].id] = ast.literal_eval(node.value)
+                value = node.value
+                # float(CONFIG.get("name", default)): the default the overlay ships with
+                if isinstance(value, ast.Call) and value.args and isinstance(value.args[0], ast.Call) \
+                        and getattr(value.args[0].func, "attr", None) == "get":
+                    value = value.args[0].args[1]
+                values[node.targets[0].id] = ast.literal_eval(value)
     assert set(found) == set(names) and set(values) == set(constants)
-    space = {"math": math, **values}
+    space = {"math": math, "time": time, **values}
     exec(compile(ast.Module(body=list(found.values()), type_ignores=[]), "_agent_overlay.py", "exec"), space)
     return space
 
@@ -593,3 +598,95 @@ def test_the_overlay_floats_only_where_no_app_switch_can_leave_it_above_another_
     assert not floats(False, True, False, settled)         # the browser in front: just above it
     assert not floats(False, False, True, settled)         # Command held: a Cmd+Tab may follow
     assert not floats(False, False, False, 0.0)            # an app has just come to the front
+
+
+def test_an_idle_agent_leaves_the_page_to_the_person():
+    """The lock stayed 90 s after the agent's last call, so a person whose agent had finished had to
+    press Take over to use their page, and nothing heard it. Steps of a working agent came at most
+    14.7 s apart (median 4.3 s), so past IDLE_AFTER the lock goes and the bar says the agent is idle."""
+    f = _overlay_functions("choose_mode", QUIET_AFTER=1, IDLE_AFTER=1)
+    f["HIDE_AFTER"] = 90.0
+    choose = f["choose_mode"]
+    assert f["QUIET_AFTER"] < 14.7 < f["IDLE_AFTER"] < f["HIDE_AFTER"]
+    assert choose(None, "agent", 0.0, None) == "agent"
+    assert choose(None, "agent", 5.0, None) == "thinking"
+    assert choose(None, "agent", f["IDLE_AFTER"] + 1, None) == "resting"
+    assert choose(None, "agent", 91.0, None) == "idle"
+    assert choose(None, "agent", f["IDLE_AFTER"] + 1, "polite") == "polite"
+    # Help and the person's hold never give way to quiet: their buttons are the way back.
+    assert choose("Log in", "agent", 500.0, None) == "help"
+    assert choose(None, "person", 500.0, None) == "person"
+
+
+def test_the_bar_says_whether_the_agent_knows_of_a_take_over(made, monkeypatch):
+    monkeypatch.setattr("mcp_stealth_chrome.state.BrowserState.session_key", classmethod(lambda cls: "s"))
+    told = _overlay_functions("told")["told"]
+    browser, overlay = made({"holder": "person", "since": time.time() - 1})
+    said = lambda: told(json.loads(overlay.agent_file.read_text()), overlay.read_control())  # noqa: E731
+    assert said() == "The agent learns it at its next step"
+    presence.refusal("click", browser)
+    assert said().startswith("The agent was told at ")
+    asyncio.run(presence.before_tool("http_request", browser, None))
+    assert said() == "The agent went on without the browser (http_request)"
+    note = presence.result_note("s", "200 OK")
+    assert "the person holds this browser" in note and "go on only with what they asked for" in note
+    presence.waiting_for_person(browser, True)
+    assert said() == "The agent is waiting for you"
+    presence.waiting_for_person(browser, False)
+    overlay.control_file.write_text(json.dumps({"holder": "person", "since": time.time() + 1}))
+    assert said() == "The agent learns it at its next step"  # a new Take over starts over
+
+
+def test_input_refused_mid_tool_also_tells_the_bar(made):
+    browser, overlay = made({"holder": "person", "since": time.time() - 1})
+    with pytest.raises(presence.PersonHasBrowser):
+        asyncio.run(presence.before_input(_Tab(browser)))
+    assert json.loads(overlay.agent_file.read_text())["told_at"] >= overlay.read_control()["since"]
+
+
+def test_what_the_person_did_while_the_agent_was_idle_reaches_its_next_call(made, monkeypatch):
+    monkeypatch.setattr("mcp_stealth_chrome.state.BrowserState.session_key", classmethod(lambda cls: "s"))
+    browser, overlay = made({"holder": "agent"})
+    overlay.touch(status="reading the page")
+    last = overlay.agent["active_at"]
+    overlay.control_file.write_text(json.dumps(
+        {"holder": "agent", "person_used": ["clicked", "typed"], "person_used_at": last + 30}))
+    asyncio.run(presence.before_tool("get_text", browser, None))
+    note = presence.result_note("s", "page text")
+    assert "while the agent was idle the person clicked and typed in the browser" in note
+    assert "read it again" in note
+    asyncio.run(presence.before_tool("get_text", browser, None))
+    assert presence.result_note("s", "again") == "again"  # said once
+    # Use from before the agent's own last call is old news.
+    overlay.touch()
+    overlay.control_file.write_text(json.dumps(
+        {"holder": "agent", "person_used": ["scrolled"], "person_used_at": overlay.agent["active_at"] - 1}))
+    asyncio.run(presence.before_tool("get_text", browser, None))
+    assert presence.result_note("s", "x") == "x"
+
+
+def test_a_note_from_the_person_reaches_the_agent_once(made, monkeypatch):
+    monkeypatch.setattr("mcp_stealth_chrome.state.BrowserState.session_key", classmethod(lambda cls: "s"))
+    asked = time.time()
+    browser, overlay = made({"holder": "agent", "reason": "button", "since": asked + 1, "note_at": asked + 1,
+                             "note": "I logged in, go on to the checkout", "note_with": "Resume agent"})
+    text = presence.note_for(browser, asked)
+    assert text.startswith(". The person left a note with Resume agent at ")
+    assert text.endswith('"I logged in, go on to the checkout"')
+    assert presence.note_for(browser, asked) == ""  # once
+    # Not waiting: the next call carries it.
+    overlay.control_file.write_text(json.dumps(
+        {"holder": "agent", "note_at": asked + 9, "note": "only compare, do not buy", "note_with": "Done"}))
+    asyncio.run(presence.before_tool("get_text", browser, None))
+    note = presence.result_note("s", "page text")
+    assert 'the person left a note with Done at' in note and '"only compare, do not buy"' in note
+
+
+def test_the_idle_time_reaches_the_overlay(tmp_path, monkeypatch):
+    monkeypatch.delenv("MCP_STEALTH_OVERLAY_IDLE_AFTER", raising=False)
+    assert presence.overlay_config(tmp_path, 1, False)["idle_after"] == presence.IDLE_AFTER
+    monkeypatch.setenv("MCP_STEALTH_OVERLAY_IDLE_AFTER", "4")
+    assert presence.overlay_config(tmp_path, 1, False)["idle_after"] == 4.0
+    monkeypatch.setenv("MCP_STEALTH_OVERLAY_IDLE_AFTER", "soon")
+    assert presence.overlay_config(tmp_path, 1, False)["idle_after"] == presence.IDLE_AFTER
+

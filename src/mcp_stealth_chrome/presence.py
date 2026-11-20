@@ -33,6 +33,8 @@ from typing import Any, Optional
 ATTR = "_mcp_agent_overlay"
 POLITE = 1.5          # the agent's input waits this long after the person's last key
 POLITE_MAX = 10.0     # and never longer than this in one go
+IDLE_AFTER = 20.0     # with no tool call for this long the agent reads as idle and the lock goes
+                      # (its steps came at most 14.7 s apart in a measured run, median 4.3 s)
 HIDE_AFTER = 90.0     # with no tool call for this long the overlay fades out (not while a
                       # request for help or the person's hold shows: their buttons stay)
 POINTER_EVERY = 1 / 30
@@ -40,6 +42,10 @@ READY_WAIT = 3.0      # a new overlay must say it is up within this, or the resu
 RESTARTS = 3          # an overlay that dies while its browser lives is started again this often
 TRUE = {"1", "true", "yes", "on"}
 NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+# Tools that work without the browser the person holds, and so could carry on what they took over to
+# stop: each result says they hold it.
+OUTSIDE = frozenset({"spawn_browser", "switch_instance", "http_request", "http_request_retry"})
 
 # Tools that touch neither the page nor the browser the person holds. Everything else is refused
 # while they hold it, reading included: a person who takes over may be typing a password.
@@ -177,8 +183,13 @@ def overlay_config(folder: Path, pid: int, cursor: bool, start: Optional[str] = 
     resolved = {key: settings.resolve(key, data) for key in LIVE_SETTINGS}
     fixed = {key: r["value"] for key, r in resolved.items() if r["source"].startswith("env")}
     hide_after = float(settings.resolve("overlay_hide_after", data)["value"])
+    try:
+        idle_after = float(os.environ.get("MCP_STEALTH_OVERLAY_IDLE_AFTER", "") or IDLE_AFTER)
+    except ValueError:
+        idle_after = IDLE_AFTER
     return {"state": str(folder), "pid": pid, "start": start, "server": os.getpid(), "cursor": cursor,
-            "hide_after": hide_after if hide_after > 0 else HIDE_AFTER, "style": style(),
+            "hide_after": hide_after if hide_after > 0 else HIDE_AFTER,
+            "idle_after": idle_after if idle_after > 0 else IDLE_AFTER, "style": style(),
             "settings_file": str(settings.path()), "fixed": fixed}
 
 
@@ -234,6 +245,8 @@ class Overlay:
         self.hide_after = HIDE_AFTER
         self.follow_task: Any = None
         self.in_flight = 0  # tool calls running on this browser
+        self.used_seen = 0.0  # the person's use of the page, and their note, already passed on
+        self.note_seen = 0.0
         self.write()
 
     def write(self, **kw: Any) -> None:
@@ -506,12 +519,55 @@ async def before_tool(name: str, browser: Any, tab: Any) -> None:
     # minutes) read as idle, and HIDE_AFTER took the light, the bar and the lock away mid-call.
     overlay.in_flight += 1
     _CALL_OVERLAY.set(overlay)
+    _pass_on(overlay, name, float(overlay.agent.get("active_at") or 0))
     overlay.touch(status=describe(name, _app.CALL_ARGUMENTS.get()), busy=True)
     last_tab, last_at = overlay.window_read
     if tab is not None and (tab is not last_tab or time.time() - last_at > 1.0):
         overlay.window_read = (tab, time.time())
         with contextlib.suppress(Exception):
             await refresh_window(overlay, tab)
+
+
+def _clock(at: float) -> str:
+    return time.strftime("%H:%M:%S", time.localtime(at))
+
+
+def _pass_on(overlay: "Overlay", name: str, last_active: float) -> None:
+    """What the agent's call must know from the person: what they did in the page while the agent
+    was idle (the lock is off then), the note they left, and that they hold the browser when the
+    call works without it."""
+    control = overlay.read_control()
+    used_at = float(control.get("person_used_at") or 0)
+    if used_at > overlay.used_seen:
+        overlay.used_seen = used_at
+        if used_at > last_active:
+            words = [w for w in control.get("person_used") or [] if w in ("clicked", "scrolled", "typed")]
+            did = (", ".join(words[:-1]) + " and " + words[-1]) if len(words) > 1 else (words[0] if words else "used")
+            _note(f"while the agent was idle the person {did} in the browser (last at {_clock(used_at)}); the "
+                  "page may differ from what the agent read before, so read it again before acting on it.")
+    note = take_note(overlay, 0.0)
+    if note:
+        _note(note)
+    if name in OUTSIDE and control.get("holder") == "person":
+        overlay.write(outside_at=time.time(), outside_tool=name)
+        since = float(control.get("since") or 0)
+        _note(f"the person holds this browser (Take over in its bar at {_clock(since)}). {name} does not "
+              "touch it, but they took over to stop the agent: go on only with what they asked for, or "
+              "ask them, or call wait_for_human.")
+
+
+def take_note(overlay: Optional["Overlay"], since: float) -> Optional[str]:
+    """The note the person left with Resume agent or Done after `since`, once."""
+    if overlay is None:
+        return None
+    control = overlay.read_control()
+    note_at = float(control.get("note_at") or 0)
+    text = str(control.get("note") or "").strip()
+    if not text or note_at <= overlay.note_seen or note_at < since:
+        return None
+    overlay.note_seen = note_at
+    return (f"the person left a note with {control.get('note_with') or 'the bar'} at {_clock(note_at)}: "
+            f"{json.dumps(text, ensure_ascii=False)}")
 
 
 def after_tool(browser: Any, tab: Any = None) -> None:
@@ -564,6 +620,7 @@ def refusal(name: str, browser: Any) -> Optional[str]:
                 "browser_launch(agent_overlay=False) releases the browser.")
     since = overlay.read_control().get("since")
     when = time.strftime(" at %H:%M:%S", time.localtime(since)) if since else ""
+    overlay.write(told_at=time.time(), told_tool=name)  # the bar tells the person it was told
     return ("Error: the person took over this browser (Take over in the bar over its window"
             f"{when}). {name} did nothing. The agent may neither act on nor read the page until "
             "they press Resume agent: call wait_for_human to wait for that, or ask them.")
@@ -620,6 +677,7 @@ async def before_input(tab: Any) -> None:
         overlay.revive()
     control = overlay.read_control()
     if control.get("holder") == "person":
+        overlay.write(told_at=time.time(), told_tool="input")
         raise PersonHasBrowser(
             "the person pressed Take over in the bar over the browser window; the agent's "
             "input stopped there. Call wait_for_human to wait for Resume agent.")
@@ -632,6 +690,7 @@ async def before_input(tab: Any) -> None:
         while time.time() - started < POLITE_MAX:
             control = overlay.read_control()
             if control.get("holder") == "person":
+                overlay.write(told_at=time.time(), told_tool="input")
                 raise PersonHasBrowser(
                     "the person pressed Take over in the bar over the browser window; the "
                     "agent's input stopped there. Call wait_for_human to wait for Resume agent.")
@@ -681,6 +740,19 @@ def answered(browser: Any, since: float) -> Optional[str]:
             and float(control.get("since") or 0) >= since:
         return "resumed"
     return None
+
+
+def note_for(browser: Any, since: float) -> str:
+    """" Their note: ..." for a result, when the person left one with Resume agent or Done."""
+    note = take_note(_handle(browser), since)
+    return f". {note[0].upper()}{note[1:]}" if note else ""
+
+
+def waiting_for_person(browser: Any, waiting: bool) -> None:
+    """While wait_for_human runs, the bar says the agent is waiting for them."""
+    overlay = _handle(browser)
+    if overlay is not None:
+        overlay.write(waiting_human=waiting)
 
 
 def holds(browser: Any) -> bool:

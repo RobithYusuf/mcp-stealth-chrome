@@ -28,6 +28,7 @@ NAME = "stealth-chrome"
 # hash here whenever SKILL.md changes (tests/test_skill_install.py checks it is listed).
 SHIPPED = {
     "11cef8e6829d86f2659cb40b7f7939404f1aa49e607bdc3a8d1a5e1475ed9472",  # 0.25.11
+    "c1cf3b05784dcb4dcf0c25c8aebe08ecf87e8360bab86b858dc53103048a3008",  # 0.25.12 to 0.25.14
 }
 
 

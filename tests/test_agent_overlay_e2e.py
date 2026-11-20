@@ -192,6 +192,68 @@ def test_the_overlay_follows_the_window_and_only_its_button_hands_over():
         shutil.rmtree(data, ignore_errors=True)
 
 
+def test_an_idle_agent_unlocks_the_page_and_a_take_over_says_what_the_agent_knows():
+    """Past IDLE_AFTER with no call the lock goes and the bar stays; a call brings the lock back.
+    After Take over the note line shows above the bar, a refused call marks the agent as told,
+    and wait_for_human marks it as waiting. (The note's text is typed only with the keyboard,
+    which a test here cannot take: tests/test_agent_overlay.py covers its way to the agent.)"""
+    pytest.importorskip("Quartz")
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(_Quiet, directory=FIXTURES))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    data = pathlib.Path(tempfile.mkdtemp(prefix="mcp-agent-overlay-idle-"))
+    overlays = data / "overlay"
+    client = Client(env={"MCP_STEALTH_DATA_DIR": str(data), "MCP_STEALTH_OVERLAY_DIR": str(overlays),
+                         "MCP_STEALTH_OVERLAY_HIDE_AFTER": "60", "MCP_STEALTH_OVERLAY_IDLE_AFTER": "3"})
+    try:
+        launched = client.call("browser_launch", _timeout=90, headless=False, persistent=False,
+                               agent_overlay=True, auto_verify=False, extra_args=SAFE_ARGS,
+                               url=f"http://127.0.0.1:{srv.server_port}/protocol.html")
+        assert not launched.failed, launched.text
+        overlay_pid = json.loads(client.call("server_status").text)["agent_overlay"]["instances"]["main"]["overlay_pid"]
+        folder = next(overlays.iterdir())
+        agent_file, control_file = folder / "agent.json", folder / "control.json"
+
+        def lock():
+            return any(b[2] > 300 and b[3] > 200 for _layer, b in _windows(overlay_pid))
+
+        def note_line():
+            return any(b[3] == 32 and b[2] >= 200 for _layer, b in _windows(overlay_pid))
+
+        assert not client.call("get_text").failed
+        assert _wait(lock, 5), _windows(overlay_pid)
+        assert _wait(lambda: not lock(), 8), "the lock stayed past IDLE_AFTER"
+        assert _bar_shown(overlay_pid) and not note_line()
+        assert not client.call("get_text").failed
+        assert _wait(lock, 5), "a call did not bring the lock back"
+
+        os.kill(overlay_pid, signal.SIGUSR2)  # Take over
+        assert _wait(lambda: _read(control_file).get("holder") == "person", 5)
+        assert _wait(note_line, 5), _windows(overlay_pid)
+        since = float(_read(control_file)["since"])
+        assert float(_read(agent_file).get("told_at") or 0) < since
+        refused = client.call("click", selector="#inc")
+        assert refused.text.startswith("Error: the person took over"), refused.text
+        assert float(_read(agent_file).get("told_at") or 0) >= since
+
+        answer = {}
+        waiter = threading.Thread(target=lambda: answer.update(
+            text=client.call("wait_for_human", timeout=20, _timeout=40).text))
+        waiter.start()
+        assert _wait(lambda: _read(agent_file).get("waiting_human") is True, 5)
+        os.kill(overlay_pid, signal.SIGUSR2)  # Resume agent
+        waiter.join(30)
+        assert "pressed Resume agent" in answer.get("text", ""), answer
+        assert _read(agent_file).get("waiting_human") is False
+        assert _wait(lambda: not note_line(), 5), "the note line stayed after Resume agent"
+    finally:
+        client.call("close_all_instances", _timeout=40)
+        client.close()
+        srv.shutdown()
+        for pid, _command in state.processes_naming(data) or []:
+            os.kill(pid, signal.SIGTERM)
+        shutil.rmtree(data, ignore_errors=True)
+
+
 def test_without_the_option_nothing_is_started():
     data = pathlib.Path(tempfile.mkdtemp(prefix="mcp-agent-overlay-off-"))
     overlays = data / "overlay"

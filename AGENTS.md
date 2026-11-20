@@ -1313,6 +1313,26 @@ the person (the same target events as Cmd+T, a followed link, a closed tab).
 - A call in flight is not quiet: `before_tool` marks the overlay busy (`in_flight`, and `_CALL_OVERLAY` carries that
   overlay to the same call's `after_tool` whatever instance is current by then), and the overlay counts no quiet time
   while `busy`. A call longer than `HIDE_AFTER` (a long wait_for) took the light, the bar and the lock away mid-call.
+- An agent that stopped calling tools left the lock up for HIDE_AFTER (90 s), so a person whose agent had finished had
+  to press Take over to use their own page, and no agent heard it (20 Nov 2026). A working agent's steps came at most
+  14.7 s apart, median 4.3 s (60 calls of a research run). Past IDLE_AFTER (20 s, `MCP_STEALTH_OVERLAY_IDLE_AFTER`)
+  with no call `choose_mode` says `resting`: no lock, the light out, the bar "Agent idle" with Take over. What the
+  person clicks or scrolls over the browser, or types with it in front, while it rests or the overlay has faded is
+  written to control.json (`person_used`, `person_used_at`) and the agent's next call carries it once (`_pass_on`),
+  so it reads the page again. The real clicks were measured on a test browser: lock off at idle, the page took the
+  click, the next call named it, the lock came back with that call.
+- The bar tells the person what the agent knows of their Take over (`told`): not yet ("learns it at its next step"),
+  told (a refusal or a stopped input writes `told_at`), going on without the browser (a tool in `presence.OUTSIDE`
+  while they hold it writes `outside_at`, and its result says they hold it), or waiting (`waiting_human`, set while
+  `wait_for_human` runs). Before, the bar said "The agent is paused" whatever the agent was doing.
+- A line above the bar takes a note for the agent while the person holds the browser or is asked for help (`Note`, a
+  `KeyPanel` that can take the keyboard without activating the overlay: it does only when its field is clicked). It is
+  saved with Resume agent or Done (Enter in it presses that button), at most 500 characters, and reaches the agent
+  once: in `wait_for_human`'s answer (`note_for`) or in its next call's result (`take_note`). Measured with real input:
+  the click gave the overlay the keyboard, the typed text reached `wait_for_human`. A line holding the keyboard is
+  ordered out at once rather than faded, which is AppKit's way to hand the keys back to the app in front; that the
+  next key reaches that app is NOT measured: macOS (cooperative activation) let no test process bring an app to the
+  front while the person used another.
 - A window whose alpha falls under 0.5 is closing and is never followed again until it is gone or back at 0.95
   (`closing`): it stays listed and on screen for its 0.3 s close animation, and the same tick took it back and showed
   the overlay over it again. Measured: last seen 0.03 s after the close, never again.
