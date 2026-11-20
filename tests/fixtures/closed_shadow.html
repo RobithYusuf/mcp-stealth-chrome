@@ -1,0 +1,17 @@
+<!doctype html>
+<html><head><title>closed shadow</title></head>
+<body>
+  <div id="tophost"></div>
+  <span id="topout">idle</span>
+  <iframe id="field" style="width:400px;height:120px;border:0"></iframe>
+  <script>
+    const root = document.getElementById('tophost').attachShadow({mode: 'closed'});
+    root.innerHTML = '<button id="go">Closed button</button>';
+    root.getElementById('go').addEventListener('click', (e) => {
+      document.getElementById('topout').textContent = 'clicked:' + e.isTrusted;
+    });
+    // Another origin, so the field is out of process like a payment provider's.
+    document.getElementById('field').src =
+      location.protocol + '//127.0.0.1:' + location.port + '/closed_shadow_child.html';
+  </script>
+</body></html>

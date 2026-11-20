@@ -1,0 +1,16 @@
+<!doctype html>
+<html>
+<head><title>hidden frame</title></head>
+<body>
+  <p>Top text</p>
+  <!-- A payment provider's helper frame: display:none, so its document is not rendered and
+       innerText would return textContent, script bodies included. -->
+  <iframe id="hidden" style="display:none"
+          srcdoc="<p>Hidden paragraph</p><script>var SCRIPT_BODY_LEAK = 1;</script>"></iframe>
+  <iframe id="shown" style="width:300px;height:150px;border:0"></iframe>
+  <script>
+    document.getElementById('shown').src =
+      location.protocol + '//127.0.0.1:' + location.port + '/frames_child.html?name=shown';
+  </script>
+</body>
+</html>

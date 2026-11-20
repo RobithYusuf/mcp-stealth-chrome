@@ -1,0 +1,14 @@
+<!doctype html>
+<html><head><title>closed child</title></head>
+<body style="margin:0">
+  <!-- A hosted card field: the input lives in a closed shadow root, as PXP's do. -->
+  <div id="host"></div>
+  <span id="echo">none</span>
+  <script>
+    const root = document.getElementById('host').attachShadow({mode: 'closed'});
+    root.innerHTML = '<label for="card">Card number</label><input id="card" aria-label="Card number">';
+    root.getElementById('card').addEventListener('input', (e) => {
+      document.getElementById('echo').textContent = 'typed:' + e.target.value + ':' + e.isTrusted;
+    });
+  </script>
+</body></html>

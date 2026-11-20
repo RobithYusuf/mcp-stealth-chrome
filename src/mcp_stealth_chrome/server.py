@@ -6176,7 +6176,11 @@ async def click_text(text: str, exact: bool = False, verify: bool = True) -> str
 @mcp.tool()
 async def fill(ref: Optional[str] = None, selector: Optional[str] = None,
                value: str = "") -> str:
-    """Clear a field and type into it with real key presses, then read it back."""
+    """Clear a field and type into it with real key presses, then read it back.
+
+    A value the page only formatted (a card mask adding spaces, a date mask adding "/") is
+    filled and says how it reads; a value the page cut or changed is an error.
+    """
     try:
         tab = BrowserState.active_tab()
         el = await resolve_ref(ref) if ref else (await tab.query_selector(selector) if selector else None)
@@ -6221,6 +6225,11 @@ async def fill(ref: Optional[str] = None, selector: Optional[str] = None,
         if isinstance(actual, str) and actual.strip() != wanted.strip():
             is_secret = (await el.apply("function() { return this.type === 'password'; }")) is True
             shown = f"{len(actual)} chars" if is_secret else repr(actual[:80])
+            # An input mask that only adds separators kept every character: PXP's card field
+            # reads '4111 1111 1111 1111' and its expiry '12/30', and calling that an error made
+            # a filled checkout look failed. A character dropped or changed is still one.
+            if _FORMAT_SEPARATORS.sub("", actual) == _FORMAT_SEPARATORS.sub("", wanted) != "":
+                return ok(f"filled; the page formatted it as {shown}")
             return err(
                 f"typed, but the field reads {shown} rather than the "
                 f"{len(str(value))}-char value sent. The page rewrote or rejected it "
@@ -6229,6 +6238,11 @@ async def fill(ref: Optional[str] = None, selector: Optional[str] = None,
         return ok("filled")
     except Exception as e:
         return err(str(e))
+
+
+# Spaces (also no-break) and the punctuation masks add. Not newlines or tabs: a single-line field
+# that drops a newline lost a character, and fill must say so.
+_FORMAT_SEPARATORS = re.compile(r"[ \u00a0/.\-()]+")
 
 
 # What has focus, seen from outside any open shadow root: "none", "frame", "multi", "single"

@@ -546,7 +546,12 @@ async def get_text(
         return err(str(e))
 
 
-_FRAME_TEXT_JS = ("(() => document.body ? (document.body.%s || '') : '')()")
+# innerText of a document that is not rendered (an iframe with display:none, such as a
+# payment provider's hidden helper frame) is its textContent, script bodies included: Google
+# Pay's payframe read as a page of minified JS. Such a frame is named, not read.
+_FRAME_TEXT_JS = ("(() => { const b = document.body; if (!b) return {rendered: true, text: ''};"
+                  " const rendered = b.getClientRects().length > 0;"
+                  " return {rendered, text: (rendered || %s) ? (b.%s || '') : ''}; })()")
 
 
 async def _frame_texts(page, raw: bool) -> str:
@@ -556,7 +561,7 @@ async def _frame_texts(page, raw: bool) -> str:
         found = await _wait(all_frames(page), what="get_text frames")
     except Exception as e:
         return f"\n\n[frames not read: {str(e)[:160] or type(e).__name__}]"
-    parts, seen = [], 0
+    parts, hidden, seen = [], [], 0
     for record in found:
         if record.get("depth", 0) == 0:
             continue
@@ -573,17 +578,24 @@ async def _frame_texts(page, raw: bool) -> str:
         try:
             ctx = await frame_world(conn, frame)
             remote, exc = await _wait(conn.send(cdp_runtime.evaluate(
-                _FRAME_TEXT_JS % ("textContent" if raw else "innerText"),
+                _FRAME_TEXT_JS % ("true" if raw else "false", "textContent" if raw else "innerText"),
                 context_id=ctx, return_by_value=True)), what="get_text frame")
             if exc is not None:
                 parts.append(f"{head} not read: {exc.text}")
                 continue
-            body = str(getattr(remote, "value", "") or "").strip()
+            value = getattr(remote, "value", None)
+            value = value if isinstance(value, dict) else {"rendered": True, "text": value}
+            if not value.get("rendered", True) and not raw:
+                hidden.append(f"{seen} ({label})")
+                continue
+            body = str(value.get("text") or "").strip()
         except Exception as e:
             parts.append(f"{head} not read: {str(e)[:160] or type(e).__name__}")
             continue
         if body:
             parts.append(f"{head}\n{body}")
+    if hidden:
+        parts.append(f"[hidden frames, not rendered, so not read: {', '.join(hidden)}]")
     return ("\n\n" + "\n\n".join(parts)) if parts else ""
 
 

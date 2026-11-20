@@ -1,0 +1,8 @@
+<!doctype html>
+<html><head><title>masked fields</title></head>
+<body>
+  <!-- A card-number mask, as payment fields have: groups of four with a space. -->
+  <input id="card" oninput="const d = this.value.replace(/\D/g, '').slice(0, 16); this.value = d.replace(/(.{4})(?=.)/g, '$1 ');">
+  <!-- A mask that loses characters must still be an error. -->
+  <input id="short" maxlength="4">
+</body></html>

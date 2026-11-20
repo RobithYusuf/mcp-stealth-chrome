@@ -206,15 +206,19 @@ _SNAPSHOT_JS_TEMPLATE = r"""(() => {
     if (!roots.length) return {json: JSON.stringify(out), els: [], owners: []};
   }
 
-  // Every open shadow root under `start`, at any depth. Closed roots are invisible
-  // to JS by design, so what lives in them is not measured.
+  // Every shadow root under `start`, at any depth. A closed root is invisible to every script;
+  // the server reads them through CDP and leaves them in this isolated world's own
+  // __mcpClosedRoots (host -> root), which the page cannot see.
+  var CLOSED = (typeof __mcpClosedRoots !== 'undefined') ? __mcpClosedRoots : null;
+  function shadowOf(n) { return n.shadowRoot || (CLOSED && CLOSED.get(n)) || null; }
   function deepRoots(start) {
     var acc = [start];
-    if (start.shadowRoot) acc = acc.concat(deepRoots(start.shadowRoot));
+    var own = shadowOf(start);
+    if (own) acc = acc.concat(deepRoots(own));
     var w = document.createTreeWalker(start, NodeFilter.SHOW_ELEMENT);
-    var n;
+    var n, sr;
     while ((n = w.nextNode())) {
-      if (n.shadowRoot) acc = acc.concat(deepRoots(n.shadowRoot));
+      if ((sr = shadowOf(n))) acc = acc.concat(deepRoots(sr));
     }
     return acc;
   }
@@ -687,6 +691,11 @@ def format_counts(counts: dict, options: dict) -> list[str]:
         lines.append(
             "Nothing matched on this page at all. A single-page app that has not rendered yet "
             "looks like this: wait_for(text=...) or wait_for(selector=...), then snapshot again."
+        )
+    if counts.get("closed_roots"):
+        lines.append(
+            f"Closed shadow roots: {counts['closed_roots']} read through the browser's DOM "
+            f"domain (no script can open them); their elements carry refs like any other."
         )
     if frames.get("failed"):
         detail = " · ".join(f"{f['url'][:60]}: {f['error']}" for f in frames["failed"])

@@ -782,6 +782,76 @@ def test_get_text_reads_the_text_of_every_frame(loop, browser, base_url):
 
 
 @E2E
+def test_get_text_names_a_hidden_frame_instead_of_reading_its_scripts(loop, browser, base_url):
+    """innerText of a display:none frame is its textContent: Google Pay's hidden payframe on a
+    real checkout read as a page of minified JS. Such a frame is named, its text left out."""
+    browser()
+    run(loop, "navigate", f"{base_url}/frame_hidden.html")
+    loop.run_until_complete(asyncio.sleep(0.7))
+    out = run(loop, "get_text")
+    assert "Top text" in out and "Inner shown" in out, out
+    assert "SCRIPT_BODY_LEAK" not in out and "Hidden paragraph" not in out, out
+    assert "hidden frames, not rendered, so not read:" in out, out
+    raw = run(loop, "get_text", raw=True)  # raw is textContent on purpose, frames included
+    assert "SCRIPT_BODY_LEAK" in raw, raw
+
+
+@E2E
+def test_fill_accepts_a_value_the_page_only_formatted(loop, browser, base_url):
+    """PXP's card field reads '4111 1111 1111 1111' after typing 16 digits; fill called that an
+    error, so a checkout that worked looked failed. Separators only: filled, and it says how.
+    A field that lost characters (maxlength) is still an error."""
+    browser()
+    run(loop, "navigate", f"{base_url}/masked.html")
+    out = run(loop, "fill", selector="#card", value="4111111111111111")
+    assert out == "filled; the page formatted it as '4111 1111 1111 1111'", out
+    short = run(loop, "fill", selector="#short", value="123456")
+    assert short.startswith("Error:") and "'1234'" in short, short
+
+
+def _ref_of(snapshot: str, text: str) -> str:
+    line = next((l for l in snapshot.splitlines() if text in l and "ref=" in l), "")
+    assert line, f"{text!r} is not in the snapshot:\n{snapshot}"
+    return line.split("ref=")[1].split()[0]
+
+
+@E2E
+def test_snapshot_reaches_closed_shadow_roots_in_the_page_and_in_a_frame(loop, browser, base_url):
+    """A hosted card field keeps its input in a closed shadow root inside a cross-origin frame.
+    No script can enter it, so the snapshot listed nothing there and the field could only be
+    used by position (on PXP's checkout a layout shift then sent clicks into a <div>). The
+    roots are read through CDP and the elements get refs: a real click and real typing land."""
+    browser()
+    run(loop, "navigate", f"{base_url}/closed_shadow.html")
+    loop.run_until_complete(asyncio.sleep(0.8))
+    snap = run(loop, "browser_snapshot", diff_from_last=False)
+    assert "Closed shadow roots: 2 read" in snap, snap
+    assert "Frames with nothing readable" not in snap, snap
+    field_line = next(l for l in snap.splitlines() if "Card number" in l and "[input]" in l)
+    assert "frame=f1" in field_line and "shadow" in field_line, field_line
+    clicked = run(loop, "click", ref=_ref_of(snap, "Closed button"))
+    assert "page changed" in clicked, clicked
+    assert run(loop, "get_text", selector="#topout") == "clicked:true"
+    filled = run(loop, "fill", ref=_ref_of(snap, "Card number"), value="4111111111111111")
+    assert not filled.startswith("Error"), filled
+    text = run(loop, "get_text")
+    assert "typed:4111111111111111:true" in text, text
+
+
+@E2E
+def test_without_the_closed_root_probe_the_frame_reads_as_blank(loop, browser, base_url, monkeypatch):
+    """The guard above, mutation-checked: with the probe off the field is gone again."""
+    from mcp_stealth_chrome import refs
+    monkeypatch.setattr(refs, "CLOSED_PROBE_MAX_NODES", 0)
+    browser()
+    run(loop, "navigate", f"{base_url}/closed_shadow.html?probe=off")
+    loop.run_until_complete(asyncio.sleep(0.8))
+    snap = run(loop, "browser_snapshot", diff_from_last=False)
+    assert "Card number" not in snap and "Closed shadow roots" not in snap, snap
+    assert "Frames with nothing readable: f1" in snap, snap
+
+
+@E2E
 def test_workflow_can_read_the_url(loop, browser, base_url):
     browser()
     run(loop, "navigate", f"{base_url}/keys.html")

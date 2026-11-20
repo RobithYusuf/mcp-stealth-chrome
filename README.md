@@ -25,7 +25,7 @@ Use the browser when a page needs JavaScript, a login or a person looking at it.
 |--|---------|--------------|
 | ✅ | Real browser | Chrome or Brave over CDP with real mouse and key input. No WebDriver, and the identity is your real browser and machine |
 | ✅ | Honest results | A click says whether the page changed and names what covers a blocked element. Nothing reports success on a guess |
-| ✅ | Small page reads | `browser_snapshot` and `describe_page` return compact refs an agent can act on, reaching into iframes and open shadow roots |
+| ✅ | Small page reads | `browser_snapshot` and `describe_page` return compact refs an agent can act on, reaching into iframes and shadow roots, closed ones too |
 | ✅ | HTTP without a browser | `http_request`, `scrape_markdown` and `smart_fetch` send the TLS fingerprint of Chrome, Firefox or Safari and can reuse the browser's cookies |
 | ✅ | Search and research | `web_search`, `deep_research`, `github_read` and `youtube_read`, with no API key |
 | ✅ | Logins that last | A kept profile, saved sessions, and cloning a profile from your own browser. Passwords and cookies are hidden from tool output by default |
@@ -673,7 +673,7 @@ Results describe what was observed. A tool that reports success when nothing hap
 - ✅ The hit test before a click and the before and after comparison run in an isolated world, like the snapshot. A page that replaces `getBoundingClientRect`, `elementFromPoint`, `getComputedStyle` or `querySelector` to watch for automation sees none of them called by a click, a hover or a navigation: 0 calls, where one click used to make 37.
 - ✅ A native dialog cannot hang the server. A click, key or pointer move that opens one returns and names it, any other tool that needs the page says so instead of waiting, and `dialog_handle` answers the one already open.
 - ✅ `select_option` sets the value from JS because a native dropdown cannot be driven with page input. The result states `isTrusted=false`, and the value is read back.
-- ✅ `browser_snapshot` writes nothing to the page. Refs live on the server and reach into iframes, cross-origin ones included, and open shadow roots. A field shows its label as `label="..."`, taken from `<label for>`, a label around it or `aria-labelledby`, and `name_contains` finds it by that. The label's own row is left out when its field is listed, and the count of those rows is reported. A page that has not rendered yet says so instead of reading as empty, and a frame whose field sits in a closed shadow root is named as not readable, with `mouse_click_xy` and `type_text` as the way in.
+- ✅ `browser_snapshot` writes nothing to the page. Refs live on the server and reach into iframes, cross-origin ones included, and shadow roots. A closed shadow root, where a payment provider keeps its card field, is read through the browser's DOM domain, so that field gets a ref like any other. A field shows its label as `label="..."`, taken from `<label for>`, a label around it or `aria-labelledby`, and `name_contains` finds it by that. The label's own row is left out when its field is listed, and the count of those rows is reported. A page that has not rendered yet says so instead of reading as empty, and a frame whose field sits in a closed shadow root is named as not readable, with `mouse_click_xy` and `type_text` as the way in.
 - ✅ `navigate` reports the final URL, redirects, status and ready state, and waits for the load event up to 15 seconds. `expect_url` and `expect_status` turn a redirect into a failure. A page that did not load is an error, and `batch_actions` and `workflow_run` count it as failed. It no longer raises the window unless you pass `focus=True`.
 - ✅ A visible browser stays behind the app you are using. `browser_launch`, `spawn_browser`, `tab_new`, `tab_select` and page actions do not take the keyboard, measured with `lsappinfo` on macOS. `tab_new` opens its own background window, or with `new_window=False` a tab behind the one its window shows, which pages still read as visible (Chrome picks the window and the result names it). `tab_select` only changes which tab tools act on unless you pass `focus=True`, and says when the page it selected reads as hidden. A click that calls `window.open` still brings Chrome forward for about 130 ms before focus returns, so keys typed in that moment reach Chrome. `tab_focus` raises the window on request. Quitting it with Cmd+Q or the Dock, or closing all its windows, ends it within about 3.5 seconds, also when the server that launched it has exited or was reinstalled meanwhile: each visible browser has a small watcher process of its own. The next tool call says it was closed, and nothing starts it again by itself. Closing the last tab with `tab_close` does not count as a Quit.
 - ✅ A profile last opened by a newer Chrome is never opened by an older one. The launch is refused with both versions named, nothing starts, and the profile is not changed. The version is read from `Last Version` and `Local State` in the profile. An older Chrome can damage a profile a newer one has upgraded.
@@ -733,7 +733,7 @@ Open a group to see its tools.
 
 `browser_snapshot`, `accessibility_snapshot`, `describe_page`, `form_introspect`, `get_text`, `get_html`, `get_attribute`, `get_links`, `inspect_element`, `query_selector_all`, `search_page`, `extract_table`, `extract_structured`, `detect_content_pattern`, `scrape_page`, `list_frames`, `frame_evaluate`
 
-`get_text` on the whole page also reads every iframe, cross-origin and nested ones too, each under a line naming the frame; `frames=False` keeps to the top document.
+`get_text` on the whole page also reads every iframe, cross-origin and nested ones too, each under a line naming the frame; `frames=False` keeps to the top document. A hidden frame (`display:none`) is named on one line instead of read, since its text would be its script source.
 </details>
 
 <details>
@@ -1027,6 +1027,7 @@ The ones most people set:
 | `MCP_STEALTH_AGENT_CURSOR` | Set to `1` so the overlay's bar starts with the agent's cursor shown. Default off |
 | `MCP_STEALTH_OVERLAY_DIR` | Folder for the files the server shares with the overlay. Default `$TMPDIR/mcp-stealth-overlay` |
 | `MCP_STEALTH_OVERLAY_HIDE_AFTER` | Seconds without a tool call before the overlay fades out (not while a request for help or your hold shows). Default 90 |
+| `MCP_STEALTH_CLOSED_PROBE_MAX_NODES` | Largest document, in elements, whose closed shadow roots `browser_snapshot` reads through the DOM domain. 0 turns it off. Default 5000 |
 | `MCP_STEALTH_ADBLOCK_DOWNLOAD_TIMEOUT` | Seconds a list download may take in all. Default 20 |
 | `MCP_STEALTH_ADBLOCK_MAX_BYTES` | Largest list accepted, in bytes. Default 16 MB |
 | `MCP_STEALTH_ADBLOCK_STALL` | Seconds ad blocking may go unanswered before it turns itself off for that browser. Default 3 |

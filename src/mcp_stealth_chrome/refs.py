@@ -23,6 +23,7 @@ import asyncio
 import inspect
 import itertools
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -70,6 +71,75 @@ _REF_MAPS: dict[str, dict[str, RefEntry]] = {}
 _FRAME_CONNS: dict[str, dict[str, Tab]] = {}
 # (connection target key, frame id) -> (loader id, isolated world context id).
 _WORLDS: dict[tuple[str, str], tuple[str, int]] = {}
+
+# A closed shadow root is out of reach of every script, the isolated world's too: a hosted card
+# field keeps its <input> in one, so the snapshot listed nothing in the frame and the field could
+# only be used by position, where a layout shift sent three clicks into a <div> (PXP checkout,
+# Ego Lite's snapshot read the same field from the accessibility tree). CDP's DOM domain sees
+# closed roots (describeNode pierce=True). Each one is resolved into the frame's isolated world
+# and handed to the walker through a Map on that world's own global, which the page cannot see.
+# Only documents of at most this many elements are read whole, so a large page pays nothing.
+try:
+    CLOSED_PROBE_MAX_NODES = int(os.environ.get("MCP_STEALTH_CLOSED_PROBE_MAX_NODES", "5000"))
+except ValueError:
+    CLOSED_PROBE_MAX_NODES = 5000
+_CLOSED_HANDED: dict[tuple, set] = {}
+_REGISTER_CLOSED_JS = ("function() { const m = globalThis.__mcpClosedRoots"
+                       " || (globalThis.__mcpClosedRoots = new Map()); m.set(this.host, this); }")
+
+
+def _closed_root_ids(node: Any) -> list[Any]:
+    """Backend ids of the closed shadow roots in one document, not those of its child frames,
+    which are walked on their own (content_document is not followed)."""
+    found, stack = [], [node]
+    while stack:
+        current = stack.pop()
+        for shadow in getattr(current, "shadow_roots", None) or []:
+            if shadow.shadow_root_type == cdp.dom.ShadowRootType.CLOSED:
+                found.append(shadow.backend_node_id)
+            stack.append(shadow)
+        stack.extend(getattr(current, "children", None) or [])
+    return found
+
+
+async def _hand_over_closed_roots(conn: Any, context_id: int, frame: Any, group: str) -> int:
+    """Put this frame's closed shadow roots where the walker in `context_id` finds them.
+    Returns how many the document has; 0 when there are none or it is too large to read whole."""
+    size, exc = await conn.send(cdp.runtime.evaluate(
+        "document.getElementsByTagName('*').length", context_id=context_id, return_by_value=True))
+    if exc is not None or not isinstance(size.value, int) or size.value > CLOSED_PROBE_MAX_NODES:
+        return 0
+    doc, exc = await conn.send(cdp.runtime.evaluate(
+        "document", context_id=context_id, object_group=group))
+    if exc is not None or doc.object_id is None:
+        return 0
+    tree = await conn.send(cdp.dom.describe_node(object_id=doc.object_id, depth=-1, pierce=True))
+    ids = _closed_root_ids(tree)
+    if not ids:
+        return 0
+    if len(_CLOSED_HANDED) > 256:
+        _CLOSED_HANDED.clear()
+    handed = _CLOSED_HANDED.setdefault((target_key(conn), str(frame.id_), context_id), set())
+    for backend_id in ids:
+        if backend_id in handed:
+            continue
+        shadow = await conn.send(cdp.dom.resolve_node(
+            backend_node_id=backend_id, execution_context_id=context_id, object_group=group))
+        if shadow.object_id is None:
+            continue
+        await conn.send(cdp.runtime.call_function_on(
+            _REGISTER_CLOSED_JS, object_id=shadow.object_id, object_group=group))
+        handed.add(backend_id)
+    return len(ids)
+
+
+async def _closed_roots_or_zero(conn: Any, context_id: int, frame: Any, group: str) -> int:
+    """The probe is an addition: when it fails the walk goes on as before, and a frame left
+    blank is still reported as one that may keep its content in a closed root."""
+    try:
+        return await _hand_over_closed_roots(conn, context_id, frame, group)
+    except Exception:
+        return 0
 
 
 async def frame_offset(owners: tuple) -> tuple[float, float]:
@@ -503,6 +573,7 @@ async def _walk_frame(
     try:
         try:
             context_id = await _isolated_world(conn, frame)
+            closed = await _closed_roots_or_zero(conn, context_id, frame, group)
             parts = await evaluate_parts(conn, expression, group, context_id=context_id)
         except Exception as exc:
             # A cached world dies with its execution context; rebuild it once.
@@ -510,6 +581,7 @@ async def _walk_frame(
             if context_id is None or transport_lost(str(exc)):
                 raise
             context_id = await _isolated_world(conn, frame)
+            closed = await _closed_roots_or_zero(conn, context_id, frame, group)
             parts = await evaluate_parts(conn, expression, group, context_id=context_id)
         payload_handle = parts.get("json")
         payload = parse_frame_payload(payload_handle.value if payload_handle else None)
@@ -523,6 +595,7 @@ async def _walk_frame(
                         "matched": int(payload.get("matched") or 0)})
     walk.loaders.append(str(frame.loader_id))
     _merge_counts(walk, payload)
+    walk.counts["closed_roots"] = walk.counts.get("closed_roots", 0) + closed
     entries = payload["elements"]
     if len(nodes) != len(entries):
         raise ValueError(
