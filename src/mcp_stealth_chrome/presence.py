@@ -62,6 +62,10 @@ STATUS = {
     "go_forward": "going forward", "reload": "reloading the page", "evaluate": "running a script",
 }
 
+# What the bar may add to the status. Typed text never: it may be a password.
+_DETAIL_SELECTOR = ("click", "hover", "fill", "select_option", "check", "uncheck", "scroll_to")
+_DETAIL_URL = ("navigate", "navigate_and_snapshot", "tab_new")
+
 _LIVE: list["Overlay"] = []
 _NOTES: dict[str, list[str]] = {}  # per session: what the next result should say
 
@@ -77,7 +81,7 @@ def state_root() -> Path:
 
 def _write(path: Path, data: dict) -> None:
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
     with os.fdopen(fd, "w") as f:
         json.dump(data, f)
     os.replace(tmp, path)
@@ -258,7 +262,8 @@ async def before_tool(name: str, browser: Any, tab: Any) -> None:
     overlay = of(browser)
     if overlay is None:
         return
-    overlay.touch(status=STATUS.get(name, name.replace("_", " ")))
+    from . import _app
+    overlay.touch(status=describe(name, _app.CALL_ARGUMENTS.get()))
     last_tab, last_at = overlay.window_read
     if tab is not None and (tab is not last_tab or time.time() - last_at > 1.0):
         overlay.window_read = (tab, time.time())
@@ -282,6 +287,32 @@ def refusal(name: str, browser: Any) -> Optional[str]:
     return ("Error: the person took over this browser (Take over in the bar over its window"
             f"{when}). {name} did nothing. The agent may neither act on nor read the page until "
             "they press Resume agent: call wait_for_human to wait for that, or ask them.")
+
+
+def describe(name: str, args: Optional[dict]) -> str:
+    """The bar's status for a tool call: what it does and, where it helps the person follow it,
+    on what (a host, a button's text, a selector). Never what is typed."""
+    from urllib.parse import urlsplit
+    args = args or {}
+    text = STATUS.get(name, name.replace("_", " "))
+    detail = None
+    if name in _DETAIL_URL and args.get("url"):
+        with contextlib.suppress(Exception):
+            detail = urlsplit(str(args["url"])).hostname
+    elif name == "click_text" and args.get("text"):
+        detail = f"\u201c{str(args['text'])[:40]}\u201d"
+    elif name == "click_role" and args.get("name"):
+        detail = f"\u201c{str(args['name'])[:40]}\u201d"
+    elif name == "press_key" and args.get("key"):
+        detail = str(args["key"])[:20]
+    elif name in _DETAIL_SELECTOR and args.get("selector"):
+        detail = str(args["selector"])[:40]
+    if detail:
+        text = {"opening a page": "opening", "pressing a key": "pressing",
+                "filling in a field": "filling in", "ticking a box": "ticking",
+                "unticking a box": "unticking", "choosing an option": "choosing an option in",
+                }.get(text, text) + f" {detail}"
+    return text[:1].upper() + text[1:]
 
 
 def _note(text: str) -> None:

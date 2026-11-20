@@ -1002,25 +1002,26 @@ class Overlay:
             if mode == "agent" and show_cursor:
                 self.ring(cx, H - cy, "#3B82F6")
 
-        status = a.get("status") or "using the browser"
+        status = a.get("status") or "Using the browser"
         if mode in WORKING and now < self.nudge_until:
             first = ("Typing does not take over" if self.nudge_why == "type"
                      else "The page is locked while the agent works")
-            self.bar.set([(first, 13, 0.3, WHITE), ("  press Take over to use it", 13, 0.0, MUTED)],
+            self.bar.set([(first, 13, 0.3, WHITE), ("  \u00b7  Press Take over to use it", 13, 0.0, MUTED)],
                          "Take over", "primary", DOT[mode], mode == "agent", show_cursor)
         elif mode in ("agent", "thinking"):
-            hint = ("  press Take over to use the browser" if over
-                    else "  thinking about the next step" if mode == "thinking" else f"  {status}")
+            hint = ("  \u00b7  Press Take over to use the browser" if over
+                    else "  \u00b7  Thinking about the next step" if mode == "thinking"
+                    else f"  \u00b7  {status}")
             self.bar.set([("Agent working", 13, 0.3, WHITE), (hint, 13, 0.0, MUTED)],
                          "Take over", "quiet", DOT[mode], mode == "agent", show_cursor)
         elif mode == "polite":
-            self.bar.set([("Agent paused", 13, 0.3, WHITE), ("  it goes on in a moment", 13, 0.0, MUTED)],
+            self.bar.set([("Agent paused", 13, 0.3, WHITE), ("  \u00b7  It goes on in a moment", 13, 0.0, MUTED)],
                          "Take over", "quiet", DOT["polite"], False, show_cursor)
         elif mode == "person":
-            self.bar.set([("You have the browser", 13, 0.3, WHITE), ("  the agent is paused", 13, 0.0, MUTED)],
+            self.bar.set([("You have the browser", 13, 0.3, WHITE), ("  \u00b7  The agent is paused", 13, 0.0, MUTED)],
                          "Resume agent", "primary", DOT["person"], False, show_cursor)
         elif mode == "help":
-            self.bar.set([("Your help is needed", 13, 0.3, WHITE), (f"  {help_text}", 13, 0.0, MUTED)],
+            self.bar.set([("Your help is needed", 13, 0.3, WHITE), (f"  \u00b7  {help_text}", 13, 0.0, MUTED)],
                          "Done", "primary", DOT["help"], True, show_cursor)
         self.bar.place(x, y_ns, w)
 

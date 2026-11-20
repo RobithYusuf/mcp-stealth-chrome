@@ -149,6 +149,7 @@ def test_the_pointer_and_clicks_reach_the_agent_file(made):
     assert agent["cursor"] == [30, 40] and agent["click_at"] > 0
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows keeps no POSIX mode bits")
 def test_files_are_private(made):
     browser, overlay = made({})
     overlay.touch(status="clicking")
@@ -173,3 +174,21 @@ def test_a_gate_refuses_at_the_tool_boundary(monkeypatch):
     result = asyncio.run(server.mcp.call_tool("server_status", {}))
     content = result[0] if isinstance(result, tuple) else result
     assert "Error: held" not in content[0].text
+
+
+@pytest.mark.parametrize("name,args,shown", [
+    ("navigate", {"url": "https://shop.example.com/cart?token=abc"}, "Opening shop.example.com"),
+    ("click_text", {"text": "Add to cart"}, "Clicking “Add to cart”"),
+    ("click_role", {"role": "button", "name": "Pay"}, "Clicking “Pay”"),
+    ("click", {"selector": "#plus"}, "Clicking #plus"),
+    ("click", {"ref": "e12"}, "Clicking"),
+    ("press_key", {"key": "Enter"}, "Pressing Enter"),
+    ("fill", {"selector": "#pw", "value": "hunter2"}, "Filling in #pw"),
+    ("check", {"selector": "#agree"}, "Ticking #agree"),
+    ("type_text", {"text": "hunter2"}, "Typing"),
+    ("some_new_tool", {}, "Some new tool"),
+])
+def test_the_bar_says_what_is_done_and_never_what_is_typed(name, args, shown):
+    text = presence.describe(name, args)
+    assert text == shown
+    assert "hunter2" not in text and "token" not in text

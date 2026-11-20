@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import time
 from typing import Any
 
@@ -44,6 +45,9 @@ RESULT_FILTERS: list = []
 # the call's result and the tool does not run. agent_overlay adds the refusal while the person
 # holds the browser. Each must be cheap and must not await; one that raises lets the call through.
 CALL_GATES: list = []
+# The arguments of the tool call running in this context, for hooks that describe it (the
+# overlay's bar names what is clicked or opened). Never the place to change them.
+CALL_ARGUMENTS: contextvars.ContextVar = contextvars.ContextVar("mcp_call_arguments", default=None)
 # Tool calls running, per session. Every call is use of the session's current instance, so the
 # idle reaper never closes that instance while one runs: tab_new, tab_select and switch_instance
 # never touched last_active, and an instance spawned with idle_timeout_seconds=2 was closed between
@@ -174,6 +178,7 @@ class StealthMCP(FastMCP):
             http_id = headers.get("mcp-session-id") if headers is not None else None
             token = BrowserState.bind_session(session, http_id)
         key = BrowserState.session_key()
+        arguments_token = CALL_ARGUMENTS.set(arguments)
         _CALLS_IN_FLIGHT[key] = _CALLS_IN_FLIGHT.get(key, 0) + 1
         try:
             still = await wait_while_closing(key, BrowserState.current_instance_id)
@@ -205,6 +210,7 @@ class StealthMCP(FastMCP):
                     hook(name)
                 except Exception:
                     pass
+            CALL_ARGUMENTS.reset(arguments_token)
             if token is not None:
                 BrowserState.unbind_session(token)
 
