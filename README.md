@@ -603,7 +603,8 @@ browser_launch()   # a new agent, same profile
 
 `browser_launch(agent_overlay=True)` and `spawn_browser(agent_overlay=True)` put three things over a visible browser window, without drawing anything inside the page:
 
-- A light that turns slowly around the window while the agent acts, dims while it thinks between steps, and fades out when it stops. Its corners follow the window's own rounded corners, and turn square in full screen.
+- A light that turns slowly around the window while the agent acts, dims while it thinks between steps, and fades out when it stops. Its corners follow the window's own rounded corners, and turn square in full screen. It leaves with the window: about 0.1 s after a Quit, with the close animation when the window closes.
+- The bar, the light and the lock can each be set: a compact bar, a bar shown only while the pointer is over the window, or none; see `MCP_STEALTH_OVERLAY_BAR`, `MCP_STEALTH_OVERLAY_LIGHT` and `MCP_STEALTH_OVERLAY_LOCK` below.
 - A bar at the bottom saying what the agent does, with **Take over**.
 - A lock over the page: a click or scroll there does not reach the page and the bar says why.
 
@@ -1027,6 +1028,9 @@ The ones most people set:
 | `MCP_STEALTH_AGENT_CURSOR` | Set to `1` so the overlay's bar starts with the agent's cursor shown. Default off |
 | `MCP_STEALTH_OVERLAY_DIR` | Folder for the files the server shares with the overlay. Default `$TMPDIR/mcp-stealth-overlay` |
 | `MCP_STEALTH_OVERLAY_HIDE_AFTER` | Seconds without a tool call before the overlay fades out (not while a request for help or your hold shows). Default 90 |
+| `MCP_STEALTH_OVERLAY_BAR` | The overlay's bar: `full` (default), `compact` (a small bar), `hover` (shown while the pointer is over the browser window) or `off` (hidden while the agent works; the lock is off too, since the bar's button is how you take over). Help requests and your hold always show it |
+| `MCP_STEALTH_OVERLAY_LIGHT` | `off` hides the light around the window. Default `on` |
+| `MCP_STEALTH_OVERLAY_LOCK` | `off` lets clicks reach the page while the agent works. Default `on` |
 | `MCP_STEALTH_OVERLAY_CORNER` | The window corner the overlay's light follows: `<box>` or `<box>,<n>` (a superellipse; `n=2` is a circle). Default `37,4` on macOS 26 (measured), `10,2` before |
 | `MCP_STEALTH_CLOSED_PROBE_MAX_NODES` | Largest document, in elements, whose closed shadow roots `browser_snapshot` reads through the DOM domain. 0 turns it off. Default 5000 |
 | `MCP_STEALTH_ADBLOCK_DOWNLOAD_TIMEOUT` | Seconds a list download may take in all. Default 20 |

@@ -169,7 +169,7 @@ def _spawn(folder: Path, pid: int, cursor: bool, start: Optional[str] = None) ->
     except ValueError:
         hide_after = HIDE_AFTER
     cfg = {"state": str(folder), "pid": pid, "start": start, "server": os.getpid(), "cursor": cursor,
-           "hide_after": hide_after if hide_after > 0 else HIDE_AFTER}
+           "hide_after": hide_after if hide_after > 0 else HIDE_AFTER, "style": style()}
     log_fd = os.open(folder / "overlay.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND | NOFOLLOW, 0o600)
     with os.fdopen(log_fd, "ab") as log:
         proc = subprocess.Popen(
@@ -590,6 +590,38 @@ def end_help(browser: Any) -> None:
     overlay = of(browser)
     if overlay is not None:
         overlay.touch(help=None)
+
+
+BAR_MODES = ("full", "compact", "hover", "off")
+
+
+def _switch(name: str, default: bool) -> bool:
+    value = os.environ.get(name, "").strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
+def style() -> dict:
+    """How the overlay looks, from the environment (set once in the MCP server's config):
+
+    MCP_STEALTH_OVERLAY_BAR   full (default), compact (a small bar: dot, short status, the
+                              button), hover (the bar shows while the pointer is over the
+                              browser window) or off (hidden while the agent works).
+    MCP_STEALTH_OVERLAY_LIGHT on (default) / off: the light around the window.
+    MCP_STEALTH_OVERLAY_LOCK  on (default) / off: the lock that keeps clicks off the page while
+                              the agent works.
+
+    The bar's button is the only way to take the browser over, so a request for help (Done) and
+    the person's hold (Resume agent) always show it, and with the bar off the lock is off too:
+    a lock with no Take over in reach would leave the person shut out of the page."""
+    bar = os.environ.get("MCP_STEALTH_OVERLAY_BAR", "").strip().lower() or "full"
+    if bar not in BAR_MODES:
+        bar = "full"
+    lock = _switch("MCP_STEALTH_OVERLAY_LOCK", True) and bar != "off"
+    return {"bar": bar, "light": _switch("MCP_STEALTH_OVERLAY_LIGHT", True), "lock": lock}
 
 
 def status(browser: Any) -> dict:

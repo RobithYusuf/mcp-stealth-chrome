@@ -1213,10 +1213,24 @@ the person (the same target events as Cmd+T, a followed link, a closed tab).
   so is the light (a second mask, swapped without drawing): a full-screen Chrome is several windows (the content one
   starts below the toolbar strip), so the bounds alone do not say it; `presence.refresh_window` sends CDP's
   `windowState`, honoured only while the window spans its screen's width, so a stale word never squares a normal window.
-- The light reaches 64 pt into the window through four mask layers (widths 30/14/6/2.5, blur 64/30/12/0, drawn once):
-  34 pt in three layers read as too faint. Measured against the old light, 15 s with the light on, two rounds each:
-  the overlay process 1.7 to 2.0% either way, and WindowServer within its own noise (16.6 to 35.6% old, 17.7 to 28.0%
-  new, other apps on screen), as the earlier finding that its cost follows frames, not area, predicts.
+- The light reaches 64 pt into the window as one smooth curve (`light_at`: a crisp edge, a short halo, a long body
+  that is exactly 0 at DEPTH), drawn once as nested frames whose alphas add up to it (`ring_image`), so no seam shows.
+  The 0.25.4 draft blurred four stroked layers with shadows: the person saw separate bands, and the widest blur ran past
+  the 96 pt strips and ended in a straight line with a square corner inside the window. STRIP is DEPTH + 8. Cost,
+  measured against the 34 pt light for 15 s with the light on: the overlay process 1.7 to 2.0% either way,
+  WindowServer within its own noise.
+- The overlay goes when the window goes. Each tick reads the browser window's alpha (`window_alpha`): gone (a Quit)
+  or under 0.5 (macOS fading it out as it closes, about 0.3 s, still listed meanwhile) hides at once; MISSING_FOR stays
+  for a window still there but unseen (another Space, a minimize). Panels have no system animation
+  (`setAnimationBehavior_(None)`), which shrank them for a third of a second. Measured: gone 0.13 s after a Quit
+  (3.35 s before), 0.31 s after a window close, with the close animation. While the window moves the tick runs at
+  TICK_MOVING (60 a second, `schedule`), 20 otherwise: at 20 the light trailed a drag.
+- `presence.style()` reads the person's choice and passes it to the overlay: `MCP_STEALTH_OVERLAY_BAR` full, compact
+  (30 pt bar, first words of the status, no cursor switch), hover (shown while the pointer is over the visible
+  browser window, `HOVER_LINGER` after) or off; `MCP_STEALTH_OVERLAY_LIGHT` and `MCP_STEALTH_OVERLAY_LOCK` on/off.
+  The bar's button is the only way to take over, so help (Done) and the person's hold (Resume agent) always show it,
+  and a bar that is off turns the lock off: a lock with no Take over in reach would shut the person out of the page.
+  `server_status.agent_overlay.style` reports it.
 - `tests/test_agent_overlay.py` (fast) and `tests/test_agent_overlay_e2e.py` (`MCP_HEADED=1`, real Chrome, through the MCP
   boundary): the strips on the window's edges, refusals while held, Resume and Done ending `wait_for_human`, the typing
   pause, the overlay still in front after `request_human_help` brings Chrome forward, and the overlay ending with the browser.

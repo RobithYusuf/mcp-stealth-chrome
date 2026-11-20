@@ -65,7 +65,8 @@ from Quartz import (CAAnimationGroup, CABasicAnimation, CACurrentMediaTime, CAGr
                     CALayer, CAMediaTimingFunction, CAShapeLayer, CATextLayer, CATransaction,
                     CATransition, CGBitmapContextCreate, CGBitmapContextCreateImage,
                     CGColorSpaceCreateDeviceRGB, CGContextAddPath, CGContextRestoreGState,
-                    CGContextSaveGState, CGContextScaleCTM, CGContextSetLineWidth,
+                    CGContextEOFillPath, CGContextSaveGState, CGContextScaleCTM,
+                    CGContextSetLineWidth, CGContextSetRGBFillColor,
                     CGContextSetRGBStrokeColor, CGContextSetShadowWithColor, CGContextStrokePath,
                     CGEventSourceSecondsSinceLastEventType, CGPathAddLineToPoint,
                     CGPathCloseSubpath, CGPathCreateMutable, CGPathCreateWithEllipseInRect,
@@ -125,8 +126,9 @@ CORNER = corner_shape()
 TURN = 16.0         # seconds per turn of the light: at 30 fps a corner moves about 9 points a
                     # frame (9 s at 20 fps moved it 25, and the soft colours stepped visibly)
 DEPTH = 64.0        # how far the light reaches into the window (34 read as too faint, 20 Nov 2026)
-STRIP = 96.0        # thickness of the edge windows that carry it: the softest layer must fit
+STRIP = DEPTH + 8   # thickness of the edge windows that carry it: the light is 0 past DEPTH
 TICK = 1 / 20       # the glow's own pace: every update lands on a frame drawn anyway
+TICK_MOVING = 1 / 60  # while the browser window moves: at 20 a second the light trailed a drag
 CALM_EVERY = 2      # with nothing moving, do a tick's work every 2nd tick
 SCAN_EVERY = 0.25   # seconds between reads of the windows above the browser's
 MOVING_FOR = 1.0    # after the browser window moved, follow it at the full rate this long
@@ -141,6 +143,11 @@ AGENT = os.path.join(STATE, "agent.json")
 CONTROL = os.path.join(STATE, "control.json")
 SERVER = int(CONFIG["server"])
 HIDE_AFTER = float(CONFIG.get("hide_after", 90.0))  # no word for this long: everything fades out
+STYLE = CONFIG.get("style") or {}  # presence.style(): the person's choice of bar, light and lock
+BAR_MODE = STYLE.get("bar", "full") if STYLE.get("bar") in ("full", "compact", "hover", "off") else "full"
+LIGHT_ON = STYLE.get("light", True) is not False
+LOCK_ON = STYLE.get("lock", True) is not False and BAR_MODE != "off"
+HOVER_LINGER = 1.2  # hover: the bar stays this long after the pointer left the window
 ME = os.getpid()
 
 
@@ -272,6 +279,16 @@ def one_window(wid):
     return entries(CGWindowListCopyWindowInfo(kCGWindowListOptionIncludingWindow, wid))
 
 
+def window_alpha(wid):
+    """The window's alpha, or None when it no longer exists. A window being closed stays listed
+    while macOS fades and shrinks it (about 0.3 s), its alpha falling."""
+    infos = CGWindowListCopyWindowInfo(kCGWindowListOptionIncludingWindow, wid) or ()
+    for w in infos:
+        if int(w["kCGWindowNumber"]) == wid:
+            return float(w.get("kCGWindowAlpha", 1))
+    return None
+
+
 def meets(a, b):
     return a[0] < b[0] + b[2] and b[0] < a[0] + a[2] and a[1] < b[1] + b[3] and b[1] < a[1] + a[3]
 
@@ -337,6 +354,9 @@ def panel(frame, takes_clicks, shadow=False):
     p.setBecomesKeyOnlyIfNeeded_(True)
     p.setCollectionBehavior_(ALL_SPACES | IGNORES_CYCLE | FULLSCREEN_AUX)
     p.setReleasedWhenClosed_(False)
+    # No system animation on ordering in or out (a panel's default shrank the strips and the lock
+    # for a third of a second after the browser had gone): the overlay goes when the window goes.
+    p.setAnimationBehavior_(2)  # NSWindowAnimationBehaviorNone
     return p
 
 
@@ -417,30 +437,49 @@ def corner_path(x, y, w, h, box, n, steps=20):
     return path
 
 
+def light_at(d):
+    """How bright the light is `d` points in from the window's edge: a crisp line on the edge, a
+    short bright halo, and a long soft body that reaches exactly 0 at DEPTH, so nothing is cut
+    off at the strips' inner edges. One smooth curve: the blurred layers it replaces showed as
+    separate bands, and their blur ran past the strips and ended in a straight line."""
+    if d < 1.5:
+        return 1.0
+    t = min(1.0, (d - 1.5) / (DEPTH - 1.5))
+    halo = 0.85 * math.exp(-(d - 1.5) / 3.0)
+    body = 0.55 * (1.0 - t) ** 2.2 if t < 1.0 else 0.0
+    return 1.0 - (1.0 - halo) * (1.0 - body) if t < 1.0 else 0.0
+
+
 def ring_image(scale, corner=None):
-    """The glow's shape, drawn once: a crisp edge and soft light falling off inward, as a
-    nine-slice whose middle stretches over any window size without drawing again. Its corners
-    follow the window's (`corner`, see corner_shape); (0, 2) draws square ones."""
+    """The glow's shape, drawn once: light_at's curve inward from an edge whose corners follow
+    the window's (`corner`, see corner_shape; (0, 2) draws square ones), as a nine-slice whose
+    middle stretches over any window size without drawing again.
+
+    Drawn as nested frames, each from the edge to one depth, from the deepest out, every frame
+    adding just enough alpha that the total at each depth is light_at: the frames share their
+    outer edge and their inner edges never coincide, so no seam appears between steps."""
     box, n = corner or CORNER
-    margin = math.ceil(box + DEPTH + 18)
+    margin = math.ceil(box + DEPTH + 4)
     side = 2 * margin + 1
     px = int(side * scale)
     ctx = CGBitmapContextCreate(None, px, px, 8, px * 4, CGColorSpaceCreateDeviceRGB(),
                                 kCGImageAlphaPremultipliedLast)
     CGContextScaleCTM(ctx, scale, scale)
-    # Widest and softest first: four layers so the light falls off in a long, even gradient
-    # instead of a band; drawn once, so the extra layer costs nothing per frame.
-    for width, alpha, soft in ((30.0, 0.14, 64.0), (14.0, 0.26, 30.0), (6.0, 0.5, 12.0), (2.5, 1.0, 0.0)):
-        CGContextSaveGState(ctx)
-        if soft:
-            CGContextSetShadowWithColor(ctx, (0, 0), soft * scale, cg((0, 0, 0, 1.0)))
-        CGContextSetRGBStrokeColor(ctx, 0, 0, 0, alpha)
-        CGContextSetLineWidth(ctx, width)
-        inset = width / 2
-        CGContextAddPath(ctx, corner_path(inset, inset, side - width, side - width,
-                                          max(box - inset, 2.0) if box else 0.0, n))
-        CGContextStrokePath(ctx)
-        CGContextRestoreGState(ctx)
+    step = 1.0 / scale  # one device pixel
+    depths = [DEPTH - i * step for i in range(int(DEPTH / step) + 1)]
+    below = 0.0  # the alpha already laid at the previous, deeper frame
+    for d in depths:
+        want = light_at(max(d, 0.0))
+        if want <= below:
+            continue
+        add = (want - below) / (1.0 - below) if below < 1.0 else 0.0
+        below = want
+        path = corner_path(0, 0, side, side, box, n)
+        inner = corner_path(d, d, side - 2 * d, side - 2 * d, max(box - d, 0.0), n)
+        CGContextAddPath(ctx, path)
+        CGContextAddPath(ctx, inner)
+        CGContextSetRGBFillColor(ctx, 0, 0, 0, add)
+        CGContextEOFillPath(ctx)
     return CGBitmapContextCreateImage(ctx), margin, side
 
 
@@ -790,6 +829,10 @@ class Bar:
 
     def __init__(self, target, still):
         self.still = still
+        self.compact = BAR_MODE == "compact"
+        if self.compact:  # a small bar: dot, the first words of the status, the button
+            self.H, self.MAX_W = 30.0, 340.0
+        self.bh = self.H - 14 if not self.compact else self.H - 8
         self.panel = panel(NSMakeRect(0, 0, 400, self.H), takes_clicks=True, shadow=True)
         self.panel.setAlphaValue_(0.0)
         # A plain tinted background: a live blur behind the bar would be redrawn on every frame
@@ -814,12 +857,17 @@ class Bar:
         self.label.setLineBreakMode_(TRUNCATE_TAIL)
         self.label.setMaximumNumberOfLines_(1)
         self.label.setWantsLayer_(True)
-        self.toggle = PillButton.alloc().initWithFrame_(NSMakeRect(0, 0, 30, 26))
+        self.toggle = PillButton.alloc().initWithFrame_(NSMakeRect(0, 0, 30, self.bh))
         self.toggle.setup(target, "onCursor:")
-        self.button = PillButton.alloc().initWithFrame_(NSMakeRect(0, 0, 100, 26))
+        self.button = PillButton.alloc().initWithFrame_(NSMakeRect(0, 0, 100, self.bh))
         self.button.setup(target, "onButton:")
+        for b in (self.toggle, self.button):
+            b.layer().setCornerRadius_(self.bh / 2)
         self.bw = max(math.ceil(attributed([(t, 12.5, 0.3, WHITE)]).size().width) for t in self.TITLES) + 28
         self.tw = 30 if SYMBOLS else math.ceil(attributed([("Cursor", 12.5, 0.3, WHITE)]).size().width) + 24
+        if self.compact:
+            self.tw = 0  # no cursor switch in the small bar (SIGUSR1 still toggles it)
+            self.toggle.setHidden_(True)
         for v in (self.dot, self.label, self.toggle, self.button):
             self.fx.addSubview_(v)
         self.width = None
@@ -829,15 +877,15 @@ class Bar:
         self.hide_at = None
 
     def fit(self, window_w):
-        width = float(max(300, min(self.MAX_W, window_w - 48)))
+        width = float(max(220 if self.compact else 300, min(self.MAX_W, window_w - 48)))
         if width == self.width:
             return
         self.width = width
-        pad = (self.H - 26) / 2
+        pad = (self.H - self.bh) / 2
         bx = width - pad - self.bw
-        tx = bx - 6 - self.tw
-        self.button.setFrame_(NSMakeRect(bx, pad, self.bw, 26))
-        self.toggle.setFrame_(NSMakeRect(tx, pad, self.tw, 26))
+        tx = bx - (6 if self.tw else 0) - self.tw
+        self.button.setFrame_(NSMakeRect(bx, pad, self.bw, self.bh))
+        self.toggle.setFrame_(NSMakeRect(tx, pad, self.tw, self.bh))
         self.label.setFrame_(NSMakeRect(34, (self.H - 17) / 2, tx - 12 - 34, 17))
         f = self.panel.frame()
         self.panel.setFrame_display_(NSMakeRect(f.origin.x, f.origin.y, width, self.H), True)
@@ -851,6 +899,9 @@ class Bar:
         return True
 
     def set(self, parts, title, kind, dot, alive, cursor_on):
+        if self.compact and title != "Done":
+            # The small bar keeps the first words; a request for help keeps what is asked.
+            parts = [(text, 12, weight, color) for text, _size, weight, color in parts[:1]]
         if self.changed("text", tuple(parts)):
             if self.label.attributedStringValue().length() and not self.still:
                 fade = CATransition.animation()
@@ -932,6 +983,7 @@ class Overlay:
         self.scanned_at = 0.0
         self.ticks = 0
         self.window_state = None
+        self.hover_until = 0.0
         self.missing_since = None
         self.gone_since = None
         self.agent = {}
@@ -1001,7 +1053,8 @@ class Overlay:
     def stack(self):
         """Our windows bottom to top: lock, light, click ring, cursor, bar."""
         out = [self.shield] if self.shield_on else []
-        out.extend(self.glow.panels)
+        if LIGHT_ON:
+            out.extend(self.glow.panels)
         if self.ripples.visible:
             out.append(self.ripples.panel)
         if self.pointer.visible:
@@ -1056,6 +1109,14 @@ class Overlay:
         if calm and not force and self.ticks % CALM_EVERY:
             return  # nothing moves: 10 ticks a second are enough
         a = self.read_agent()
+        alpha = window_alpha(self.win) if self.shown and self.win is not None else 1.0
+        if alpha is None or alpha < 0.5:
+            # The browser's window no longer exists (the browser quit), or is fading out as macOS
+            # closes it: go with it now. MISSING_FOR is for a window that is still there but not
+            # seen (another Space, a minimize), where hiding at once would blink.
+            self.hide()
+            self.frame = None
+            self.missing_since = self.missing_since or now
         if a.get("ended"):
             leave(True)  # the server removes the folder too; whichever comes first
             return
@@ -1157,7 +1218,8 @@ class Overlay:
 
         show_cursor = bool(self.control.get("show_cursor"))
         self.glow.colors(HELP_GLOW if mode == "help" else AGENT_GLOW)
-        self.glow.set("on" if mode in ("agent", "help") else "dim" if mode in WORKING else "off")
+        self.glow.set(("on" if mode in ("agent", "help") else "dim" if mode in WORKING else "off")
+                      if LIGHT_ON else "off")
         self.glow.settle(now)
         cursor, vp = a.get("cursor"), a.get("viewport")
         if cursor and vp:
@@ -1194,7 +1256,7 @@ class Overlay:
                          "Done", "primary", DOT["help"], True, show_cursor)
         self.bar.place(x, y_ns, w)
 
-        want_shield = mode in WORKING and bool(vp)
+        want_shield = LOCK_ON and mode in WORKING and bool(vp)
         if want_shield:
             left, top, vw, vh = vp
             rect = (x + left, H - (y + top) - vh, vw, vh)
@@ -1219,7 +1281,15 @@ class Overlay:
         if self.ripples.visible and not self.ripples.active():
             self.ripples.panel.orderOut_(None)
             self.ripples.visible = False
-        want_bar = mode != "idle"
+        must_show = mode in ("help", "person") or now < self.nudge_until  # their buttons are the way back
+        if BAR_MODE == "off":
+            want_bar = must_show
+        elif BAR_MODE == "hover":
+            if visible_at(self.wins, wid, loc.x, H - loc.y) or self.bar.contains(loc.x, loc.y):
+                self.hover_until = now + HOVER_LINGER
+            want_bar = mode != "idle" and (must_show or now < self.hover_until)
+        else:
+            want_bar = mode != "idle"
         fade_in = False
         if want_bar and not self.bar.visible:
             self.bar.visible = True
@@ -1266,10 +1336,29 @@ class Overlay:
         self.save()
 
 
+TIMER = None
+FAST = False
+
+
+def schedule(interval):
+    """(Re)start the tick timer at `interval`: TICK normally, TICK_MOVING while the window moves."""
+    global TIMER
+    if TIMER is not None:
+        TIMER.invalidate()
+    TIMER = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+        interval, TARGET, "tick:", None, True)
+    TIMER.setTolerance_(interval / 4)
+
+
 class Target(NSObject):
     def tick_(self, _timer):
+        global FAST
         try:
             OVERLAY.tick()
+            fast = time.time() < OVERLAY.moved_until
+            if fast != FAST:
+                FAST = fast
+                schedule(TICK_MOVING if fast else TICK)
         except Exception:
             traceback.print_exc()
             sys.stderr.flush()
@@ -1307,7 +1396,5 @@ if __name__ in ("__main__", "<stdin>"):
     center = NSWorkspace.sharedWorkspace().notificationCenter()
     for name in (NSWorkspaceDidActivateApplicationNotification, NSWorkspaceActiveSpaceDidChangeNotification):
         center.addObserver_selector_name_object_(TARGET, "switched:", name, None)
-    timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-        TICK, TARGET, "tick:", None, True)
-    timer.setTolerance_(TICK / 4)
+    schedule(TICK)
     app.run()

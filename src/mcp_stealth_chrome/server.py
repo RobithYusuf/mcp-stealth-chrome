@@ -7873,6 +7873,7 @@ async def server_status() -> str:
         "agent_overlay": {
             "default": "on" if presence.wanted(None) else "off (MCP_STEALTH_AGENT_OVERLAY)",
             "available": presence.unavailable() or "yes",
+            "style": presence.style(),
             "instances": {iid: presence.status(b) for iid, b in [
                 (BrowserState.current_instance_id, BrowserState.browser)] + [
                 (i, snap.browser) for i, snap in BrowserState.instances.items()] if b is not None},

@@ -401,3 +401,22 @@ def test_no_restart_for_a_pid_that_now_runs_something_else(made, monkeypatch):
     monkeypatch.setattr(presence, "_spawn", lambda *a: pytest.fail("restarted for another process"))
     assert presence.refusal("click", browser)  # still refused: the hold stands
     assert overlay.restarts == 0
+
+
+@pytest.mark.parametrize("env,expected", [
+    ({}, {"bar": "full", "light": True, "lock": True}),
+    ({"MCP_STEALTH_OVERLAY_BAR": "compact"}, {"bar": "compact", "light": True, "lock": True}),
+    ({"MCP_STEALTH_OVERLAY_BAR": "HOVER"}, {"bar": "hover", "light": True, "lock": True}),
+    # The bar's button is the only way to take over: with no bar, no lock either.
+    ({"MCP_STEALTH_OVERLAY_BAR": "off"}, {"bar": "off", "light": True, "lock": False}),
+    ({"MCP_STEALTH_OVERLAY_BAR": "tiny"}, {"bar": "full", "light": True, "lock": True}),
+    ({"MCP_STEALTH_OVERLAY_LIGHT": "off"}, {"bar": "full", "light": False, "lock": True}),
+    ({"MCP_STEALTH_OVERLAY_LOCK": "0"}, {"bar": "full", "light": True, "lock": False}),
+    ({"MCP_STEALTH_OVERLAY_LOCK": "maybe"}, {"bar": "full", "light": True, "lock": True}),
+])
+def test_the_overlay_style_comes_from_the_environment(monkeypatch, env, expected):
+    for name in ("MCP_STEALTH_OVERLAY_BAR", "MCP_STEALTH_OVERLAY_LIGHT", "MCP_STEALTH_OVERLAY_LOCK"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    assert presence.style() == expected
