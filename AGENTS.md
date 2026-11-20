@@ -205,6 +205,11 @@ conclusions. Each rule below replaced a real lie.
   another element carrying the same text that is genuinely reachable (scrolling it into view if that
   is the only problem) before giving up. On github.com the fuzzy match is a hidden marketing `<span>`;
   refusing there was truthful and still left the caller unable to click "Issues".
+  The result says another element was clicked ("the first text match was unreachable (why), so a reachable element
+  with the same text was clicked") unless it was the first match itself: only out of view, and the one reachable
+  element found (an element only out of view counts among them). Then "(scrolled into view)" alone; the old
+  "used a visible one of 1 candidates" read as a different element. `found` counts reachable candidates, not every
+  element with the text: a hidden decoy plus the real control is found == 1 and must still be explained.
 - `_page_sig` carries a hash of the body HTML. Comparing only its length read a counter going from 1 to 2 as
   `NO page change`, and an agent clicked again. Focus falling back to `<body>` is not a reaction: it is what clicking
   anything unfocusable does. Focus arriving on another element is.
@@ -1280,6 +1285,20 @@ the person (the same target events as Cmd+T, a followed link, a closed tab).
   (`closing`): it stays listed and on screen for its 0.3 s close animation, and the same tick took it back and showed
   the overlay over it again. Measured: last seen 0.03 s after the close, never again.
 - The first tick runs as the overlay starts (the timer's first one is skipped as calm).
+- Full screen is recognised from the browser's own windows too (`full_screen(..., others=)`): a window spanning the
+  screen's width down to its bottom, with another window of the browser above it from the top of the screen down to
+  it, is a full-screen content view. The lock no longer waits for the server's `windowState` (0.6 to 0.8 s after the
+  window settled): measured, it is on the content view at 0.58 s, as Chrome's content window appears (0.67 s, the
+  macOS animation), with no blink entering or leaving.
+- A window gone from the screen with no Space change in the last `SPACE_GRACE` (1.5 s, from
+  NSWorkspaceActiveSpaceDidChangeNotification) was minimized or hidden: the overlay goes after `MISSING_QUICK` (0.1 s).
+  `MISSING_FOR` stays for a Space change, full screen included (a Space of its own), where the window is missing for a
+  moment and hiding would blink. Minimize measured 0.003 to 0.04 s, and 0.42 s when macOS reports the window gone only
+  at the end of its minimize animation (before: 0.55 to 0.62 s).
+- A light that has faded out takes its four windows off the screen (`Glow.out`; `back` makes the overlay restack when
+  it turns on again): they stayed listed, transparent, while the overlay was idle.
+- The start-time check of a Chrome whose window has been missing for 3 s (`chrome_start`, which runs `ps`) runs on a
+  thread, so the tick that also hides the overlay never waits for a shell.
 - `presence.style()` reads the person's choice (the `overlay_bar`, `overlay_light` and `overlay_lock` settings) and passes
   it to the overlay: bar full, compact (30 pt bar, first words of the status, no cursor switch), hover (shown while the
   pointer is over the visible browser window, `HOVER_LINGER` after) or off; light and lock on/off. The overlay reads the

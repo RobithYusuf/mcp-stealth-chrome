@@ -124,6 +124,28 @@ def test_click_text_skips_hidden_decoy_and_reaches_the_real_control(loop):
     assert "RESCUED" in state
 
 
+def test_click_text_on_the_one_element_below_the_fold_says_only_that_it_scrolled(loop):
+    """The first match only out of view, and the only element with that text: it is the element
+    clicked. "First text match was unreachable, used a visible one of 1 candidates" read as if
+    another element had been clicked."""
+    loop.run_until_complete(tool("evaluate")(
+        "(() => { const spacer = document.createElement('div'); spacer.id = 'farspacer'; spacer.style.height = '3000px';"
+        " const b = document.createElement('button'); b.id = 'farbtn'; b.textContent = 'Far Below Button';"
+        " b.onclick = () => { b.textContent = 'Far Below Button clicked'; };"
+        " document.body.append(spacer, b); window.scrollTo(0, 0); return true; })()"))
+    try:
+        out = loop.run_until_complete(tool("click_text")("Far Below Button"))
+        assert "clicked" in out and "NOT clicked" not in out
+        assert "(scrolled into view)" in out and "unreachable" not in out, out
+        state = loop.run_until_complete(tool("evaluate")("document.getElementById('farbtn').textContent"))
+        assert "clicked" in state
+    finally:
+        # The module shares one page: leave it as it was, or later hit tests run on a scrolled page.
+        loop.run_until_complete(tool("evaluate")(
+            "(() => { for (const id of ['farspacer', 'farbtn']) document.getElementById(id)?.remove();"
+            " window.scrollTo(0, 0); return true; })()"))
+
+
 def test_assert_clickable_diagnoses_without_clicking(loop):
     covered = json.loads(loop.run_until_complete(
         tool("assert_clickable")(selector="#realbtn")))

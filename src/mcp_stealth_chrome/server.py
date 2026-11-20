@@ -3994,10 +3994,11 @@ async def browser_launch(
         headless: run without UI (many sites detect headless — prefer False). A visible
             window opens behind the app in use and does not take the keyboard. A click that
             calls window.open still brings Chrome forward for about 130 ms before focus returns.
-            With MCP_STEALTH_DOCK_ICON=1 in the server's environment, on macOS it runs from a
-            copy of Chrome with its own Dock icon. The copy is made in the background and a
-            launch never waits for it: when it is not ready this launch uses Chrome itself and
-            the result says so. Off by default.
+            With the dock_icon setting on (macOS; `mcp-stealth-chrome settings` or
+            MCP_STEALTH_DOCK_ICON=1), a visible browser on a new profile runs from Google Chrome
+            Beta with the project icon, or Brave Beta with its own for browser="brave", so it is
+            not mistaken for the person's own browser. Without Beta, or on a profile Beta must
+            not open, it is the usual browser and the result says why. Off by default.
             When the person quits it (Cmd+Q, Dock > Quit) or closes every window, the server
             ends that Chrome within a few seconds, and the next call says it was closed and
             why; call browser_launch again to continue. tab_close on the last tab does not.
@@ -4078,8 +4079,9 @@ async def browser_launch(
             identity (navigator.brave, userAgentData naming Brave). Its profiles are separate:
             ~/.mcp-stealth/brave-profile for main, ~/.mcp-stealth/brave-profiles/<id> for
             others. A profile belongs to the browser that made it, and opening it with the
-            other one is refused, since neither can read the other's cookies. The Dock icon
-            switch applies to Chrome only. Needs Brave installed.
+            other one is refused, since neither can read the other's cookies. With the dock_icon
+            setting a visible Brave runs from Brave Beta, with Beta's own icon. Needs Brave
+            installed.
         vertical_tabs: "left", "right" or "off" writes the tab-strip setting into the profile
             before the browser starts; None (default) leaves the profile's own setting.
             Brave has both sides; Chrome only "left", and "right" there is refused.
@@ -6282,12 +6284,22 @@ async def click_text(text: str, exact: bool = False, verify: bool = True) -> str
                 return err(f"{label}: NOT clicked — moving the pointer there opened a dialog"
                            f"{_dialog_note(tab)}")
             await _dispatch_input(tab, tab.mouse_click(cand["x"], cand["y"]))
+            # The first match only out of view, and one reachable element with the text: that
+            # element is the first match itself (an element only out of view is reachable, so it
+            # is among those found), and "(scrolled into view)" says all. "First text match was
+            # unreachable, used a visible one of 1 candidates" read as if another element had been
+            # clicked. Hidden, covered, disabled or zero-size: another element was, and it says so.
+            found = cand.get("found") or 0
+            why = _blocked_reason(probe) if el is not None else None
+            only_out_of_view = (el is not None and bool(probe) and probe.get("sized") and not probe.get("hidden")
+                                and not probe.get("disabled") and not probe.get("in_viewport"))
+            same = only_out_of_view and found == 1
             note = (f"{label}: clicked — method=cdp_mouse target=<{cand.get('target')}> "
-                    f"at {{'x': {cand['x']}, 'y': {cand['y']}}}"
+                    f"at ({cand['x']},{cand['y']})"
                     + (" (scrolled into view)" if cand.get("scrolled") else "")
-                    + (f"; first text match was unreachable, used a visible one "
-                       f"of {cand.get('found')} candidates"
-                       if el is not None else ""))
+                    + (f"; the first text match was unreachable ({why}), so a reachable element "
+                       f"with the same text was clicked" + (f" ({found} found)" if found > 1 else "")
+                       if el is not None and not same else ""))
             if _dialog_note(tab):
                 return ok(note + _dialog_note(tab))
             if not verify:

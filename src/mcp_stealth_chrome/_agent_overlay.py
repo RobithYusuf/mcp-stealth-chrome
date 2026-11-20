@@ -49,6 +49,7 @@ import shutil
 import signal
 import stat
 import sys
+import threading
 import time
 import traceback
 
@@ -135,6 +136,8 @@ SCAN_EVERY = 0.25   # seconds between reads of the windows above the browser's
 MOVING_FOR = 1.0    # after the browser window moved, follow it at the full rate this long
 QUIET_AFTER = 2.5   # no word from the agent for this long: it is thinking, the glow dims
 MISSING_FOR = 0.6   # the browser window must be gone this long before anything hides
+MISSING_QUICK = 0.1  # the same, when no Space changed: minimized or hidden, not moving Spaces
+SPACE_GRACE = 1.5   # a Space change this recent may still be hiding the window
 NUDGE_FOR = 3.0     # how long the bar explains a click or key that did not take over
 WORKING = ("agent", "polite", "thinking")
 
@@ -315,7 +318,7 @@ def screen_height():
     return NSScreen.screens()[0].frame().size.height
 
 
-def full_screen(x, y, w, h, state=None):
+def full_screen(x, y, w, h, state=None, others=None):
     """Whether a window (global coordinates, top-left origin) is in full screen: its corners are
     square then, and the light's must be too. A full-screen Chrome is several windows on macOS:
     the content one starts below the toolbar strip (measured: 0,121 1728x996 on a 1728x1117
@@ -331,6 +334,14 @@ def full_screen(x, y, w, h, state=None):
             return True
         if spans and state == "fullscreen":
             return True
+        if spans and others is not None and y > top and abs((y + h) - (top + f.size.height)) < 1:
+            # Down to the screen's bottom, and the browser's own window above it from the top of
+            # the screen down to it: the tab strip and toolbar of a full-screen browser (a normal
+            # window is one window). Without waiting for the server's word, which came 0.6 to
+            # 0.8 s after the window had settled.
+            for ox, oy, ow, oh in others():
+                if abs(ox - x) < 1 and abs(ow - w) < 1 and oy <= top + 40 and oy + oh >= y - 2:
+                    return True
     return False
 
 
@@ -621,6 +632,8 @@ class Glow:
         # Two masks drawn once: the window's own corners, and square ones for a full-screen window.
         self.masks = {"round": ring_image(scale), "square": ring_image(scale, (0.0, 2.0))}
         self.shape = "round"
+        self.out = False   # faded out and ordered off the screen
+        self.back = False  # turned on again after that: the overlay must order it back in
         image, margin, side = self.masks["round"]
         self.strips = []
         CATransaction.begin()  # one transaction: every strip's animation starts at the same time
@@ -717,6 +730,8 @@ class Glow:
             self.pause_at = time.time() + 0.8
         else:
             self.pause_at = None
+            if self.out:
+                self.out, self.back = False, True  # ordered out once faded: the overlay restacks
             for strip in self.strips:
                 resume(strip[2])
         CATransaction.begin()
@@ -727,11 +742,15 @@ class Glow:
         CATransaction.commit()
 
     def settle(self, now):
-        """Stop the turning once the light has faded out: frames nobody can see still cost."""
+        """Stop the turning once the light has faded out, and take its windows off the screen:
+        frames nobody can see still cost, and four transparent windows stayed listed."""
         if self.pause_at is not None and self.level == "off" and now >= self.pause_at:
             self.pause_at = None
             for strip in self.strips:
                 pause(strip[2])
+            for p in self.panels:
+                p.orderOut_(None)
+            self.out = True
 
 
 class Pointer:
@@ -1126,6 +1145,8 @@ class Overlay:
         self.insets = None      # the page's insets from its window, measured outside full screen
         self.want_seen = None   # the server's last window bounds already matched against
         self.closing = None     # a window seen fading out as it closes: not followed again
+        self.space_changed_at = 0.0
+        self.start_probe = None  # (thread, result) of a start-time check running off the main thread
         self.hover_until = 0.0
         self.missing_since = None
         self.gone_since = None
@@ -1237,7 +1258,7 @@ class Overlay:
     def stack(self):
         """Our windows bottom to top: lock, light, click ring, cursor, bar."""
         out = [self.shield] if self.shield_on else []
-        if LIGHT_ON:
+        if LIGHT_ON and not self.glow.out:
             out.extend(self.glow.panels)
         if self.ripples.visible:
             out.append(self.ripples.panel)
@@ -1342,7 +1363,11 @@ class Overlay:
                 self.shield.orderOut_(None)
                 self.shield_on = False
             self.missing_since = self.missing_since or now
-            if now - self.missing_since > MISSING_FOR:
+            # MISSING_FOR keeps a Space change or a full-screen move (a Space of its own) from
+            # blinking the overlay; with no Space change around, a window gone from the screen
+            # was minimized or hidden, and the light went 0.6 s after it.
+            space_moved = now - self.space_changed_at < SPACE_GRACE
+            if now - self.missing_since > (MISSING_FOR if space_moved else MISSING_QUICK):
                 self.hide()
                 self.frame = None
             if pid:
@@ -1352,9 +1377,18 @@ class Overlay:
                     # A window missing for a while on a PID that runs: that PID may now be
                     # another process's. Its start time says.
                     start = CONFIG.get("start")
-                    if start and now - self.missing_since > 3 and now - self.start_checked > 5:
+                    if (start and now - self.missing_since > 3 and now - self.start_checked > 5
+                            and self.start_probe is None):
+                        # ps on a thread: the tick, which also hides the overlay, never waits
+                        # for a shell.
                         self.start_checked = now
-                        current = chrome_start(pid)
+                        box = {}
+                        probe = threading.Thread(target=lambda: box.update(value=chrome_start(pid)), daemon=True)
+                        probe.start()
+                        self.start_probe = (probe, box)
+                    if self.start_probe is not None and not self.start_probe[0].is_alive():
+                        box, self.start_probe = self.start_probe[1], None
+                        current = box.get("value")
                         if current is None or (current and current != start):
                             leave(True)
                             return
@@ -1372,7 +1406,8 @@ class Overlay:
         relayout = b != self.frame
         if b != self.frame or state != self.window_state:
             self.window_state = state
-            full = full_screen(x, y, w, h, state)
+            full = full_screen(x, y, w, h, state, others=lambda: [
+                e[3] for e in all_windows() if e[1] == pid and e[2] and e[3] is not None and e[0] != wid])
             relayout = relayout or full != self.full
             self.full = full
             self.glow.corners("square" if self.full else "round")
@@ -1428,6 +1463,9 @@ class Overlay:
         self.glow.set(("on" if mode in ("agent", "help") else "dim" if mode in WORKING else "off")
                       if LIGHT_ON else "off")
         self.glow.settle(now)
+        if self.glow.back:
+            self.glow.back = False
+            self.above = None  # order the light's windows back in on this tick
         cursor, vp = a.get("cursor"), a.get("viewport")
         page = self.page_rect(b, a) if vp else None
         if cursor and page:
@@ -1689,9 +1727,11 @@ class Target(NSObject):
             traceback.print_exc()
             sys.stderr.flush()
 
-    def switched_(self, _note):
+    def switched_(self, note):
         """Another app came to the front, or the Space changed: settle at once."""
         try:
+            if note is not None and note.name() == NSWorkspaceActiveSpaceDidChangeNotification:
+                OVERLAY.space_changed_at = time.time()
             OVERLAY.tick(force=True)
         except Exception:
             traceback.print_exc()
