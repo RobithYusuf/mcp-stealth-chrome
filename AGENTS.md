@@ -1205,6 +1205,14 @@ the person (the same target events as Cmd+T, a followed link, a closed tab).
   turn (about 9 points a frame), keeps turning while dimmed and stops only once it has faded out. The agent's cursor costs about
   +18 points while it moves, in a small window or a full one alike, so it is off by default. Pausing the light while other
   windows cover the browser made no difference (WindowServer skips them already) and is not done.
+- The light's corners follow the window's (`corner_shape`, `corner_path`). macOS 26 draws windows with a continuous
+  corner, a superellipse: measured from the window's own image (alpha) on 26.6.1, Chrome and Brave Beta alike fit n=4
+  over a 37 pt box within 0.31 pt rms; the best circle (21 pt) was 0.86 pt off. With the old 12 pt circle the light's
+  edge stood up to 15 pt off the window's corner (rms 3.75 pt); now rms 0.45 pt, worst 2 pt. Earlier macOS: a 10 pt
+  circle. `MCP_STEALTH_OVERLAY_CORNER` ("<box>" or "<box>,<n>") overrides. In full screen the corners are square and
+  so is the light (a second mask, swapped without drawing): a full-screen Chrome is several windows (the content one
+  starts below the toolbar strip), so the bounds alone do not say it; `presence.refresh_window` sends CDP's
+  `windowState`, honoured only while the window spans its screen's width, so a stale word never squares a normal window.
 - The light reaches 64 pt into the window through four mask layers (widths 30/14/6/2.5, blur 64/30/12/0, drawn once):
   34 pt in three layers read as too faint. Measured against the old light, 15 s with the light on, two rounds each:
   the overlay process 1.7 to 2.0% either way, and WindowServer within its own noise (16.6 to 35.6% old, 17.7 to 28.0%

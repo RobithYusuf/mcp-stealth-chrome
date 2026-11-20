@@ -69,7 +69,7 @@ from Quartz import (CAAnimationGroup, CABasicAnimation, CACurrentMediaTime, CAGr
                     CGContextSetRGBStrokeColor, CGContextSetShadowWithColor, CGContextStrokePath,
                     CGEventSourceSecondsSinceLastEventType, CGPathAddLineToPoint,
                     CGPathCloseSubpath, CGPathCreateMutable, CGPathCreateWithEllipseInRect,
-                    CGPathCreateWithRoundedRect, CGPathMoveToPoint, CGRectMake,
+                    CGPathMoveToPoint, CGRectMake,
                     CGWindowListCopyWindowInfo, kCAMediaTimingFunctionEaseInEaseOut,
                     kCATransitionFade, kCGEventKeyDown, kCGEventSourceStateHIDSystemState,
                     kCGImageAlphaPremultipliedLast, kCGNullWindowID,
@@ -94,7 +94,34 @@ ALL_SPACES, IGNORES_CYCLE, FULLSCREEN_AUX = 1 << 0, 1 << 6, 1 << 8
 TRACK = 0x01 | 0x80 | 0x200  # entered/exited, always, in visible rect
 IMAGE_ONLY = 1
 TRUNCATE_TAIL = 4
-RADIUS = 12.0
+RADIUS = 12.0       # the bar's corners
+
+
+def corner_shape():
+    """(box, n): the window corner the light follows, a superellipse |x|^n + |y|^n = 1 over a
+    box of `box` points (n=2 is a circle of that radius). macOS 26 draws windows with a continuous
+    corner: on 26.6.1 Chrome's and Brave Beta's fit n=4 over 37 pt within 0.31 pt rms, where the
+    best circle (21 pt) was 0.86 pt off and the old 12 pt one far more, so the light's corners
+    stood off the window's. Earlier macOS: a 10 pt circle. MCP_STEALTH_OVERLAY_CORNER overrides
+    with "<box>" or "<box>,<n>"."""
+    given = os.environ.get("MCP_STEALTH_OVERLAY_CORNER", "").strip()
+    if given:
+        try:
+            parts = [float(v) for v in given.split(",")]
+            box, n = parts[0], (parts[1] if len(parts) > 1 else 4.0)
+            if 0 <= box <= 200 and 1.0 <= n <= 12.0:
+                return box, n
+        except ValueError:
+            pass
+    try:
+        import platform
+        major = int((platform.mac_ver()[0] or "0").split(".")[0])
+    except (ValueError, IndexError):
+        major = 0
+    return (37.0, 4.0) if major >= 26 else (10.0, 2.0)
+
+
+CORNER = corner_shape()
 TURN = 16.0         # seconds per turn of the light: at 30 fps a corner moves about 9 points a
                     # frame (9 s at 20 fps moved it 25, and the soft colours stepped visibly)
 DEPTH = 64.0        # how far the light reaches into the window (34 read as too faint, 20 Nov 2026)
@@ -192,6 +219,25 @@ def write(path, data):
 
 def screen_height():
     return NSScreen.screens()[0].frame().size.height
+
+
+def full_screen(x, y, w, h, state=None):
+    """Whether a window (global coordinates, top-left origin) is in full screen: its corners are
+    square then, and the light's must be too. A full-screen Chrome is several windows on macOS:
+    the content one starts below the toolbar strip (measured: 0,121 1728x996 on a 1728x1117
+    screen), so the browser's own word counts (`state`, from CDP's windowState, read before each
+    tool call), taken only while the window still spans its screen's width, so a word that went
+    stale after the person left full screen never squares a normal window."""
+    H = screen_height()
+    for screen in NSScreen.screens():
+        f = screen.frame()
+        top = H - (f.origin.y + f.size.height)
+        spans = abs(x - f.origin.x) < 1 and abs(w - f.size.width) < 1
+        if spans and abs(y - top) < 1 and abs(h - f.size.height) < 1:
+            return True
+        if spans and state == "fullscreen":
+            return True
+    return False
 
 
 def entries(infos):
@@ -349,10 +395,34 @@ def attributed(parts, truncate=False):
     return out
 
 
-def ring_image(scale):
+def corner_path(x, y, w, h, box, n, steps=20):
+    """A rectangle whose corners follow the superellipse (box, n); box 0 is square."""
+    path = CGPathCreateMutable()
+    box = max(0.0, min(box, w / 2, h / 2))
+    centers = ((x + w - box, y + box, -math.pi / 2), (x + w - box, y + h - box, 0.0),
+               (x + box, y + h - box, math.pi / 2), (x + box, y + box, math.pi))
+    first = True
+    for cx, cy, start in centers:
+        for i in range(steps + 1):
+            t = start + (math.pi / 2) * i / steps
+            c, s_ = math.cos(t), math.sin(t)
+            px = cx + box * math.copysign(abs(c) ** (2 / n), c)
+            py = cy + box * math.copysign(abs(s_) ** (2 / n), s_)
+            if first:
+                CGPathMoveToPoint(path, None, px, py)
+                first = False
+            else:
+                CGPathAddLineToPoint(path, None, px, py)
+    CGPathCloseSubpath(path)
+    return path
+
+
+def ring_image(scale, corner=None):
     """The glow's shape, drawn once: a crisp edge and soft light falling off inward, as a
-    nine-slice whose middle stretches over any window size without drawing again."""
-    margin = math.ceil(RADIUS + DEPTH + 18)
+    nine-slice whose middle stretches over any window size without drawing again. Its corners
+    follow the window's (`corner`, see corner_shape); (0, 2) draws square ones."""
+    box, n = corner or CORNER
+    margin = math.ceil(box + DEPTH + 18)
     side = 2 * margin + 1
     px = int(side * scale)
     ctx = CGBitmapContextCreate(None, px, px, 8, px * 4, CGColorSpaceCreateDeviceRGB(),
@@ -367,9 +437,8 @@ def ring_image(scale):
         CGContextSetRGBStrokeColor(ctx, 0, 0, 0, alpha)
         CGContextSetLineWidth(ctx, width)
         inset = width / 2
-        CGContextAddPath(ctx, CGPathCreateWithRoundedRect(
-            CGRectMake(inset, inset, side - width, side - width),
-            max(RADIUS - inset, 2.0), max(RADIUS - inset, 2.0), None))
+        CGContextAddPath(ctx, corner_path(inset, inset, side - width, side - width,
+                                          max(box - inset, 2.0) if box else 0.0, n))
         CGContextStrokePath(ctx)
         CGContextRestoreGState(ctx)
     return CGBitmapContextCreateImage(ctx), margin, side
@@ -381,7 +450,10 @@ class Glow:
     turning in step, so the light reads as one ring."""
 
     def __init__(self, still, scale):
-        image, margin, side = ring_image(scale)
+        # Two masks drawn once: the window's own corners, and square ones for a full-screen window.
+        self.masks = {"round": ring_image(scale), "square": ring_image(scale, (0.0, 2.0))}
+        self.shape = "round"
+        image, margin, side = self.masks["round"]
         self.strips = []
         CATransaction.begin()  # one transaction: every strip's animation starts at the same time
         for _ in range(4):
@@ -425,6 +497,19 @@ class Glow:
         self.palette = None
         self.level = "off"
         self.pause_at = None
+
+    def corners(self, shape):
+        """'round' or 'square' (a full-screen window has square corners): swap the mask, no redraw."""
+        if shape == self.shape:
+            return
+        self.shape = shape
+        image, margin, side = self.masks[shape]
+        CATransaction.begin()
+        CATransaction.setDisableActions_(True)
+        for strip in self.strips:
+            strip[4].setContents_(image)
+            strip[4].setContentsCenter_(((margin / side, margin / side), (1 / side, 1 / side)))
+        CATransaction.commit()
 
     def layout(self, x, y_ns, w, h):
         """Place the strips on the window's edges; each one's layers keep the whole window's
@@ -846,6 +931,7 @@ class Overlay:
         self.wins = []
         self.scanned_at = 0.0
         self.ticks = 0
+        self.window_state = None
         self.missing_since = None
         self.gone_since = None
         self.agent = {}
@@ -1024,6 +1110,10 @@ class Overlay:
         wid = self.win
         H = screen_height()
         y_ns = H - y - h
+        state = a.get("window_state")
+        if b != self.frame or state != self.window_state:
+            self.window_state = state
+            self.glow.corners("square" if full_screen(x, y, w, h, state) else "round")
         if b != self.frame:
             self.glow.layout(x, y_ns, w, h)
             self.bar.fit(w)

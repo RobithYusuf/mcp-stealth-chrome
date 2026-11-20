@@ -416,7 +416,12 @@ async def refresh_window(overlay: Overlay, tab: Any) -> None:
     viewport = None
     if width and height and inner_w and inner_h:
         viewport = [max(0.0, (width - inner_w) / 2), max(0.0, height - inner_h), inner_w, inner_h]
-    overlay.write(window=window if None not in window else None, viewport=viewport)
+    # A full-screen Chrome is several windows on macOS (the toolbar strip apart from the content),
+    # so the overlay cannot tell full screen from the bounds alone; the browser says it here.
+    state = getattr(bounds, "window_state", None)
+    state = getattr(state, "value", state)
+    overlay.write(window=window if None not in window else None, viewport=viewport,
+                  window_state=str(state) if state else None)
 
 
 async def before_tool(name: str, browser: Any, tab: Any) -> None:

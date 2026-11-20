@@ -603,7 +603,7 @@ browser_launch()   # a new agent, same profile
 
 `browser_launch(agent_overlay=True)` and `spawn_browser(agent_overlay=True)` put three things over a visible browser window, without drawing anything inside the page:
 
-- A light that turns slowly around the window while the agent acts, dims while it thinks between steps, and fades out when it stops.
+- A light that turns slowly around the window while the agent acts, dims while it thinks between steps, and fades out when it stops. Its corners follow the window's own rounded corners, and turn square in full screen.
 - A bar at the bottom saying what the agent does, with **Take over**.
 - A lock over the page: a click or scroll there does not reach the page and the bar says why.
 
@@ -1027,6 +1027,7 @@ The ones most people set:
 | `MCP_STEALTH_AGENT_CURSOR` | Set to `1` so the overlay's bar starts with the agent's cursor shown. Default off |
 | `MCP_STEALTH_OVERLAY_DIR` | Folder for the files the server shares with the overlay. Default `$TMPDIR/mcp-stealth-overlay` |
 | `MCP_STEALTH_OVERLAY_HIDE_AFTER` | Seconds without a tool call before the overlay fades out (not while a request for help or your hold shows). Default 90 |
+| `MCP_STEALTH_OVERLAY_CORNER` | The window corner the overlay's light follows: `<box>` or `<box>,<n>` (a superellipse; `n=2` is a circle). Default `37,4` on macOS 26 (measured), `10,2` before |
 | `MCP_STEALTH_CLOSED_PROBE_MAX_NODES` | Largest document, in elements, whose closed shadow roots `browser_snapshot` reads through the DOM domain. 0 turns it off. Default 5000 |
 | `MCP_STEALTH_ADBLOCK_DOWNLOAD_TIMEOUT` | Seconds a list download may take in all. Default 20 |
 | `MCP_STEALTH_ADBLOCK_MAX_BYTES` | Largest list accepted, in bytes. Default 16 MB |
