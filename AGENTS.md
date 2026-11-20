@@ -40,6 +40,10 @@ uvx mcp-stealth-chrome → Python 3.11+ → FastMCP → nodriver → Chrome/Chro
 - `src/mcp_stealth_chrome/adblock.py`: `block_ads`: the filter lists, the stored engine, and the blocker's own CDP connection.
 - `src/mcp_stealth_chrome/presence.py`: `agent_overlay`, the server's side: when it starts, the refusal while the person holds
   the browser, the pause for their typing. `_agent_overlay.py` is the overlay process, a standalone script (PyObjC).
+- `src/mcp_stealth_chrome/assets/claude-skill/SKILL.md`: the Claude Code skill (`/stealth-chrome`); `skill_install.py` installs it
+  (`mcp-stealth-chrome install-skill`). `tests/test_skill_install.py` fails when it names a tool that is not registered,
+  names an AI model, or carries a key: the vision provider is the user's own (BYOK). Update it when a tool it names changes.
+  hCaptcha is handed to the person there (`request_human_help`): its terms forbid bots and AI that bypass its challenges.
 - `src/mcp_stealth_chrome/settings.py`: the person's settings (`~/.mcp-stealth/settings.json`, the environment over it) and
   `mcp-stealth-chrome settings`.
 - `src/mcp_stealth_chrome/_app.py` — `StealthMCP`, the FastMCP boundary. `captcha.py`, `image_output.py`, `result_types.py` — their named helpers.

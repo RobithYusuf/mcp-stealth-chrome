@@ -239,6 +239,17 @@ Add to `~/.omp/agent/mcp.json`:
 
 See [docs/INSTALL.md](docs/INSTALL.md) for verification and troubleshooting.
 
+### Claude Code skill
+
+The package carries a Claude Code skill that teaches an agent how to use these tools: launching on the right profile, reading pages before acting, what each result means, working with the person through the overlay, and which bot checks to solve or hand over.
+
+```bash
+uvx mcp-stealth-chrome install-skill            # into ~/.claude/skills (or $CLAUDE_CONFIG_DIR/skills)
+uvx mcp-stealth-chrome install-skill --project  # into ./.claude/skills for one project
+```
+
+Then type `/stealth-chrome` in a new Claude Code session; agents also load it on their own when a task needs the stealth browser. A copy you edited is not replaced unless you pass `--force` (the old one is kept as `SKILL.md.bak`). The skill names no AI model and holds no key: CAPTCHA tools use the vision provider you configure yourself.
+
 ### Optional extras
 
 | Extra | Needed for | In your client config |

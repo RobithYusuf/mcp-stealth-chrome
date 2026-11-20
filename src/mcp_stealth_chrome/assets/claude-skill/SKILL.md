@@ -1,0 +1,70 @@
+---
+name: stealth-chrome
+description: Use the mcp-stealth-chrome MCP server (tools named mcp__stealth-chrome__* or mcp__<your server name>__*) when a task needs a browser that gets past bot checks - Cloudflare or other anti-bot pages, CAPTCHAs (reCAPTCHA, Turnstile, hCaptcha), sites that block automation, checkouts with 3-D Secure frames, or the agent's own logged-in browser profile - or when the user says stealth, stealth-chrome or /stealth-chrome. Read it before the first stealth-chrome tool call. For ordinary browsing another browser skill may fit better.
+---
+
+# stealth-chrome
+
+A real Chrome (or Brave) driven over CDP, with a browserless HTTP client that has a real Chrome TLS fingerprint. Every tool result says what actually happened. Read the result before the next step: it is how you avoid acting on a page that did not change.
+
+## Start
+
+1. `server_status()` once per session: the version, `settings` (each with its source), `agent_overlay`, and whether a browser runs.
+2. `browser_launch(...)`:
+   - Default (`persistent` unset) opens the agent's own profile, where its logins live. Add `profile_conflict="fail"` whenever those logins matter: another Chrome holding the profile then refuses the launch instead of opening an empty fallback.
+   - `persistent=False` for a clean, throwaway profile (tests, demos, one-off reads). `privacy=True` keeps nothing at all.
+   - Keep `headless=False` on protected sites (they detect headless). The window opens behind the app in use and does not take the keyboard.
+   - `browser="brave"` for Brave with its Shields. `keep_alive=True` leaves it running when the session ends.
+   - A result that starts with `WARNING: EMPTY FALLBACK PROFILE` means your logins are not there. Stop and tell the user; never log in on the fallback.
+3. `browser_close()` when done (`close_all_instances()` for every instance).
+
+## Read before you act
+
+- Text first: `get_text()`, `get_text(selector=...)`, `describe_page(wait_stable=True)`. Use `screenshot()` only when layout or an image matters.
+- `browser_snapshot(...)` lists interactive elements with refs (`e0`, `e1`, ...). Every snapshot replaces all refs. Narrow it with `name_contains`, `role`, `container_selector`, `max_elements`.
+- Snapshots reach into iframes (cross-origin too, marked `frame=fN`) and closed shadow roots. Hosted card fields and 3-D Secure challenges are filled by ref.
+- `frame_evaluate(frame_url_pattern, expression)` runs JS in a cross-origin frame. `list_frames()` lists them. `wait_for(frame_url=...)` waits for a frame such as a 3-D Secure challenge.
+- "Nothing matched ... not rendered yet" means a single-page app has not drawn yet: `wait_for(text=...)` or `wait_for(selector=...)`, then snapshot again.
+
+## Act
+
+- Prefer `click(ref=...)`; `click_text(text)` when there is no ref. `mouse_click_xy(x, y)` for canvas and positions inside widgets (viewport CSS pixels).
+- `fill(ref=..., value=...)` types real keys and reads the field back. "the page formatted it as ..." is fine (a card mask added spaces).
+- `select_option`, `check`, `type_text`, `press_key`, `scroll` (real wheel events), `fill_form`.
+- Add `humanize=True` on bot-sensitive pages.
+
+## What results mean
+
+| Result says | Do this |
+|---|---|
+| `clicked but NO page change detected` | The click landed, nothing reacted yet. Read the page before clicking again; some reactions are asynchronous. |
+| `NOT clicked ... obscured by <x>` | Something covers the target. Close the cookie banner or modal named, then retry. |
+| `NOT clicked ... pointer-events:none` | You hit a label inside a button. Click the button itself (its ref, or its position). |
+| `the first text match was unreachable (...), so a reachable element with the same text was clicked` | Another element than the first match was clicked. Check it was the one you meant. |
+| `the person took over this browser` | The person pressed Take over. Do not retry; `wait_for_human()` or ask them. |
+| `[agent_overlay: the person typed in the browser ...]` | Their keys reached the page too. Re-read the field before going on. |
+| `auto-verify: ... challenge gone` | A Cloudflare widget was handled during the load. |
+
+## Working with the person
+
+With the overlay on (macOS, visible browser) the person sees a light, a bar and a lock while you work, and can press **Take over**. Tools are refused while they hold the browser.
+
+- `request_human_help(message)` shows your request in the bar with a **Done** button; then `wait_for_human()`. Use it for anything a person should do: logging in with 2FA, a CAPTCHA you should not solve, confirming a payment.
+- The person changes the overlay from its **...** menu or `mcp-stealth-chrome settings`. You do not need to.
+
+## Bot checks and CAPTCHAs
+
+Solve a challenge only where the user is entitled to: their own site or test keys, a demo page, or a site they asked you to use with a check they want you to pass. When in doubt, hand it to the person with `request_human_help`.
+
+- **Cloudflare / Turnstile:** `browser_launch` and `navigate` handle the widget themselves (`auto_verify`). For a full-page "Just a moment..." challenge, `solve_turnstile_oscursor()` clicks with the real OS cursor; it takes over the mouse for up to 50 s, so tell the user first.
+- **reCAPTCHA v2 (checkbox and image grid):** `solve_recaptcha_ai()`. It needs a vision-capable model that the user brings (BYOK): `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL` (any OpenAI-compatible provider) or `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL` in the server's environment, or `provider`, `base_url`, `api_key`, `model` passed in the call. On "No vision provider configured", ask the user which provider to use. Never invent or guess a key, and never repeat one back. A checked box is not proof: confirm the page accepted it (its own success message or result).
+- **reCAPTCHA v3:** nothing to click or solve. It scores the session from 0 to 1 by profile, IP and behaviour. A warm persistent profile scores better than a new throwaway one.
+- **hCaptcha:** there is no built-in solver, and hCaptcha's terms forbid bots and AI that bypass its challenges. Use `request_human_help`. `solve_captcha(kind="hcaptcha", ...)` exists only for a solving service the user has a key for (`CAPSOLVER_KEY`).
+- `detect_anti_bot()` names the protection on a page and the tools that fit it.
+
+## Rules
+
+- Do not log in, post, like, follow, comment, buy or submit real personal data on the user's accounts unless the user asked for that exact action.
+- Never print cookie values, tokens or API keys. `cookie_list()` masks values unless `reveal_values=True`; use that only when the value itself is needed.
+- One page at a time: read the result, then decide. Do not chain clicks on coordinates measured before the page changed.
+- When a tool refuses, the reason is in its text. Fix the cause it names instead of repeating the call.
