@@ -1101,7 +1101,27 @@ the person (the same target events as Cmd+T, a followed link, a closed tab).
   ends on Done or on Resume agent pressed after it was asked, and ignores page changes while the person holds the browser:
   their own clicks change the page.
 - Clicks reach the overlay's click ring through one wrapper on nodriver's `Tab.mouse_click` (`patches.
-  _patch_mouse_click_reports_pointer`), since sixteen places press through it.
+  _patch_mouse_click_reports_pointer`), since sixteen places press through it; it also runs `before_input`. So do every
+  step of a drag (the button is still let go in its `finally`), every chunk of `humanized_scroll` (outside its retry, which
+  would send the wheel event again), every JS click fallback, and each step of `batch_actions` and `workflow_run`
+  (`presence.refusal`). `fill`'s fallback to a JS value re-raises `PersonHasBrowser` instead of writing the value anyway.
+- Fails closed (from a review of the first version): `refusal` and `before_input` act on the overlay's handle whether its
+  process runs or not. A dead one is started again (`revive`, at most `RESTARTS` 3, only while Chrome's PID lives) and
+  keeps who held the browser, since the new process reads `control.json` first. Held with no overlay to show Resume agent,
+  every tool is refused except `browser_launch(agent_overlay=False)`, which stops it: the one way out, said in the refusal.
+  `attach` is async and says on only once the process wrote its own PID into `control.json` after its windows exist
+  (`READY_WAIT` 3 s), else OFF with the last line of `overlay.log`. `agent_overlay=False` on a browser that has one stops it.
+- Stopping: the stdio server ignores SIGTERM and children inherit that, so `_agent_overlay.py` resets it to the default,
+  and `Overlay.stop` follows `ended` with terminate and then kill, removing the folder only once the process is gone.
+  `_safe_stop_browser` stops it too, for launches that fail after it started. A process left by a killed server removes
+  its own folder when it sees the browser or the server gone; `attach` prunes folders whose Chrome PID is gone. State files
+  are read with `O_NOFOLLOW` and only as regular files, the log is created 0600, and a state root that is a link is refused.
+- The handoff bar outlives quiet: help and the person's hold are chosen before `HIDE_AFTER`, so Done and Resume agent never
+  fade out while they are the only way back. `MCP_STEALTH_OVERLAY_HIDE_AFTER` sets the quiet time (tests use 3 s).
+- Window identity is by bounds: CDP's window id is not a CGWindowID, and window titles need Screen Recording. Two windows of
+  the browser at exactly the same rect cannot be told apart; the overlay follows the front one. Coordinates are right on
+  every display: CG and AppKit global coordinates both start at the main display (`screens()[0]`), so its height converts
+  them; a review that called this wrong for other monitors was checked against that.
 - No blinking, each from a cause seen in the prototype: the bar keeps one width per window width (resizing its background
   flashed and moved it on every status change) and cross-fades its text; the light dims between tool calls instead of going
   out (`QUIET_AFTER` 2.5 s, out after `HIDE_AFTER` 90 s); a missing window must stay missing 0.6 s before anything hides;

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .. import key_outcome
+from .. import presence
 from .. import server as _srv
 from .._app import mcp
 from ..helpers import err, get_url, ok, short_url
@@ -587,6 +588,8 @@ async def drag_and_drop(start_x: int, start_y: int, end_x: int, end_y: int) -> s
                 # Intermediate steps for natural drag
                 steps = 20
                 for i in range(1, steps + 1):
+                    # Take over stops the drag here; the finally below still lets go.
+                    await presence.before_input(tab)
                     t = i / steps
                     x = int(start_x + (end_x - start_x) * t)
                     y = int(start_y + (end_y - start_y) * t)

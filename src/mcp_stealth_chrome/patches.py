@@ -160,8 +160,8 @@ def _patch_tab_get_keeps_session() -> None:
 
 def _patch_mouse_click_reports_pointer() -> None:
     """Tab.mouse_click tells agent_overlay where the press landed, for the click ring its bar
-    can show. Sixteen places press through it; one wrapper here covers them all. A no-op for a
-    browser without an overlay."""
+    can show, and refuses once the person took over. Sixteen places press through it; one
+    wrapper here covers them all. A no-op for a browser without an overlay."""
     try:
         from nodriver.core.tab import Tab
         if getattr(Tab, "_mcp_click_reported", False):
@@ -170,6 +170,7 @@ def _patch_mouse_click_reports_pointer() -> None:
 
         async def mouse_click(self, x, y, *args, **kwargs):
             from . import presence
+            await presence.before_input(self)  # refuses once the person took over
             with contextlib.suppress(Exception):
                 presence.note_pointer(self, x, y, pressed=True)
             return await original_click(self, x, y, *args, **kwargs)

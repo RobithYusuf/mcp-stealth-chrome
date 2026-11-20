@@ -1157,6 +1157,7 @@ async def _safe_stop_browser(browser: Optional[Browser]) -> None:
     doesn't leak its profile lock."""
     if browser is None:
         return
+    presence.stop(browser)  # a launch that failed after its overlay started leaves none behind
     try:
         browser.stop()
     except Exception:
@@ -3367,7 +3368,7 @@ async def _launch_by_reattach(profile: Path, verdict: dict, *, url: str, keep_al
     observed["profile"] = {"actual_profile": str(BrowserState.current_profile_dir),
                            "session_state_source": "reattached to the browser kept alive on it"}
     ads_note = await _block_ads_on_reattach(block_ads, browser, iid)
-    ads_note += presence.attach(browser, _browser_process_pid(browser), ask=agent_overlay,
+    ads_note += await presence.attach(browser, _browser_process_pid(browser), ask=agent_overlay,
                                 headless=bool(record.get("headless")),
                                 persons_browser=_persons_browser(browser))
     action = "Loaded" if url and url != "about:blank" else "Selected tab shows"
@@ -4081,7 +4082,7 @@ async def browser_launch(
                                    f"takes effect on a new launch")
                 if block_ads:
                     reuse_head += _adblock_module().reuse_note(block_ads, BrowserState.browser)
-                reuse_head += presence.attach(
+                reuse_head += await presence.attach(
                     BrowserState.browser, _browser_process_pid(BrowserState.browser),
                     ask=agent_overlay, headless=BrowserState.current_headless,
                     persons_browser=_persons_browser(BrowserState.browser))
@@ -4485,7 +4486,7 @@ async def browser_launch(
         if ads_pending is not None:
             dock_note += await _adblock_module().attach(
                 ads_pending, browser, BrowserState.current_instance_id, BrowserState.session_key())
-        dock_note += presence.attach(browser, _browser_process_pid(browser), ask=agent_overlay,
+        dock_note += await presence.attach(browser, _browser_process_pid(browser), ask=agent_overlay,
                                      headless=headless)
 
         if cookie_move.backup is not None:
@@ -6045,6 +6046,7 @@ async def _click_and_report(
                 f"overlay / js_fallback=True for an untrusted JS click."
             )
         before = await _page_sig(tab, el, pages=True) if verify else {}
+        await presence.before_input(tab)  # a JS click is input too
         await _js_click(el)
         head = (f"{label}: clicked via JS FALLBACK (isTrusted=false, real click refused: "
                 f"{reason})")
@@ -6202,6 +6204,8 @@ async def fill(ref: Optional[str] = None, selector: Optional[str] = None,
             else:
                 await apply_isolated(el, "function() { this.focus(); }")
                 await _type_keys(el.tab, str(value), press_controls=False)
+        except presence.PersonHasBrowser:
+            raise  # never the JS fallback: the person took the browser
         except Exception:
             await el.set_value(value)
         actual = await el.apply(
@@ -6369,6 +6373,7 @@ async def _set_checked(ref, selector, state: bool, js_fallback: bool = False) ->
                 if not js_fallback:
                     return err(f"{result[len('Error: '):]} Neither the input nor a label could "
                                f"be clicked; js_fallback=True toggles it from JS.")
+                await presence.before_input(tab)  # a JS click is input too
                 await _js_click(el)
                 how = "method=js_click (isTrusted=false, the input is hidden or covered)"
         if bool(await el.apply(_READ_CHECKED_JS)) != state:
@@ -6584,7 +6589,8 @@ async def batch_actions(actions: list[dict]) -> str:
             if tool is None:
                 r = err(f"unknown action type: {atype}")
             else:
-                r = _inner_arguments_error(tool, args) or await _WORKFLOW_TOOLS[tool](**args)
+                r = (_inner_arguments_error(tool, args) or presence.refusal(tool, BrowserState.browser)
+                     or await _WORKFLOW_TOOLS[tool](**args))
             results.append(f"[{i}] {atype}: {str(r)[:160]}")
             # A tool can return an "Error: ..." string WITHOUT raising — honor
             # stop_on_error for those too, not just for exceptions.
@@ -8744,7 +8750,7 @@ async def _launch_browser_instance(
     if ads_pending is not None:
         dock_note += await _adblock_module().attach(ads_pending, browser, instance_id,
                                                     BrowserState.session_key())
-    dock_note += presence.attach(browser, _browser_process_pid(browser), ask=agent_overlay,
+    dock_note += await presence.attach(browser, _browser_process_pid(browser), ask=agent_overlay,
                                  headless=headless)
 
     if cookie_move.backup is not None:
@@ -8909,7 +8915,7 @@ async def _spawn_by_reattach(instance_id: str, profile: Path, verdict: dict, *, 
     BrowserState.window_closed.pop(instance_id, None)
     _ATTACHED_BROWSERS.discard(instance_id)
     keep_text += await _block_ads_on_reattach(block_ads, browser, instance_id)
-    keep_text += presence.attach(browser, _browser_process_pid(browser), ask=agent_overlay,
+    keep_text += await presence.attach(browser, _browser_process_pid(browser), ask=agent_overlay,
                                  headless=bool(verdict["record"].get("headless")),
                                  persons_browser=_persons_browser(browser))
     return True, (f"instance {instance_id!r} {summary}{keep_text}\n"
@@ -11028,7 +11034,9 @@ async def workflow_run(
         return err("steps must be a list of dicts")
 
     async def dispatch(tool: str, args: dict) -> Any:
-        refused = _inner_arguments_error(tool, args)
+        # Each step meets the checks a call from the client meets, Take over included: the
+        # person may take the browser between two steps.
+        refused = _inner_arguments_error(tool, args) or presence.refusal(tool, BrowserState.browser)
         if refused:
             return refused
         return await _WORKFLOW_TOOLS[tool](**args)

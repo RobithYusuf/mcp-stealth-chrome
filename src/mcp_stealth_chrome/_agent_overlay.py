@@ -44,7 +44,9 @@ SIGUSR1 toggles the cursor and SIGUSR2 presses the bar's button, for tests.
 import json
 import math
 import os
+import shutil
 import signal
+import stat
 import sys
 import time
 import traceback
@@ -141,11 +143,27 @@ def ns(c):
 
 
 def read(path):
+    """A state file, never through a link and only a regular file; {} when it cannot be read."""
     try:
-        with open(path) as f:
-            return json.load(f)
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return {}
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            return {}
+        with os.fdopen(fd) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
     except Exception:
         return {}
+
+
+def leave(remove_files):
+    """End this process. When the browser or the server is gone, nobody else removes the files."""
+    if remove_files:
+        shutil.rmtree(STATE, ignore_errors=True)
+    NSApplication.sharedApplication().terminate_(None)
 
 
 def write(path, data):
@@ -771,7 +789,12 @@ class Overlay:
     def __init__(self, target, show_cursor):
         self.control = {"holder": "agent", "since": time.time(), "reason": "start",
                         "person_last_input": 0.0, "help_done": 0.0, "show_cursor": show_cursor}
-        write(CONTROL, self.control)
+        # Started again after a crash: who held the browser, and the person's choices, stay.
+        before = read(CONTROL)
+        if before.get("holder") in ("agent", "person"):
+            for key in ("holder", "since", "reason", "person_last_input", "help_done", "show_cursor"):
+                if key in before:
+                    self.control[key] = before[key]
         scale = NSScreen.mainScreen().backingScaleFactor()
         still = bool(NSWorkspace.sharedWorkspace().accessibilityDisplayShouldReduceMotion())
         self.glow = Glow(still, scale)
@@ -804,6 +827,10 @@ class Overlay:
         self.nudge_until = 0.0
         self.nudge_why = None
         self.moved_until = 0.0
+
+        # Ready: the windows exist. The server waits for this before it says the overlay is on.
+        self.control["overlay_pid"] = ME
+        write(CONTROL, self.control)
 
     def save(self):
         write(CONTROL, self.control)
@@ -917,7 +944,7 @@ class Overlay:
             NSApplication.sharedApplication().terminate_(None)
             return
         if os.getppid() != SERVER:
-            NSApplication.sharedApplication().terminate_(None)  # the server is gone
+            leave(True)  # the server is gone
             return
         pid = a.get("pid")
         scan = force or now - self.scanned_at >= SCAN_EVERY
@@ -941,7 +968,7 @@ class Overlay:
                 except OSError:
                     self.gone_since = self.gone_since or now
                     if now - self.gone_since > 3:
-                        NSApplication.sharedApplication().terminate_(None)
+                        leave(True)  # the browser is gone
             return
         self.missing_since = None
         x, y, w, h = b
@@ -964,12 +991,14 @@ class Overlay:
         quiet = now - float(a.get("active_at", 0))
         help_text = a.get("help")
 
-        if quiet > HIDE_AFTER:
-            mode = "idle"
-        elif help_text:
+        # A request for help and the person's hold outlast any quiet: their buttons (Done,
+        # Resume agent) are the only way back, so they never fade out.
+        if help_text:
             mode = "help"
         elif self.control["holder"] == "person":
             mode = "person"
+        elif quiet > HIDE_AFTER:
+            mode = "idle"
         elif a.get("waiting") == "polite":
             mode = "polite"
         elif quiet > QUIET_AFTER:
@@ -1126,6 +1155,9 @@ class Target(NSObject):
 
 
 if __name__ in ("__main__", "<stdin>"):
+    # The stdio server ignores SIGTERM and children inherit that: without this, terminate()
+    # from the server would do nothing.
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
     app = NSApplication.sharedApplication()
     app.setActivationPolicy_(1)  # accessory: no Dock icon, never the active app
     TARGET = Target.alloc().init()

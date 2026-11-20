@@ -611,10 +611,13 @@ Only **Take over** hands the browser to you. While you hold it, every tool that 
 
 The arrow button in the bar shows where the agent points and clicks, as a cursor labelled Agent. It is off unless `MCP_STEALTH_AGENT_CURSOR=1`.
 
-- Off by default. `MCP_STEALTH_AGENT_OVERLAY=1` turns it on for every launch. It needs the `os-cursor` extra; without it, headless, or on a browser you opened from the Dock launcher, the launch result says it is off and why.
+- Off by default. `MCP_STEALTH_AGENT_OVERLAY=1` turns it on for every launch, and `agent_overlay=False` on a running browser stops it. It needs the `os-cursor` extra; without it, headless, or on a browser you opened from the Dock launcher, the launch result says it is off and why. The result says on only once the overlay reports it is up.
+- The bar with **Done** or **Resume agent** stays as long as the request or your hold lasts; otherwise everything fades out after 90 seconds without a tool call (`MCP_STEALTH_OVERLAY_HIDE_AFTER`).
+- If the overlay process dies, it is started again (three times at most) and keeps who holds the browser. If it cannot be, the tools stay refused while you hold it, and `browser_launch(agent_overlay=False)` is the way to release it once you tell the agent you are done.
+- Take over stops input already under way: a drag, a scroll, typing or a click stops at its next step, a held button is let go, and each step of `batch_actions` and `workflow_run` is refused like a call.
 - Measured on a MacBook with a 120 Hz display, against no overlay at all: the overlay process uses about 3% CPU and WindowServer about 10 points more while the agent works with the cursor off. The light is drawn at 20 frames a second in four thin windows along the edges. With the cursor on, WindowServer uses about 25 points more.
 - While nothing covers the browser the overlay sits above it in the floating level, so bringing the browser to the front does not hide it for a moment.
-- Keys cannot be held back without taking the keyboard from the browser, so a key such as Enter can still act on the page before the agent pauses. The lock covers the page only: tabs, the address bar and the window buttons stay usable.
+- Keys cannot be held back without taking the keyboard from the browser, so a key such as Enter can still act on the page before the agent pauses. The lock covers the page only: tabs, the address bar and the window buttons stay usable. When two windows of the browser sit at exactly the same place and size, the overlay follows the front one.
 </details>
 
 <details>
@@ -1021,6 +1024,7 @@ The ones most people set:
 | `MCP_STEALTH_AGENT_OVERLAY` | Set to `1` to show `agent_overlay` on every headed launch (macOS). Default off |
 | `MCP_STEALTH_AGENT_CURSOR` | Set to `1` so the overlay's bar starts with the agent's cursor shown. Default off |
 | `MCP_STEALTH_OVERLAY_DIR` | Folder for the files the server shares with the overlay. Default `$TMPDIR/mcp-stealth-overlay` |
+| `MCP_STEALTH_OVERLAY_HIDE_AFTER` | Seconds without a tool call before the overlay fades out (not while a request for help or your hold shows). Default 90 |
 | `MCP_STEALTH_ADBLOCK_DOWNLOAD_TIMEOUT` | Seconds a list download may take in all. Default 20 |
 | `MCP_STEALTH_ADBLOCK_MAX_BYTES` | Largest list accepted, in bytes. Default 16 MB |
 | `MCP_STEALTH_ADBLOCK_STALL` | Seconds ad blocking may go unanswered before it turns itself off for that browser. Default 3 |

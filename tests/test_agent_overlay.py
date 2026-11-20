@@ -3,6 +3,7 @@ the person holds the browser, the pause for their typing, and how wait_for_human
 The overlay itself is proved on a real window in test_agent_overlay_e2e.py (MCP_HEADED=1)."""
 import asyncio
 import json
+import os
 import subprocess
 import sys
 import time
@@ -21,13 +22,16 @@ class _Tab:
         self.browser = browser
 
 
-def _overlay(tmp_path, control=None):
+SLEEPER = [sys.executable, "-c", "import time; time.sleep(60)"]
+
+
+def _overlay(tmp_path, control=None, pid=None):
     """A server-side handle on a folder, with a process standing in for the overlay."""
     folder = tmp_path / "overlay"
     folder.mkdir()
-    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    proc = subprocess.Popen(SLEEPER)
     browser = _Browser()
-    overlay = presence.Overlay(browser, 4242, folder, proc)
+    overlay = presence.Overlay(browser, pid or 4242, folder, proc, False)
     setattr(browser, presence.ATTR, overlay)
     if control is not None:
         (folder / "control.json").write_text(json.dumps(control))
@@ -51,7 +55,7 @@ def made(tmp_path):
 def test_off_unless_asked(monkeypatch):
     monkeypatch.delenv("MCP_STEALTH_AGENT_OVERLAY", raising=False)
     assert presence.wanted(None) is False
-    assert presence.attach(_Browser(), 1, ask=None, headless=False) == ""
+    assert asyncio.run(presence.attach(_Browser(), 1, ask=None, headless=False)) == ""
     monkeypatch.setenv("MCP_STEALTH_AGENT_OVERLAY", "1")
     assert presence.wanted(None) is True
     assert presence.wanted(False) is False
@@ -62,12 +66,12 @@ def test_off_unless_asked(monkeypatch):
     ({"headless": False, "persons_browser": True}, "launcher"),
 ])
 def test_says_why_it_is_off(kw, why):
-    note = presence.attach(_Browser(), 1234, ask=True, **kw)
+    note = asyncio.run(presence.attach(_Browser(), 1234, ask=True, **kw))
     assert note.startswith(" [agent_overlay: OFF") and why in note, note
 
 
 def test_off_for_a_browser_this_server_did_not_start():
-    note = presence.attach(_Browser(), None, ask=True, headless=False)
+    note = asyncio.run(presence.attach(_Browser(), None, ask=True, headless=False))
     assert "OFF" in note and "did not start" in note
 
 
@@ -192,3 +196,129 @@ def test_the_bar_says_what_is_done_and_never_what_is_typed(name, args, shown):
     text = presence.describe(name, args)
     assert text == shown
     assert "hunter2" not in text and "token" not in text
+
+
+# What the review of the first version found, each proved here.
+
+def test_an_overlay_that_died_while_the_person_held_the_browser_still_refuses(made, monkeypatch):
+    browser, overlay = made({"holder": "person", "since": time.time()})
+    overlay.proc.kill()
+    overlay.proc.wait()
+    monkeypatch.setattr(presence, "_spawn", lambda *a: (_ for _ in ()).throw(OSError("no display")))
+    text = presence.refusal("get_text", browser)
+    assert text and "overlay has stopped" in text and "browser_launch(agent_overlay=False)" in text
+    with pytest.raises(presence.PersonHasBrowser):
+        asyncio.run(presence.before_input(_Tab(browser)))
+    from mcp_stealth_chrome import _app
+    token = _app.CALL_ARGUMENTS.set({"agent_overlay": False})
+    try:
+        assert presence.refusal("browser_launch", browser) is None  # the way out
+    finally:
+        _app.CALL_ARGUMENTS.reset(token)
+    token = _app.CALL_ARGUMENTS.set({"agent_overlay": True})
+    try:
+        assert presence.refusal("browser_launch", browser)  # not with any other launch
+    finally:
+        _app.CALL_ARGUMENTS.reset(token)
+
+
+def test_a_dead_overlay_is_started_again_and_keeps_the_hold(made, monkeypatch):
+    import os
+    browser, overlay = made({"holder": "person"})
+    overlay.pid = os.getpid()  # the browser still runs
+    overlay.proc.kill()
+    overlay.proc.wait()
+    spawned = []
+    monkeypatch.setattr(presence, "_spawn", lambda *a: spawned.append(a) or subprocess.Popen(SLEEPER))
+    text = presence.refusal("click", browser)
+    assert spawned and overlay.alive() and overlay.restarts == 1
+    assert text and "Take over" in text and "overlay has stopped" not in text
+    for _ in range(presence.RESTARTS + 2):
+        overlay.proc.kill()
+        overlay.proc.wait()
+        presence.refusal("click", browser)
+    assert overlay.restarts == presence.RESTARTS  # no endless restarts
+    overlay.proc.kill()
+
+
+def test_stop_ends_an_overlay_that_ignores_sigterm(tmp_path):
+    folder = tmp_path / "overlay"
+    folder.mkdir()
+    proc = subprocess.Popen([sys.executable, "-c", "import signal, time; "
+                             "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"])
+    time.sleep(0.3)
+    browser = _Browser()
+    overlay = presence.Overlay(browser, 4242, folder, proc, False)
+    setattr(browser, presence.ATTR, overlay)
+    started = time.time()
+    presence.stop(browser)
+    assert proc.poll() is not None, "the overlay outlived stop()"
+    assert not folder.exists()
+    assert time.time() - started < 5
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the overlay is macOS only")
+def test_attach_waits_for_the_overlay_and_says_off_when_it_dies_at_start(tmp_path, monkeypatch):
+    monkeypatch.setenv("MCP_STEALTH_OVERLAY_DIR", str(tmp_path / "root"))
+    monkeypatch.setattr(presence, "unavailable", lambda: None)
+
+    def dies(folder, pid, cursor):
+        (folder / "overlay.log").write_text("ImportError: no AppKit here\n")
+        return subprocess.Popen([sys.executable, "-c", "raise SystemExit(1)"])
+    monkeypatch.setattr(presence, "_spawn", dies)
+    browser = _Browser()
+    note = asyncio.run(presence.attach(browser, 1234, ask=True, headless=False))
+    assert "OFF" in note and "no AppKit here" in note, note
+    assert presence.of(browser) is None
+    assert not any((tmp_path / "root").iterdir())  # its folder went with it
+
+    def comes_up(folder, pid, cursor):
+        code = ("import json, os, time; "
+                f"json.dump({{'holder': 'agent', 'overlay_pid': os.getpid()}}, open({str(folder / 'control.json')!r}, 'w')); "
+                "time.sleep(60)")
+        return subprocess.Popen([sys.executable, "-c", code])
+    monkeypatch.setattr(presence, "_spawn", comes_up)
+    browser = _Browser()
+    note = asyncio.run(presence.attach(browser, os.getpid(), ask=True, headless=False))
+    assert note.startswith(" [agent_overlay: on:"), note
+    overlay = presence.of(browser)
+    assert overlay is not None and overlay.ready()
+    presence.stop(browser)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the overlay is macOS only")
+def test_agent_overlay_false_on_a_browser_with_one_stops_it(made):
+    browser, overlay = made({"holder": "agent"})
+    note = asyncio.run(presence.attach(browser, 4242, ask=False, headless=False))
+    assert "stopped" in note
+    assert overlay.proc.poll() is not None and presence._handle(browser) is None
+
+
+def test_state_files_are_not_read_through_a_link(made, tmp_path):
+    browser, overlay = made()
+    target = tmp_path / "elsewhere.json"
+    target.write_text(json.dumps({"holder": "person"}))
+    overlay.control_file.symlink_to(target)
+    assert overlay.read_control() == {}
+    assert presence.refusal("click", browser) is None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the overlay is macOS only")
+def test_a_state_folder_that_is_a_link_is_refused(tmp_path, monkeypatch):
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    monkeypatch.setenv("MCP_STEALTH_OVERLAY_DIR", str(link))
+    monkeypatch.setattr(presence, "unavailable", lambda: None)
+    note = asyncio.run(presence.attach(_Browser(), 1234, ask=True, headless=False))
+    assert "OFF" in note and "is a link" in note
+
+
+def test_each_batch_step_meets_the_take_over_refusal(monkeypatch):
+    from mcp_stealth_chrome import server
+    monkeypatch.setattr(server.presence, "refusal", lambda name, browser: "Error: held by the person")
+    result = asyncio.run(server.batch_actions(actions=[{"type": "get_url"}]))
+    assert "held by the person" in result
+    result = asyncio.run(server.workflow_run(steps=[{"tool": "get_url"}]))
+    assert "held by the person" in result

@@ -236,6 +236,8 @@ async def humanized_scroll(
         remaining = target - scrolled
         # Variable chunk — DataDome detects uniform distances
         chunk = min(random.randint(50, 150), remaining)
+        from . import presence
+        await presence.before_input(tab)  # Take over stops the rest; outside the retry below
         try:
             await tab.send(cdp_input.dispatch_mouse_event(
                 type_="mouseWheel",

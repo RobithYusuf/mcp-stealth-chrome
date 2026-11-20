@@ -73,6 +73,11 @@ def _in_front(ours: int, browser: int) -> bool:
     return False
 
 
+def _bar_shown(pid: int) -> bool:
+    """The bar: the overlay's window 40 points high, on screen."""
+    return any(b[3] == 40 for _layer, b in _windows(pid))
+
+
 def _read(path: pathlib.Path) -> dict:
     try:
         return json.loads(path.read_text())
@@ -86,13 +91,15 @@ def test_the_overlay_follows_the_window_and_only_its_button_hands_over():
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     data = pathlib.Path(tempfile.mkdtemp(prefix="mcp-agent-overlay-"))
     overlays = data / "overlay"
-    client = Client(env={"MCP_STEALTH_DATA_DIR": str(data), "MCP_STEALTH_OVERLAY_DIR": str(overlays)})
+    client = Client(env={"MCP_STEALTH_DATA_DIR": str(data), "MCP_STEALTH_OVERLAY_DIR": str(overlays),
+                         "MCP_STEALTH_OVERLAY_HIDE_AFTER": "3"})
     try:
         launched = client.call("browser_launch", _timeout=90, headless=False, persistent=False,
                                agent_overlay=True, auto_verify=False, extra_args=SAFE_ARGS,
                                url=f"http://127.0.0.1:{srv.server_port}/protocol.html")
         assert not launched.failed, launched.text
-        assert "agent_overlay: on" in launched.text, launched.text
+        # Said on only once the overlay said it was up.
+        assert "agent_overlay: on:" in launched.text and "not confirmed" not in launched.text, launched.text
         status = json.loads(client.call("server_status").text)["agent_overlay"]["instances"]["main"]
         assert status["on"] and status["holder"] == "agent", status
         overlay_pid = status["overlay_pid"]
@@ -128,8 +135,21 @@ def test_the_overlay_follows_the_window_and_only_its_button_hands_over():
             refused = client.call(name, **args)
             assert refused.failed and "took over this browser" in refused.text, (name, refused.text)
         assert not client.call("server_status").failed
+        # The hold outlasts the quiet time (3 s here): Resume agent stays on screen.
+        time.sleep(4.5)
+        assert _bar_shown(overlay_pid), "the bar with Resume agent faded out"
 
-        # wait_for_human ends when the person presses Resume agent; the refused click did nothing.
+        # The overlay dies while the person holds the browser: it is started again, still held.
+        os.kill(overlay_pid, signal.SIGKILL)
+        time.sleep(0.5)  # a zombie until the server reaps it, which the next call does
+        refused = client.call("click", selector="#inc")
+        assert refused.failed and "took over this browser" in refused.text, refused.text
+        status = json.loads(client.call("server_status").text)["agent_overlay"]["instances"]["main"]
+        assert status["on"] and status["restarts"] == 1 and status["holder"] == "person", status
+        overlay_pid = status["overlay_pid"]
+        assert _wait(lambda: _bar_shown(overlay_pid), 5), "the restarted overlay shows no bar"
+
+        # wait_for_human ends when the person presses Resume agent; the refused clicks did nothing.
         threading.Timer(1.0, os.kill, (overlay_pid, signal.SIGUSR2)).start()
         resumed = client.call("wait_for_human", _timeout=30, timeout=20)
         assert not resumed.failed and "Resume agent" in resumed.text, resumed.text
@@ -141,7 +161,8 @@ def test_the_overlay_follows_the_window_and_only_its_button_hands_over():
         # That brought Chrome to the front: the light is still in front of it.
         assert _wait(lambda: _in_front(overlay_pid, chrome_pid), 2), "Chrome covered the overlay"
         assert _wait(lambda: _read(agent_file).get("help") == "Tick Agree", 5)
-        time.sleep(0.5)  # the overlay sees the request before its button is pressed
+        time.sleep(4.5)  # longer than the quiet time: the request and its Done stay
+        assert _bar_shown(overlay_pid), "the bar with Done faded out"
         threading.Timer(1.0, os.kill, (overlay_pid, signal.SIGUSR2)).start()
         done = client.call("wait_for_human", _timeout=30, timeout=20)
         assert not done.failed and "pressed Done" in done.text, done.text

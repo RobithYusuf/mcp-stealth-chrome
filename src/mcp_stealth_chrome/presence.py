@@ -32,9 +32,13 @@ from typing import Any, Optional
 ATTR = "_mcp_agent_overlay"
 POLITE = 1.5          # the agent's input waits this long after the person's last key
 POLITE_MAX = 10.0     # and never longer than this in one go
-HIDE_AFTER = 90.0     # with no tool call for this long the overlay fades out
+HIDE_AFTER = 90.0     # with no tool call for this long the overlay fades out (not while a
+                      # request for help or the person's hold shows: their buttons stay)
 POINTER_EVERY = 1 / 30
+READY_WAIT = 3.0      # a new overlay must say it is up within this, or the result says so
+RESTARTS = 3          # an overlay that dies while its browser lives is started again this often
 TRUE = {"1", "true", "yes", "on"}
+NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 
 # Tools that touch neither the page nor the browser the person holds. Everything else is refused
 # while they hold it, reading included: a person who takes over may be typing a password.
@@ -81,10 +85,46 @@ def state_root() -> Path:
 
 def _write(path: Path, data: dict) -> None:
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | NOFOLLOW, 0o600)
     with os.fdopen(fd, "w") as f:
         json.dump(data, f)
     os.replace(tmp, path)
+
+
+def _read(path: Path) -> Optional[dict]:
+    """A state file, never through a link, only a regular file. None when it cannot be read."""
+    try:
+        fd = os.open(path, os.O_RDONLY | NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        import stat as _stat
+        if not _stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        with os.fdopen(fd, "r", encoding="utf-8") as f:
+            fd = -1
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+    finally:
+        if fd != -1:
+            os.close(fd)
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True  # exists, not ours to signal
+
+
+def _call_args() -> dict:
+    from . import _app
+    return _app.CALL_ARGUMENTS.get() or {}
 
 
 def wanted(arg: Optional[bool]) -> bool:
@@ -111,14 +151,42 @@ def _script() -> str:
     return (Path(__file__).with_name("_agent_overlay.py")).read_text(encoding="utf-8")
 
 
+def _spawn(folder: Path, pid: int, cursor: bool) -> subprocess.Popen:
+    try:
+        hide_after = float(os.environ.get("MCP_STEALTH_OVERLAY_HIDE_AFTER") or HIDE_AFTER)
+    except ValueError:
+        hide_after = HIDE_AFTER
+    cfg = {"state": str(folder), "pid": pid, "server": os.getpid(), "cursor": cursor,
+           "hide_after": hide_after if hide_after > 0 else HIDE_AFTER}
+    log_fd = os.open(folder / "overlay.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND | NOFOLLOW, 0o600)
+    with os.fdopen(log_fd, "ab") as log:
+        proc = subprocess.Popen(
+            [sys.executable, "-I", "-", "mcp-stealth-agent-overlay", json.dumps(cfg)],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=log, start_new_session=True)
+    assert proc.stdin is not None
+    proc.stdin.write(_script().encode("utf-8"))
+    proc.stdin.close()
+    return proc
+
+
+def _last_log_line(folder: Path) -> str:
+    try:
+        lines = (folder / "overlay.log").read_text(encoding="utf-8", errors="replace").strip().splitlines()
+    except OSError:
+        return "no log"
+    return lines[-1][:200] if lines else "nothing logged"
+
+
 class Overlay:
     """This server's side of one overlay: the files it shares with the overlay process."""
 
-    def __init__(self, browser: Any, pid: int, folder: Path, proc: subprocess.Popen):
+    def __init__(self, browser: Any, pid: int, folder: Path, proc: subprocess.Popen, cursor: bool):
         self.browser = browser
         self.pid = pid
         self.folder = folder
         self.proc = proc
+        self.cursor = cursor
+        self.restarts = 0
         self.agent_file = folder / "agent.json"
         self.control_file = folder / "control.json"
         self.agent: dict = {"pid": pid, "active_at": 0.0, "status": "", "help": None,
@@ -140,53 +208,103 @@ class Overlay:
 
     def read_control(self) -> dict:
         try:
-            st = os.stat(self.control_file)
+            st = os.lstat(self.control_file)
         except OSError:
             return self.control
         stamp = (st.st_ino, st.st_mtime_ns)
         if stamp != self.control_stamp:
-            with contextlib.suppress(OSError, ValueError):
-                self.control = json.loads(self.control_file.read_text(encoding="utf-8"))
-                self.control_stamp = stamp
+            data = _read(self.control_file)
+            if data is not None:
+                self.control, self.control_stamp = data, stamp
         return self.control
 
-    def person_holds(self) -> bool:
-        return self.alive() and self.read_control().get("holder") == "person"
+    def held(self) -> bool:
+        """The person holds the browser, by the last word of the overlay, alive or not."""
+        return self.read_control().get("holder") == "person"
 
     def alive(self) -> bool:
         return self.proc.poll() is None
 
+    def ready(self) -> bool:
+        return self.alive() and self.read_control().get("overlay_pid") == self.proc.pid
+
+    def revive(self) -> bool:
+        """Start the overlay again when it died while its browser still runs: it keeps who held
+        the browser. At most RESTARTS times; True when one runs."""
+        if self.alive():
+            return True
+        if self.restarts >= RESTARTS or not _pid_alive(self.pid) or not self.folder.is_dir():
+            return False
+        try:
+            self.proc = _spawn(self.folder, self.pid, self.cursor)
+        except Exception:
+            return False
+        self.restarts += 1
+        return True
+
     def stop(self) -> None:
+        """Ask it to end, then make sure: the server ignores SIGTERM and children inherit that,
+        so the overlay resets it, and a kill follows a terminate that was not enough. The folder
+        goes once the process is gone."""
         self.write(ended=True)
-        if self.proc.poll() is None:
+        for step in (None, "terminate", "kill"):
+            if self.proc.poll() is not None:
+                break
+            if step:
+                with contextlib.suppress(Exception):
+                    getattr(self.proc, step)()
             with contextlib.suppress(Exception):
                 self.proc.wait(timeout=1.0)
-        if self.proc.poll() is None:
-            with contextlib.suppress(Exception):
-                self.proc.terminate()
-                self.proc.wait(timeout=1.0)
-        with contextlib.suppress(OSError):
-            shutil.rmtree(self.folder)
+        if self.proc.poll() is not None:
+            with contextlib.suppress(OSError):
+                shutil.rmtree(self.folder)
         with contextlib.suppress(ValueError):
             _LIVE.remove(self)
 
 
-def of(browser: Any) -> Optional[Overlay]:
+def _handle(browser: Any) -> Optional[Overlay]:
+    """The browser's overlay, running or not."""
     found = getattr(browser, ATTR, None) if browser is not None else None
-    return found if isinstance(found, Overlay) and found.alive() else None
+    return found if isinstance(found, Overlay) else None
+
+
+def of(browser: Any) -> Optional[Overlay]:
+    """The browser's overlay when it runs."""
+    found = _handle(browser)
+    return found if found is not None and found.alive() else None
 
 
 def of_tab(tab: Any) -> Optional[Overlay]:
     return of(getattr(tab, "browser", None))
 
 
-def attach(browser: Any, pid: Optional[int], *, ask: Optional[bool], headless: bool,
-           persons_browser: bool = False) -> str:
-    """Start the overlay for a browser when asked; the launch result's note, or ""."""
+def _prune(root: Path) -> None:
+    """Folders of overlays whose browser is gone (a server killed before it cleaned up)."""
+    with contextlib.suppress(OSError):
+        for entry in root.iterdir():
+            parts = entry.name.split("-")
+            if (len(parts) >= 3 and parts[0] == "chrome" and parts[1].isdigit()
+                    and not entry.is_symlink() and entry.is_dir() and not _pid_alive(int(parts[1]))):
+                with contextlib.suppress(OSError):
+                    shutil.rmtree(entry)
+
+
+async def attach(browser: Any, pid: Optional[int], *, ask: Optional[bool], headless: bool,
+                 persons_browser: bool = False) -> str:
+    """Start the overlay for a browser when asked; the launch result's note, or "".
+    False stops one already running (a browser reused or reattached)."""
+    existing = _handle(browser)
+    if ask is False:
+        if existing is not None:
+            stop(browser)
+            return " [agent_overlay: off, the overlay on this browser was stopped]"
+        return ""
     if not wanted(ask):
         return ""
-    if of(browser) is not None:
-        return " [agent_overlay: on]"
+    if existing is not None:
+        if existing.alive():
+            return " [agent_overlay: on]"
+        stop(browser)  # died: start a fresh one
     why = None
     if headless:
         why = "the browser is headless, so there is no window to show it on"
@@ -200,34 +318,37 @@ def attach(browser: Any, pid: Optional[int], *, ask: Optional[bool], headless: b
     if why:
         return f" [agent_overlay: OFF, {why}]"
     root = state_root()
+    if root.is_symlink():
+        return f" [agent_overlay: OFF, its state folder {root} is a link]"
+    cursor = os.environ.get("MCP_STEALTH_AGENT_CURSOR", "").strip().lower() in TRUE
     try:
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(root, 0o700)
+        _prune(root)
         folder = Path(tempfile.mkdtemp(prefix=f"chrome-{pid}-", dir=root))
-        cfg = {"state": str(folder), "pid": pid, "server": os.getpid(),
-               "cursor": os.environ.get("MCP_STEALTH_AGENT_CURSOR", "").strip().lower() in TRUE,
-               "hide_after": HIDE_AFTER}
-        with open(folder / "overlay.log", "wb") as log:
-            proc = subprocess.Popen(
-                [sys.executable, "-I", "-", "mcp-stealth-agent-overlay", json.dumps(cfg)],
-                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=log,
-                start_new_session=True)
-        assert proc.stdin is not None
-        proc.stdin.write(_script().encode("utf-8"))
-        proc.stdin.close()
+        proc = _spawn(folder, pid, cursor)
     except Exception as exc:
         return f" [agent_overlay: OFF, it could not start ({type(exc).__name__}: {exc})]"
-    overlay = Overlay(browser, pid, folder, proc)
+    overlay = Overlay(browser, pid, folder, proc, cursor)
     setattr(browser, ATTR, overlay)
     _LIVE.append(overlay)
-    return (" [agent_overlay: on: a light around the window while the agent acts and a bar "
-            "with Take over; while the person holds the browser the tools that act on or read "
-            "the page are refused]")
+    # Up when it says so: a process that started is not yet an overlay on the screen.
+    end = time.time() + READY_WAIT
+    while time.time() < end and overlay.alive() and not overlay.ready():
+        await asyncio.sleep(0.05)
+    if not overlay.alive():
+        why = _last_log_line(folder)
+        stop(browser)
+        return f" [agent_overlay: OFF, the overlay ended as it started: {why}]"
+    confirmed = "" if overlay.ready() else f" (started; it had not confirmed within {READY_WAIT:.0f}s)"
+    return (f" [agent_overlay: on{confirmed}: a light around the window while the agent acts and "
+            "a bar with Take over; while the person holds the browser the tools that act on or "
+            "read the page are refused]")
 
 
 def stop(browser: Any) -> None:
-    overlay = getattr(browser, ATTR, None) if browser is not None else None
-    if isinstance(overlay, Overlay):
+    overlay = _handle(browser)
+    if overlay is not None:
         overlay.stop()
         with contextlib.suppress(Exception):
             delattr(browser, ATTR)
@@ -259,8 +380,8 @@ async def refresh_window(overlay: Overlay, tab: Any) -> None:
 
 
 async def before_tool(name: str, browser: Any, tab: Any) -> None:
-    overlay = of(browser)
-    if overlay is None:
+    overlay = _handle(browser)
+    if overlay is None or not overlay.revive():
         return
     from . import _app
     overlay.touch(status=describe(name, _app.CALL_ARGUMENTS.get()))
@@ -278,10 +399,22 @@ def after_tool(browser: Any) -> None:
 
 
 def refusal(name: str, browser: Any) -> Optional[str]:
-    """Error text when the person holds this browser and the tool would act on or read it."""
-    overlay = of(browser)
-    if overlay is None or name in WHILE_PERSON_HOLDS or not overlay.person_holds():
+    """Error text when the person holds this browser and the tool would act on or read it.
+    Fails closed: an overlay that died while they held it still holds it."""
+    overlay = _handle(browser)
+    if overlay is None or name in WHILE_PERSON_HOLDS:
         return None
+    if not overlay.alive():
+        overlay.revive()
+    if not overlay.held():
+        return None
+    if not overlay.alive():
+        if name == "browser_launch" and _call_args().get("agent_overlay") is False:
+            return None  # the way out once nothing can show Resume agent
+        return ("Error: the person took over this browser, and its overlay has stopped and could "
+                f"not be started again ({_last_log_line(overlay.folder)}), so they cannot press "
+                f"Resume agent. {name} did nothing. Ask the person; once they say they are done, "
+                "browser_launch(agent_overlay=False) releases the browser.")
     since = overlay.read_control().get("since")
     when = time.strftime(" at %H:%M:%S", time.localtime(since)) if since else ""
     return ("Error: the person took over this browser (Take over in the bar over its window"
@@ -333,16 +466,18 @@ def result_note(session_key: str, result: str) -> str:
 async def before_input(tab: Any) -> None:
     """Before input reaches the page: refuse once the person holds the browser, and let a
     person who is typing finish first."""
-    overlay = of_tab(tab)
+    overlay = _handle(getattr(tab, "browser", None))
     if overlay is None:
         return
+    if not overlay.alive():
+        overlay.revive()
     control = overlay.read_control()
     if control.get("holder") == "person":
         raise PersonHasBrowser(
             "the person pressed Take over in the bar over the browser window; the agent's "
             "input stopped there. Call wait_for_human to wait for Resume agent.")
     last = float(control.get("person_last_input") or 0)
-    if time.time() - last >= POLITE:
+    if time.time() - last >= POLITE or not overlay.alive():
         return
     started = time.time()
     overlay.write(waiting="polite")
@@ -389,7 +524,7 @@ def ask(browser: Any, objective: str) -> Optional[float]:
 
 def answered(browser: Any, since: float) -> Optional[str]:
     """What the person did with the bar since `since`: "done", "resumed", or None."""
-    overlay = of(browser)
+    overlay = _handle(browser)
     if overlay is None:
         return None
     control = overlay.read_control()
@@ -402,8 +537,8 @@ def answered(browser: Any, since: float) -> Optional[str]:
 
 
 def holds(browser: Any) -> bool:
-    overlay = of(browser)
-    return overlay is not None and overlay.person_holds()
+    overlay = _handle(browser)
+    return overlay is not None and overlay.held()
 
 
 def end_help(browser: Any) -> None:
@@ -413,9 +548,10 @@ def end_help(browser: Any) -> None:
 
 
 def status(browser: Any) -> dict:
-    overlay = of(browser)
+    overlay = _handle(browser)
     if overlay is None:
         return {"on": False}
     control = overlay.read_control()
-    return {"on": True, "overlay_pid": overlay.proc.pid, "holder": control.get("holder", "agent"),
+    return {"on": overlay.alive(), "overlay_pid": overlay.proc.pid, "ready": overlay.ready(),
+            "restarts": overlay.restarts, "holder": control.get("holder", "agent"),
             "cursor_shown": bool(control.get("show_cursor"))}
