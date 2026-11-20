@@ -108,6 +108,26 @@ def _brave_lean_records_in_a_temp_folder():
 
 
 @pytest.fixture(scope="session", autouse=True)
+def _agent_overlay_off_and_in_a_temp_folder():
+    """agent_overlay is off for every server the suite starts, whatever the developer's own
+    environment says, and its files go to a temporary folder. A test about it passes
+    agent_overlay=True."""
+    previous = {k: os.environ.get(k) for k in ("MCP_STEALTH_AGENT_OVERLAY", "MCP_STEALTH_OVERLAY_DIR")}
+    folder = tempfile.mkdtemp(prefix="mcp-stealth-overlay-")
+    os.environ["MCP_STEALTH_AGENT_OVERLAY"] = "0"
+    os.environ["MCP_STEALTH_OVERLAY_DIR"] = folder
+    try:
+        yield folder
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+@pytest.fixture(scope="session", autouse=True)
 def _keep_alive_records_in_a_temp_folder():
     """keep_alive records for every server the suite starts and every in-process launch, so no
     test reads or writes the person's ~/.mcp-stealth/keep-alive, and none reattaches to a

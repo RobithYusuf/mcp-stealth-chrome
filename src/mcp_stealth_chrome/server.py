@@ -88,6 +88,7 @@ from . import brave_beta
 from . import launch_lock
 from . import profile_gc
 from . import profile_version
+from . import presence
 from . import cookie_migration
 from . import quit_watch
 from . import keep_alive as _keep_alive
@@ -492,6 +493,7 @@ def _socket_dropped(browser: Any) -> bool:
 
 
 async def _ensure_browser_dead(browser, profile_dir=None, grace: float = 1.5) -> dict:
+    presence.stop(browser)  # its overlay goes first: nothing is left over a closing window
     """Stop a browser and VERIFY the OS process actually died.
 
     `browser.stop()` talks over CDP. When the websocket is already gone — a
@@ -3317,7 +3319,8 @@ async def _block_ads_on_reattach(block_ads: bool, browser: Any, instance_id: str
 
 async def _launch_by_reattach(profile: Path, verdict: dict, *, url: str, keep_alive: Optional[bool],
                              ignored: list[str], expect_url: Optional[str],
-                             expect_status: Optional[int], block_ads: bool = False) -> str:
+                             expect_status: Optional[int], block_ads: bool = False,
+                             agent_overlay: Optional[bool] = None) -> str:
     """browser_launch's reattach: the kept browser becomes the calling session's current one."""
     iid = BrowserState.current_instance_id
     record = verdict["record"]
@@ -3364,6 +3367,9 @@ async def _launch_by_reattach(profile: Path, verdict: dict, *, url: str, keep_al
     observed["profile"] = {"actual_profile": str(BrowserState.current_profile_dir),
                            "session_state_source": "reattached to the browser kept alive on it"}
     ads_note = await _block_ads_on_reattach(block_ads, browser, iid)
+    ads_note += presence.attach(browser, _browser_process_pid(browser), ask=agent_overlay,
+                                headless=bool(record.get("headless")),
+                                persons_browser=_persons_browser(browser))
     action = "Loaded" if url and url != "about:blank" else "Selected tab shows"
     return _nav_result(f"{summary[0].upper()}{summary[1:]}. {action}", observed,
                        expect_url=expect_url, expect_status=expect_status,
@@ -3634,6 +3640,37 @@ if _adblock_notice not in _app_module.RESULT_FILTERS:
     _app_module.RESULT_FILTERS.append(_adblock_notice)
 
 
+# agent_overlay: the refusal while the person holds the browser, what the agent is doing, and
+# the note of a pause for the person's typing. Each is a no-op for a browser without an overlay.
+def _overlay_gate(name: str) -> Optional[str]:
+    return presence.refusal(name, BrowserState.browser)
+
+
+async def _overlay_before_tool(name: str) -> None:
+    browser = BrowserState.browser
+    if presence.of(browser) is None:
+        return
+    tab = None
+    with contextlib.suppress(Exception):
+        tab = BrowserState.active_tab()
+    await presence.before_tool(name, browser, tab)
+
+
+def _overlay_after_tool(_name: str) -> None:
+    presence.after_tool(BrowserState.browser)
+
+
+def _overlay_note(session_key: str, result: str) -> str:
+    return presence.result_note(session_key, result)
+
+
+for _hooks, _hook in ((_app_module.CALL_GATES, _overlay_gate),
+                      (_app_module.BEFORE_TOOL_HOOKS, _overlay_before_tool),
+                      (_app_module.AFTER_TOOL_HOOKS, _overlay_after_tool),
+                      (_app_module.RESULT_FILTERS, _overlay_note)):
+    _hooks[:] = [h for h in _hooks if getattr(h, "__name__", "") != _hook.__name__] + [_hook]
+
+
 async def _load_saved_tab(tab: Any, url: str) -> dict:
     doc_state, disarm = await _arm_document_watch(tab)
     try:
@@ -3814,6 +3851,7 @@ async def browser_launch(
     vertical_tabs: Optional[str] = None,
     block_ads: bool = False,
     brave_lean: Optional[bool] = None,
+    agent_overlay: Optional[bool] = None,
 ) -> str:
     """Launch stealth Chrome via nodriver. Creates persistent profile by default.
 
@@ -3939,6 +3977,16 @@ async def browser_launch(
             keeps Brave as it ships and puts back what an earlier lean launch changed. The result
             says what was turned off and what was not; server_status shows it. Ignored for
             Chrome, and said so when passed.
+        agent_overlay: macOS, headed. Over the browser window: a light around it while the agent
+            acts, a bar saying what it does, and a lock over the page so a stray click or scroll
+            never reaches it. The bar's Take over hands the browser to the person; while they
+            hold it every tool that acts on or reads the page is refused, saying so, until they
+            press Resume agent (wait_for_human waits for that). A key they press while the agent
+            works pauses its input for a moment and the result says so. request_human_help
+            shows the request in the bar with Done. The bar can show the agent's cursor (off
+            unless MCP_STEALTH_AGENT_CURSOR=1). None (default) follows MCP_STEALTH_AGENT_OVERLAY,
+            off unless set. Needs the os-cursor extra (PyObjC); without it, headless, or on a
+            browser the person opened from the launcher, the result says it is off and why.
     """
     product, brave_executable, problem = brave_mode.check_request(browser, vertical_tabs)
     if problem:
@@ -4033,6 +4081,10 @@ async def browser_launch(
                                    f"takes effect on a new launch")
                 if block_ads:
                     reuse_head += _adblock_module().reuse_note(block_ads, BrowserState.browser)
+                reuse_head += presence.attach(
+                    BrowserState.browser, _browser_process_pid(BrowserState.browser),
+                    ask=agent_overlay, headless=BrowserState.current_headless,
+                    persons_browser=_persons_browser(BrowserState.browser))
                 _doc_state, _disarm = await _arm_document_watch(_tab)
                 try:
                     if url and url != "about:blank":
@@ -4138,7 +4190,7 @@ async def browser_launch(
                         explicit_udd, kept, url=url, keep_alive=keep_alive,
                         ignored=_reattach_ignored(locals()), expect_url=expect_url,
                         expect_status=expect_status,
-                        block_ads=block_ads)
+                        block_ads=block_ads, agent_overlay=agent_overlay)
                 return err(
                     f"user_data_dir {explicit_udd} is currently in use by Chrome PID {holder_pid}. "
                     "Close that Chrome window first (a single Chrome process locks the whole "
@@ -4190,7 +4242,7 @@ async def browser_launch(
                             custom_udd, kept, url=url, keep_alive=keep_alive,
                             ignored=_reattach_ignored(locals()), expect_url=expect_url,
                             expect_status=expect_status,
-                            block_ads=block_ads)
+                            block_ads=block_ads, agent_overlay=agent_overlay)
                     return err(
                         f"Profile directory is locked by another Chrome process: "
                         f"{custom_udd} (PID {holder_pid}). Close that Chrome window first, "
@@ -4211,7 +4263,7 @@ async def browser_launch(
                             _candidate, _kept, url=url, keep_alive=keep_alive,
                             ignored=_reattach_ignored(locals()), expect_url=expect_url,
                             expect_status=expect_status,
-                            block_ads=block_ads)
+                            block_ads=block_ads, agent_overlay=agent_overlay)
                     kept_note += _not_reattached_note(_candidate, _kept)
             # Each instance has one deterministic profile, and a conflict over it is
             # settled by the caller's profile_conflict. Only "main" takes part in
@@ -4433,6 +4485,8 @@ async def browser_launch(
         if ads_pending is not None:
             dock_note += await _adblock_module().attach(
                 ads_pending, browser, BrowserState.current_instance_id, BrowserState.session_key())
+        dock_note += presence.attach(browser, _browser_process_pid(browser), ask=agent_overlay,
+                                     headless=headless)
 
         if cookie_move.backup is not None:
             moved, moved_text = await _finish_cookie_move(browser, Path(str(profile_path)), cookie_move)
@@ -5846,6 +5900,7 @@ def _ignore_task_result(task: asyncio.Future) -> None:
 
 async def _dispatch_input(tab, press) -> None:
     """Run input that a native dialog could block, and stop waiting once one does."""
+    await presence.before_input(tab)  # refuses once the person took over; lets their typing end
     with contextlib.suppress(Exception):
         await _watch_dialogs(tab)
     key = _target_key(tab)
@@ -6198,6 +6253,7 @@ async def _type_keys(tab, text: str, mean_delay: Optional[float] = None,
     """
     from nodriver.cdp import input_ as cdp_input
     for ch in re.sub(r"\r\n?", "\n", text):
+        await presence.before_input(tab)
         if ch == "\n":
             if press_controls:
                 await _dispatch_key(tab, key_event_params("Enter"))
@@ -7658,6 +7714,13 @@ async def server_status() -> str:
             snap.browser for snap in BrowserState.instances.values()]) if _adblock_if_loaded()
             else {"browsers": [], "package": adblock_package_note(),
                   "note": "no launch in this process asked for block_ads"}),
+        "agent_overlay": {
+            "default": "on" if presence.wanted(None) else "off (MCP_STEALTH_AGENT_OVERLAY)",
+            "available": presence.unavailable() or "yes",
+            "instances": {iid: presence.status(b) for iid, b in [
+                (BrowserState.current_instance_id, BrowserState.browser)] + [
+                (i, snap.browser) for i, snap in BrowserState.instances.items()] if b is not None},
+        },
     }
     return ok(json.dumps(status, indent=2, default=str))
 
@@ -8507,6 +8570,7 @@ async def _launch_browser_instance(
     vertical_tabs: Optional[str] = None,
     block_ads: bool = False,
     brave_lean: Optional[bool] = None,
+    agent_overlay: Optional[bool] = None,
 ) -> tuple[bool, str]:
     """Shared launcher for browser_launch + spawn_browser.
 
@@ -8571,7 +8635,7 @@ async def _launch_browser_instance(
                     return await _spawn_by_reattach(instance_id, profile_path, kept, url=url,
                                                     keep_alive=keep_alive, ignored=ignored or [],
                                                     idle_timeout=idle_timeout, desc=desc,
-                                                    block_ads=block_ads)
+                                                    block_ads=block_ads, agent_overlay=agent_overlay)
                 return False, (
                     f"profile {profile_path} is locked by Chrome PID {holder}; "
                     "close that browser or clone the profile first"
@@ -8680,6 +8744,8 @@ async def _launch_browser_instance(
     if ads_pending is not None:
         dock_note += await _adblock_module().attach(ads_pending, browser, instance_id,
                                                     BrowserState.session_key())
+    dock_note += presence.attach(browser, _browser_process_pid(browser), ask=agent_overlay,
+                                 headless=headless)
 
     if cookie_move.backup is not None:
         moved, moved_text = await _finish_cookie_move(browser, Path(str(profile_path)), cookie_move)
@@ -8798,7 +8864,8 @@ def _being_closed(instance_id: str) -> bool:
 
 async def _spawn_by_reattach(instance_id: str, profile: Path, verdict: dict, *, url: str,
                             keep_alive: Optional[bool], ignored: list[str], idle_timeout: int,
-                            desc: str, block_ads: bool = False) -> tuple[bool, str]:
+                            desc: str, block_ads: bool = False,
+                            agent_overlay: Optional[bool] = None) -> tuple[bool, str]:
     """spawn_browser's reattach: the kept browser fills the instance slot, current or stored."""
     record = verdict["record"]
     ignored = [item for item in ignored if item != f"headless={bool(record.get('headless'))!r}"]
@@ -8842,6 +8909,9 @@ async def _spawn_by_reattach(instance_id: str, profile: Path, verdict: dict, *, 
     BrowserState.window_closed.pop(instance_id, None)
     _ATTACHED_BROWSERS.discard(instance_id)
     keep_text += await _block_ads_on_reattach(block_ads, browser, instance_id)
+    keep_text += presence.attach(browser, _browser_process_pid(browser), ask=agent_overlay,
+                                 headless=bool(verdict["record"].get("headless")),
+                                 persons_browser=_persons_browser(browser))
     return True, (f"instance {instance_id!r} {summary}{keep_text}\n"
                   f"{json.dumps(observed, indent=2, default=str)}")
 
@@ -9176,6 +9246,7 @@ async def spawn_browser(
     vertical_tabs: Optional[str] = None,
     block_ads: bool = False,
     brave_lean: Optional[bool] = None,
+    agent_overlay: Optional[bool] = None,
 ) -> str:
     """Create a new named browser instance running in parallel with main.
     Each instance has its own profile, cookies, tabs, logs. Use for multi-account
@@ -9204,6 +9275,8 @@ async def spawn_browser(
             browser_launch(block_ads=True) does
         brave_lean: Brave only; as in browser_launch (None: lean on a profile this server
             made empty, True: lean, False: as it ships)
+        agent_overlay: the light, bar and Take over over this instance's window, as in
+            browser_launch (macOS, headed; None follows MCP_STEALTH_AGENT_OVERLAY)
         other args: same as browser_launch
 
     Use switch_instance(id) to route subsequent tool calls to this instance.
@@ -9281,6 +9354,7 @@ async def spawn_browser(
                     vertical_tabs=vertical_tabs,
                     block_ads=block_ads,
                     brave_lean=brave_lean,
+                    agent_overlay=agent_overlay,
                 )
                 msg += launch_lock.note() if ok_flag else ""
     finally:
@@ -12172,6 +12246,8 @@ def _stop_all_browsers() -> None:
     with contextlib.suppress(Exception):
         if _adblock_if_loaded() is not None:
             _adblock_if_loaded().shutdown()
+    with contextlib.suppress(Exception):
+        presence.stop_all()
     for key in BrowserState.session_keys():
         token = BrowserState.in_session(key)
         try:

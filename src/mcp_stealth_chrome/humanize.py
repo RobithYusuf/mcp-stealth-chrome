@@ -123,7 +123,10 @@ async def move_pointer(tab: Tab, x: float, y: float) -> None:
     Nothing is sent once the gesture this move belongs to was given up on (check_gesture).
     """
     check_gesture()
+    from . import presence
+    await presence.before_input(tab)
     await tab.send(cdp.input_.dispatch_mouse_event("mouseMoved", x=x, y=y))
+    presence.note_pointer(tab, x, y)
 
 
 async def humanized_approach(
@@ -167,6 +170,8 @@ async def humanized_mouse_press(
         await asyncio.sleep(random.uniform(0.02, 0.06))
     await move_pointer(tab, x, y)
     await asyncio.sleep(random.uniform(0.04, 0.12))  # dwell before pressing
+    from . import presence
+    presence.note_pointer(tab, x, y, pressed=True)
     await tab.send(cdp.input_.dispatch_mouse_event(
         "mousePressed", x=x, y=y,
         button=cdp.input_.MouseButton.LEFT, buttons=1, click_count=1,

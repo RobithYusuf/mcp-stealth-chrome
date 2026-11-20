@@ -17,6 +17,7 @@ from typing import Optional
 
 from nodriver import Tab
 
+from .. import presence
 from .. import server as _srv
 from .._app import mcp
 from ..helpers import err, get_url, ok
@@ -158,12 +159,15 @@ async def request_human_help(objective: str, timeout: float = 300) -> str:
             "requested_at": time.time(),
             "timeout": max(0.0, float(timeout)),
         }
+        shown = presence.ask(BrowserState.browser, objective)
+        bar = ("\nThe overlay's bar shows the request with a Done button; wait_for_human ends "
+               "when the person presses it." if shown is not None else "")
         return ok(
             f"Browser is visible and in the foreground ({', '.join(actions) or 'focus requested'}).\n"
             f"Human: {objective}\n"
             "When finished, leave the page in its completed state. The agent must call "
             "wait_for_human(done_url_contains=... or done_selector=...); without a "
-            "specific signal it will wait for a URL/DOM change from this handoff."
+            f"specific signal it will wait for a URL/DOM change from this handoff.{bar}"
         )
     except Exception as e:
         return err(str(e))
@@ -207,6 +211,10 @@ async def wait_for_human(
         baseline = request.get("baseline") or await _srv._page_sig(tab)
         loop = asyncio.get_event_loop()
         started = loop.time()
+        # agent_overlay: Done in the bar, or Resume agent after Take over, ends the wait. While
+        # the person holds the browser their own clicks change the page, so a change is no answer.
+        browser = BrowserState.browser
+        asked_since = float(request.get("requested_at") or time.time())
         selector_expr = (
             "(() => JSON.stringify({hit: !!document.querySelector(%s)}))()"
             % json.dumps(done_selector)
@@ -214,10 +222,21 @@ async def wait_for_human(
         )
         while loop.time() - started < max(0.0, timeout):
             elapsed = round(loop.time() - started, 2)
+            answer = presence.answered(browser, asked_since)
+            if answer:
+                _srv._HUMAN_HELP.pop(key, None)
+                presence.end_help(browser)
+                return ok(f"human handoff completed after {elapsed}s: the person pressed "
+                          + ("Done in the overlay's bar" if answer == "done"
+                             else "Resume agent in the overlay's bar, handing the browser back"))
+            if presence.holds(browser):
+                await asyncio.sleep(0.25)
+                continue
             if done_url_contains:
                 current_url = await get_url(tab)
                 if done_url_contains in current_url:
                     _srv._HUMAN_HELP.pop(key, None)
+                    presence.end_help(browser)
                     return ok(
                         f"human handoff completed after {elapsed}s: URL contains "
                         f"{done_url_contains!r}{unasked}"
@@ -227,6 +246,7 @@ async def wait_for_human(
                 value = value.value if hasattr(value, "value") and not isinstance(value, str) else value
                 if value and bool(json.loads(value).get("hit")):
                     _srv._HUMAN_HELP.pop(key, None)
+                    presence.end_help(browser)
                     return ok(
                         f"human handoff completed after {elapsed}s: selector "
                         f"{done_selector!r} appeared{unasked}"
@@ -240,11 +260,16 @@ async def wait_for_human(
                     or current.get("hash") != baseline.get("hash")
                 ):
                     _srv._HUMAN_HELP.pop(key, None)
+                    presence.end_help(browser)
                     return ok(f"human handoff completed after {elapsed}s: page changed{unasked}")
             await asyncio.sleep(0.25)
         # Drop the pending handoff so a later wait re-baselines against the page
         # as it is now, instead of measuring against a stale pre-handoff snapshot.
         _srv._HUMAN_HELP.pop(key, None)
+        presence.end_help(browser)
+        if presence.holds(browser):
+            return err(f"timeout after {timeout}s: the person still holds the browser (Take over "
+                       "in the overlay's bar) and has not pressed Resume agent.")
         return err(
             f"timeout after {timeout}s waiting for human completion — nothing changed "
             "and no completion signal was observed. Call request_human_help again "

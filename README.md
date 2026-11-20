@@ -243,7 +243,7 @@ See [docs/INSTALL.md](docs/INSTALL.md) for verification and troubleshooting.
 
 | Extra | Needed for | In your client config |
 |-------|------------|-----------------------|
-| `os-cursor` | `solve_turnstile_oscursor` | `"args": ["mcp-stealth-chrome[os-cursor]@latest"]` |
+| `os-cursor` | `solve_turnstile_oscursor`, `agent_overlay` | `"args": ["mcp-stealth-chrome[os-cursor]@latest"]` |
 | `adblock` | `block_ads` | `"args": ["mcp-stealth-chrome[adblock]@latest"]` |
 | both | | `"args": ["mcp-stealth-chrome[adblock,os-cursor]@latest"]` |
 
@@ -462,6 +462,7 @@ Options for one launch. Open one for the details:
 | Keep the browser open after the agent ends | `keep_alive=True` |
 | Reopen the tabs from last time | `restore_tabs=True` |
 | Block ads and trackers in Chrome | `block_ads=True` |
+| See when the agent drives the window, and take it over (macOS) | `agent_overlay=True` |
 | Tabs in a side bar | `vertical_tabs="left"`, or `"right"` in Brave |
 | Brave without Leo, VPN, P3A and the other extras (on by default for a profile the server made) | `brave_lean=True`, or `False` to keep Brave as it ships |
 | Open the agent's browser from the Dock | `mcp-stealth-chrome install-launcher` |
@@ -595,6 +596,25 @@ browser_launch()   # a new agent, same profile
 - A signal from the watcher or the server only goes to a process proved to be the one meant, checked right before it: exact profile, and the start time recorded for it. A process whose command line or start time cannot be read is not signalled, and the close says it is not verified. On Linux the signal goes through a pidfd, so it cannot reach a process that took the PID after the check. On macOS the start time has one-second resolution and the check and the signal are separate calls, and Windows goes by the exact command line: small residual risks, not guarantees.
 - If the watcher cannot identify the browser after its last window was closed, it stops after three tries and leaves the reason behind; the next tool call says the browser may still be running and was not ended.
 - `MCP_STEALTH_KEEP_ALIVE_MAX_HOURS` must be a positive finite number. `inf`, `nan`, 0 or a negative value fall back to 24 and a value over a year is cut to a year; the launch result names either.
+</details>
+
+<details>
+<summary><b>Seeing and taking over the agent's browser (macOS)</b></summary>
+
+`browser_launch(agent_overlay=True)` and `spawn_browser(agent_overlay=True)` put three things over a visible browser window, without drawing anything inside the page:
+
+- A light that turns slowly around the window while the agent acts, dims while it thinks between steps, and fades out when it stops.
+- A bar at the bottom saying what the agent does, with **Take over**.
+- A lock over the page: a click or scroll there does not reach the page and the bar says why.
+
+Only **Take over** hands the browser to you. While you hold it, every tool that would act on or read the page is refused and says why, so the agent cannot see what you type there. **Resume agent** hands it back, and `wait_for_human` returns when you press it. A key you press while the agent works does not take over: its input waits until you stop, and the tool's result says your keys reached the page. `request_human_help` shows its request in the bar in amber with **Done**, and `wait_for_human` returns when you press it.
+
+The arrow button in the bar shows where the agent points and clicks, as a cursor labelled Agent. It is off unless `MCP_STEALTH_AGENT_CURSOR=1`.
+
+- Off by default. `MCP_STEALTH_AGENT_OVERLAY=1` turns it on for every launch. It needs the `os-cursor` extra; without it, headless, or on a browser you opened from the Dock launcher, the launch result says it is off and why.
+- Measured on a MacBook with a 120 Hz display, against no overlay at all: the overlay process uses about 3% CPU and WindowServer about 10 points more while the agent works with the cursor off. The light is drawn at 20 frames a second in four thin windows along the edges. With the cursor on, WindowServer uses about 25 points more.
+- While nothing covers the browser the overlay sits above it in the floating level, so bringing the browser to the front does not hide it for a moment.
+- Keys cannot be held back without taking the keyboard from the browser, so a key such as Enter can still act on the page before the agent pauses. The lock covers the page only: tabs, the address bar and the window buttons stay usable.
 </details>
 
 <details>
@@ -998,6 +1018,9 @@ The ones most people set:
 | `MCP_STEALTH_LAUNCHER_ACTIVATE` | Set to `0` so `open` leaves the browser behind the app in use instead of bringing it forward (tests) |
 | `MCP_STEALTH_LAUNCHER_EXTRA_ARGS` | A JSON list of extra browser flags for `open`, used by tests |
 | `MCP_STEALTH_ADBLOCK_DIR` | Folder for the filter lists and engine of `block_ads`. Default `~/.mcp-stealth/adblock` |
+| `MCP_STEALTH_AGENT_OVERLAY` | Set to `1` to show `agent_overlay` on every headed launch (macOS). Default off |
+| `MCP_STEALTH_AGENT_CURSOR` | Set to `1` so the overlay's bar starts with the agent's cursor shown. Default off |
+| `MCP_STEALTH_OVERLAY_DIR` | Folder for the files the server shares with the overlay. Default `$TMPDIR/mcp-stealth-overlay` |
 | `MCP_STEALTH_ADBLOCK_DOWNLOAD_TIMEOUT` | Seconds a list download may take in all. Default 20 |
 | `MCP_STEALTH_ADBLOCK_MAX_BYTES` | Largest list accepted, in bytes. Default 16 MB |
 | `MCP_STEALTH_ADBLOCK_STALL` | Seconds ad blocking may go unanswered before it turns itself off for that browser. Default 3 |

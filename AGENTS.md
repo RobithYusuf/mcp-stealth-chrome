@@ -38,6 +38,8 @@ uvx mcp-stealth-chrome → Python 3.11+ → FastMCP → nodriver → Chrome/Chro
 - `src/mcp_stealth_chrome/tab_record.py`: the saved tab list behind `restore_tabs`: the file, its order, masking, `/json/list` at exit.
 - `src/mcp_stealth_chrome/keep_alive.py`: browsers left running at exit (`keep_alive=True`): the record, the "is it ours" check, leaving one running at exit.
 - `src/mcp_stealth_chrome/adblock.py`: `block_ads`: the filter lists, the stored engine, and the blocker's own CDP connection.
+- `src/mcp_stealth_chrome/presence.py`: `agent_overlay`, the server's side: when it starts, the refusal while the person holds
+  the browser, the pause for their typing. `_agent_overlay.py` is the overlay process, a standalone script (PyObjC).
 - `src/mcp_stealth_chrome/_app.py` — `StealthMCP`, the FastMCP boundary. `captcha.py`, `image_output.py`, `result_types.py` — their named helpers.
 - `src/mcp_stealth_chrome/tools/` — `research.py`, `devtools.py`, `vision.py`, `network_http.py`, `profiles.py`,
   `storage.py` (cookies, web storage, IndexedDB, cache), `capture.py` (request interception, HAR, dry_run),
@@ -1074,6 +1076,51 @@ the person (the same target events as Cmd+T, a followed link, a closed tab).
   fetch the page aborted, an iframe or image removed and a navigation away each give exactly that, with the page
   already settled (the fetch rejected with AbortError); a redirect and a target closed meanwhile give no error.
   Nothing is left held then. `answer_errors` counts every other refusal, with samples (detik.com showed 2 of 399).
+
+### Agent overlay (agent_overlay)
+
+- Per launch (`browser_launch`, `spawn_browser`, both reattaches), off unless asked or `MCP_STEALTH_AGENT_OVERLAY=1`; macOS,
+  headed, PyObjC from the `os-cursor` extra (found with `find_spec`, nothing imported). Headless, a browser the person opened
+  from the launcher (a lock over their window would keep them from their own tabs) or no known Chrome PID: the result says
+  OFF and why. `tests/conftest.py` sets it off and `MCP_STEALTH_OVERLAY_DIR` to a temporary folder for every server.
+- The overlay is its own process (`python -I -`, source on stdin, like the quit watcher, but with `sys.executable`: it
+  needs the venv's PyObjC). It shares two 0600 files in a 0700 folder: `agent.json` (the server writes: status, active_at,
+  help, the agent's tab's window bounds, the page's place in it, the pointer in page coordinates) and `control.json` (the
+  overlay writes: holder, since, reason, person_last_input, help_done, show_cursor). It exits on `ended`, when Chrome's PID
+  is gone, or when its parent is no longer the server (`getppid`). `_ensure_browser_dead` stops it first, `_stop_all_browsers`
+  stops them all. SIGUSR1 toggles the cursor and SIGUSR2 presses the bar's button: that is how tests press it.
+- Only the bar's button changes who holds the browser. A click or scroll on the page while the agent works lands on the lock
+  (a fully transparent window over the viewport; it takes clicks only because `ignoresMouseEvents` is set to False
+  explicitly, checked with `windowNumberAtPoint`) and the bar says the page is locked. A key cannot be held back without
+  taking the keyboard from the browser: the overlay records it, `presence.before_input` (in `_dispatch_input`,
+  `_type_keys`, `move_pointer`) waits until 1.5 s of quiet (10 s at most) and the result says the person's keys reached the
+  page. Enter can still act on the page first; that is the stated limit.
+- While the person holds it, `_app.CALL_GATES` refuses every tool not in `presence.WHILE_PERSON_HOLDS`, reading tools
+  included (they may be typing a password), naming Resume agent and `wait_for_human`. A gate runs for every tool, also those
+  in `_RUNS_DESPITE_DIALOG` (tab_list reads titles). Mid-tool, `before_input` raises `PersonHasBrowser`. `wait_for_human`
+  ends on Done or on Resume agent pressed after it was asked, and ignores page changes while the person holds the browser:
+  their own clicks change the page.
+- Clicks reach the overlay's click ring through one wrapper on nodriver's `Tab.mouse_click` (`patches.
+  _patch_mouse_click_reports_pointer`), since sixteen places press through it.
+- No blinking, each from a cause seen in the prototype: the bar keeps one width per window width (resizing its background
+  flashed and moved it on every status change) and cross-fades its text; the light dims between tool calls instead of going
+  out (`QUIET_AFTER` 2.5 s, out after `HIDE_AFTER` 90 s); a missing window must stay missing 0.6 s before anything hides;
+  the window followed is kept while on screen (a Chrome popup over 300x200 moved the overlay); and while no other window
+  covers the browser the overlay sits in the floating level (3). At level 0 just above Chrome, clicking an inactive Chrome
+  brought its windows over the overlay until the next tick. Covered, it drops to level 0 just above Chrome. App switches
+  and Space changes run a tick at once (NSWorkspace notifications).
+- Cost, measured with a benchmark against no overlay at all (macOS 26, 120 Hz display, 15 s runs alternated): WindowServer
+  +35 points and the overlay 8 to 9% CPU for the first design, +10 to 11 points and 3% after. What mattered: the light in
+  four edge windows under a nine-slice mask drawn once (no live blur, which three blurred rings were), animations asked
+  for 20 fps (`preferredFrameRateRange`), the bar without a behind-window blur (it re-blurred the moving light every frame),
+  reading only the windows above the browser's four times a second (each value read from a CGWindowList dictionary goes
+  through the PyObjC bridge: the full list was 1.2 ms and the per-tick scan most of the CPU), and updating at the glow's own
+  20 Hz (WindowServer's cost follows the number of distinct frames more than their area). The agent's cursor costs about
+  +18 points while it moves, in a small window or a full one alike, so it is off by default. Pausing the light while other
+  windows cover the browser made no difference (WindowServer skips them already) and is not done.
+- `tests/test_agent_overlay.py` (fast) and `tests/test_agent_overlay_e2e.py` (`MCP_HEADED=1`, real Chrome, through the MCP
+  boundary): the strips on the window's edges, refusals while held, Resume and Done ending `wait_for_human`, the typing
+  pause, the overlay still in front after `request_human_help` brings Chrome forward, and the overlay ending with the browser.
 
 ### Request interception
 

@@ -40,6 +40,10 @@ BEFORE_TOOL_HOOKS: list = []
 # Called with (session key, result) on every text result, returning the text to give. block_ads
 # adds one that says, once, that it stopped and why. Each must be cheap; one that raises is skipped.
 RESULT_FILTERS: list = []
+# Called with the tool's name before every tool, inside the caller's session: a text returned is
+# the call's result and the tool does not run. agent_overlay adds the refusal while the person
+# holds the browser. Each must be cheap and must not await; one that raises lets the call through.
+CALL_GATES: list = []
 # Tool calls running, per session. Every call is use of the session's current instance, so the
 # idle reaper never closes that instance while one runs: tab_new, tab_select and switch_instance
 # never touched last_active, and an instance spawned with idle_timeout_seconds=2 was closed between
@@ -176,6 +180,13 @@ class StealthMCP(FastMCP):
             if still:
                 return tool.fn_metadata.convert_result(still)
             _touch_current()
+            for gate in CALL_GATES:
+                try:
+                    refused = gate(name)
+                except Exception:
+                    refused = None
+                if refused:
+                    return tool.fn_metadata.convert_result(refused)
             if name not in _RUNS_DESPITE_DIALOG:
                 for hook in BEFORE_TOOL_HOOKS:
                     try:

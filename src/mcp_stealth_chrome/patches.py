@@ -10,6 +10,7 @@ crash. `status()` exposes what applied, and server_status surfaces it.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 
 # name -> True (applied) | str (why it did not)
 _STATUS: dict[str, object] = {}
@@ -155,6 +156,29 @@ def _patch_tab_get_keeps_session() -> None:
             _STATUS["tab_get_keeps_session"] = True
     except Exception as e:  # never block server startup on patch failure
         _STATUS["tab_get_keeps_session"] = f"{type(e).__name__}: {e}"
+
+
+def _patch_mouse_click_reports_pointer() -> None:
+    """Tab.mouse_click tells agent_overlay where the press landed, for the click ring its bar
+    can show. Sixteen places press through it; one wrapper here covers them all. A no-op for a
+    browser without an overlay."""
+    try:
+        from nodriver.core.tab import Tab
+        if getattr(Tab, "_mcp_click_reported", False):
+            return
+        original_click = Tab.mouse_click
+
+        async def mouse_click(self, x, y, *args, **kwargs):
+            from . import presence
+            with contextlib.suppress(Exception):
+                presence.note_pointer(self, x, y, pressed=True)
+            return await original_click(self, x, y, *args, **kwargs)
+
+        type.__setattr__(Tab, "mouse_click", mouse_click)
+        type.__setattr__(Tab, "_mcp_click_reported", True)
+        _STATUS["mouse_click_reports_pointer"] = True
+    except Exception as e:  # never block server startup on patch failure
+        _STATUS["mouse_click_reports_pointer"] = f"{type(e).__name__}: {e}"
 
 
 def _patch_fastmcp_keeps_text() -> None:
@@ -307,3 +331,4 @@ def apply_all() -> None:
     _patch_cookie_same_party()
     _patch_client_security_state()
     _patch_tab_get_keeps_session()
+    _patch_mouse_click_reports_pointer()
