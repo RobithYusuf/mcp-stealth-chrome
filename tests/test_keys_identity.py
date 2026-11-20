@@ -763,6 +763,25 @@ def test_text_lookup_never_clicks_at_frame_local_coordinates(loop, browser, base
 
 
 @E2E
+def test_get_text_reads_the_text_of_every_frame(loop, browser, base_url):
+    """A cross-origin frame's text follows the page's, under a line naming the frame; a
+    page reader that stopped at the top document missed it (Ego Lite's snapshot did not)."""
+    browser()
+    run(loop, "navigate", f"{base_url}/frame_text.html")
+    loop.run_until_complete(asyncio.sleep(0.7))
+    out = run(loop, "get_text")
+    assert "Decoy" in out and "Inner only" in out, out
+    assert "[frame 1, depth 1:" in out and "frames_child.html" in out, out
+    assert out.index("Decoy") < out.index("Inner only")
+    top = run(loop, "get_text", frames=False)
+    assert "Decoy" in top and "Inner only" not in top and "[frame" not in top, top
+    plain = None
+    run(loop, "navigate", f"{base_url}/keys.html")
+    plain = run(loop, "get_text")
+    assert "[frame" not in plain, plain  # a page without frames reads as before
+
+
+@E2E
 def test_workflow_can_read_the_url(loop, browser, base_url):
     browser()
     run(loop, "navigate", f"{base_url}/keys.html")

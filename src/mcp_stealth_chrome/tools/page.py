@@ -510,8 +510,15 @@ async def get_text(
     ref: Optional[str] = None,
     raw: bool = False,
     tab: Optional[int] = None,
+    frames: bool = True,
 ) -> str:
-    """Return visible text without changing active tab selection or focus."""
+    """Return visible text without changing active tab selection or focus.
+
+    For the whole page, the text of every iframe follows the page's own, each under a
+    line naming the frame (cross-origin and nested frames too, read in an isolated world,
+    so nothing is written to the page). A frame that could not be read is named with the
+    reason. frames=False returns the top document only.
+    """
     try:
         page = select_tab(tab)
         if ref:
@@ -531,9 +538,53 @@ async def get_text(
         expr = "document.body.textContent" if raw else "document.body.innerText"
         result = await _wait(page.evaluate(expr, return_by_value=True), what="get_text")
         text = result.value if hasattr(result, "value") and not isinstance(result, str) else result
-        return ok(str(text or ""))
+        text = str(text or "")
+        if frames:
+            text += await _frame_texts(page, raw)
+        return ok(text)
     except Exception as e:
         return err(str(e))
+
+
+_FRAME_TEXT_JS = ("(() => document.body ? (document.body.%s || '') : '')()")
+
+
+async def _frame_texts(page, raw: bool) -> str:
+    """The text of each child frame, under a line naming it; "" when the page has none.
+    Read in each frame's isolated world: the DOM is shared, nothing is added to the page."""
+    try:
+        found = await _wait(all_frames(page), what="get_text frames")
+    except Exception as e:
+        return f"\n\n[frames not read: {str(e)[:160] or type(e).__name__}]"
+    parts, seen = [], 0
+    for record in found:
+        if record.get("depth", 0) == 0:
+            continue
+        seen += 1
+        if seen > MAX_FRAMES:
+            parts.append(f"[{len([r for r in found if r.get('depth', 0)]) - MAX_FRAMES} more frames not read]")
+            break
+        frame, conn = record.get("frame"), record.get("conn")
+        label = short_url(getattr(frame, "url", "") or "") if frame is not None else "a frame"
+        head = f"[frame {seen}, depth {record.get('depth')}: {label}]"
+        if conn is None or frame is None:
+            parts.append(f"{head} not read: {record.get('scan_error') or 'unreachable'}")
+            continue
+        try:
+            ctx = await frame_world(conn, frame)
+            remote, exc = await _wait(conn.send(cdp_runtime.evaluate(
+                _FRAME_TEXT_JS % ("textContent" if raw else "innerText"),
+                context_id=ctx, return_by_value=True)), what="get_text frame")
+            if exc is not None:
+                parts.append(f"{head} not read: {exc.text}")
+                continue
+            body = str(getattr(remote, "value", "") or "").strip()
+        except Exception as e:
+            parts.append(f"{head} not read: {str(e)[:160] or type(e).__name__}")
+            continue
+        if body:
+            parts.append(f"{head}\n{body}")
+    return ("\n\n" + "\n\n".join(parts)) if parts else ""
 
 
 @mcp.tool()

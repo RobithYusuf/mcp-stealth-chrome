@@ -732,6 +732,8 @@ Open a group to see its tools.
 <summary><b>Reading the page</b> (17)</summary>
 
 `browser_snapshot`, `accessibility_snapshot`, `describe_page`, `form_introspect`, `get_text`, `get_html`, `get_attribute`, `get_links`, `inspect_element`, `query_selector_all`, `search_page`, `extract_table`, `extract_structured`, `detect_content_pattern`, `scrape_page`, `list_frames`, `frame_evaluate`
+
+`get_text` on the whole page also reads every iframe, cross-origin and nested ones too, each under a line naming the frame; `frames=False` keeps to the top document.
 </details>
 
 <details>
