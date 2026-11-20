@@ -420,3 +420,120 @@ def test_the_overlay_style_comes_from_the_environment(monkeypatch, env, expected
     for name, value in env.items():
         monkeypatch.setenv(name, value)
     assert presence.style() == expected
+
+
+# ── The lock follows the page: zoom, a resize between tool calls, full screen ────────────────
+
+
+class _Viewport:
+    def __init__(self, w, h):
+        self.client_width, self.client_height = w, h
+
+
+def test_the_page_is_measured_in_screen_points_whatever_its_zoom():
+    """CSS pixels shrink with zoom: at 125% the lock came out 800x442 over a 1000x553 page."""
+    at_100 = (_Viewport(2000, 1106), None, None, _Viewport(1000, 553))
+    at_125 = (_Viewport(2000, 1106), None, None, _Viewport(800, 442))
+    assert presence.page_size(at_100, 1000) == (1000.0, 553.0)
+    assert presence.page_size(at_125, 1000) == (1000.0, 553.0)
+    assert presence.page_size((_Viewport(1000, 553), None, None, _Viewport(800, 442)), 1000) == (1000.0, 553.0)
+    # A classic scrollbar takes a few pixels: the display's scale still rounds to 2.
+    assert presence.page_size((_Viewport(1970, 1106), None, None, _Viewport(985, 553)), 1000) == (985.0, 553.0)
+    # Without the device-pixel viewport, the CSS one as before.
+    assert presence.page_size((None, None, None, _Viewport(800, 442)), 1000) == (800, 442)
+
+
+class _Bounds:
+    left, top, width, height, window_state = 100, 100, 1000, 640, "normal"
+
+
+class _MetricsTab:
+    target = None
+
+    def __init__(self):
+        self.sent = 0
+
+    async def send(self, cmd):
+        self.sent += 1
+        name = getattr(cmd, "__qualname__", "") or repr(cmd)
+        if "window_for_target" in repr(cmd) or "get_window_for_target" in name:
+            return 1, _Bounds()
+        return (_Viewport(2000, 1106), None, None, _Viewport(800, 442))
+
+
+def test_refresh_window_writes_only_what_changed(tmp_path, monkeypatch):
+    browser, overlay = _overlay(tmp_path)
+    try:
+        writes = []
+        real = overlay.write
+        monkeypatch.setattr(overlay, "write", lambda **kw: (writes.append(kw), real(**kw)))
+        from nodriver.cdp import browser as cdp_browser
+        monkeypatch.setattr(cdp_browser, "get_window_for_target", lambda target_id=None: "window_for_target")
+        tab = _MetricsTab()
+        asyncio.run(presence.refresh_window(overlay, tab))
+        assert writes == [{"window": [100, 100, 1000, 640], "viewport": [0.0, 87.0, 1000.0, 553.0],
+                           "window_state": "normal", "zoom": 1.25}]
+        asyncio.run(presence.refresh_window(overlay, tab))
+        assert len(writes) == 1  # nothing changed: the file is left alone
+    finally:
+        overlay.proc.kill()
+
+
+def _overlay_page_rect(full=False, saved=None):
+    """The overlay's own insets() and Overlay.page_rect, taken from its source (it imports AppKit
+    at the top, so it cannot be imported here)."""
+    import ast
+    from pathlib import Path
+    tree = ast.parse((Path(presence.__file__).with_name("_agent_overlay.py")).read_text())
+    func = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "insets")
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Overlay")
+    method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "page_rect")
+    holder = ast.ClassDef(name="Holder", bases=[], keywords=[], body=[method], decorator_list=[])
+    space = {}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[func, holder], type_ignores=[])), "_agent_overlay.py", "exec"), space)
+    obj = space["Holder"]()
+    obj.full, obj.insets = full, saved
+    return obj
+
+
+def test_the_lock_follows_a_window_resized_between_tool_calls():
+    measured = {"window": [100, 100, 1000, 640], "viewport": [0.0, 87.0, 1000.0, 553.0], "window_state": "normal"}
+    o = _overlay_page_rect()
+    assert o.page_rect((100.0, 100.0, 1000.0, 640.0), measured) == (100.0, 187.0, 1000.0, 553.0)
+    # The person widened and moved the window; the server has not measured since.
+    assert o.page_rect((220.0, 100.0, 1250.0, 640.0), measured) == (220.0, 187.0, 1250.0, 553.0)
+
+
+def test_in_full_screen_the_lock_is_the_content_window_and_its_insets_are_not_kept():
+    fs = {"window": [0, 0, 1728, 1117], "viewport": [0.0, 121.0, 1728.0, 996.0], "window_state": "fullscreen"}
+    o = _overlay_page_rect(full=True, saved=(0.0, 87.0, 0.0, 0.0))
+    assert o.page_rect((0.0, 121.0, 1728.0, 996.0), fs) == (0.0, 121.0, 1728.0, 996.0)
+    # Back from full screen before the next measurement: the normal insets, not full screen's.
+    o.full = False
+    assert o.page_rect((220.0, 100.0, 1250.0, 640.0), fs) == (220.0, 187.0, 1250.0, 553.0)
+
+
+def test_a_call_marks_its_overlay_busy_until_it_ends_whatever_is_current_by_then(tmp_path):
+    """A call longer than the quiet times read as idle: HIDE_AFTER took the lock away mid-call."""
+    browser, overlay = _overlay(tmp_path)
+    other = _Browser()  # switch_instance during the call: another browser is current at its end
+
+    async def one_call(current_at_end, running_before):
+        await presence.before_tool("wait_for", browser, None)
+        assert overlay.agent["busy"] is True and overlay.in_flight == running_before + 1
+        presence.after_tool(current_at_end)
+
+    async def two_at_once():
+        await presence.before_tool("wait_for", browser, None)
+        await asyncio.gather(one_call(browser, 1))  # a second call starts and ends meanwhile
+        assert overlay.agent["busy"] is True and overlay.in_flight == 1
+        presence.after_tool(browser)
+        assert overlay.agent["busy"] is False and overlay.in_flight == 0
+
+    try:
+        asyncio.run(one_call(other, 0))
+        assert overlay.agent["busy"] is False and overlay.in_flight == 0
+        assert json.loads((overlay.folder / "agent.json").read_text())["busy"] is False
+        asyncio.run(two_at_once())
+    finally:
+        overlay.proc.kill()

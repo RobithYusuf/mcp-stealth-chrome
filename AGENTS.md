@@ -1149,7 +1149,12 @@ the person (the same target events as Cmd+T, a followed link, a closed tab).
   `settings.get`, never `os.environ` directly, or the file and the menu silently do nothing for it.
 - A value that does not parse is skipped with a note (`resolve`), never applied; the file is read with `O_NOFOLLOW`,
   only as a regular file owned by this user, and anything else reads as no settings. It is written 0600 in a 0700
-  folder through a fresh `O_EXCL` file and `os.replace`, never through a link.
+  folder through a fresh `O_EXCL` file and `os.replace`, never through a link, under an flock on `.settings.json.lock`
+  taken by both writers (`settings._one_writer` and the overlay's `write_settings`): without it, two writers each read
+  the old file and the second rename dropped the first one's choice (75 of 120 lost in the test).
+- The overlay applies `overlay_bar`, `overlay_light`, `overlay_lock`, `overlay_hide_after` and `agent_cursor` from the
+  file as they change; a value the environment fixed comes in `fixed` and wins. The menu's cursor item saves
+  `agent_cursor`; the bar's arrow button toggles the cursor for that browser alone, and an unchanged file never undoes it.
 - `server_status.settings` lists each value and its source (`default`, `file`, `env <NAME>`): a setting that "does
   not change" is usually one an environment variable fixes.
 - `_agent_overlay.py` has its own copy of the reader and of the order (it runs with `-I` and imports nothing of the
@@ -1249,6 +1254,32 @@ the person (the same target events as Cmd+T, a followed link, a closed tab).
   (`setAnimationBehavior_(None)`), which shrank them for a third of a second. Measured: gone 0.13 s after a Quit
   (3.35 s before), 0.31 s after a window close, with the close animation. While the window moves the tick runs at
   TICK_MOVING (60 a second, `schedule`), 20 otherwise: at 20 the light trailed a drag.
+- The lock follows the page, not the last measurement (OMP review and measurements, 20 Nov 2026). The server reads the
+  window and the page (`refresh_window`) before each call, right after each call (`after_tool` starts it, so a launch has
+  its lock at once; before, none until the next call), and about once a second while the overlay shows
+  (`_follow_window`; not while the person holds the browser or after the overlay faded), and writes only what changed.
+  The overlay applies the page's insets from its window to the window's live frame every tick (`page_rect`): a window
+  widened from 1000 to 1250 pt between calls left the right 250 pt unlocked; now the lock follows 0.001 s after the light.
+  In full screen the window followed is Chrome's content view (the tab strip and toolbar are windows of their own), so
+  the lock is that window and the light goes round the screen less its safe-area band (`screen_frame_of`: 32 pt under
+  the camera housing, 0 on an external display; measured on both). Insets measured in full screen are not kept for the
+  normal window. Panels are a `Panel` subclass that AppKit does not constrain: it pushed the full-screen light's top
+  33 pt down, out of the menu bar's band.
+- The page is measured in screen points from the device-pixel `layoutViewport` (`presence.page_size`), not the CSS
+  one: CSS pixels shrink with the page's zoom, and at 125% the lock was 800x442 at an offset over a 1000x553 page.
+  `zoom` goes to the overlay for the agent's cursor, which is in CSS pixels.
+- The followed window is kept when the person moves or resizes it; another window is followed only when it matches the
+  server's last bounds, checked once per new measurement (`want_seen`). Dropping it on any mismatch jumped to the
+  largest window of the browser and read every window on screen four times a second; minimize hid in 0.55 s that way,
+  now 0.02 s. Between scans the followed window's own bounds are read every tick (`followed_bounds`: one window 0.12 ms
+  against 0.47 ms for all on screen), so a drag or resize is followed in 0.03 to 0.12 s instead of the next scan.
+- A call in flight is not quiet: `before_tool` marks the overlay busy (`in_flight`, and `_CALL_OVERLAY` carries that
+  overlay to the same call's `after_tool` whatever instance is current by then), and the overlay counts no quiet time
+  while `busy`. A call longer than `HIDE_AFTER` (a long wait_for) took the light, the bar and the lock away mid-call.
+- A window whose alpha falls under 0.5 is closing and is never followed again until it is gone or back at 0.95
+  (`closing`): it stays listed and on screen for its 0.3 s close animation, and the same tick took it back and showed
+  the overlay over it again. Measured: last seen 0.03 s after the close, never again.
+- The first tick runs as the overlay starts (the timer's first one is skipped as calm).
 - `presence.style()` reads the person's choice (the `overlay_bar`, `overlay_light` and `overlay_lock` settings) and passes
   it to the overlay: bar full, compact (30 pt bar, first words of the status, no cursor switch), hover (shown while the
   pointer is over the visible browser window, `HOVER_LINGER` after) or off; light and lock on/off. The overlay reads the

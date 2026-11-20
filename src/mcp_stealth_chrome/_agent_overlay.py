@@ -260,12 +260,23 @@ def write_settings(changes):
     """Merge into the settings file as settings.write does: a fresh 0600 file, then a rename."""
     if not SETTINGS_FILE:
         return
-    data = read_settings()
-    data.update(changes)
     folder = os.path.dirname(SETTINGS_FILE)
     os.makedirs(folder, mode=0o700, exist_ok=True)
     if os.path.islink(SETTINGS_FILE):
         return
+    import fcntl
+    lock = os.open(os.path.join(folder, f".{os.path.basename(SETTINGS_FILE)}.lock"),
+                   os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)  # settings.write takes the same: no choice is lost
+        _merge_settings(changes, folder)
+    finally:
+        os.close(lock)
+
+
+def _merge_settings(changes, folder):
+    data = read_settings()
+    data.update(changes)
     tmp = os.path.join(folder, f".settings.{os.getpid()}.{time.time_ns()}.tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
@@ -323,6 +334,26 @@ def full_screen(x, y, w, h, state=None):
     return False
 
 
+def screen_frame_of(x, y, w, h):
+    """The part of the screen holding a window's centre that a full-screen app draws in (global,
+    top-left origin), or None: the whole screen less the camera housing's band on a display with
+    one (its safe area, 33 pt on a 14-inch MacBook Pro), where macOS keeps full screen black."""
+    H = screen_height()
+    cx, cy = x + w / 2, y + h / 2
+    for screen in NSScreen.screens():
+        f = screen.frame()
+        top = H - (f.origin.y + f.size.height)
+        if f.origin.x <= cx < f.origin.x + f.size.width and top <= cy < top + f.size.height:
+            band = 0.0
+            if hasattr(screen, "safeAreaInsets"):
+                try:
+                    band = float(screen.safeAreaInsets().top)
+                except Exception:
+                    band = 0.0
+            return (f.origin.x, top + band, f.size.width, f.size.height - band)
+    return None
+
+
 def entries(infos):
     """Window dictionaries as plain tuples, front to back: (number, pid, normal, bounds, onscreen).
     Each value read from a dictionary goes through the bridge, so read each once, and only the
@@ -373,6 +404,19 @@ def inside(a, b):
     return a[0] >= b[0] and a[1] >= b[1] and a[0] + a[2] <= b[0] + b[2] and a[1] + a[3] <= b[1] + b[3]
 
 
+def insets(window, viewport):
+    """The page's distance from each edge of its window (left, top, right, bottom), from the
+    server's last measurement (CDP window bounds and the page's place in them), or None."""
+    if not (isinstance(window, list) and isinstance(viewport, list) and len(window) == 4 and len(viewport) == 4):
+        return None
+    try:
+        width, height = float(window[2]), float(window[3])
+        left, top, vw, vh = (float(v) for v in viewport)
+    except (TypeError, ValueError):
+        return None
+    return (max(0.0, left), max(0.0, top), max(0.0, width - left - vw), max(0.0, height - top - vh))
+
+
 def near(b, want, slack=4.0):
     return all(abs(float(p) - float(q)) <= slack for p, q in zip(b, want))
 
@@ -419,8 +463,17 @@ def visible_at(wins, target, x, y):
     return False
 
 
+class Panel(NSPanel):
+    """A panel that stays where it is put. AppKit moves a window out of the menu bar's band when
+    it is ordered in: in full screen the light's top edge was pushed 33 pt down, off the tab
+    strip it should outline."""
+
+    def constrainFrameRect_toScreen_(self, rect, _screen):
+        return rect
+
+
 def panel(frame, takes_clicks, shadow=False):
-    p = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+    p = Panel.alloc().initWithContentRect_styleMask_backing_defer_(
         frame, BORDERLESS | NONACTIVATING, BUFFERED, False)
     p.setOpaque_(False)
     p.setBackgroundColor_(NSColor.clearColor())
@@ -1047,6 +1100,7 @@ class Overlay:
         still = bool(NSWorkspace.sharedWorkspace().accessibilityDisplayShouldReduceMotion())
         self.target, self.still = target, still
         self.settings_at, self.settings_seen = 0.0, None
+        self.cursor_seen = bool(CONFIG.get("cursor"))
         self.glow = Glow(still, scale)
         self.pointer = Pointer(scale)
         self.ripples = Ripples()
@@ -1068,6 +1122,10 @@ class Overlay:
         self.scanned_at = 0.0
         self.ticks = 0
         self.window_state = None
+        self.full = False       # the window followed is a full-screen content view
+        self.insets = None      # the page's insets from its window, measured outside full screen
+        self.want_seen = None   # the server's last window bounds already matched against
+        self.closing = None     # a window seen fading out as it closes: not followed again
         self.hover_until = 0.0
         self.missing_since = None
         self.gone_since = None
@@ -1101,15 +1159,54 @@ class Overlay:
                 self.agent, self.agent_stamp = data, stamp
         return self.agent
 
+    def followed_bounds(self, pid):
+        """The followed window's bounds now, or None when it is gone or off screen."""
+        if self.win is None:
+            return None
+        for number, owner, ordinary, bounds, onscreen in one_window(self.win):
+            if number == self.win:
+                return bounds if ordinary and onscreen and owner == pid else None
+        return None
+
+    def page_rect(self, b, a):
+        """Where the page is on screen now (global, top-left origin). The server measures it at
+        each tool call and about once a second while the overlay shows, but the person can move
+        or resize the window in between: the light followed at once and the lock kept the old
+        size (measured: a window widened from 1000 to 1250 left 250 pt of the page unlocked). So
+        the page's insets from its window are applied to the window's live frame. In full screen
+        the window followed is the content view itself (the toolbar is a window of its own), so
+        it is the page."""
+        x, y, w, h = b
+        if self.full:
+            return x, y, w, h
+        measured = insets(a.get("window"), a.get("viewport"))
+        if measured is not None and a.get("window_state") != "fullscreen":
+            self.insets = measured  # full screen's insets belong to another window
+        left, top, right, bottom = self.insets or measured or (0.0, 0.0, 0.0, 0.0)
+        return x + left, y + top, max(0.0, w - left - right), max(0.0, h - top - bottom)
+
     def browser_window(self, pid, scan, want=None):
         """Bounds of the window followed, kept while it is on screen, so a popup the browser
         opens never moves the overlay. A scan reads the windows above it as well. `want` is
         where the server last saw the window of the agent's tab; another window of the browser
         matching it better is followed instead."""
-        if self.win is not None and want and scan:
+        if self.win is not None and want and scan and want != self.want_seen:
+            # Once per new word from the server: it saw the agent's tab in a window of another
+            # size or place. Either the person moved or resized this one (keep following it), or
+            # the tab is now in another window (follow that). Only a window matching says which;
+            # dropping this one whenever its bounds differed jumped to the largest window, and
+            # read every window on screen four times a second until the next tool call.
+            self.want_seen = want
             current = next((e for e in one_window(self.win) if e[0] == self.win), None)
-            if current is None or current[3] is None or not near(current[3], want):
+            if current is None or current[3] is None:
                 self.win = None
+            elif not near(current[3], want):
+                match = next((e[0] for e in all_windows()
+                              if e[1] == pid and e[2] and e[3] is not None and near(e[3], want)), None)
+                if match is not None and match != self.win:
+                    self.win = None
+        if self.win is not None and self.win == self.closing:
+            self.win = None
         if self.win is not None:
             got = above_and_including(self.win) if scan else one_window(self.win)
             for number, owner, ordinary, b, onscreen in got:
@@ -1122,6 +1219,8 @@ class Overlay:
         # Lost or not chosen yet: the one where the agent's tab is, else the largest.
         best = None
         for number, owner, ordinary, b, _on in all_windows():
+            if number == self.closing:
+                continue
             if owner == pid and ordinary and b[2] >= 300 and b[3] >= 200:
                 if want and near(b, want):
                     best = (number, b)
@@ -1195,6 +1294,14 @@ class Overlay:
             return  # nothing moves: 10 ticks a second are enough
         a = self.read_agent()
         self.check_settings(now)
+        if self.closing is not None:
+            # A window seen closing is never followed again while it fades: it stays listed and
+            # "on screen" for the 0.3 s of its close animation, and taking it back showed the
+            # light and the lock over it again until it was gone. Only gone, or fully back (an
+            # alpha that dipped for another reason), ends that.
+            closing_alpha = window_alpha(self.closing)
+            if closing_alpha is None or closing_alpha >= 0.95:
+                self.closing = None
         alpha = window_alpha(self.win) if self.shown and self.win is not None else 1.0
         if alpha is None or alpha < 0.5:
             # The browser's window no longer exists (the browser quit), or is fading out as macOS
@@ -1203,6 +1310,8 @@ class Overlay:
             self.hide()
             self.frame = None
             self.missing_since = self.missing_since or now
+            self.closing = self.win if alpha is not None else None
+            self.win = None
         if a.get("ended"):
             leave(True)  # the server removes the folder too; whichever comes first
             return
@@ -1218,11 +1327,13 @@ class Overlay:
             if scan:
                 self.scanned_at = now
         elif pid and self.frame is not None and self.missing_since is None:
-            # The last bounds stand in between scans only while the window is there. Once a scan
-            # missed it they must not, or every tick in between reset the missing time and
-            # MISSING_FOR never ran out: after a Quit the light and the lock over the page (which
-            # takes clicks) stayed 3.35 s, until this process left with the browser.
-            b = self.frame
+            # Between scans, the followed window's own bounds (one window: 0.12 ms, against 0.47
+            # for every window on screen), so a drag or a resize the person starts is followed from
+            # its first frame instead of the next scan (it lagged 0.2 to 0.3 s). Only while the
+            # window is there: once a scan missed it the cached bounds must not stand in, or every
+            # tick reset the missing time and MISSING_FOR never ran out (after a Quit the light and
+            # the lock, which takes clicks, stayed 3.35 s).
+            b = self.followed_bounds(pid)
         if b is None:
             # The lock over the page is invisible, so it goes at once: nothing on screen changes,
             # and clicks where the closed window was are not swallowed during MISSING_FOR. The
@@ -1258,11 +1369,19 @@ class Overlay:
         H = screen_height()
         y_ns = H - y - h
         state = a.get("window_state")
+        relayout = b != self.frame
         if b != self.frame or state != self.window_state:
             self.window_state = state
-            self.glow.corners("square" if full_screen(x, y, w, h, state) else "round")
-        if b != self.frame:
-            self.glow.layout(x, y_ns, w, h)
+            full = full_screen(x, y, w, h, state)
+            relayout = relayout or full != self.full
+            self.full = full
+            self.glow.corners("square" if self.full else "round")
+        if relayout:
+            # The light goes round the whole browser. In full screen the window followed is the
+            # page's content view, and the tab strip and toolbar are windows of their own above
+            # it, so the light took in the page alone; there it goes round the screen.
+            lx, ly, lw, lh = (screen_frame_of(x, y, w, h) or b) if self.full else b
+            self.glow.layout(lx, H - ly - lh, lw, lh)
             self.bar.fit(w)
             self.frame = b
             self.moved_until = now + MOVING_FOR  # follow a dragged window at the full rate
@@ -1274,7 +1393,9 @@ class Overlay:
         new_key = key + 0.005 < self.prev_key
         self.prev_key = key
         over = not self.bar.contains(loc.x, loc.y) and visible_at(self.wins, wid, loc.x, H - loc.y)
-        quiet = now - float(a.get("active_at", 0))
+        # A tool call still running is not quiet, however long it takes (a long wait_for): the
+        # server marks it busy from before the call to after it.
+        quiet = 0.0 if a.get("busy") else now - float(a.get("active_at", 0))
         help_text = a.get("help")
 
         # A request for help and the person's hold outlast any quiet: their buttons (Done,
@@ -1308,8 +1429,14 @@ class Overlay:
                       if LIGHT_ON else "off")
         self.glow.settle(now)
         cursor, vp = a.get("cursor"), a.get("viewport")
-        if cursor and vp:
-            cx, cy = x + vp[0] + cursor[0], y + vp[1] + cursor[1]  # screen, top-left origin
+        page = self.page_rect(b, a) if vp else None
+        if cursor and page:
+            try:
+                zoom = float(a.get("zoom") or 1.0)
+            except (TypeError, ValueError):
+                zoom = 1.0
+            # screen, top-left origin; the cursor is in CSS pixels, which the page's zoom scales
+            cx, cy = page[0] + cursor[0] * zoom, page[1] + cursor[1] * zoom
             self.pointer.move(cx, H - cy)
         else:
             cursor = None
@@ -1342,10 +1469,10 @@ class Overlay:
                          "Done", "primary", DOT["help"], True, show_cursor)
         self.bar.place(x, y_ns, w)
 
-        want_shield = LOCK_ON and mode in WORKING and bool(vp)
+        want_shield = LOCK_ON and mode in WORKING and bool(page)
         if want_shield:
-            left, top, vw, vh = vp
-            rect = (x + left, H - (y + top) - vh, vw, vh)
+            px, py, pw, ph = page
+            rect = (px, H - py - ph, pw, ph)
             if rect != self.shield_rect:
                 self.shield.setFrame_display_(NSMakeRect(*rect), False)
                 self.shield_rect = rect
@@ -1433,7 +1560,28 @@ class Overlay:
         if seen == self.settings_seen and not force:
             return
         self.settings_seen = seen
-        self.apply_style(*chosen_style(read_settings()))
+        data = read_settings()
+        self.apply_style(*chosen_style(data))
+        self.apply_timing_and_cursor(data)
+
+    def apply_timing_and_cursor(self, data):
+        """overlay_hide_after and agent_cursor from the file (the environment's fixed value wins),
+        applied as they change: they were read only when the overlay started."""
+        global HIDE_AFTER
+        try:
+            hide = float(FIXED.get("overlay_hide_after", data.get("overlay_hide_after", CONFIG.get("hide_after", 90.0))))
+            if 1.0 <= hide <= 86400.0:
+                HIDE_AFTER = hide
+        except (TypeError, ValueError):
+            pass
+        cursor = _flag(FIXED.get("agent_cursor", data.get("agent_cursor", CONFIG.get("cursor", False))), False)
+        if cursor != self.cursor_seen:
+            # Only a change of the setting: the bar's arrow button toggles the cursor for this
+            # browser alone, and a file left as it was must not undo that.
+            self.cursor_seen = cursor
+            if bool(self.control.get("show_cursor")) != cursor:
+                self.control["show_cursor"] = cursor
+                self.save()
 
     def apply_style(self, bar, light, lock):
         global BAR_MODE, LIGHT_ON, LOCK_SETTING, LOCK_ON
@@ -1497,7 +1645,10 @@ class Overlay:
         lock_title = ("Lock the page" + (fixed_note if "overlay_lock" in FIXED else "")
                       + ("  (off while the bar is hidden)" if BAR_MODE == "off" else ""))
         item(lock_title, "toggleLock:", LOCK_ON, "overlay_lock" not in FIXED and BAR_MODE != "off")
-        item("Agent's cursor", "onCursor:", bool(self.control.get("show_cursor")))
+        if "agent_cursor" in FIXED:
+            item("Agent's cursor" + fixed_note, "onCursor:", bool(self.control.get("show_cursor")))
+        else:
+            item("Agent's cursor", "pickCursor:", bool(self.control.get("show_cursor")))
         menu.addItem_(NSMenuItem.separatorItem())
         item("Saved for every agent browser", None, enabled=False)
         # Above the button: the bar sits at the bottom of the window, and a menu opened below it
@@ -1569,6 +1720,12 @@ class Target(NSObject):
         except Exception:
             traceback.print_exc()
 
+    def pickCursor_(self, _sender):
+        try:
+            OVERLAY.choose("agent_cursor", not bool(OVERLAY.control.get("show_cursor")))
+        except Exception:
+            traceback.print_exc()
+
     def toggleLight_(self, _sender):
         try:
             OVERLAY.choose("overlay_light", not LIGHT_ON)
@@ -1595,5 +1752,6 @@ if __name__ in ("__main__", "<stdin>"):
     center = NSWorkspace.sharedWorkspace().notificationCenter()
     for name in (NSWorkspaceDidActivateApplicationNotification, NSWorkspaceActiveSpaceDidChangeNotification):
         center.addObserver_selector_name_object_(TARGET, "switched:", name, None)
+    OVERLAY.tick(force=True)  # the first tick now: the timer's first one was skipped as calm
     schedule(TICK)
     app.run()

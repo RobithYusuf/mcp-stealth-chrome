@@ -81,7 +81,7 @@ def test_write_merges_removes_and_keeps_the_file_private(sfile):
     assert json.loads(sfile.read_text()) == {"overlay_bar": "compact", "overlay_light": False}
     assert stat.S_IMODE(sfile.stat().st_mode) == 0o600
     assert stat.S_IMODE(sfile.parent.stat().st_mode) == 0o700
-    assert [p.name for p in sfile.parent.iterdir()] == ["settings.json"]  # no temporary file left
+    assert sorted(p.name for p in sfile.parent.iterdir()) == [".settings.json.lock", "settings.json"]  # no temporary file
 
 
 def test_set_value_refuses_what_it_does_not_know(sfile):
@@ -157,7 +157,7 @@ def _overlay_rule(settings_file, fixed):
     the top, so it cannot be imported here."""
     source = (Path(presence.__file__).with_name("_agent_overlay.py")).read_text()
     tree = ast.parse(source)
-    wanted = {"read_settings", "write_settings", "_flag", "chosen_style"}
+    wanted = {"read_settings", "write_settings", "_merge_settings", "_flag", "chosen_style"}
     body = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in wanted]
     assert {node.name for node in body} == wanted
     space = {"os": os, "json": json, "stat": stat, "time": time, "SETTINGS_FILE": str(settings_file),
@@ -196,7 +196,7 @@ def test_a_choice_from_the_overlay_menu_lands_in_the_file_the_server_reads(sfile
     assert settings.resolve("overlay_bar") == {"value": "hover", "source": "file"}
     assert settings.get("agent_overlay") is True  # merged, not replaced
     assert stat.S_IMODE(sfile.stat().st_mode) == 0o600
-    assert [p.name for p in sfile.parent.iterdir()] == ["settings.json"]
+    assert sorted(p.name for p in sfile.parent.iterdir()) == [".settings.json.lock", "settings.json"]
 
 
 def test_server_status_reports_each_setting_and_where_it_came_from(sfile, monkeypatch):
@@ -216,3 +216,66 @@ def test_the_developers_own_file_never_reaches_the_suite():
     """conftest points every test at a file of the run's own."""
     given = os.environ.get(settings.ENV_FILE, "")
     assert given and Path(given) != Path.home() / ".mcp-stealth" / "settings.json"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the lock is flock, POSIX only")
+def test_two_writers_at_once_lose_no_choice(sfile):
+    """Read, merge and rename were not one step: two writers each read the old file and the
+    second rename dropped the first one's choice. The command and the overlay share one lock."""
+    import threading
+    settings.write({})
+    rule = _overlay_rule(sfile, {})
+
+    def server_side(n):
+        for i in range(40):
+            settings.write({f"server_{n}_{i}": i})
+
+    def overlay_side():
+        for i in range(40):
+            rule["write_settings"]({f"overlay_{i}": i})
+
+    threads = [threading.Thread(target=server_side, args=(n,)) for n in range(2)]
+    threads.append(threading.Thread(target=overlay_side))
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    data = json.loads(sfile.read_text())
+    assert len(data) == 120, f"{120 - len(data)} choices were lost"
+
+
+def _overlay_live(fixed, cursor_at_start=False, show_cursor=False):
+    """Overlay.apply_timing_and_cursor with the globals it uses, taken from the overlay's source."""
+    source = (Path(presence.__file__).with_name("_agent_overlay.py")).read_text()
+    tree = ast.parse(source)
+    flag = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_flag")
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Overlay")
+    method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "apply_timing_and_cursor")
+    holder = ast.ClassDef(name="Holder", bases=[], keywords=[], body=[method], decorator_list=[])
+    space = {"FIXED": fixed, "CONFIG": {"hide_after": 90.0, "cursor": cursor_at_start}, "HIDE_AFTER": 90.0}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[flag, holder], type_ignores=[])), "_agent_overlay.py", "exec"), space)
+    obj = space["Holder"]()
+    obj.control, obj.cursor_seen, obj.saved = {"show_cursor": show_cursor}, cursor_at_start, 0
+
+    def save():
+        obj.saved += 1
+    obj.save = save
+    return obj, space
+
+
+def test_the_overlay_applies_its_hide_delay_and_the_cursor_setting_as_they_change():
+    obj, space = _overlay_live({})
+    obj.apply_timing_and_cursor({"overlay_hide_after": 10})
+    assert space["HIDE_AFTER"] == 10.0
+    obj.apply_timing_and_cursor({"overlay_hide_after": -1})  # out of range: kept
+    assert space["HIDE_AFTER"] == 10.0
+    obj.apply_timing_and_cursor({"agent_cursor": True})
+    assert obj.control["show_cursor"] is True and obj.saved == 1
+    # The bar's arrow turned it off for this browser; the file did not change: left off.
+    obj.control["show_cursor"] = False
+    obj.apply_timing_and_cursor({"agent_cursor": True})
+    assert obj.control["show_cursor"] is False
+    # The environment fixed both: the file does not move them.
+    obj, space = _overlay_live({"overlay_hide_after": 45.0, "agent_cursor": False})
+    obj.apply_timing_and_cursor({"overlay_hide_after": 5, "agent_cursor": True})
+    assert space["HIDE_AFTER"] == 45.0 and obj.control["show_cursor"] is False

@@ -151,10 +151,39 @@ def report() -> dict:
     return {"file": str(path()), **{s.key: resolve(s.key, data) for s in SETTINGS}}
 
 
+@contextlib.contextmanager
+def _one_writer(target: Path):
+    """An exclusive flock beside the file for the whole read, merge and rename: two writers at
+    once (the menu of two overlays, or the menu and the command) each read the old file and the
+    second rename dropped the first one's choice. The overlay process takes the same lock.
+    Without fcntl (Windows) writes go on unlocked, as before."""
+    try:
+        import fcntl
+    except ImportError:
+        yield
+        return
+    fd = os.open(target.parent / f".{target.name}.lock",
+                 os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
 def write(changes: dict, target: Optional[Path] = None) -> None:
     """Merge `changes` (key -> value, None removes it) into the file: a fresh 0600 file beside it,
     then a rename, so a reader sees the old file or the whole new one."""
     target = target or path()
+    folder = target.parent
+    folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if target.is_symlink():
+        raise OSError(f"{target} is a link; not written through")
+    with _one_writer(target):
+        _merge_and_replace(changes, target)
+
+
+def _merge_and_replace(changes: dict, target: Path) -> None:
     data = read_file(target)
     for key, value in changes.items():
         if value is None:
@@ -162,9 +191,6 @@ def write(changes: dict, target: Optional[Path] = None) -> None:
         else:
             data[key] = value
     folder = target.parent
-    folder.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if target.is_symlink():
-        raise OSError(f"{target} is a link; not written through")
     tmp = folder / f".{target.name}.{secrets.token_hex(4)}.tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
     try:

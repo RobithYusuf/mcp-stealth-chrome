@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import importlib.util
 import json
 import os
@@ -164,7 +165,7 @@ def _script() -> str:
     return (Path(__file__).with_name("_agent_overlay.py")).read_text(encoding="utf-8")
 
 
-LIVE_SETTINGS = ("overlay_bar", "overlay_light", "overlay_lock")
+LIVE_SETTINGS = ("overlay_bar", "overlay_light", "overlay_lock", "overlay_hide_after", "agent_cursor")
 
 
 def overlay_config(folder: Path, pid: int, cursor: bool, start: Optional[str] = None) -> dict:
@@ -223,13 +224,16 @@ class Overlay:
         self.restarts = 0
         self.agent_file = folder / "agent.json"
         self.control_file = folder / "control.json"
-        self.agent: dict = {"pid": pid, "active_at": 0.0, "status": "", "help": None,
+        self.agent: dict = {"pid": pid, "active_at": 0.0, "busy": False, "status": "", "help": None,
                             "waiting": None, "cursor": None, "click_at": 0.0,
                             "viewport": None, "window": None}
         self.control: dict = {}
         self.control_stamp: Any = None
         self.pointer_at = 0.0
         self.window_read: tuple = (None, 0.0)  # (tab, when)
+        self.hide_after = HIDE_AFTER
+        self.follow_task: Any = None
+        self.in_flight = 0  # tool calls running on this browser
         self.write()
 
     def write(self, **kw: Any) -> None:
@@ -395,6 +399,11 @@ async def attach(browser: Any, pid: Optional[int], *, ask: Optional[bool], headl
                else f"the overlay did not confirm it was up within {READY_WAIT:.0f}s")
         stop(browser)
         return f" [agent_overlay: OFF, {why}]"
+    from . import settings
+    with contextlib.suppress(Exception):
+        overlay.hide_after = float(settings.get("overlay_hide_after"))
+    with contextlib.suppress(RuntimeError):
+        overlay.follow_task = asyncio.get_running_loop().create_task(_follow_window(overlay))
     return (" [agent_overlay: on: a light around the window while the agent acts and "
             "a bar with Take over; while the person holds the browser the tools that act on or "
             "read the page are refused]")
@@ -415,6 +424,24 @@ def stop_all() -> None:
             overlay.stop()
 
 
+def page_size(metrics: Any, window_width: Any) -> tuple:
+    """The page's width and height in screen points (what window bounds use), or (None, None).
+
+    Not the CSS layout viewport: CSS pixels shrink with the page's zoom, and at 125% the lock
+    over the page came out 800x442 at an offset over a 1000x553 page, leaving 100 pt on each
+    side and 111 at the top unlocked (measured, Chrome 157). The legacy layoutViewport is in
+    device pixels, which zoom does not change (2000x1106 at 100% and at 125% on a 2x display);
+    the display's scale is that width over the window's, rounded, since a Chrome window has no
+    side border and a classic scrollbar only takes a few pixels off it."""
+    device = metrics[0] if metrics else None
+    dw, dh = getattr(device, "client_width", None), getattr(device, "client_height", None)
+    if dw and dh and window_width:
+        scale = max(1, round(float(dw) / float(window_width)))
+        return float(dw) / scale, float(dh) / scale
+    view = metrics[3] if metrics and len(metrics) > 3 else (metrics[1] if metrics else None)
+    return getattr(view, "client_width", None), getattr(view, "client_height", None)
+
+
 async def refresh_window(overlay: Overlay, tab: Any) -> None:
     """Which window shows the agent's tab, and where its page sits inside it."""
     from nodriver.cdp import browser as cdp_browser
@@ -423,9 +450,8 @@ async def refresh_window(overlay: Overlay, tab: Any) -> None:
     _wid, bounds = await asyncio.wait_for(
         tab.send(cdp_browser.get_window_for_target(target_id=target_id)), 1.0)
     metrics = await asyncio.wait_for(tab.send(cdp_page.get_layout_metrics()), 1.0)
-    view = metrics[3] if len(metrics) > 3 else metrics[1]  # css layout viewport
     width, height = getattr(bounds, "width", None), getattr(bounds, "height", None)
-    inner_w, inner_h = getattr(view, "client_width", None), getattr(view, "client_height", None)
+    inner_w, inner_h = page_size(metrics, width)
     window = [getattr(bounds, "left", None), getattr(bounds, "top", None), width, height]
     viewport = None
     if width and height and inner_w and inner_h:
@@ -434,8 +460,41 @@ async def refresh_window(overlay: Overlay, tab: Any) -> None:
     # so the overlay cannot tell full screen from the bounds alone; the browser says it here.
     state = getattr(bounds, "window_state", None)
     state = getattr(state, "value", state)
-    overlay.write(window=window if None not in window else None, viewport=viewport,
-                  window_state=str(state) if state else None)
+    css = metrics[3] if len(metrics) > 3 else None
+    css_w = getattr(css, "client_width", None)
+    # Page coordinates (the agent's pointer) are CSS pixels: on screen they are this many points.
+    zoom = round(float(inner_w) / float(css_w), 4) if inner_w and css_w else 1.0
+    measured = {"window": window if None not in window else None, "viewport": viewport,
+                "window_state": str(state) if state else None, "zoom": zoom}
+    if any(overlay.agent.get(key) != value for key, value in measured.items()):
+        overlay.write(**measured)  # unchanged: the overlay's file stays as it is
+
+
+FOLLOW_EVERY = 1.0  # seconds between window reads while the overlay shows and no tool runs
+
+
+async def _follow_window(overlay: Overlay) -> None:
+    """Read the agent's window and page again about once a second while the overlay shows.
+    Tool calls read them too, but between two calls the person can enter full screen, show the
+    bookmarks bar or zoom, and the lock over the page must not stay where the page was. The
+    overlay follows moves and resizes itself, from the window's live frame. Nothing is read
+    while the person holds the browser (the lock is off then) or once the overlay has faded."""
+    while overlay in _LIVE:
+        await asyncio.sleep(FOLLOW_EVERY)
+        tab, read_at = overlay.window_read
+        now = time.time()
+        if tab is None or now - read_at < FOLLOW_EVERY:
+            continue
+        if now - float(overlay.agent.get("active_at") or 0) > overlay.hide_after or overlay.held():
+            continue
+        overlay.window_read = (tab, now)
+        with contextlib.suppress(Exception):
+            await refresh_window(overlay, tab)
+
+
+# The overlay a tool call marked busy, for that call's after_tool: set in before_tool, which runs
+# in the call's own context, so the same call finds it whatever instance is current by then.
+_CALL_OVERLAY: contextvars.ContextVar = contextvars.ContextVar("overlay_call", default=None)
 
 
 async def before_tool(name: str, browser: Any, tab: Any) -> None:
@@ -443,7 +502,11 @@ async def before_tool(name: str, browser: Any, tab: Any) -> None:
     if overlay is None or not overlay.revive():
         return
     from . import _app
-    overlay.touch(status=describe(name, _app.CALL_ARGUMENTS.get()))
+    # Busy until after_tool: a call longer than the overlay's quiet times (a wait_for of two
+    # minutes) read as idle, and HIDE_AFTER took the light, the bar and the lock away mid-call.
+    overlay.in_flight += 1
+    _CALL_OVERLAY.set(overlay)
+    overlay.touch(status=describe(name, _app.CALL_ARGUMENTS.get()), busy=True)
     last_tab, last_at = overlay.window_read
     if tab is not None and (tab is not last_tab or time.time() - last_at > 1.0):
         overlay.window_read = (tab, time.time())
@@ -451,10 +514,35 @@ async def before_tool(name: str, browser: Any, tab: Any) -> None:
             await refresh_window(overlay, tab)
 
 
-def after_tool(browser: Any) -> None:
+def after_tool(browser: Any, tab: Any = None) -> None:
+    """The call has ended: not busy any more (once no other call of it runs), and the window and
+    page read again now, since the call may have opened, moved to or resized the agent's tab
+    (browser_launch itself: the lock had no page to cover until the next tool call)."""
+    marked = _CALL_OVERLAY.get()
+    if marked is not None:
+        _CALL_OVERLAY.set(None)
+        marked.in_flight = max(0, marked.in_flight - 1)
+        marked.touch(busy=marked.in_flight > 0)
     overlay = of(browser)
-    if overlay is not None:
-        overlay.touch()
+    if overlay is None:
+        return
+    if overlay is not marked:
+        overlay.touch(busy=overlay.in_flight > 0)
+    if tab is not None:
+        overlay.window_read = (tab, time.time())
+        with contextlib.suppress(RuntimeError):
+            loop = asyncio.get_running_loop()
+            task = loop.create_task(_refresh_quietly(overlay, tab))
+            _REFRESHES.add(task)
+            task.add_done_callback(_REFRESHES.discard)
+
+
+_REFRESHES: set = set()  # refreshes started after a call, kept until done
+
+
+async def _refresh_quietly(overlay: "Overlay", tab: Any) -> None:
+    with contextlib.suppress(Exception):
+        await refresh_window(overlay, tab)
 
 
 def refusal(name: str, browser: Any) -> Optional[str]:

@@ -3781,7 +3781,12 @@ async def _overlay_before_tool(name: str) -> None:
 
 
 def _overlay_after_tool(_name: str) -> None:
-    presence.after_tool(BrowserState.browser)
+    browser = BrowserState.browser
+    tab = None
+    if presence.of(browser) is not None:
+        with contextlib.suppress(Exception):
+            tab = BrowserState.active_tab()
+    presence.after_tool(browser, tab)
 
 
 def _overlay_note(session_key: str, result: str) -> str:
