@@ -230,6 +230,13 @@ conclusions. Each rule below replaced a real lie.
   worlds, so the answers are the same. Page globals are not: `window.turnstile` reads undefined there. Both
   helpers fall back to the page's world when the isolated one cannot be used, and a context kept from before a
   navigation fails once and is made again. A new probe that only reads the DOM belongs there too.
+- A context id is unique only within one renderer process, so a kept one does not always fail. A cross-site
+  navigation moves the tab to a new process that numbers its contexts again, and the id kept for the tab named an
+  about:blank ad iframe there: navigate said `final_url: about:blank` for a loaded page (8 of 8 runs from CNBC to a
+  Kompas article; same-site 0 of 9), and the page fingerprint and `_what_is_at` read that iframe too. Every world
+  `refs` makes holds a random mark in its own global (`_new_world`), and a script run in a kept one goes through
+  `refs.guard` or `guard_function`, which throws `STALE_WORLD` when the mark is not there; the caller then makes the
+  world again. A new caller of `_world_context` must do the same.
 - A native dialog blocks the renderer, so input never gets its acknowledgement and a click on a button calling `alert()`
   hung forever. `_dispatch_input` stops waiting once `_watch_dialogs` sees one open and the result names it. Pointer moves go
   through it too, because `onmousemove` can open a dialog before any press. `Page.enable` needs the renderer as well, so the

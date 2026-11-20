@@ -75,6 +75,8 @@ PAGES = {
         '<p><label>Colour <select id="colour"><option>Red</option><option>Blue</option></select></label></p>'
         '<p><input id="dark" type="checkbox" style="display:none"><label for="dark">Dark mode</label></p>'
         '<p><input id="bare"></p><p><label>Orphan text</label></p>'),
+    "/frames.html": ('<!doctype html><title>Frames</title><h1 id=h>Frames</h1>'
+                     + "<iframe></iframe>" * 6),
     "/idb.html": ("<!doctype html><title>IDB</title><script>const r=indexedDB.open('protodb',1);"
                   "r.onupgradeneeded=()=>r.result.createObjectStore('o');r.onsuccess=()=>r.result.close();</script>"),
 }
@@ -1002,3 +1004,18 @@ def test_an_instance_in_use_is_not_closed_by_its_idle_timeout(base):
     finally:
         client.call("close_all_instances", _timeout=40)
         client.close()
+
+
+def test_navigate_reads_the_new_page_after_a_cross_site_navigation(page, base):
+    """A cross-site navigation moves the tab to a new renderer, which numbers its contexts
+    again. The isolated world kept for the tab then named another context of the new process,
+    here an about:blank iframe, so navigate said final_url about:blank for a page that had
+    loaded (8 of 8 runs from CNBC to a Kompas article, whose ad slots are such iframes)."""
+    other = base.replace("localhost", "127.0.0.1")
+    for _ in range(3):
+        assert not page.call("navigate", url=f"{base}/page2.html").failed
+        assert page.evaluate("document.title") == "Page Two"
+        reply = page.call("navigate", url=f"{other}/frames.html")
+        assert not reply.failed, reply.text
+        assert reply.text.startswith(f"Navigated: {other}/frames.html "), reply.text
+        assert page.evaluate("location.href") == f"{other}/frames.html"

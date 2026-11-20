@@ -24,9 +24,10 @@ import inspect
 import itertools
 import json
 import os
+import secrets
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 from nodriver import Element, Tab, cdp
 from nodriver.core.element import Position
@@ -69,8 +70,24 @@ class RefEntry:
 _REF_MAPS: dict[str, dict[str, RefEntry]] = {}
 # target key of the root tab -> OOPIF target id -> connection.
 _FRAME_CONNS: dict[str, dict[str, Tab]] = {}
-# (connection target key, frame id) -> (loader id, isolated world context id).
-_WORLDS: dict[tuple[str, str], tuple[str, int]] = {}
+
+
+class World(NamedTuple):
+    """An isolated world this module made, and the mark it left in that world's own global."""
+    ctx: int
+    mark: str
+
+
+# (connection target key, frame id) -> (loader id, isolated world).
+_WORLDS: dict[tuple[str, str], tuple[str, World]] = {}
+
+# A context id is unique only within one renderer process. A cross-site navigation moves the tab
+# to a new process, which numbers its contexts again, so a kept id then named another context
+# there: an about:blank ad iframe, whose location navigate reported as the page's final_url (8 of
+# 8 runs from CNBC to a Kompas article). Each world made here holds a random mark in its global,
+# which the page cannot see, and a script run in a kept world checks it first (`guard`).
+_MARK_NAME = "__mcpWorldMark"
+STALE_WORLD = "mcp-stale-world: the kept isolated world belongs to another document"
 
 # A closed shadow root is out of reach of every script, the isolated world's too: a hosted card
 # field keeps its <input> in one, so the snapshot listed nothing in the frame and the field could
@@ -302,14 +319,43 @@ def _flatten_frames(node: Any) -> list[Any]:
     return frames
 
 
+async def _new_world(conn: Any, frame_id: Any) -> World:
+    ctx = await conn.send(cdp.page.create_isolated_world(frame_id=cdp.page.FrameId(str(frame_id))))
+    mark = secrets.token_hex(8)
+    _result, exc = await conn.send(cdp.runtime.evaluate(
+        f"globalThis.{_MARK_NAME} = {json.dumps(mark)}; 1", context_id=ctx, return_by_value=True))
+    if exc is not None:
+        raise RuntimeError(f"could not mark the isolated world: {exc.text}")
+    return World(ctx, mark)
+
+
+def guard(expression: str, world: World) -> str:
+    """The expression, run only when its context is still the world it was made as. The check is
+    a statement of its own, so the script's value stays the expression's, statements included."""
+    return (f"if (globalThis.{_MARK_NAME} !== {json.dumps(world.mark)}) "
+            f"throw new Error({json.dumps(STALE_WORLD)});\n{expression}")
+
+
+def guard_function(js_function: str, world: World) -> str:
+    """A function declaration for Runtime.callFunctionOn, checked the same way."""
+    body = js_function.strip().rstrip(";")
+    return (f"function(...args) {{ if (globalThis.{_MARK_NAME} !== {json.dumps(world.mark)}) "
+            f"throw new Error({json.dumps(STALE_WORLD)}); return ({body}\n).apply(this, args); }}")
+
+
+def _is_stale(exc: Any) -> bool:
+    detail = getattr(getattr(exc, "exception", None), "description", None) or getattr(exc, "text", "") or ""
+    return STALE_WORLD in str(detail)
+
+
 async def _isolated_world(conn: Any, frame: Any) -> int:
     key = (target_key(conn), str(frame.id_))
     cached = _WORLDS.get(key)
     if cached and cached[0] == str(frame.loader_id):
-        return cached[1]
-    ctx = await conn.send(cdp.page.create_isolated_world(frame_id=frame.id_))
-    _WORLDS[key] = (str(frame.loader_id), ctx)
-    return ctx
+        return cached[1].ctx
+    world = await _new_world(conn, frame.id_)
+    _WORLDS[key] = (str(frame.loader_id), world)
+    return world.ctx
 
 
 def _world_of(el: Any) -> tuple[Any, str]:
@@ -321,20 +367,21 @@ def _world_of(el: Any) -> tuple[Any, str]:
     return conn, str(frame_id)
 
 
-async def _world_context(conn: Any, frame_id: str, fresh: bool = False) -> int:
+async def _world_context(conn: Any, frame_id: str, fresh: bool = False) -> World:
     """The isolated world of a frame, without asking for the frame tree first.
 
-    A context kept from before a navigation no longer exists, which the next use reports;
-    the caller then asks again with fresh=True. The empty loader id makes the snapshot,
+    A world kept from before a navigation is gone, or its id now names another context of the
+    tab's new process. Run scripts in it through `guard`/`guard_function`: either case then
+    fails, and the caller asks again with fresh=True. The empty loader id makes the snapshot,
     which knows the real one, replace this entry rather than trust it.
     """
     key = (target_key(conn), frame_id)
     cached = _WORLDS.get(key)
     if cached and not fresh:
         return cached[1]
-    ctx = await conn.send(cdp.page.create_isolated_world(frame_id=cdp.page.FrameId(frame_id)))
-    _WORLDS[key] = ("", ctx)
-    return ctx
+    world = await _new_world(conn, frame_id)
+    _WORLDS[key] = ("", world)
+    return world
 
 
 async def apply_isolated(el: Any, js_function: str) -> Any:
@@ -353,11 +400,11 @@ async def apply_isolated(el: Any, js_function: str) -> Any:
     for fresh in (False, True):
         group = new_object_group()
         try:
-            ctx = await _world_context(conn, frame_id, fresh)
+            world = await _world_context(conn, frame_id, fresh)
             remote = await conn.send(cdp.dom.resolve_node(
-                backend_node_id=el.backend_node_id, object_group=group, execution_context_id=ctx))
+                backend_node_id=el.backend_node_id, object_group=group, execution_context_id=world.ctx))
             result, exc = await conn.send(cdp.runtime.call_function_on(
-                js_function, object_id=remote.object_id,
+                guard_function(js_function, world), object_id=remote.object_id,
                 arguments=[cdp.runtime.CallArgument(object_id=remote.object_id)],
                 return_by_value=True,
             ))
@@ -365,6 +412,8 @@ async def apply_isolated(el: Any, js_function: str) -> Any:
             continue
         finally:
             await release_group(conn, group)
+        if exc is not None and _is_stale(exc):
+            continue
         if exc is not None:
             detail = getattr(exc.exception, "description", None) if exc.exception else None
             raise RuntimeError(detail or exc.text or "script threw")
@@ -380,10 +429,12 @@ async def evaluate_isolated(tab: Any, expression: str) -> Any:
     """
     for fresh in (False, True):
         try:
-            ctx = await _world_context(tab, str(tab.target.target_id), fresh)
+            world = await _world_context(tab, str(tab.target.target_id), fresh)
             result, exc = await tab.send(cdp.runtime.evaluate(
-                expression, context_id=ctx, return_by_value=True))
+                guard(expression, world), context_id=world.ctx, return_by_value=True))
         except Exception:
+            continue
+        if exc is not None and _is_stale(exc):
             continue
         if exc is not None:
             detail = getattr(exc.exception, "description", None) if exc.exception else None

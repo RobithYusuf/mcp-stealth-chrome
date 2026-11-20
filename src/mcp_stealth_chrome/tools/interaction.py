@@ -443,9 +443,10 @@ async def _what_is_at(tab: Any, x: int, y: int) -> str:
         parts = None
         for fresh in (False, True):
             try:
-                ctx = await refs._world_context(tab, str(tab.target.target_id), fresh)
+                world = await refs._world_context(tab, str(tab.target.target_id), fresh)
                 parts = await refs.evaluate_parts(
-                    tab, _POINT_JS % {"x": float(x), "y": float(y)}, group, context_id=ctx)
+                    tab, refs.guard(_POINT_JS % {"x": float(x), "y": float(y)}, world), group,
+                    context_id=world.ctx)
                 break
             except Exception:
                 continue

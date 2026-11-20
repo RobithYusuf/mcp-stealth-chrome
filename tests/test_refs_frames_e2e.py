@@ -241,7 +241,9 @@ def test_snapshot_reaches_frames_and_open_shadow_roots(page):
     assert "Frames: 5 measured" in shot, shot
     for needle in ("Inner same", "Inner cross", "Frame Shadow cross", "Shadow One", "Shadow Deep"):
         assert needle in shot
-    assert "Closed Secret" not in shot
+    # Closed roots are read through CDP since 0.25.1 (refs._hand_over_closed_roots): a hosted
+    # card field keeps its input in one. Before, no script could enter them.
+    assert "Closed Secret" in shot and "Closed shadow roots: " in shot, shot
     line = next(l for l in shot.splitlines() if "Inner cross" in l)
     assert "frame=f" in line
     line = next(l for l in shot.splitlines() if "Shadow Deep" in l)
