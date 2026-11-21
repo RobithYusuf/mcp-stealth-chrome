@@ -20,6 +20,11 @@ Part of the agent guide: [AGENTS.md](../../AGENTS.md) says when to read this. It
   instance but main names it and its profile on the summary line (the JSON body after it still parses).
 - The HTTP transport always requires the token (never printed) and refuses non-loopback binds without `--allow-remote`.
   Use pure ASGI middleware: `BaseHTTPMiddleware` buffers the MCP event stream.
+- An instance holding no browser names no removed folder: once a privacy profile is removed, the instance that
+  still names it forgets it (`_forget_removed_profile`, called by `_remove_privacy_profile`). `list_instances` and
+  `server_status` gave the removed folder as the profile after a `browser_close` and after a failed launch. A new
+  browser's uptime starts when `_launch_record_browser` records it: `current_created_at` was never set there, so
+  `list_instances` showed 84 s for a browser just launched.
 - Per-tab caches are keyed by `_target_key(tab)` (the CDP target id), never `id(tab)`: the object address changes when
   nodriver recreates a `Tab` for the same target, and can be reused for another tab after GC.
 

@@ -1203,6 +1203,16 @@ async def _write_in_thread(fn: Any, *args: Any, **kwargs: Any) -> Any:
         raise cancelled
 
 
+def _forget_removed_profile(profile_dir: Path) -> None:
+    """The instance that still names a privacy folder just removed names no profile any more.
+    list_instances and server_status went on giving the removed folder as the instance's profile
+    after a browser_close and after a failed launch. Only an instance holding no browser: one
+    that runs names what it runs on."""
+    if BrowserState.browser is None and BrowserState.current_profile_dir == profile_dir:
+        BrowserState.current_profile_dir = None
+        BrowserState.current_privacy = False
+
+
 async def _remove_privacy_profile(profile_dir: Optional[Path]) -> bool:
     """Remove a privacy profile once its browser is gone, with bounded retries.
 
@@ -1264,9 +1274,11 @@ async def _remove_privacy_profile(profile_dir: Optional[Path]) -> bool:
             else:
                 await asyncio.sleep(delay)
                 if not target.exists():
+                    _forget_removed_profile(profile_dir)
                     return True
                 reason = "it was written again after being removed"
         if not target.exists():
+            _forget_removed_profile(profile_dir)
             return True
         if attempt >= len(_PRIVACY_REMOVE_DELAYS) and time.monotonic() >= deadline:
             break
@@ -5106,6 +5118,9 @@ def _launch_record_browser(req: _LaunchRequest, plan: _LaunchPlan, browser: Any,
     BrowserState.current_privacy = req.privacy
     BrowserState.current_fingerprint = dict(plan.effective_fingerprint)
     BrowserState.current_proxy = plan.effective_proxy
+    # list_instances' uptime is this browser's: left alone, it counted from the server's start
+    # or from the instance's previous browser (84 s on a browser just launched).
+    BrowserState.current_created_at = time.time()
     # A stdio browser_launch is not idle-reaped: it is what the person is looking at,
     # and the server exits with its client anyway. The timeout has to be cleared and not
     # merely the reaper left off, because any spawn_browser starts the reaper, which

@@ -672,3 +672,49 @@ def test_on_brave_lean_and_the_tabs_are_written_after_the_commit_and_read_back(e
     assert len(features) == 1 and all(name in features[0] for name in brave_lean.FEATURES), features
     assert json.loads((env.profile / "Default" / "Preferences").read_text())["brave"]["tabs"] == {
         "vertical_tabs_enabled": True, "vertical_tabs_on_right": True}
+
+
+def test_an_instance_forgets_a_privacy_folder_once_it_is_removed(tmp_path, monkeypatch):
+    """After a failed privacy launch (and after a browser_close) list_instances went on giving the
+    removed folder as the instance's profile. The instance that names the folder, and holds no
+    browser, names no profile once the folder is gone; one that runs keeps what it runs on."""
+    root = tmp_path / "privacy-profiles"
+    folder = root / "main-abc123"
+    folder.mkdir(parents=True)
+    monkeypatch.setattr(server, "PRIVACY_PROFILE_ROOT", root)
+    monkeypatch.setattr(server, "_PRIVACY_REMOVE_DELAYS", (0.0,))
+    monkeypatch.setattr("mcp_stealth_chrome.state.processes_holding", lambda _p: [])
+    monkeypatch.setattr(server.BrowserState, "browser", None)
+    monkeypatch.setattr(server.BrowserState, "current_profile_dir", folder)
+    monkeypatch.setattr(server.BrowserState, "current_privacy", True)
+    assert asyncio.run(server._remove_privacy_profile(folder)) is True
+    assert not folder.exists()
+    assert server.BrowserState.current_profile_dir is None and server.BrowserState.current_privacy is False
+
+    # Another folder's removal, or an instance with a browser, changes nothing.
+    other, mine = root / "main-other", root / "main-mine"
+    other.mkdir(); mine.mkdir()
+    monkeypatch.setattr(server.BrowserState, "current_profile_dir", mine)
+    monkeypatch.setattr(server.BrowserState, "current_privacy", True)
+    assert asyncio.run(server._remove_privacy_profile(other)) is True
+    assert server.BrowserState.current_profile_dir == mine and server.BrowserState.current_privacy is True
+    monkeypatch.setattr(server.BrowserState, "browser", object())
+    assert asyncio.run(server._remove_privacy_profile(mine)) is True
+    assert server.BrowserState.current_profile_dir == mine
+
+
+def test_a_new_browser_starts_its_own_uptime(monkeypatch):
+    """list_instances counts uptime from current_created_at, which browser_launch never set for a
+    new browser: it counted from the server's start or the instance's earlier browser."""
+    import time
+    import types
+
+    old = time.time() - 500
+    monkeypatch.setattr(server.BrowserState, "current_created_at", old)
+    monkeypatch.setattr(server.BrowserState, "tabs", [])
+    monkeypatch.setattr(server, "_watch_windows", lambda _b: None)
+    req = types.SimpleNamespace(headless=True, privacy=False)
+    plan = types.SimpleNamespace(profile_path=None, effective_fingerprint={}, effective_proxy=None)
+    before = time.time()
+    server._launch_record_browser(req, plan, object(), object())
+    assert server.BrowserState.current_created_at >= before
