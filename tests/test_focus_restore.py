@@ -7,6 +7,7 @@ import subprocess
 from types import SimpleNamespace
 
 from mcp_stealth_chrome import identity, server
+from mcp_stealth_chrome.tools import attach
 
 
 def _record_activate(monkeypatch, front):
@@ -446,9 +447,9 @@ def test_chrome_flags_keep_a_profile_path_with_spaces(tmp_path):
     root.mkdir()
     (root / "DevToolsActivePort").write_text("54321\n/devtools/browser/x\n")
     cmd = f"/x/Chrome --remote-debugging-port=0 --user-data-dir={root} --no-first-run"
-    assert server._chrome_flags_from_args(cmd) == (54321, str(root))
-    assert server._chrome_flags_from_args("/x/Chrome --user-data-dir=/a/b") == (None, "/a/b")
-    assert server._chrome_flags_from_args("/x/Chrome --remote-debugging-port=9222") == (9222, None)
+    assert attach._chrome_flags_from_args(cmd) == (54321, str(root))
+    assert attach._chrome_flags_from_args("/x/Chrome --user-data-dir=/a/b") == (None, "/a/b")
+    assert attach._chrome_flags_from_args("/x/Chrome --remote-debugging-port=9222") == (9222, None)
 
 
 # --- tab_new: its own window, or a tab behind in an existing one ------------------------------
