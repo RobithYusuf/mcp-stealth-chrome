@@ -331,6 +331,5 @@ def test_r2_3_network_start_marks_a_restart_and_a_plain_start_sends_what_main_se
     finally:
         (server.BrowserState.network_logs, server.BrowserState.network_index,
          server.BrowserState.capture_network) = saved
-        server._NETWORK_ARMED_TAB_IDS.discard("TARGET-FF")
+        server._NETWORK_CAPTURES.pop("TARGET-FF", None)
         server._NETWORK_KEPT_BODIES.discard("TARGET-FF")
-        server._NETWORK_CAPTURE_BODIES.pop("TARGET-FF", None)

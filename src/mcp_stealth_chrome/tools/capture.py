@@ -10,7 +10,6 @@ import asyncio
 import base64
 import fnmatch
 import json
-import os
 import sys
 import threading
 import time
@@ -20,8 +19,9 @@ from .. import __version__
 from .._app import mcp
 from ..helpers import (
     BODY_REVEAL_NOTE, cdp_glob, confined_output_path, err, mask_request_entry, ok, reveal_mode,
-    target_key, ts_filename,
+    target_key, ts_filename, write_private,
 )
+from ..request_headers import PAGE_HEADERS_NOTE
 from .. import server as _srv
 from ..state import EXPORT_DIR, BrowserState, ensure_dirs
 
@@ -525,6 +525,7 @@ def _har_entry(entry: dict) -> dict:
     def pairs(headers: Optional[dict]) -> list[dict]:
         return [{"name": k, "value": str(v)} for k, v in (headers or {}).items()]
 
+    entry = mask_request_entry(entry)
     url = entry.get("url") or ""
     body = entry.get("request_body")
     wall = entry.get("wall_time")
@@ -533,12 +534,15 @@ def _har_entry(entry: dict) -> dict:
         "url": url,
         "httpVersion": "",
         "headers": pairs(entry.get("request_headers")),
+        "_headersSource": entry.get("headers_source", "page"),
         "queryString": [{"name": k, "value": v} for k, v in
                         parse_qsl(urlsplit(url).query, keep_blank_values=True)],
         "cookies": [],
         "headersSize": -1,
         "bodySize": len(body) if body else 0,
     }
+    if request["_headersSource"] == "page":
+        request["_headersNote"] = PAGE_HEADERS_NOTE
     if body:
         kind = next((v for k, v in (entry.get("request_headers") or {}).items()
                      if k.lower() == "content-type"), "")
@@ -571,8 +575,8 @@ async def export_har(filename: Optional[str] = None) -> str:
     """Export captured requests to a HAR file: URLs, headers, bodies sent, status, type.
 
     Needs network_start(capture_bodies=True), the default. Timings and response bodies are
-    not captured. The file holds real header values, so it is written mode 600 and only its
-    path is returned.
+    not captured. Credential fields are masked. request._headersSource says "wire" when Chrome
+    supplied network headers for that hop, otherwise "page". Only the file path and count are returned.
     """
     try:
         entries = list((BrowserState.network_index or {}).values())
@@ -588,10 +592,7 @@ async def export_har(filename: Optional[str] = None) -> str:
                 "entries": [_har_entry(e) for e in entries],
             }
         }, indent=2, default=str)
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w") as handle:
-            handle.write(document)
-        return ok(f"{path}\n{len(entries)} request(s), mode 600: holds real header values")
+        write_private(path, document)
+        return ok(f"{path}\n{len(entries)} request(s), credential fields masked")
     except Exception as e:
         return err(str(e))

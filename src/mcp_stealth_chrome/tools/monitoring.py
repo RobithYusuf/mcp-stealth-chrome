@@ -19,6 +19,7 @@ from .. import _app as _app_module
 from .. import body_saver
 from .._app import mcp
 from ..helpers import cut_url, err, mask_body, mask_request_entry, reveal_mode, ok
+from ..request_headers import PAGE_HEADERS_NOTE, RequestHeaders
 from ..state import EXPORT_DIR, BrowserState
 from .. import server as _srv
 
@@ -408,7 +409,8 @@ async def _start_capture(capture_bodies: bool, keep_bodies: bool) -> str:
         # The handler is installed once per target, but this option is mutable:
         # a later network_start(capture_bodies=True) must change what that
         # existing handler indexes instead of merely claiming that it did.
-        _srv._NETWORK_CAPTURE_BODIES[tid] = bool(capture_bodies)
+        armed = tid in _srv._NETWORK_CAPTURES
+        tracker = RequestHeaders(_srv.CAPTURE_MAX_INDEXED) if capture_bodies else None
 
         # Bound now, to the instance being armed — see console_start for why
         # reading the class attribute at event time cross-files the capture.
@@ -428,6 +430,8 @@ async def _start_capture(capture_bodies: bool, keep_bodies: bool) -> str:
                     "resource_type": _srv._resource_type(event),
                     "_loader": str(getattr(event, "loader_id", "") or ""),
                     "request_headers": req_headers,
+                    "headers_source": "page",
+                    "headers_note": PAGE_HEADERS_NOTE,
                     "request_body": getattr(req, "post_data", None),
                     "status": None,
                     "response_headers": None,
@@ -439,7 +443,11 @@ async def _start_capture(capture_bodies: bool, keep_bodies: bool) -> str:
                 if (entry["resource_type"] == "Document" and entry["_loader"]
                         and str(getattr(event, "frame_id", "") or "") == tid):
                     _srv._NETWORK_DOC_LOADER[tid] = entry["_loader"]
-                if _srv._NETWORK_CAPTURE_BODIES.get(tid, False):
+                tracker = _srv._NETWORK_CAPTURES.get(tid)
+                if tracker is not None:
+                    tracker.request(rid, entry, index_sink.get(rid),
+                                    getattr(event, "redirect_response", None) is not None,
+                                    getattr(event, "redirect_has_extra_info", False))
                     index_sink[rid] = entry
                     _srv._trim_index(index_sink)
                 log_sink.append({
@@ -462,6 +470,9 @@ async def _start_capture(capture_bodies: bool, keep_bodies: bool) -> str:
                     e["response_headers"] = resp_headers
                     e["mime"] = getattr(resp, "mime_type", None)
                     e["size"] = getattr(resp, "encoded_data_length", None)
+                    tracker = _srv._NETWORK_CAPTURES.get(tid)
+                    if tracker is not None:
+                        tracker.finish(rid, e, getattr(event, "has_extra_info", False))
                 log_sink.append({
                     "type": "response", "request_id": rid,
                     "url": getattr(resp, "url", ""),
@@ -473,14 +484,28 @@ async def _start_capture(capture_bodies: bool, keep_bodies: bool) -> str:
             except Exception:
                 pass
 
-        if tid in _srv._NETWORK_ARMED_TAB_IDS:
+        async def on_extra(event):
+            tracker = _srv._NETWORK_CAPTURES.get(tid)
+            if tracker is not None:
+                tracker.extra(str(event.request_id), event.headers)
+
+        async def on_failed(event):
+            rid = str(event.request_id)
+            tracker = _srv._NETWORK_CAPTURES.get(tid)
+            if tracker is not None and rid in index_sink:
+                tracker.finish(rid, index_sink[rid], True)
+
+        if armed:
+            _srv._NETWORK_CAPTURES[tid] = tracker
             return ok(
                 f"network capture started (capture_bodies={capture_bodies}); "
                 f"handler already armed on this tab{kept_note}"
             )
         tab.add_handler(cdp_network.RequestWillBeSent, on_req)
         tab.add_handler(cdp_network.ResponseReceived, on_res)
-        _srv._NETWORK_ARMED_TAB_IDS.add(tid)
+        tab.add_handler(cdp_network.RequestWillBeSentExtraInfo, on_extra)
+        tab.add_handler(cdp_network.LoadingFailed, on_failed)
+        _srv._NETWORK_CAPTURES[tid] = tracker
         return ok(f"network capture started (capture_bodies={capture_bodies}){kept_note}")
     except Exception as e:
         return err(str(e))
@@ -507,6 +532,8 @@ async def network_get(
             dropped first; one body up to CAPTURE_BODY_MAX_BYTES, 10 MB), readable after the page navigated.
         max_body_bytes: cap per-body length (default 10000)
         full: True returns entries with full headers and body fields from network_index (after network_start).
+            headers_source="wire" means Chrome supplied the network headers for this hop;
+            "page" means only the page's view is available (wire headers not observed).
             False (default) = the legacy flat event stream.
         reveal_values: True returns credential headers, fields and query parameters as they are; by default
             their values read "*** (N chars)", since tool output lands in the transcript. "body" shows body

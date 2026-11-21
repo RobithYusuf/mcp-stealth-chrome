@@ -248,16 +248,16 @@ def test_per_target_handlers_do_not_duplicate_and_network_mode_reconfigures(monk
         classmethod(lambda cls: next(active)),
     )
 
-    server._NETWORK_ARMED_TAB_IDS.clear()
-    server._NETWORK_CAPTURE_BODIES.clear()
+    server._NETWORK_CAPTURES.clear()
     old_logs = server.BrowserState.network_logs
     old_index = server.BrowserState.network_index
     try:
         network_start = server.mcp._tool_manager._tools["network_start"].fn
         asyncio.run(network_start(capture_bodies=False))
-        assert len(first.handlers) == 2
+        assert len(first.handlers) == 4
 
         asyncio.run(network_start(capture_bodies=True))
+        assert len(first.handlers) == 4
         assert replacement.handlers == []
 
         request_handler = first.handlers[0][1]
@@ -273,8 +273,7 @@ def test_per_target_handlers_do_not_duplicate_and_network_mode_reconfigures(monk
         asyncio.run(request_handler(event))
         assert "request-1" in server.BrowserState.network_index
     finally:
-        server._NETWORK_ARMED_TAB_IDS.clear()
-        server._NETWORK_CAPTURE_BODIES.clear()
+        server._NETWORK_CAPTURES.clear()
         server.BrowserState.network_logs = old_logs
         server.BrowserState.network_index = old_index
 
@@ -364,17 +363,13 @@ def test_tab_cache_cleanup_preserves_other_live_targets(monkeypatch):
     monkeypatch.setattr(server, "_HUMAN_HELP", {
         "TARGET-A": {"objective": "a"}, "TARGET-B": {"objective": "b"},
     })
-    monkeypatch.setattr(server, "_NETWORK_ARMED_TAB_IDS", {"TARGET-A", "TARGET-B"})
-    monkeypatch.setattr(server, "_NETWORK_CAPTURE_BODIES", {
-        "TARGET-A": True, "TARGET-B": False,
-    })
+    monkeypatch.setattr(server, "_NETWORK_CAPTURES", {"TARGET-A": None, "TARGET-B": None})
 
     server._clear_tab_scoped_state([_TabA()])
 
     assert set(page._SNAPSHOT_CACHE) == {"TARGET-B"}
     assert set(server._HUMAN_HELP) == {"TARGET-B"}
-    assert server._NETWORK_ARMED_TAB_IDS == {"TARGET-B"}
-    assert server._NETWORK_CAPTURE_BODIES == {"TARGET-B": False}
+    assert set(server._NETWORK_CAPTURES) == {"TARGET-B"}
 
 
 def test_trace_stop_removes_handlers_when_cdp_end_fails(monkeypatch):
@@ -2873,7 +2868,7 @@ def console_state(monkeypatch):
     monkeypatch.setattr(server.BrowserState, "capture_console", False)
     monkeypatch.setattr(server.BrowserState, "capture_network", False)
     monkeypatch.setattr(server, "_CONSOLE_ARMED_TAB_IDS", set())
-    monkeypatch.setattr(server, "_NETWORK_ARMED_TAB_IDS", set())
+    monkeypatch.setattr(server, "_NETWORK_CAPTURES", {})
     return server
 
 
@@ -2985,7 +2980,7 @@ def test_network_start_says_when_network_could_not_be_enabled(monkeypatch, conso
     assert out.startswith("Error:") and "NOT started" in out
     assert console_state.BrowserState.capture_network is False
     assert not tab.handlers.get(cdp_network.RequestWillBeSent)
-    assert "T1" not in console_state._NETWORK_ARMED_TAB_IDS
+    assert "T1" not in console_state._NETWORK_CAPTURES
 
 
 # ── AU: emulate_device ──

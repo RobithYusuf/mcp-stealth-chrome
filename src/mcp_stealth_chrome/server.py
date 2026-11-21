@@ -83,6 +83,7 @@ from . import keep_alive as _keep_alive
 from . import tab_record
 from . import instance_notes
 from . import run_marker
+from .request_headers import RequestHeaders
 from .state import data_root as state_data_root
 from .humanize import (
     CURRENT_GESTURE, Gesture, humanized_approach, humanized_move, humanized_mouse_press,
@@ -7451,8 +7452,10 @@ _CONSOLE_STARTED_AT: Optional[str] = None
 def _now_iso() -> str:
     from datetime import datetime
     return datetime.now().isoformat(timespec="seconds")
-_NETWORK_ARMED_TAB_IDS: set = set()
-_NETWORK_CAPTURE_BODIES: dict[str, bool] = {}
+
+
+# Registered target -> header tracker, or None when only the flat stream is enabled.
+_NETWORK_CAPTURES: dict[str, RequestHeaders | None] = {}
 
 
 def _clear_tab_scoped_state(tabs: list[Any]) -> None:
@@ -7469,8 +7472,7 @@ def _clear_tab_scoped_state(tabs: list[Any]) -> None:
         _DIALOG_WATCHED.discard(key)
         _OPEN_DIALOGS.pop(key, None)
         _CONSOLE_ARMED_TAB_IDS.discard(key)
-        _NETWORK_ARMED_TAB_IDS.discard(key)
-        _NETWORK_CAPTURE_BODIES.pop(key, None)
+        _NETWORK_CAPTURES.pop(key, None)
         _NETWORK_KEPT_BODIES.discard(key)
         _NETWORK_DOC_LOADER.pop(key, None)
         presence._OVERRIDES.pop(key, None)  # emulate_device's record, for the overlay's lock
