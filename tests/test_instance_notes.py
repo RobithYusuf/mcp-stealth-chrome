@@ -57,9 +57,10 @@ def test_the_tools_carry_the_notes(monkeypatch):
     import inspect
 
     from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import instances
 
     assert "block_ads" in inspect.signature(server.browser_launch).parameters
-    assert "forget_tabs" in inspect.signature(server.close_instance).parameters
+    assert "forget_tabs" in inspect.signature(instances.close_instance).parameters
     registered = {t.name: t.fn for t in server.mcp._tool_manager.list_tools()}
     assert registered["browser_launch"].__code__.co_qualname.startswith("names_the_instance")
     assert registered["close_instance"].__code__.co_qualname.startswith("says_what_stays_current")

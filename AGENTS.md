@@ -49,18 +49,34 @@ uvx mcp-stealth-chrome → Python 3.11+ → FastMCP → nodriver → Chrome/Chro
 - `src/mcp_stealth_chrome/settings.py`: the person's settings (`~/.mcp-stealth/settings.json`, the environment over it) and
   `mcp-stealth-chrome settings`.
 - `src/mcp_stealth_chrome/_app.py` — `StealthMCP`, the FastMCP boundary. `captcha.py`, `image_output.py`, `result_types.py` — their named helpers.
-- `src/mcp_stealth_chrome/tools/` — `research.py`, `devtools.py`, `vision.py`, `network_http.py`, `profiles.py`,
+- `src/mcp_stealth_chrome/tools/` — one module per group of tools, each registering itself on import:
+  `research.py`, `devtools.py`, `vision.py`, `network_http.py`, `profiles.py`,
   `storage.py` (cookies, web storage, IndexedDB, cache), `capture.py` (request interception, HAR, dry_run),
   `page.py` (snapshot, reading, screenshot, PDF, inspection, frames, scraping),
-  `navigation.py` (history, tabs, handing over to a person; `navigate` itself stays in `server.py`),
-  `interaction.py` (hover, mouse, drag, keys, select, upload, click_role, wait_for; the core click and typing
-  tools stay in `server.py`),
+  `navigation.py` (history, tabs, handing over to a person),
+  `interaction.py` (hover, mouse, drag, keys, select, upload, click_role, wait_for),
   `mouse_kit.py` (precision mouse kit and `click_turnstile`),
   `stealth.py` (identity, fingerprint, human-like input, saved sessions, `solve_captcha`, `verify_cf`),
-  `turnstile_oscursor.py`; each registers itself on import.
-  `server.py` is being split into these one section at a time, with no change in behaviour. Code that still
-  shares helpers with `server.py` reaches them as `_srv.<name>` at call time, so tests patching `server.<name>`
-  keep working; a module-level `from ..server import x` would freeze a copy.
+  `turnstile_oscursor.py`, `scripting.py` (`evaluate`, init scripts, `wait_for_function`),
+  `batch.py` (`batch_actions`, `fill_form`, `navigate_and_snapshot`), `viewport.py` (viewport size, scroll),
+  `dialogs.py` (dialogs, `accessibility_snapshot`), `monitoring.py` (console and network capture),
+  `diagnostics.py` (`server_status`, `get_page_errors`, `export_curl`, `fingerprint_audit`),
+  `chrome_profiles.py` (`list_chrome_profiles`, `clone_chrome_profile`),
+  `action_kit.py` (`describe_page`, `smart_fill`, the assert and storage-snapshot tools, `workflow_run`,
+  `wait_for_request`, `auth_capture`), `instances.py` (`spawn_browser`, the instance tools and
+  `_launch_browser_instance`), `attach.py` (`attach_to_chrome`, `detach`, `list_external_chrome`).
+- `server.py` keeps nine tools (`browser_launch`, `browser_close`, `browser_recover`, `navigate`, `click`,
+  `click_text`, `fill`, `type_text`, `check`) and what the modules share: the launch phases (`_launch_*`),
+  closing a browser, the click path, focus, per-tab state. How a module uses it:
+  - It reaches a `server.py` name as `_srv.<name>` at call time (`from .. import server as _srv`), so tests
+    patching `server.<name>` keep working. A module-level `from ..server import x` freezes a copy.
+  - A name tests patch on `server` (`PROFILES_ROOT`, `PROFILE_DIR`, `ensure_dirs`, the profile lock lookups) is
+    read as `_srv.<name>` too, even though `server.py` only imports it. With its own import a module no longer
+    sees the patch: the tests that keep it away from the real `~/.mcp-stealth` still pass while it acts there.
+    `tests/test_server_patches.py` fails on a new case.
+  - `server.py` never imports a name back from a tools module to share it (that made an import cycle that only
+    showed when the tools module was imported first). A name both sides use stays in `server.py`.
+  - The order tools register in is not a contract; nothing may depend on it.
 - `tests/test_registry.py` — the tool-surface gate. `tests/test_reliability_e2e.py` and
   `tests/test_agent_ergonomics.py` — behaviour, real browser and fast unit respectively.
   `tests/test_old_tools_e2e.py` and `tests/test_slow_start_e2e.py` — tools and launch paths on real Chrome.
@@ -137,6 +153,11 @@ uvx mcp-stealth-chrome → Python 3.11+ → FastMCP → nodriver → Chrome/Chro
   (`_inner_arguments_error`) and a refused step is a counted failure with the same message. The six legacy batch
   names (`click`, `fill`, `type`, `press`, `wait`, `navigate`) keep their defaults and pass every other key on:
   `wait` dropped `frame_url` and `navigate` dropped `expect_url` and `expect_status`.
+- What a client lists is not the tool's own schema and text: `StealthMCP.list_tools` leaves out pydantic's made-up
+  titles (`_app.without_titles`; "Js Fallback" for `js_fallback`), which were 30% of the input schemas a client hands
+  to its model (15.9 of 53.4 KB), and the docstring's indentation (`inspect.cleandoc`; 9% of the description text).
+  `tool.parameters` and `tool.description` keep them. Say what a parameter means in the docstring: a title or a
+  `Field(description=...)` is not where this project documents one, and nothing reads it.
 - Do not add a tool that can fail silently. If an action may not have taken effect, the response says
   so: see `docs/agents/honest-reporting.md`.
 - Do not weaken a security property to make a test pass: managed paths never escape their root,

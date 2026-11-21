@@ -127,11 +127,12 @@ def test_brave_missing_is_named_with_how_to_install(monkeypatch, tmp_path):
 
 def test_browser_launch_refuses_before_anything_runs(monkeypatch):
     from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import instances
 
     monkeypatch.setattr(server, "ensure_dirs", lambda: pytest.fail("got past the check"))
     text = asyncio.run(server.browser_launch(browser="chrome", vertical_tabs="right"))
     assert text.startswith("Error:") and "on the left" in text
-    ok, text = asyncio.run(server._launch_browser_instance(
+    ok, text = asyncio.run(instances._launch_browser_instance(
         instance_id="w", url="about:blank", headless=True, proxy=None, user_agent=None,
         window_width=800, window_height=600, persistent=False, lang="en-US", extra_args=None,
         storage_state_path=None, idle_timeout=0, browser="chrome", vertical_tabs="right"))
@@ -197,6 +198,7 @@ def test_the_launch_check_applies_the_binding(tmp_path):
 
 def test_brave_profiles_live_apart_from_chromes(tmp_path, monkeypatch):
     from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import instances
 
     monkeypatch.setattr(server, "PROFILE_DIR", tmp_path / "profile")
     monkeypatch.setattr(server, "PROFILES_ROOT", tmp_path / "profiles")
@@ -207,11 +209,11 @@ def test_brave_profiles_live_apart_from_chromes(tmp_path, monkeypatch):
     path, _ = server._resolve_launch_profile("acct", persistent=True, profile_conflict="fallback",
                                              browser="brave")
     assert path == tmp_path / "brave-profiles" / "acct"
-    assert server._instance_profile_path("acct", persistent=True, privacy=False,
-                                         profile_dir_override=None, browser="brave") \
+    assert instances._instance_profile_path("acct", persistent=True, privacy=False,
+                                            profile_dir_override=None, browser="brave") \
         == tmp_path / "brave-profiles" / "acct"
-    assert server._instance_profile_path("main", persistent=True, privacy=False,
-                                         profile_dir_override=None) == tmp_path / "profile"
+    assert instances._instance_profile_path("main", persistent=True, privacy=False,
+                                            profile_dir_override=None) == tmp_path / "profile"
 
 
 def test_a_held_brave_profile_falls_back_to_a_brave_folder(tmp_path, monkeypatch):
@@ -285,6 +287,7 @@ def test_vertical_tabs_none_writes_nothing_and_a_broken_file_is_not_replaced(tmp
 
 def test_a_brave_clone_lands_in_brave_profiles_and_says_to_launch_brave(tmp_path, monkeypatch):
     from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import chrome_profiles
 
     root = _profile(tmp_path / "BraveSoftware" / "Brave-Browser", {"brave": {}, "profile": {}},
                     {"brave": {}})
@@ -294,7 +297,7 @@ def test_a_brave_clone_lands_in_brave_profiles_and_says_to_launch_brave(tmp_path
     monkeypatch.setattr(server, "ensure_dirs", lambda: None)
     monkeypatch.setattr(server, "chrome_user_data_root", lambda b=None: root)
     monkeypatch.setattr(server, "chrome_user_data_roots", lambda: [("brave", root)])
-    text = asyncio.run(server.clone_chrome_profile(target_instance_id="mine", browser="brave"))
+    text = asyncio.run(chrome_profiles.clone_chrome_profile(target_instance_id="mine", browser="brave"))
     assert not text.startswith("Error"), text
     result = json.loads(text[text.index("{"):])
     assert result["target"] == str(data / "brave-profiles" / "mine")

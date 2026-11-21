@@ -613,6 +613,7 @@ def test_spawn_refuses_stale_instance_slot_before_launch(monkeypatch):
     import asyncio
 
     from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import instances
     from mcp_stealth_chrome.state import InstanceSnapshot
 
     calls = []
@@ -627,7 +628,7 @@ def test_spawn_refuses_stale_instance_slot_before_launch(monkeypatch):
         "instances",
         {"worker": InstanceSnapshot(instance_id="worker")},
     )
-    monkeypatch.setattr(server, "_launch_browser_instance", _unexpected_launch)
+    monkeypatch.setattr(instances, "_launch_browser_instance", _unexpected_launch)
     spawn = server.mcp._tool_manager._tools["spawn_browser"].fn
     result = asyncio.run(spawn(instance_id="worker"))
     assert result.startswith("Error: instance 'worker' already exists")
@@ -636,14 +637,15 @@ def test_spawn_refuses_stale_instance_slot_before_launch(monkeypatch):
 
 def test_named_ephemeral_launch_does_not_claim_or_create_persistent_profile(monkeypatch, tmp_path):
     from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import instances
 
-    assert server._instance_profile_path(
+    assert instances._instance_profile_path(
         "worker", persistent=False, privacy=False, profile_dir_override=None,
     ) is None
 
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))  # what expanduser reads on Windows
-    override = server._instance_profile_path(
+    override = instances._instance_profile_path(
         "worker", persistent=False, privacy=False,
         profile_dir_override="~/chosen-profile",
     )
@@ -987,7 +989,7 @@ def test_storage_snapshot_marks_unmeasured_areas_instead_of_empty():
     """
     import asyncio
 
-    from mcp_stealth_chrome.server import _take_storage_snapshot
+    from mcp_stealth_chrome.tools.action_kit import _take_storage_snapshot
 
     class _Tab:
         async def send(self, _cmd):
@@ -1010,6 +1012,7 @@ def test_storage_diff_flags_areas_it_could_not_measure():
     import json as _json
 
     import mcp_stealth_chrome.server as srv
+    from mcp_stealth_chrome.tools import action_kit
 
     before = {
         "url": "https://a.test/", "title": "a", "cookies": [],
@@ -1021,22 +1024,22 @@ def test_storage_diff_flags_areas_it_could_not_measure():
     after = dict(before, errors={}, measured={"url": True, "cookies": True,
                                               "localStorage": True,
                                               "sessionStorage": True})
-    srv._STORAGE_SNAPSHOTS["unit_diff"] = before
+    action_kit._STORAGE_SNAPSHOTS["unit_diff"] = before
 
     async def fake_snapshot(_tab):
         return after
 
-    original = srv._take_storage_snapshot
+    original = action_kit._take_storage_snapshot
     original_tab = srv.BrowserState.active_tab
-    srv._take_storage_snapshot = fake_snapshot
+    action_kit._take_storage_snapshot = fake_snapshot
     srv.BrowserState.active_tab = classmethod(lambda cls: object())
     try:
         out = _json.loads(asyncio.run(
             srv.mcp._tool_manager._tools["storage_diff"].fn("unit_diff")))
     finally:
-        srv._take_storage_snapshot = original
+        action_kit._take_storage_snapshot = original
         srv.BrowserState.active_tab = original_tab
-        srv._STORAGE_SNAPSHOTS.pop("unit_diff", None)
+        action_kit._STORAGE_SNAPSHOTS.pop("unit_diff", None)
 
     assert out["unreliable_areas"] == ["cookies"]
     assert "meaningless" in out["warning"]
@@ -1231,13 +1234,13 @@ def test_report_lines_say_when_facts_are_unreadable():
 def test_storage_snapshot_marks_an_unread_url_as_unmeasured():
     import asyncio
 
-    from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import action_kit
 
     class _Tab(_BrokenTab):
         async def send(self, *_a, **_k):
             raise RuntimeError("no")
 
-    snap = asyncio.run(server._take_storage_snapshot(_Tab("context destroyed")))
+    snap = asyncio.run(action_kit._take_storage_snapshot(_Tab("context destroyed")))
     assert snap["measured"]["url"] is False and "url" in snap["errors"]
 
 
@@ -1470,15 +1473,16 @@ def test_same_name_cookie_keeps_the_most_specific_path(monkeypatch):
 
 def test_sniffed_token_only_goes_back_to_its_exact_origin(monkeypatch):
     from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import action_kit
 
     monkeypatch.setattr(server.BrowserState, "network_index", {
         "1": {"url": "https://x.test/api", "request_headers": {"Authorization": "Bearer secret"}},
     })
-    assert server._latest_auth_header_for("https://x.test/other") == "Bearer secret"
-    assert server._latest_auth_header_for("https://x.test:443/other") == "Bearer secret"
-    assert server._latest_auth_header_for("http://x.test:8080/") is None
-    assert server._latest_auth_header_for("http://x.test/") is None
-    assert server._latest_auth_header_for("https://x.test:8443/") is None
+    assert action_kit._latest_auth_header_for("https://x.test/other") == "Bearer secret"
+    assert action_kit._latest_auth_header_for("https://x.test:443/other") == "Bearer secret"
+    assert action_kit._latest_auth_header_for("http://x.test:8080/") is None
+    assert action_kit._latest_auth_header_for("http://x.test/") is None
+    assert action_kit._latest_auth_header_for("https://x.test:8443/") is None
 
 
 def test_redirected_post_failure_is_not_called_safe_to_replay():
@@ -1524,6 +1528,7 @@ def test_storage_diff_masks_new_credentials_unless_asked(monkeypatch):
     import json as _json
 
     from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import action_kit
 
     empty = {"url": "u", "title": "t", "cookies": [], "localStorage": {"k": "old"},
              "sessionStorage": {}, "errors": {},
@@ -1534,9 +1539,9 @@ def test_storage_diff_masks_new_credentials_unless_asked(monkeypatch):
     async def fake_snapshot(_tab):
         return after
 
-    monkeypatch.setattr(server, "_take_storage_snapshot", fake_snapshot)
+    monkeypatch.setattr(action_kit, "_take_storage_snapshot", fake_snapshot)
     monkeypatch.setattr(server.BrowserState, "active_tab", classmethod(lambda cls: object()))
-    monkeypatch.setitem(server._STORAGE_SNAPSHOTS, "login", empty)
+    monkeypatch.setitem(action_kit._STORAGE_SNAPSHOTS, "login", empty)
     diff = server.mcp._tool_manager._tools["storage_diff"].fn
     masked = asyncio.run(diff("login"))
     for secret in ("TOKENVALUE", "NEWSECRET", "JWTSECRET", "old"):
@@ -3075,7 +3080,7 @@ def test_storage_diff_tells_cookies_on_different_paths_apart(monkeypatch):
     import asyncio
     import json as _json
 
-    from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import action_kit
 
     def snapshot(admin_value):
         return {"url": "u", "title": "t", "localStorage": {}, "sessionStorage": {}, "errors": {},
@@ -3086,9 +3091,9 @@ def test_storage_diff_tells_cookies_on_different_paths_apart(monkeypatch):
     async def fake_snapshot(_tab):
         return snapshot("new")
 
-    monkeypatch.setattr(server, "_take_storage_snapshot", fake_snapshot)
+    monkeypatch.setattr(action_kit, "_take_storage_snapshot", fake_snapshot)
     _active(monkeypatch, object())
-    monkeypatch.setitem(server._STORAGE_SNAPSHOTS, "paths", snapshot("old"))
+    monkeypatch.setitem(action_kit._STORAGE_SNAPSHOTS, "paths", snapshot("old"))
     cookies = _json.loads(asyncio.run(_tool("storage_diff")("paths")))["cookies"]
     assert cookies["modified"] == [{"name": "SID", "domain": "x", "path": "/admin"}]
     assert cookies["added"] == [] and cookies["removed"] == []
@@ -4071,6 +4076,7 @@ def test_switch_instance_waits_while_a_sweep_closes_that_instance(monkeypatch):
     import asyncio
 
     from mcp_stealth_chrome import _app, server
+    from mcp_stealth_chrome.tools import instances
 
     switched = []
     monkeypatch.setattr(server.BrowserState, "switch_to",
@@ -4081,7 +4087,7 @@ def test_switch_instance_waits_while_a_sweep_closes_that_instance(monkeypatch):
     async def run():
         event = asyncio.Event()
         monkeypatch.setitem(_app.INSTANCE_CLOSING, (server.BrowserState.session_key(), "gone"), event)
-        task = asyncio.ensure_future(server.switch_instance("gone"))
+        task = asyncio.ensure_future(instances.switch_instance("gone"))
         await asyncio.sleep(0.2)
         assert switched == [] and not task.done()
         event.set()
@@ -4098,6 +4104,7 @@ def test_the_idle_sweep_leaves_alone_an_instance_close_instance_is_closing(monke
     import asyncio
 
     from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import instances
 
     snap = SimpleNamespace(browser=object(), tabs=[], active_tab_index=0, profile_dir=None,
                            privacy=False, idle_timeout=1, is_running=lambda: True,
@@ -4127,7 +4134,7 @@ def test_the_idle_sweep_leaves_alone_an_instance_close_instance_is_closing(monke
             return {"verified": True}
 
         monkeypatch.setattr(server, "_ensure_browser_dead", slow_dead)
-        closing = asyncio.ensure_future(server.close_instance("a"))
+        closing = asyncio.ensure_future(instances.close_instance("a"))
         await asyncio.sleep(0.05)
         await server._sweep_idle_instances()
         release.set()
@@ -4144,6 +4151,7 @@ def test_a_close_still_running_after_the_wait_is_an_error_not_a_go_ahead(monkeyp
     import asyncio
 
     from mcp_stealth_chrome import _app, server
+    from mcp_stealth_chrome.tools import instances
 
     switched = []
     monkeypatch.setattr(_app, "_CLOSING_WAIT_SECONDS", 0.1)
@@ -4155,7 +4163,7 @@ def test_a_close_still_running_after_the_wait_is_an_error_not_a_go_ahead(monkeyp
         key = server.BrowserState.session_key()
         monkeypatch.setitem(_app.INSTANCE_CLOSING, (key, "stuck"), event)
         monkeypatch.setitem(_app.INSTANCE_CLOSING, (key, server.BrowserState.current_instance_id), event)
-        return (await server.switch_instance("stuck"), await server.close_instance("stuck"),
+        return (await instances.switch_instance("stuck"), await instances.close_instance("stuck"),
                 await server.mcp.call_tool("tab_list", {}))
 
     switch_reply, close_reply, listed = asyncio.run(run())

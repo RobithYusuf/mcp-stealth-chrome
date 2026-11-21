@@ -352,14 +352,15 @@ def test_f1_the_mock_keychain_is_refused_outside_tests(monkeypatch):
     import asyncio
 
     from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import instances
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     assert "test" in server._mock_keychain_refusal(["--use-mock-keychain"])
     assert server._mock_keychain_refusal(["--mute-audio"]) == ""
     out = asyncio.run(server.browser_launch(persistent=False, headless=True,
                                             extra_args=["--use-mock-keychain"]))
     assert out.startswith("Error") and "--use-mock-keychain" in out
-    out = asyncio.run(server.spawn_browser(instance_id="f1", persistent=False, headless=True,
-                                           extra_args=["--use-mock-keychain"]))
+    out = asyncio.run(instances.spawn_browser(instance_id="f1", persistent=False, headless=True,
+                                              extra_args=["--use-mock-keychain"]))
     assert out.startswith("Error") and "--use-mock-keychain" in out
     monkeypatch.setenv("PYTEST_CURRENT_TEST", "x")
     assert server._mock_keychain_refusal(["--use-mock-keychain"]) == ""

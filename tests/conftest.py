@@ -169,9 +169,14 @@ def _cookie_backups_in_a_temp_folder(monkeypatch, tmp_path_factory):
     fake Chrome 158 in test_profile_version once left six database copies in the person's
     ~/.mcp-stealth/storage-states. A test that needs its own folder patches it again."""
     import sys
-    server = sys.modules.get("mcp_stealth_chrome.server")
-    if server is not None:
-        monkeypatch.setattr(server, "STORAGE_STATE_DIR", tmp_path_factory.mktemp("storage-states"))
+    # The cookie and saved-session tools read their own import of the name (tools/storage.py,
+    # tools/stealth.py), so the server module alone would leave them on the real folder.
+    folder = None
+    for name in ("server", "tools.storage", "tools.stealth"):
+        module = sys.modules.get(f"mcp_stealth_chrome.{name}")
+        if module is not None and hasattr(module, "STORAGE_STATE_DIR"):
+            folder = folder or tmp_path_factory.mktemp("storage-states")
+            monkeypatch.setattr(module, "STORAGE_STATE_DIR", folder)
 
 
 @pytest.fixture(autouse=True)

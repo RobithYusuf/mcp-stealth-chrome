@@ -221,3 +221,98 @@ def test_every_tool_still_takes_every_argument_it_advertises(mcp):
     for name, arg in (("upload_file", "drop"), ("clone_chrome_profile", "keep_site_data")):
         tool = server._tool_manager.get_tool(name)
         assert unknown_arguments_error(name, tool, {arg: True}) is None, (name, arg)
+
+
+def _schema_titles(node, path=""):
+    """Every "title" annotation of a schema, by the same walk the server's own function makes."""
+    if not isinstance(node, dict):
+        return
+    for key, value in node.items():
+        if key == "title" and isinstance(value, str):
+            yield path or "/"
+        elif key in ("properties", "$defs", "definitions", "patternProperties") and isinstance(value, dict):
+            for name, child in value.items():
+                yield from _schema_titles(child, f"{path}/{key}/{name}")
+        elif key in ("anyOf", "oneOf", "allOf", "prefixItems") and isinstance(value, list):
+            for index, child in enumerate(value):
+                yield from _schema_titles(child, f"{path}/{key}/{index}")
+        elif key in ("items", "additionalProperties", "not"):
+            yield from _schema_titles(value, f"{path}/{key}")
+
+
+def test_listed_schemas_carry_no_made_up_titles_and_lose_nothing_else(mcp):
+    """pydantic titles every property after its own name ("Js Fallback"). A client hands the input
+    schema to its model, and those titles were 30% of it. What a client lists has none, and is
+    otherwise the tool's own schema: every name, type, default and required list."""
+    from mcp_stealth_chrome._app import without_titles
+    from mcp_stealth_chrome.server import mcp as server
+    listed = _listed_tools(mcp)
+    with_title = {tool.name: where for tool in listed
+                  for where in [list(_schema_titles(tool.inputSchema)) + list(_schema_titles(tool.outputSchema or {}))]
+                  if where}
+    assert with_title == {}
+    for tool in listed:
+        own = server._tool_manager.get_tool(tool.name)
+        assert list(_schema_titles(own.parameters)), tool.name  # the tool's own schema is untouched
+        assert tool.inputSchema == without_titles(own.parameters), tool.name
+        assert list(tool.inputSchema.get("properties") or {}) == list(own.parameters.get("properties") or {})
+        assert tool.inputSchema.get("required") == own.parameters.get("required"), tool.name
+        assert tool.outputSchema["required"] == ["result"], tool.name
+    # A call still passes the client's check of the reply against the listed output schema.
+    assert "version" in mcp.call("server_status").text
+
+
+def test_only_a_schemas_own_title_goes():
+    from mcp_stealth_chrome._app import without_titles
+    schema = {
+        "title": "saveArguments", "type": "object", "required": ["title"],
+        "properties": {
+            "title": {"title": "Title", "type": "string"},                      # a property CALLED title
+            "meta": {"title": "Meta", "type": "object", "default": {"title": "kept: a value"},
+                     "examples": [{"title": "kept too"}]},
+            "kind": {"title": "Kind", "enum": ["title", "body"], "const": "title"},
+            "tags": {"title": "Tags", "type": "array", "items": {"title": "Tag", "type": "string"}},
+            "when": {"title": "When", "anyOf": [{"title": "Seconds", "type": "number"}, {"type": "null"}]},
+            "ref": {"$ref": "#/$defs/Step"},
+            "free": {"type": "object", "additionalProperties": {"title": "Value", "type": "integer"}},
+            "open": {"type": "object", "additionalProperties": True},
+        },
+        "$defs": {"Step": {"title": "Step", "type": "object", "properties": {"title": {"title": "Title", "type": "string"}}}},
+    }
+    before = repr(schema)
+    assert without_titles(schema) == {
+        "type": "object", "required": ["title"],
+        "properties": {
+            "title": {"type": "string"},
+            "meta": {"type": "object", "default": {"title": "kept: a value"}, "examples": [{"title": "kept too"}]},
+            "kind": {"enum": ["title", "body"], "const": "title"},
+            "tags": {"type": "array", "items": {"type": "string"}},
+            "when": {"anyOf": [{"type": "number"}, {"type": "null"}]},
+            "ref": {"$ref": "#/$defs/Step"},
+            "free": {"type": "object", "additionalProperties": {"type": "integer"}},
+            "open": {"type": "object", "additionalProperties": True},
+        },
+        "$defs": {"Step": {"type": "object", "properties": {"title": {"type": "string"}}}},
+    }
+    assert repr(schema) == before  # a new object: the tool's own schema is not changed
+    assert without_titles(None) is None
+
+
+def test_listed_descriptions_carry_no_docstring_indentation(mcp):
+    """FastMCP hands on the raw docstring, so every line after the first began with the four
+    spaces of its function body (9% of all description text). What a client lists has the common
+    indentation removed and nothing else: an argument's continuation lines stay indented under it."""
+    import inspect
+    from mcp_stealth_chrome.server import mcp as server
+    listed = _listed_tools(mcp)
+    indented_before = 0
+    for tool in listed:
+        own = server._tool_manager.get_tool(tool.name).description or ""
+        assert tool.description == inspect.cleandoc(own), tool.name
+        assert tool.description.split() == own.split(), tool.name  # the same words, in the same order
+        later = [line for line in tool.description.splitlines()[1:] if line.strip()]
+        assert not later or min(len(line) - len(line.lstrip(" ")) for line in later) == 0, tool.name
+        indented_before += own != tool.description
+    assert indented_before > 100  # the raw docstrings really were indented
+    launch = next(tool for tool in listed if tool.name == "browser_launch").description
+    assert "\nArgs:\n    url: initial URL to load\n" in launch

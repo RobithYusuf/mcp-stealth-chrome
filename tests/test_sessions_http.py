@@ -249,27 +249,27 @@ def test_spawning_one_name_from_two_sessions_is_refused(monkeypatch):
 
 
 def test_storage_snapshots_and_dialog_settings_are_per_session():
-    from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import action_kit
 
     token = BrowserState.in_session(state.POOL_SESSION)
     try:
-        other_key = server._snapshot_key("before")
+        other_key = action_kit._snapshot_key("before")
     finally:
         BrowserState.unbind_session(token)
-    assert server._snapshot_key("before") == "before" != other_key
+    assert action_kit._snapshot_key("before") == "before" != other_key
 
 
 def test_a_snapshot_name_cannot_reach_another_session():
     """A joined string let the primary name a snapshot "pool::before" and read that one."""
-    from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import action_kit
 
     token = BrowserState.in_session(state.POOL_SESSION)
     try:
-        other_key = server._snapshot_key("before")
+        other_key = action_kit._snapshot_key("before")
     finally:
         BrowserState.unbind_session(token)
-    assert server._snapshot_key(f"{state.POOL_SESSION}::before") != other_key
-    assert server._snapshot_key(str(other_key)) != other_key
+    assert action_kit._snapshot_key(f"{state.POOL_SESSION}::before") != other_key
+    assert action_kit._snapshot_key(str(other_key)) != other_key
 
 
 def test_dialog_policy_follows_the_instance_through_a_handoff():
@@ -712,20 +712,20 @@ def test_failed_intercept_start_leaves_another_sessions_interception(monkeypatch
 
 def test_next_client_does_not_inherit_requests_or_snapshots():
     """The string "primary" passes on; the browser may, the records must not."""
-    from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import action_kit
     from mcp_stealth_chrome.tools import network_http as nh
 
     alive = {"first"}
     state.set_session_liveness(lambda sid: sid in alive)
     assert _bind("first") == state.PRIMARY_SESSION
-    server._STORAGE_SNAPSHOTS["secret"] = {"cookies": ["x"]}
+    action_kit._STORAGE_SNAPSHOTS["secret"] = {"cookies": ["x"]}
     nh._TRACKED["r9"] = nh._Tracked(request_id="r9", method="GET", url="http://x", created_at=0.0,
                                     operation_deadline=1.0, session=state.PRIMARY_SESSION)
     alive.clear()
     BrowserState.collect_departed_sessions()
     alive.add("second")
     assert _bind("second") == state.PRIMARY_SESSION
-    assert "secret" not in server._STORAGE_SNAPSHOTS
+    assert "secret" not in action_kit._STORAGE_SNAPSHOTS
     assert "r9" not in nh._TRACKED
 
 

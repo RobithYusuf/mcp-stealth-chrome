@@ -800,41 +800,32 @@ async def http_request(
     direct: Optional[bool] = None,
     reveal_values: bool = False,
 ) -> str:
-    """HTTP request with TLS-perfect browser fingerprint via curl_cffi.
-    Use for API scraping after browser login — same stealth as real Chrome's JA3/JA4.
-
-    Each call gets its own curl session, so parallel calls are safe — nothing
-    shares a browser tab. Localhost / private-network targets bypass the
-    environment proxy automatically.
-
-    Every call is tracked: if it does not settle within `wait_timeout` you get a
-    request_id back instead of a dead end, the request keeps running until
-    `timeout`, and http_request_status / http_request_cancel take it from there.
+    """HTTP request with a real Chrome TLS fingerprint (JA3/JA4) via curl_cffi, e.g. for an API after a browser
+    login. Each call has its own curl session, so parallel calls are safe. Localhost / private-network targets
+    bypass the environment proxy. A call that does not settle within `wait_timeout` returns a request_id: the
+    request runs on until `timeout`, and http_request_status / http_request_cancel take it from there.
 
     Args:
         url, method: target URL and HTTP verb
         impersonate: chrome, chrome124, firefox, safari, edge (default chrome)
-        use_browser_cookies: snapshot cookies from the active browser instance
-            BEFORE the request starts (a later switch_instance cannot leak in). On a
-            redirect they follow the first host only, by their path and Secure flag;
-            cookies_sent counts what each request carried
+        use_browser_cookies: snapshot cookies from the active browser instance BEFORE the request starts (a
+            later switch_instance cannot leak in). On a redirect they follow the first host only, by their path
+            and Secure flag; cookies_sent counts what each request carried
         headers, params: extra headers/query params
         data: raw body string (form-urlencoded or custom)
         json_body: JSON body dict (sets Content-Type automatically)
-        timeout: total request budget in seconds, and the operation deadline —
-            the request keeps running this long even after wait_timeout returns
+        timeout: total budget in seconds and the operation deadline, also after wait_timeout returned
         follow_redirects: usual HTTP option
         return_mode: auto (json if parseable else text), json, text, or meta (status+headers only)
-        wait_timeout: how long THIS call blocks. Default None = the whole
-            timeout. Set it lower to get a request_id back early and poll.
-        connect_timeout: connect-phase budget (default 10s, capped by timeout).
-            Separating it is what lets a failure say "never reached the server"
-            instead of a bare timeout.
-        direct: force (True) or forbid (False) the proxy-bypassing direct
-            transport. Default None auto-detects loopback / private targets.
-        reveal_values: True returns credential headers, JSON fields and query parameters
-            as they are. By default their values read "*** (N chars)", because tool output
-            lands in the transcript. Bodies other than JSON or forms pass through.
+        wait_timeout: how long this call blocks. None (default) = the whole timeout; lower it to get a
+            request_id back early and poll.
+        connect_timeout: connect-phase budget (default 10s, capped by timeout), so a failure can say "never
+            reached the server" instead of a bare timeout.
+        direct: force (True) or forbid (False) the proxy-bypassing direct transport. None (default)
+            auto-detects loopback / private targets.
+        reveal_values: True returns credential headers, JSON fields and query parameters as they are. By default
+            their values read "*** (N chars)", since tool output lands in the transcript. Bodies other than JSON
+            or forms pass through.
     """
     try:
         from curl_cffi.requests import AsyncSession  # noqa: F401

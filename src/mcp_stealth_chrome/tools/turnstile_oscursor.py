@@ -358,19 +358,15 @@ async def _attempt(url: Optional[str], timeout_s: float, report: dict, resources
 async def solve_turnstile_oscursor(url: Optional[str] = None, timeout_s: float = 50.0) -> str:
     """Try interactive Turnstile with the real OS cursor in a disposable headed Chrome.
 
-    Takes desktop focus and moves the physical cursor. Do not use the desktop during
-    the call. Requires a running main browser, matching IP and natural user agent,
-    and macOS Accessibility + Screen Recording permissions (install [os-cursor]).
-    Windows SendInput and Linux X11 backends are implemented but not yet field-tested.
-    No sidecar CDP client connects until six seconds of rendering, native input and
-    eight seconds of scoring have elapsed. Site cookies are transferred privately
-    through the existing storage-state loader, then main HTTP status/challenge are
-    checked. A clearance cookie or a click alone never counts as confirmed access.
-    url defaults to the active tab URL. timeout_s bounds the attempt, not cleanup;
-    at least 16 seconds is required. A standalone run takes about 16 to 20 seconds,
-    but inside the MCP server native input and screen capture run slower: 35 timed out
-    during scoring and 50 passed, so 50 is the default. Only this call's temporary
-    profile is removed.
+    Takes desktop focus and moves the physical cursor: do not use the desktop during the call. Needs a running
+    main browser, matching IP and natural user agent, and macOS Accessibility + Screen Recording permissions
+    (install [os-cursor]); the Windows SendInput and Linux X11 backends are not yet field-tested. Site cookies
+    are transferred privately through the storage-state loader, then main's HTTP status/challenge are checked.
+    A clearance cookie or a click alone never counts as confirmed access. Only this call's temporary profile is
+    removed.
+
+    url defaults to the active tab URL. timeout_s bounds the attempt, not cleanup; at least 16 seconds is
+    required; keep the default 50, since a run inside the MCP server is slower than standalone (35 timed out).
     """
     if not math.isfinite(timeout_s) or timeout_s < 16:
         return err("solve_turnstile_oscursor: timeout_s must be finite and >= 16 (rendering + scoring)")

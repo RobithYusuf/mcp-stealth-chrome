@@ -7,6 +7,7 @@ import subprocess
 from types import SimpleNamespace
 
 from mcp_stealth_chrome import identity, server
+from mcp_stealth_chrome.tools import attach
 
 
 def _record_activate(monkeypatch, front):
@@ -44,11 +45,20 @@ def test_a_failure_giving_focus_back_never_fails_the_launch(monkeypatch):
 
 
 def test_activation_names_a_process_never_an_application(monkeypatch):
-    """Nothing that moves focus may run `open -a`: it cannot tell one Chrome from another."""
-    from mcp_stealth_chrome.tools import navigation
-    for module in (server, navigation):
-        source = inspect.getsource(module)
-        assert '"open", "-a"' not in source, module.__name__
+    """Nothing that moves focus may run `open -a`: it cannot tell one Chrome from another.
+
+    Every file of the package is read, not a list of modules: the launch code of spawn_browser
+    moved to tools/instances.py and a list of two modules no longer covered it."""
+    import pathlib
+    import re
+    package = pathlib.Path(server.__file__).parent
+    files = sorted(package.rglob("*.py"))
+    assert package / "tools" / "instances.py" in files and package / "_agent_overlay.py" in files
+    by_name = re.compile(r"""["']open["']\s*,\s*["']-a["']""")  # the argument list of a process
+    found = [f"{path.relative_to(package)}:{number}" for path in files
+             for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+             if by_name.search(line)]
+    assert found == []
     monkeypatch.setattr(server.sys, "platform", "linux")
     assert server._activate_pid(4242) is False
     monkeypatch.setattr(server.sys, "platform", "darwin")
@@ -446,9 +456,9 @@ def test_chrome_flags_keep_a_profile_path_with_spaces(tmp_path):
     root.mkdir()
     (root / "DevToolsActivePort").write_text("54321\n/devtools/browser/x\n")
     cmd = f"/x/Chrome --remote-debugging-port=0 --user-data-dir={root} --no-first-run"
-    assert server._chrome_flags_from_args(cmd) == (54321, str(root))
-    assert server._chrome_flags_from_args("/x/Chrome --user-data-dir=/a/b") == (None, "/a/b")
-    assert server._chrome_flags_from_args("/x/Chrome --remote-debugging-port=9222") == (9222, None)
+    assert attach._chrome_flags_from_args(cmd) == (54321, str(root))
+    assert attach._chrome_flags_from_args("/x/Chrome --user-data-dir=/a/b") == (None, "/a/b")
+    assert attach._chrome_flags_from_args("/x/Chrome --remote-debugging-port=9222") == (9222, None)
 
 
 # --- tab_new: its own window, or a tab behind in an existing one ------------------------------
