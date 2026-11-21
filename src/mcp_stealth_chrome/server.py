@@ -5314,23 +5314,29 @@ async def _launch_restore_tabs(req: _LaunchRequest, plan: _LaunchPlan, browser: 
 
 
 def _launch_result(req: _LaunchRequest, plan: _LaunchPlan, observed: dict, *, suffix: str,
-                   verify_suffix: str, health_suffix: str, place_suffix: str, restore_suffix: str) -> str:
+                   verify_suffix: str, health_suffix: str, place_suffix: str, restore_suffix: str,
+                   trip: Optional[_Trip] = None) -> str:
     """The launch's result: the fallback warning first, what was launched and what the first
     load observed (checked against expect_url and expect_status), then every note."""
     profile_info = plan.profile_info
-    return _nav_result(
-        (f"WARNING: EMPTY FALLBACK PROFILE, your saved logins are NOT here "
+    warning = (f"WARNING: EMPTY FALLBACK PROFILE, your saved logins are NOT here "
          f"({profile_info.get('holder') or 'another Chrome'} holds "
          f"{profile_info.get('desired_profile')}); do not log in again here, that splits the "
          f"logins over two folders. "
          if plan.used_fallback and str(profile_info.get("session_state_source") or "").startswith("FALLBACK")
-         else "") +
-        f"Browser launched (headless={req.headless}, persistent={plan.persistent}, "
+         else "")
+    if trip is not None and trip.mode == "pause":
+        paused = _tripwire_pause(trip, "browser_launch reached a verification page", asked_for=req.url,
+                                 launched=True)
+        return f"{paused}\n{warning.rstrip()}{suffix}" if plan.used_fallback else paused
+    result = _nav_result(
+        warning + f"Browser launched (headless={req.headless}, persistent={plan.persistent}, "
         f"privacy={req.privacy}, identity={plan.identity_source}). Loaded",
         observed,
         expect_url=req.expect_url, expect_status=req.expect_status,
         suffix=f"{suffix}{verify_suffix}{health_suffix}{place_suffix}{restore_suffix}{plan.dock_note}",
     )
+    return _tripwire_render(trip, "browser_launch", result, asked_for=req.url, launched=True)
 
 
 @mcp.tool()
@@ -5617,12 +5623,9 @@ async def _launch_run(req: _LaunchRequest, launching: _Launching, session: str, 
             await _give_focus_back(plan.previous_app)
             if (stop := await _launch_settle(req, plan, launching, None)) is not None:
                 return stop
-            return _tripwire_render(
-                trip, "browser_launch",
-                _launch_result(req, plan, observed, suffix=suffix, verify_suffix=verify_suffix,
-                               health_suffix=health_suffix, place_suffix=place_suffix,
-                               restore_suffix=restore_suffix),
-                asked_for=req.url, launched=True)
+            return _launch_result(req, plan, observed, suffix=suffix, verify_suffix=verify_suffix,
+                                  health_suffix=health_suffix, place_suffix=place_suffix,
+                                  restore_suffix=restore_suffix, trip=trip)
     except asyncio.CancelledError:
         # A phase with no cancel path of its own: the browser it started still goes.
         if plan is not None and plan.browser is not None and not plan.ended:

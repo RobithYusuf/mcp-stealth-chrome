@@ -686,3 +686,17 @@ def test_reuse_preserves_the_new_tabs_outcome(monkeypatch, tab_result):
     monkeypatch.setattr(nav, 'tab_new', opened)
     out = asyncio.run(server._reuse_without_an_agent_tab('not ours', FIELD_URL, None, None, None))
     assert out.startswith(tab_result) and 'could not be opened' not in out
+
+
+def test_fallback_launch_pause_keeps_profile_warning(page):
+    from types import SimpleNamespace
+    tab = page(FIELD_URL, headless=True)
+    req = SimpleNamespace(url=FIELD_URL, headless=True, privacy=False, expect_url=None, expect_status=None)
+    plan = SimpleNamespace(used_fallback=True, persistent=True, identity_source='default', dock_note='',
+                           profile_info={'session_state_source': 'FALLBACK profile', 'holder': 'other Chrome',
+                                         'desired_profile': '/profiles/desired'})
+    out = server._launch_result(req, plan, {'final_url': FIELD_URL}, suffix=' [fallback profile: temp]',
+                                verify_suffix='', health_suffix='', place_suffix='', restore_suffix='',
+                                trip=look(tab, url=FIELD_URL))
+    assert out.startswith('Error: antibot_paused:') and 'WARNING: EMPTY FALLBACK PROFILE' in out
+    assert 'do not log in again here' in out and '/profiles/desired' in out and 'temp' in out
