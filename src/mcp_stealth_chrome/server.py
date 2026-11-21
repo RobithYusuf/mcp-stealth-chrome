@@ -6384,7 +6384,8 @@ class _Trip:
     verdict: Any                # antibot.Verdict
     repeat: bool = False        # the page reported before on this tab, its request still pending
     where: str = ""             # pause: "bar", "window", "headless" or "pending" (antibot.next_line)
-    again: bool = False         # the earlier request was answered while the tab stayed: asked again
+    again: str = ""             # why the person was asked again
+    request: Optional[dict] = None  # exact handoff at detection, including its id and owner
     target: Optional[str] = None    # popup target when this pause came from a new tab
     auto_verify: str = ""       # what auto_verify said on this page, kept in a Cloudflare pause
 
@@ -6456,6 +6457,7 @@ def _record_human_help(tab: Tab, objective: str, timeout: float, *, by: str, clo
             _tripwire_note(f"help request {old['request_id']} was replaced by {request_id}.")
     record = {
         "objective": objective,
+        "target": key,
         "baseline": baseline,
         "requested_at": time.time(),
         "requested_clock": clock,
@@ -6585,7 +6587,7 @@ def _tripwire_seen(browser: Any, key: Optional[str], mode: str, verdict: Any, he
         (None, None),
     )
     if agent_request is not None:
-        trip = _Trip(mode, verdict, repeat=same, where="agent_pending")
+        trip = _Trip(mode, verdict, repeat=same, where="agent_pending", request=agent_request)
         if agent_key != key:
             trip.target = key
         return trip
@@ -6593,10 +6595,10 @@ def _tripwire_seen(browser: Any, key: Optional[str], mode: str, verdict: Any, he
     if request is not None and request["browser"] is browser:
         where = ("pending" if request.get("by") != "tripwire"
                  else "bar" if request.get("was_shown") else "window")
-        return _Trip(mode, verdict, repeat=same, where=where)
+        return _Trip(mode, verdict, repeat=same, where=where, request=request)
     if headless:
         return _Trip(mode, verdict, repeat=same, where="headless")
-    return _Trip(mode, verdict, where="ask", again=same)
+    return _Trip(mode, verdict, where="ask", again="after the request for it was answered" if same else "")
 
 
 def _tripwire_ask(tab: Tab, browser: Any, trip: _Trip, baseline: Optional[dict], *, target: Optional[str] = None) -> None:
@@ -6607,6 +6609,7 @@ def _tripwire_ask(tab: Tab, browser: Any, trip: _Trip, baseline: Optional[dict],
         tab, f"This site shows a verification page ({trip.verdict.host}). Please complete it, "
              "then press Done.", TRIPWIRE_HELP_TIMEOUT, by="tripwire", clock=_handoff_clock(),
         baseline=baseline, browser=browser, target=target)
+    trip.request = record
     trip.where = "bar" if record["was_shown"] else "window"
 
 
@@ -6649,7 +6652,7 @@ def _tripwire_after_action(tab: Tab, result: str, after: Optional[dict]) -> str:
             _tripwire_ask(tab, browser, trip, None if target else after, target=target)
         run = _TRIPWIRE_RUN.get()
         if target and mode == "pause" and run:
-            run["popup"] = trip
+            run["popup"] = (browser, trip)
     except Exception:
         return result
     if mode == "warn":
@@ -6682,8 +6685,7 @@ def _tripwire_pause(trip: _Trip, lead: str, *, asked_for: Optional[str] = None,
         return err(f"{antibot.PAUSED}: still on the verification page reported before "
                    f"({verdict.place}){popup}{running}; {_TRIPWIRE_PENDING[trip.where]}.")
     if trip.again:
-        lead += (", again after the request for it was answered (the tripwire does not judge the "
-                 "answer); the person was asked again")
+        lead += f", again {trip.again}; the person was asked again"
     elif launched:
         lead += running
     elif asked_for:
@@ -6734,6 +6736,36 @@ async def _tripwire_after_navigation(tab: Tab, observed: Optional[dict], *,
     return trip
 
 
+def _popup_handoff(browser: Any, trip: _Trip) -> _Trip:
+    """The popup URL was just confirmed. Reuse the click's handoff only while it is pending."""
+    old = trip.request
+    if old is None:  # headless: the click never asked anybody
+        return trip
+    request_id, key = old["request_id"], old["target"]
+    answered = None
+    if _HUMAN_HELP.get(key) is old:
+        shown = old["shown_at"]
+        if shown is not None:
+            answered = presence.answered(browser, shown, request_id)
+        if not answered and (not old["was_shown"] or presence.shows_request(browser, shown, request_id)):
+            return trip
+        if not answered and old["by"] == "agent":
+            # An explicit request whose bar stopped showing it still belongs to the agent.
+            trip.where = "pending"
+            return trip
+        del _HUMAN_HELP[key]
+        presence.end_help(browser, request_id)
+    # A wait may already have consumed it, or another request may now own the bar. Apply
+    # the normal browser-local priority rules again; never close that other request's id.
+    fresh = _tripwire_seen(browser, trip.target, trip.mode, trip.verdict, headless=False)
+    fresh.target = trip.target
+    if fresh.where == "ask":
+        _tripwire_ask(None, browser, fresh, None, target=trip.target)
+        if not answered:
+            fresh.again = "because the earlier request is no longer pending"
+    return fresh
+
+
 async def _tripwire_step(previous: Optional[str], next_tool: str) -> Optional[str]:
     """Before a step of workflow_run or batch_actions: the step before may have sent the page away
     (a click), or reached a Cloudflare challenge a navigation did not look for (auto_verify=False,
@@ -6748,16 +6780,19 @@ async def _tripwire_step(previous: Optional[str], next_tool: str) -> Optional[st
         return None
     try:
         run = _TRIPWIRE_RUN.get()
-        trip = run.pop("popup", None) if run else None
-        if trip is not None:
+        popup = run.pop("popup", None) if run else None
+        trip = None
+        if popup is not None:
+            browser, trip = popup
             # Only revisit a popup whose URL matched at click time. Target metadata suffices:
             # never inspect a popup's document or keep a verdict after its URL changed.
-            browser = BrowserState.browser
             pages = await asyncio.wait_for(_page_targets(browser), timeout=2)
             current = dict(pages).get(trip.target)
             if current != trip.verdict.url:
                 _tripwire_left(browser, trip.target)
                 trip = None
+            else:
+                trip = _popup_handoff(browser, trip)
         if trip is None:
             trip = await _tripwire_look(BrowserState.active_tab(), want_cf=True)
     except Exception:
