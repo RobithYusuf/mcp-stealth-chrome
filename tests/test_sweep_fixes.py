@@ -933,7 +933,7 @@ class _MouseTab:
 def test_click_outcome_says_when_it_could_not_verify(before, after):
     from mcp_stealth_chrome import server
 
-    out = server._click_outcome("click 'x': clicked", "method=cdp_mouse", before, after)
+    out = server._click_outcome(None, "click 'x': clicked", "method=cdp_mouse", before, after)
     assert "could NOT be verified" in out, out
     assert out != "click 'x': clicked — method=cdp_mouse"
 

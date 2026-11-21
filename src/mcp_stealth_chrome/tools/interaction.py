@@ -249,7 +249,7 @@ async def press_key(key: str, verify: bool = True, settle_ms: int = 1000) -> str
         effect, after = await key_outcome.watch(
             lambda: _srv._page_sig(tab, focused), before, settle_ms)
         if effect:  # a key that led to a site's verification page says so first
-            return _srv._tripwire_after_action(ok(f"pressed {key} — sent to {target}; {effect}"), after)
+            return _srv._tripwire_after_action(tab, ok(f"pressed {key} — sent to {target}; {effect}"), after)
         if before and not after:
             return ok(f"pressed {key} — sent to {target}; the page stopped answering "
                       f"within {settle_ms}ms, so the effect is unknown (it may be navigating)")
@@ -392,7 +392,7 @@ async def _drop_file(tab, el, path: Path) -> str:
     note = _srv._dialog_note(tab)
     if note:
         return ok(f"{label}: dropped, {detail}{note}")
-    result = _srv._click_outcome(f"{label}: dropped", detail, before, after)
+    result = _srv._click_outcome(tab, f"{label}: dropped", detail, before, after)
     return result.replace("the page did not react (handler not bound, click swallowed, or the "
                           "change is purely visual)",
                           "the page did not react: it may not take drops there (it needs "
@@ -613,7 +613,7 @@ async def drag_and_drop(start_x: int, start_y: int, end_x: int, end_y: int) -> s
             return ok(f"drag from ({start_x},{start_y}) interrupted{_srv._dialog_note(tab)}. "
                       f"It finishes once the dialog is answered.")
         return _srv._click_outcome(
-            f"dragged ({start_x},{start_y}) to ({end_x},{end_y})", "method=cdp_mouse",
+            tab, f"dragged ({start_x},{start_y}) to ({end_x},{end_y})", "method=cdp_mouse",
             before, await _srv._sig_after_action(tab, before),
         )
     except Exception as e:

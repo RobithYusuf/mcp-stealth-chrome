@@ -304,24 +304,23 @@ def test_checks_takeover_before_tripwire_checkpoint(monkeypatch, runner):
                       if runner == "batch" else workflow_run([{"tool": "navigate", "args": {"url": "https://example.test"}}]))
     assert "the person took over" in out
     assert checks == []
-def test_workflow_rejects_disallowed_step_before_checkpoint(monkeypatch):
+
+
+def test_workflow_rejects_disallowed_step_before_checkpoint(monkeypatch, page):
     from mcp_stealth_chrome.tools.action_kit import workflow_run
-    checks = []
+    tab = page("https://example.test/", overlay=True)
+    bar = presence._handle(tab.browser)
 
-    async def checkpoint(*_args):
-        checks.append("read")
-        return None
+    async def take_over():
+        bar.control_file.write_text(json.dumps({"holder": "person"}))
+        return tab.url
 
-    async def refusal(*_args):
-        return "Error: the person took over"
-
-    monkeypatch.setattr(server, "_WORKFLOW_TOOLS", {"get_url": lambda **_: "ok"})
-    monkeypatch.setattr(server, "_inner_arguments_error", lambda *_args: None)
-    monkeypatch.setattr(batch.presence, "refusal", refusal)
-    monkeypatch.setattr(server, "_tripwire_step", checkpoint)
-    out = asyncio.run(workflow_run([{"tool": "server_status", "args": {}}]))
+    monkeypatch.setattr(server, "_register_workflow_tools", lambda: None)
+    monkeypatch.setattr(server, "_WORKFLOW_TOOLS", {"get_url": take_over})
+    out = asyncio.run(workflow_run([{"tool": "get_url"}, {"tool": "server_status"}]))
     assert "unknown or non-allowlisted tool: server_status" in out
-    assert checks == []
+    assert presence.holds(tab.browser)
+    assert tab.probes == 1  # Only the first step, before Take over.
 
 
 def test_late_text_probe_rechecks_takeover(monkeypatch, page):
@@ -607,7 +606,7 @@ def test_off_reads_nothing(page, monkeypatch):
     tab = page(FIELD_URL, overlay=True, cf="x")
     assert look(tab, url=FIELD_URL, want_cf=True) is None and look(tab, want_cf=True) is None
     assert tab.probes == 0 and not server._HUMAN_HELP
-    assert server._tripwire_after_action("clicked; navigated to x", {"url": FIELD_URL}) == \
+    assert server._tripwire_after_action(tab, "clicked; navigated to x", {"url": FIELD_URL}) == \
         "clicked; navigated to x"
 
 
@@ -625,15 +624,15 @@ def test_warn_mode_records_nothing_and_says_it_once(page, monkeypatch):
 
 def test_a_click_onto_the_page_says_it_first_and_asks_in_pause_mode(page):
     tab = page("https://shopee.co.id/product/1", overlay=True)
-    out = server._tripwire_after_action("click '#go': clicked; navigated to x", {"url": FIELD_URL})
+    out = server._tripwire_after_action(tab, "click '#go': clicked; navigated to x", {"url": FIELD_URL})
     assert out.startswith("antibot_warning: this led to a verification page (shopee.co.id built-in rule")
     assert "the person was asked in the overlay's bar (Done): call wait_for_human" in out
     assert out.endswith("\nclick '#go': clicked; navigated to x")
     assert server._HUMAN_HELP[KEY]["by"] == "tripwire"
     assert server._HUMAN_HELP[KEY]["baseline"] == {"url": FIELD_URL}
     # A click elsewhere, or one that failed, is left as it was.
-    assert server._tripwire_after_action("x", {"url": "https://shopee.co.id/p"}) == "x"
-    assert server._tripwire_after_action("Error: NOT clicked", {"url": FIELD_URL}) == "Error: NOT clicked"
+    assert server._tripwire_after_action(tab, "x", {"url": "https://shopee.co.id/p"}) == "x"
+    assert server._tripwire_after_action(tab, "Error: NOT clicked", {"url": FIELD_URL}) == "Error: NOT clicked"
 
 
 def test_the_step_check_skips_only_a_first_navigation(page):
@@ -763,9 +762,9 @@ def test_closed_popup_withdraws_only_its_tripwire_request(page, monkeypatch):
         return [(server._target_key(parent), parent.url)]
 
     monkeypatch.setattr(server, "_page_targets", targets)
-    token = server._TRIPWIRE_RUN.set({"popup": server._Trip(
-        "pause", antibot.url_verdict(FIELD_URL, antibot.BUILT_IN), target="closed-popup")})
+    token = server._TRIPWIRE_RUN.set({"tool": "batch_actions"})
     try:
+        _click_popup(parent, "closed-popup")
         assert asyncio.run(server._tripwire_step("click", "navigate")) is None
     finally:
         server._TRIPWIRE_RUN.reset(token)
@@ -785,9 +784,9 @@ def test_closed_popup_keeps_request_when_target_list_is_unreadable(page, monkeyp
         raise ConnectionError("target list unreadable")
 
     monkeypatch.setattr(server, "_page_targets", unread)
-    token = server._TRIPWIRE_RUN.set({"popup": server._Trip(
-        "pause", antibot.url_verdict(FIELD_URL, antibot.BUILT_IN), target="unread-popup")})
+    token = server._TRIPWIRE_RUN.set({"tool": "batch_actions"})
     try:
+        _click_popup(parent, "unread-popup")
         assert asyncio.run(server._tripwire_step("click", "navigate")) is None
     finally:
         server._TRIPWIRE_RUN.reset(token)
@@ -805,3 +804,80 @@ def test_tripwire_does_not_replace_explicit_agent_request(page, monkeypatch):
     out = server._tripwire_render(trip, "navigate", "x", asked_for=FIELD_URL)
     assert "explicit request made with request_human_help is still pending" in out
     assert "popup tab manual-popup" in out
+
+
+def test_spawn_verification_handoff_belongs_to_work_while_main_has_explicit_request(page, monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from test_focus_restore import _fake_launch
+    from mcp_stealth_chrome.tools import instances
+
+    work = page(FIELD_URL, overlay=True)
+    work.target = SimpleNamespace(target_id="work-tab")
+    main = page("https://example.test/", overlay=True)
+    monkeypatch.setattr(BrowserState, "instances", {})
+    monkeypatch.setattr(BrowserState, "current_instance_id", "main")
+    asyncio.run(nav.request_human_help("Finish the main form"))
+    explicit = server._HUMAN_HELP[KEY]
+
+    # Exercise the public spawn path with a stand-in browser, never a visible window.
+    _fake_launch(monkeypatch)
+    monkeypatch.setattr(server, "ensure_dirs", lambda: None)
+    monkeypatch.setattr(server, "_launch_identity", lambda *a, **kw: (None, {}, "native"))
+    monkeypatch.setattr(server, "_start_chrome", AsyncMock(return_value=work.browser))
+    monkeypatch.setattr(server, "_first_live_tab", AsyncMock(return_value=work))
+    monkeypatch.setattr(work, "get", AsyncMock(), raising=False)
+    monkeypatch.setattr(server, "_wait_load_complete", AsyncMock())
+    monkeypatch.setattr(server, "_observe_navigation", AsyncMock(return_value={"final_url": FIELD_URL}))
+    monkeypatch.setattr(server, "_record_tabs_at_launch", AsyncMock())
+    monkeypatch.setattr(server, "_watch_windows", lambda _: None)
+    monkeypatch.setattr(server, "_ensure_idle_reaper_running", lambda: None)
+    monkeypatch.setattr(presence, "attach", AsyncMock(return_value=""))
+    out = asyncio.run(instances.spawn_browser("work", url=FIELD_URL, profile_dir=str(tmp_path / "work")))
+    assert out.startswith("Error: antibot_paused:") and "person was asked" in out, out
+    assert "explicit request" not in out and BrowserState.browser is main.browser
+    assert server._HUMAN_HELP[KEY] is explicit and "replaced_by" not in explicit
+    asked = server._HUMAN_HELP["work-tab"]
+    assert asked["browser"] is work.browser and asked["instance_id"] == "work"
+    assert presence.shows_request(work.browser, asked["shown_at"], asked["request_id"])
+
+
+def _click_popup(parent, target):
+    before = {**parent.sig(), "pages": {KEY: parent.url}}
+    after = {**before, "pages": {**before["pages"], target: FIELD_URL}, "opened_here": [target]}
+    return server._click_outcome(parent, "clicked", "#open", before, after)
+
+
+@pytest.mark.parametrize("answer,still_matches", [
+    ("none", True), ("done", True), ("wait", True), ("explicit_done", True), ("done", False),
+])
+def test_popup_checkpoint_revalidates_the_clicks_handoff(page, monkeypatch, answer, still_matches):
+    parent = page("https://example.test/", overlay=True)
+    popup = Tab(FIELD_URL, parent.browser)
+    popup.target = type("Target", (), {"target_id": "popup"})()
+    monkeypatch.setattr(BrowserState, "tabs", [parent, popup])
+    bar = presence._handle(parent.browser)
+    async def targets(_browser):
+        return [(KEY, parent.url), ("popup", FIELD_URL if still_matches else parent.url)]
+    monkeypatch.setattr(server, "_page_targets", targets)
+    run = server._TRIPWIRE_RUN.set({"tool": "batch_actions"})
+    try:
+        if answer == "explicit_done":
+            asyncio.run(nav.request_human_help("Complete the parent form"))
+        assert "in opened tab" in _click_popup(parent, "popup")
+        old = server._HUMAN_HELP[KEY if answer == "explicit_done" else "popup"]["request_id"]
+        if answer != "none":
+            press_done(bar)
+        if answer == "wait":
+            assert "pressed Done" in asyncio.run(nav.wait_for_human(timeout=1))
+        out = asyncio.run(server._tripwire_step("click", "navigate"))
+        if not still_matches:
+            assert out is None and "popup" not in server._HUMAN_HELP and not bar.agent["help"]
+        else:
+            assert out.startswith("Error: antibot_paused:") and "popup tab popup" in out
+            new = server._HUMAN_HELP["popup"]["request_id"]
+            assert new == bar.agent["request_id"]
+            assert (new != old) == (answer != "none")
+            assert ("asked again" in out) == (answer != "none")
+    finally:
+        server._TRIPWIRE_RUN.reset(run)

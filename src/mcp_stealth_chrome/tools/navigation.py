@@ -161,6 +161,7 @@ async def request_human_help(objective: str, timeout: float = 300) -> str:
     """
     try:
         tab = BrowserState.active_tab()
+        browser = BrowserState.browser
         if BrowserState.current_headless:
             return err(
                 "human help unavailable: this browser is headless, so there is no "
@@ -177,7 +178,7 @@ async def request_human_help(objective: str, timeout: float = 300) -> str:
         # one and shows in the overlay's bar when one runs.
         record = _srv._record_human_help(tab, objective, timeout, by="agent", clock=_clock(),
                                          baseline=await _srv._page_sig(tab),
-                                         browser=BrowserState.browser)
+                                         browser=browser)
         if record["asked_at"] is not None:
             how = ("Call wait_for_human next. The overlay's bar shows the request with a Done "
                    "button: the wait ends when the person presses it, or on done_url_contains or "
