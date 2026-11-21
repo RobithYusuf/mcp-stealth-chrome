@@ -783,7 +783,8 @@ def test_navigation_commit_timeout_reports_observation_and_leaves_tab_usable(pag
     assert reply.failed, reply.text
     assert "did not answer within 30s" in reply.text
     assert "observed URL" in reply.text and "ready_state" in reply.text
-    assert "tab may still be loading" in reply.text
+    assert "earlier navigation was stopped" in reply.text, reply.text
+    assert '"loading_stopped": true' in reply.text and '"tab_may_still_be_loading": false' in reply.text, reply.text
     recovered = page.call("navigate", url=f"{base}/page2.html", _timeout=20)
     assert not recovered.failed, recovered.text
     assert '"status": 200' in recovered.text and '"status_source": "cdp:Network.responseReceived"' in recovered.text, recovered.text

@@ -6275,15 +6275,16 @@ def _carry_nav_timeout_recovery(observed: dict, timeout_observation: Optional[di
     return observed
 
 
-async def _stop_navigation_after_timeout(tab: Tab) -> None:
-    """Stop a timed-out load so the tab's CDP session can serve the next navigation."""
+async def _stop_navigation_after_timeout(tab: Tab) -> Optional[bool]:
+    """Stop a timed-out load, returning True, False, or None when it cannot be measured."""
     from nodriver.cdp import page as cdp_page
     try:
         await _wait(tab.send(cdp_page.stop_loading()), timeout=5, what="Page.stopLoading")
     except Exception:
-        return
+        return False
     with contextlib.suppress(Exception):
         setattr(tab, "_mcp_navigation_stopped_after_timeout", True)
+    return True
 
 
 def _nav_result(
@@ -6336,23 +6337,31 @@ async def _commit_navigation(tab, url: str, doc_state: dict) -> Optional[dict]:
         if _nav_timeout_recovered(url, observed):
             observed["_commit_timeout_recovered"] = True
         else:
-            await _stop_navigation_after_timeout(tab)
+            stopped = await _stop_navigation_after_timeout(tab)
+            observed["loading_stopped"] = stopped is True
+            if stopped is False:
+                observed["loading_stop_error"] = "Page.stopLoading failed"
         return observed
     return None
 
 
 def _nav_commit_timeout_message(action: str, observed: dict) -> str:
-    """Describe a commit timeout with observations and no claim that loading stopped."""
+    """Describe a commit timeout and whether the unfinished load was stopped."""
     observed = dict(observed)
     observed["commit_timeout_seconds"] = NAV_COMMIT_TIMEOUT
-    observed["tab_may_still_be_loading"] = True
+    stopped = observed.get("loading_stopped") is True
+    observed["loading_stopped"] = stopped
+    observed["tab_may_still_be_loading"] = not stopped
+    if stopped:
+        detail = "The earlier navigation was stopped; use navigate again to load a page."
+    else:
+        detail = "The tab may still be loading; use wait_for_url or wait_for, or navigate again."
     body = json.dumps(observed, indent=2, default=str)
     shown_url = repr(observed.get("final_url") or "(unmeasured)")
     ready = observed.get("ready_state") or "unmeasured"
     return (
         f"{action}: the page did not answer within {NAV_COMMIT_TIMEOUT:g}s; observed URL "
-        f"{shown_url}, ready_state {ready}. The tab may still be loading; use "
-        f"wait_for_url or wait_for, or navigate again.\n{body}"
+        f"{shown_url}, ready_state {ready}. {detail}\n{body}"
     )
 
 

@@ -570,7 +570,10 @@ async def _history_navigation(
         timeout_observation = await _srv._observe_navigation(tab, requested_url, doc_state)
         timeout_observation["commit_timeout_seconds"] = _srv.NAV_COMMIT_TIMEOUT
         if not _srv._nav_timeout_recovered(requested_url, timeout_observation):
-            await _srv._stop_navigation_after_timeout(tab)
+            stopped = await _srv._stop_navigation_after_timeout(tab)
+            timeout_observation["loading_stopped"] = stopped is True
+            if stopped is False:
+                timeout_observation["loading_stop_error"] = "Page.stopLoading failed"
             return _srv._nav_commit_timeout(action, timeout_observation)
         try:
             await _srv._wait_load_complete(tab, 10)
