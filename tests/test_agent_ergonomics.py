@@ -215,8 +215,10 @@ def test_target_key_is_shared_and_console_alias_delegates():
 
 
 def test_per_target_handlers_do_not_duplicate_and_network_mode_reconfigures(monkeypatch):
-    """A replacement Tab wrapper for one CDP target must not stack handlers."""
+    """Re-arming a target fences callbacks already queued on its previous Tab wrapper."""
     import asyncio
+    from collections import defaultdict
+    from nodriver.cdp import network
     from types import SimpleNamespace
 
     from mcp_stealth_chrome import server
@@ -228,16 +230,13 @@ def test_per_target_handlers_do_not_duplicate_and_network_mode_reconfigures(monk
         target = _Target()
 
         def __init__(self):
-            self.handlers = []
+            self.handlers = defaultdict(list)
 
         async def send(self, _command):
             return None
 
         def add_handler(self, event_type, handler):
-            self.handlers.append((event_type, handler))
-
-        async def send(self, _command):
-            return None
+            self.handlers[event_type].append(handler)
 
     first = _Tab()
     replacement = _Tab()
@@ -248,19 +247,18 @@ def test_per_target_handlers_do_not_duplicate_and_network_mode_reconfigures(monk
         classmethod(lambda cls: next(active)),
     )
 
-    server._NETWORK_ARMED_TAB_IDS.clear()
-    server._NETWORK_CAPTURE_BODIES.clear()
+    server._NETWORK_CAPTURES.clear()
     old_logs = server.BrowserState.network_logs
     old_index = server.BrowserState.network_index
+    server.BrowserState.network_logs = []
+    server.BrowserState.network_index = {}
     try:
         network_start = server.mcp._tool_manager._tools["network_start"].fn
-        asyncio.run(network_start(capture_bodies=False))
-        assert len(first.handlers) == 2
-
         asyncio.run(network_start(capture_bodies=True))
-        assert replacement.handlers == []
-
-        request_handler = first.handlers[0][1]
+        stale = {kind: handler for kind, (handler,) in first.handlers.items()}
+        asyncio.run(network_start(capture_bodies=True))
+        assert not any(first.handlers.values())
+        current = {kind: handler for kind, (handler,) in replacement.handlers.items()}
         event = SimpleNamespace(
             request_id="request-1",
             request=SimpleNamespace(
@@ -270,11 +268,29 @@ def test_per_target_handlers_do_not_duplicate_and_network_mode_reconfigures(monk
             type_="Document",
             timestamp=1,
         )
-        asyncio.run(request_handler(event))
-        assert "request-1" in server.BrowserState.network_index
+        # A queued callback, rather than a new callback delivered after the reset.
+        asyncio.run(stale[network.RequestWillBeSent](event))
+        assert not server.BrowserState.network_logs and not server.BrowserState.network_index
+        # An event generated before re-arm can also reach the new handler on the socket.
+        event.wall_time = 1
+        asyncio.run(current[network.RequestWillBeSent](event))
+        assert not server.BrowserState.network_logs and not server.BrowserState.network_index
+        del event.wall_time
+        asyncio.run(current[network.RequestWillBeSent](event))
+        extra = SimpleNamespace(request_id="request-1", headers={"X-Capture": "old"})
+        response = SimpleNamespace(request_id="request-1", response=SimpleNamespace(status=200),
+                                   has_extra_info=True)
+        asyncio.run(stale[network.RequestWillBeSentExtraInfo](extra))
+        asyncio.run(stale[network.ResponseReceived](response))
+        entry = server.BrowserState.network_index["request-1"]
+        assert entry["status"] is None
+        asyncio.run(current[network.ResponseReceived](response))
+        assert entry["headers_source"] == "page"
+        extra.headers = {"X-Capture": "new"}
+        asyncio.run(current[network.RequestWillBeSentExtraInfo](extra))
+        assert entry["request_headers"] == {"X-Capture": "new"}
     finally:
-        server._NETWORK_ARMED_TAB_IDS.clear()
-        server._NETWORK_CAPTURE_BODIES.clear()
+        server._NETWORK_CAPTURES.clear()
         server.BrowserState.network_logs = old_logs
         server.BrowserState.network_index = old_index
 
@@ -364,18 +380,38 @@ def test_tab_cache_cleanup_preserves_other_live_targets(monkeypatch):
     monkeypatch.setattr(server, "_HUMAN_HELP", {
         "TARGET-A": {"objective": "a"}, "TARGET-B": {"objective": "b"},
     })
-    monkeypatch.setattr(server, "_NETWORK_ARMED_TAB_IDS", {"TARGET-A", "TARGET-B"})
-    monkeypatch.setattr(server, "_NETWORK_CAPTURE_BODIES", {
-        "TARGET-A": True, "TARGET-B": False,
-    })
+    monkeypatch.setattr(server, "_NETWORK_CAPTURES", {"TARGET-A": None, "TARGET-B": None})
 
     server._clear_tab_scoped_state([_TabA()])
 
     assert set(page._SNAPSHOT_CACHE) == {"TARGET-B"}
     assert set(server._HUMAN_HELP) == {"TARGET-B"}
-    assert server._NETWORK_ARMED_TAB_IDS == {"TARGET-B"}
-    assert server._NETWORK_CAPTURE_BODIES == {"TARGET-B": False}
+    assert set(server._NETWORK_CAPTURES) == {"TARGET-B"}
 
+
+
+def test_tab_cleanup_removes_network_handlers(monkeypatch):
+    from collections import defaultdict
+    from mcp_stealth_chrome import server
+    from nodriver.cdp import network
+
+    class _Target:
+        target_id = "TARGET-CLOSED"
+
+    class _Tab:
+        target = _Target()
+        def __init__(self):
+            self.handlers = defaultdict(list)
+
+    tab = _Tab()
+    handler = lambda event: None
+    tab.handlers[network.RequestWillBeSent].append(handler)
+    monkeypatch.setattr(server, "_NETWORK_CAPTURES", {
+        "TARGET-CLOSED": ({}, tab, ((network.RequestWillBeSent, handler),)),
+    })
+    server._clear_tab_scoped_state([tab])
+    assert not tab.handlers[network.RequestWillBeSent]
+    assert "TARGET-CLOSED" not in server._NETWORK_CAPTURES
 
 def test_trace_stop_removes_handlers_when_cdp_end_fails(monkeypatch):
     import asyncio
@@ -2873,7 +2909,7 @@ def console_state(monkeypatch):
     monkeypatch.setattr(server.BrowserState, "capture_console", False)
     monkeypatch.setattr(server.BrowserState, "capture_network", False)
     monkeypatch.setattr(server, "_CONSOLE_ARMED_TAB_IDS", set())
-    monkeypatch.setattr(server, "_NETWORK_ARMED_TAB_IDS", set())
+    monkeypatch.setattr(server, "_NETWORK_CAPTURES", {})
     return server
 
 
@@ -2985,7 +3021,7 @@ def test_network_start_says_when_network_could_not_be_enabled(monkeypatch, conso
     assert out.startswith("Error:") and "NOT started" in out
     assert console_state.BrowserState.capture_network is False
     assert not tab.handlers.get(cdp_network.RequestWillBeSent)
-    assert "T1" not in console_state._NETWORK_ARMED_TAB_IDS
+    assert "T1" not in console_state._NETWORK_CAPTURES
 
 
 # ── AU: emulate_device ──

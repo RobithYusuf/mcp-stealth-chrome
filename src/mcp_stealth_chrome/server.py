@@ -7515,8 +7515,10 @@ _CONSOLE_STARTED_AT: Optional[str] = None
 def _now_iso() -> str:
     from datetime import datetime
     return datetime.now().isoformat(timespec="seconds")
-_NETWORK_ARMED_TAB_IDS: set = set()
-_NETWORK_CAPTURE_BODIES: dict[str, bool] = {}
+
+
+# Active subscription per target: owning index, tab wrapper and exact registered callbacks.
+_NETWORK_CAPTURES: dict[str, tuple[dict, Any, tuple]] = {}
 
 
 def _clear_tab_scoped_state(tabs: list[Any]) -> None:
@@ -7532,9 +7534,9 @@ def _clear_tab_scoped_state(tabs: list[Any]) -> None:
         _DIALOG_AUTO_CFG["_registered_tab_ids"].discard(key)
         _DIALOG_WATCHED.discard(key)
         _OPEN_DIALOGS.pop(key, None)
-        _CONSOLE_ARMED_TAB_IDS.discard(key)
-        _NETWORK_ARMED_TAB_IDS.discard(key)
-        _NETWORK_CAPTURE_BODIES.pop(key, None)
+        subscription = _NETWORK_CAPTURES.pop(key, None)
+        if subscription is not None:
+            _drop_handlers(subscription[1], subscription[2])
         _NETWORK_KEPT_BODIES.discard(key)
         _NETWORK_DOC_LOADER.pop(key, None)
         presence._OVERRIDES.pop(key, None)  # emulate_device's record, for the overlay's lock

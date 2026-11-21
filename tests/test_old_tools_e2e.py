@@ -25,6 +25,31 @@ class _Api(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *_args):
         pass
 
+    def do_GET(self):
+        if self.path == "/held-capture":
+            self.server.started.set()
+            if not self.server.release.wait(15):
+                self.send_error(504)
+                return
+            self.send_response(302)
+            self.send_header("Location", "/wire-echo?old-capture")
+            self.end_headers()
+            return
+        if self.path == "/wire-redirect":
+            self.send_response(302)
+            self.send_header("Location", "/wire-echo")
+            self.end_headers()
+        elif self.path.split("?", 1)[0] == "/wire-echo":
+            # Only the receiver can say which headers actually arrived.
+            body = json.dumps({name: self.headers[name] for name in
+                               ("Accept", "Sec-Fetch-Mode", "Sec-Fetch-Dest")}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            super().do_GET()
+
     def do_POST(self):
         self.rfile.read(int(self.headers.get("Content-Length") or 0))
         body = json.dumps({"ok": True, "token": "RESPONSESECRET"}).encode()
@@ -328,6 +353,60 @@ def test_status_names_the_ephemeral_profile(loop, browser):
 def test_viewport_is_read_back(loop, browser):
     out = run(loop, "set_viewport_size", 1000, 700)
     assert out.startswith("window set to 1000x700") and "viewport reads" in out, out
+
+
+@pytest.mark.parametrize("indexed", [True, False])
+def test_capture_restart_drops_in_flight_request_and_redirect(loop, browser, indexed):
+    with http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Api) as srv:
+        srv.started, srv.release = threading.Event(), threading.Event()
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            run(loop, "navigate", f"http://127.0.0.1:{srv.server_port}/wire-echo", auto_verify=False)
+            run(loop, "network_start", capture_bodies=indexed)
+            js(loop, "window.pending = fetch('/held-capture', {headers:{'X-Capture':'old'}})"
+                     ".then(r => r.text()); true")
+            assert srv.started.wait(3)
+            run(loop, "network_start", capture_bodies=indexed)
+            srv.release.set()
+            js(loop, "window.pending")
+            js(loop, "fetch('/wire-echo?new-capture', {headers:{'X-Capture':'new'}}).then(r => r.text())")
+            for full in ([False, True] if indexed else [False]):
+                entries = json.loads(run(loop, "network_get", full=full))
+                assert not any("held-capture" in e["url"] or "old-capture" in e["url"] for e in entries)
+                fresh = [e for e in entries if "new-capture" in e["url"]]
+                if full:
+                    assert [e["request_headers"]["X-Capture"] for e in fresh] == ["new"]
+                else:
+                    assert [e["type"] for e in fresh] == ["request", "response"]
+        finally:
+            srv.release.set()
+            srv.shutdown()
+
+
+def test_capture_reports_the_headers_received_on_the_final_hop(loop, page, tmp_path, monkeypatch):
+    from mcp_stealth_chrome.tools import capture
+
+    monkeypatch.setattr(capture, "EXPORT_DIR", tmp_path)
+    run(loop, "network_start")
+    # Path-scoped: only the final hop has this cookie. Matching by request id alone
+    # risks returning the redirect's headers for the destination.
+    js(loop, "document.cookie = 'wire=COOKIESECRET; Path=/wire-echo'")
+    received = json.loads(js(loop, "fetch('/wire-redirect').then(r => r.json())"))
+    assert all(received.values())
+    entry, = json.loads(run(loop, "network_get", filter_url="/wire-echo", full=True))
+    js(loop, "fetch('data:text/plain,no-wire-headers').then(r => r.text())")
+    fallback, = json.loads(run(loop, "network_get", filter_url="no-wire-headers", full=True))
+    run(loop, "export_har", filename="wire.har")
+    archive = json.loads((tmp_path / "wire.har").read_text())["log"]["entries"]
+    request, = [e["request"] for e in archive if e["request"]["url"].endswith("/wire-echo")]
+    for headers in (entry["request_headers"], {h["name"]: h["value"] for h in request["headers"]}):
+        values = {k.lower(): v for k, v in headers.items()}
+        assert {k: values.get(k.lower()) for k in received} == received
+        assert values["cookie"].startswith("***")
+    assert entry["headers_source"] == request["_headersSource"] == "wire"
+    cached, = [e["request"] for e in archive if e["request"]["url"] == fallback["url"]]
+    assert fallback["headers_source"] == cached["_headersSource"] == "page"
+    assert "not observed" in fallback["headers_note"] == cached["_headersNote"]
 
 
 def test_export_har_is_a_har_and_private(loop, page):
