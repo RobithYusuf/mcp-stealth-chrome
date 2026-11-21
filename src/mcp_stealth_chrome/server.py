@@ -4804,8 +4804,9 @@ async def _launch_window_health(req: _LaunchRequest, main: Any) -> str:
     # corruption) Chrome can come up with outerWidth==0, position
     # off-screen, or visibilityState=='hidden'. Tools work but every
     # mouse_click_xy / set_viewport_size fails with cryptic CDP errors.
-    # Detect once + try a single bring_to_front; report rather than fix
-    # silently so the caller knows when to call browser_recover().
+    # Detect once, set the window state back to normal without raising the window, and
+    # probe again; report rather than fix silently so the caller knows when to call
+    # browser_recover().
     health_suffix = ""
     if not req.headless:
         try:

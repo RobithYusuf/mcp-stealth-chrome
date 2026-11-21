@@ -248,3 +248,40 @@ def test_vertical_tabs_that_cannot_be_written_still_start_nothing(env, monkeypat
 def test_unset_persistent_is_true_except_under_testing_mode(asked, testing_mode, expected):
     """Only the value: a description of where it came from was computed, returned and never read."""
     assert server._launch_default_persistent(asked, testing_mode) is expected
+
+
+class _DegenerateWindowTab:
+    def __init__(self, probes):
+        self.probes, self.calls = list(probes), []
+
+    async def evaluate(self, *_a, **_kw):
+        import json
+        return json.dumps(self.probes.pop(0))
+
+    async def get_window(self):
+        self.calls.append("get_window")
+        return 1, None
+
+    async def set_window_state(self, state="normal", **_kw):
+        self.calls.append(f"set_window_state:{state}")
+
+    async def bring_to_front(self):
+        self.calls.append("bring_to_front")
+
+    async def activate(self):
+        self.calls.append("activate")
+
+
+@pytest.mark.parametrize("second,note", [({"w": 1280, "h": 800, "v": "visible"}, False),
+                                         ({"w": 0, "h": 0, "v": "hidden"}, True)])
+def test_the_health_probe_restores_a_degenerate_window_without_raising_it(second, note):
+    """One nudge: the window state set back to normal, never brought to the front (taking the
+    foreground to check on a window is what this launch must not do), then one more probe."""
+    import inspect
+    tab = _DegenerateWindowTab([{"w": 0, "h": 0, "v": "hidden", "sx": 0, "sy": 0}, second])
+    out = asyncio.run(server._launch_window_health(SimpleNamespace(headless=False), tab))
+    assert tab.calls == ["get_window", "set_window_state:normal"], tab.calls
+    assert ("window degenerate" in out) is note, out
+    source = inspect.getsource(server._launch_window_health)
+    assert "bring_to_front" not in source and "activate" not in source, \
+        "the health probe names a call that raises the window"
