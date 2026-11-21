@@ -155,6 +155,21 @@ def _trim_index(index: dict) -> None:
 CAPTURE_BODY_BUFFER_BYTES = int(os.environ.get("CAPTURE_BODY_BUFFER_BYTES", str(64 * 2**20)))
 CAPTURE_BODY_MAX_BYTES = int(os.environ.get("CAPTURE_BODY_MAX_BYTES", str(10 * 2**20)))
 
+def _network_session_key(tab: Any) -> tuple[int, int | None]:
+    """Identify the live CDP session, which changes when a tab reconnects."""
+    connection = getattr(tab, "connection", None) or tab
+    websocket = getattr(connection, "_websocket", None)
+    return id(connection), id(websocket) if websocket is not None else None
+
+
+def _network_enabled_session(tab: Any) -> Optional[tuple[int, int | None]]:
+    return getattr(tab, "_mcp_network_enabled_session", None)
+
+
+def _mark_network_enabled(tab: Any) -> None:
+    with contextlib.suppress(Exception):
+        setattr(tab, "_mcp_network_enabled_session", _network_session_key(tab))
+
 
 def _resource_type(event: Any) -> str:
     """"XHR", "Fetch", "Document"...: the CDP resource type's own name."""
@@ -6090,16 +6105,15 @@ async def _arm_document_watch(tab: Tab) -> tuple[dict, Any]:
     # nodriver waiting on the next command while Chrome finishes the old one.  Do not send a
     # second enable on the same CDP session: the first successful enable already covers every
     # later document, and its event handlers are scoped by `state` below.
-    enabled_connection = getattr(tab, "_mcp_network_enabled_connection", None)
-    enabled_domains = getattr(tab, "enabled_domains", ())
-    if (enabled_connection is tab or cdp_network in enabled_domains) and not getattr(tab, "closed", False):
+    session_key = _network_session_key(tab)
+    if (_network_enabled_session(tab) == session_key and
+            not getattr(tab, "closed", False)):
         state["armed"] = True
     else:
         try:
             await _wait(tab.send(cdp_network.enable()), timeout=5, what="Network.enable")
             state["armed"] = True
-            with contextlib.suppress(Exception):
-                setattr(tab, "_mcp_network_enabled_connection", tab)
+            _mark_network_enabled(tab)
         except Exception as exc:
             state["arm_error"] = f"{type(exc).__name__}: {exc}"
     if state["armed"]:

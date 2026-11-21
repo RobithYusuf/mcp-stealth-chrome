@@ -1723,6 +1723,29 @@ class _CdpTab:
         return [r["method"] for r in self.sent]
 
 
+def test_document_watch_network_enable_cache_tracks_cdp_reconnect():
+    import asyncio
+
+    from mcp_stealth_chrome import server
+
+    tab = _CdpTab()
+
+    async def scenario():
+        first, disarm_first = await server._arm_document_watch(tab)
+        disarm_first()
+        second, disarm_second = await server._arm_document_watch(tab)
+        disarm_second()
+        same_session = tab.methods().count("Network.enable")
+        tab._websocket = object()
+        third, disarm_third = await server._arm_document_watch(tab)
+        disarm_third()
+        return first, second, third, same_session, tab.methods().count("Network.enable")
+
+    first, second, third, same_session, total = asyncio.run(scenario())
+    assert first["armed"] and second["armed"] and third["armed"]
+    assert same_session == 1 and total == 2
+
+
 def _active(monkeypatch, tab):
     from mcp_stealth_chrome import server
 
