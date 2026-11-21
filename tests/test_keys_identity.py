@@ -26,7 +26,7 @@ from mcp_stealth_chrome.identity import (
     navigator_languages,
     navigator_platform,
     os_family,
-    reduced_user_agent,
+    strip_headless,
     ua_metadata_fields,
 )
 
