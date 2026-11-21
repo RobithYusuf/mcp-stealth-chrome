@@ -27,6 +27,8 @@ RESULT_PREVIEW = 500
 # How far back from RESULT_PREVIEW a cut looks for a line break or ", " to end on.
 PREVIEW_BREAK_WINDOW = 80
 CUT_MARK = " ... [+{left} chars; the whole result is in vars when the step has save_as]"
+VAR_LARGE_THRESHOLD = 200_000
+VAR_INLINE_LIMIT = 1_000_000
 
 # How much of a run the report shows. "full" is the report as it always was; the others are
 # made from it by _shorten and show nothing it does not, except a last step past the entry cap.
@@ -221,6 +223,9 @@ class _Run:
     # a value (by index); and the last step, even when it fell past the cap.
     tally: dict[str, dict[str, int]] = field(default_factory=dict)
     saved: set[str] = field(default_factory=set)
+    # Names written through save_as="name[]". They are the values that may be omitted from
+    # an oversized report; ordinary input vars stay available for a caller's resume.
+    collected: set[str] = field(default_factory=set)
     last: Optional[dict] = None
     # Failed or ignored entries past the cap (the first MAX_LATE_FAILURES), and how many more.
     late_failures: list[dict] = field(default_factory=list)
@@ -354,12 +359,37 @@ async def _run_tool(run: _Run, step: dict, path: list[int]) -> None:
         return
     failed = text.startswith("Error:")
     value = step_value(text)
+    save_as = step.get("save_as")
+    if save_as:
+        try:
+            save_name = str(save_as)
+            if save_name.endswith("[]"):
+                name = save_name[:-2]
+                if not name:
+                    raise WorkflowError("save_as '[]' needs a variable name before []")
+                existing = run.variables.get(name)
+                if existing is None and name not in run.variables:
+                    existing = []
+                    run.variables[name] = existing
+                elif not isinstance(existing, list):
+                    raise WorkflowError(
+                        f"save_as {save_name!r} requires variable {name!r} to be a list, "
+                        f"but it holds {type(existing).__name__}"
+                    )
+                existing.append(value)
+                run.collected.add(name)
+            else:
+                run.variables[save_name] = value
+                run.collected.discard(save_name)
+            run.saved.add(str(path[0] if len(path) == 1 else _dotted(path)))
+        except WorkflowError as exc:
+            text = f"Error: {exc}"
+            failed = True
+            value = step_value(text)
+            _note_failure(run, text)
     run.variables["last"] = {"ok": not failed, "value": value, "text": text}
     entry = {"index": path[0] if len(path) == 1 else _dotted(path), "tool": tool,
              "label": step.get("label", ""), "ok": not failed, "result": _preview(text)}
-    if step.get("save_as"):
-        run.variables[str(step["save_as"])] = value
-        run.saved.add(str(entry["index"]))
     if failed and step.get("continue_on_error"):
         entry["ignored"] = True
         _record(run, entry)
@@ -483,6 +513,7 @@ async def run_workflow(
     if not run.stopped:
         # Only a resume needs it, and a resume only follows a failure or a pause.
         public_vars.pop(BRANCHES_VAR, None)
+    _guard_vars(result, public_vars, run)
     if public_vars:
         result["vars"] = public_vars
     if run.failure is not None:
@@ -549,6 +580,45 @@ def _unchanged(key: str, value: Any, given: dict[str, Optional[str]]) -> bool:
     return before is not None and _json_text(value) == before
 
 
+def _vars_size(variables: dict) -> int:
+    """Return the report size of vars without changing or truncating their values."""
+    text = _json_text(variables)
+    return len(text) if text is not None else len(repr(variables))
+
+
+def _guard_vars(result: dict, public_vars: dict, run: _Run) -> None:
+    """Annotate oversized vars, omitting only collected lists above the hard inline limit."""
+    size = _vars_size(public_vars)
+    if size <= VAR_LARGE_THRESHOLD:
+        return
+    result["vars_size"] = size
+    if size <= VAR_INLINE_LIMIT:
+        result["vars_warning"] = (
+            f"vars are large ({size} characters) but are kept whole; split collected runs "
+            "into smaller batches if the result is too large for the client."
+        )
+        return
+    omitted = []
+    for name in sorted(run.collected):
+        if name not in public_vars:
+            continue
+        value_text = _json_text(public_vars[name])
+        chars = len(value_text) if value_text is not None else len(repr(public_vars[name]))
+        public_vars.pop(name)
+        omitted.append({"name": name, "characters": chars})
+    if omitted:
+        result["vars_omitted"] = omitted
+        result["vars_warning"] = (
+            f"vars exceed the {VAR_INLINE_LIMIT} character inline limit; collected values "
+            "were not cut and are not inlined. Run smaller foreach batches to return them."
+        )
+    else:
+        result["vars_warning"] = (
+            f"vars are too large to inline ({size} characters); no collected value was cut. "
+            "Run smaller batches or pass fewer input vars."
+        )
+
+
 _NOTES = {
     "summary": "a summary: counts, every failed or ignored step, and the result of each step with "
                "save_as, each reader and the last step; vars only as this run set or changed them, "
@@ -603,6 +673,9 @@ def _shorten(full: dict, run: _Run, output: str, given: dict[str, Optional[str]]
     if cut:
         out["failed_or_ignored_not_shown"] = cut
     for key in ("completed_omitted", "failed_count", "failed_paths", "antibot_warnings"):
+        if key in full:
+            out[key] = full[key]
+    for key in ("vars_size", "vars_warning", "vars_omitted"):
         if key in full:
             out[key] = full[key]
     if "failed_at" in full:

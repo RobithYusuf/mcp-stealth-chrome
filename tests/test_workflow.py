@@ -113,6 +113,61 @@ def test_save_as_feeds_later_steps():
     assert result["vars"]["data"] == {"user": "ann"}
 
 
+def test_save_as_brackets_appends_parsed_results_in_nested_foreach():
+    steps = [{"foreach": [[1, {"x": 2}], [3]], "as": "row", "steps": [
+        {"foreach": "${row}", "as": "item", "steps": [
+            {"tool": "read", "args": {"value": "${item}"}, "save_as": "pages[]"}
+        ]}
+    ]}]
+    result, _ = run(steps, {"read": lambda args: json.dumps({"value": args["value"]})})
+    assert result["vars"]["pages"] == [{"value": 1}, {"value": {"x": 2}}, {"value": 3}]
+
+
+def test_save_as_brackets_rejects_an_existing_non_list():
+    result, calls = run([{"tool": "read", "save_as": "pages[]"}], {"read": "ok"},
+                        variables={"pages": {"old": True}})
+    assert not calls or calls == [("read", {})]
+    assert result["failed_at"] == 0
+    assert "requires variable 'pages' to be a list" in result["failure_context"]["error"]
+    assert result["vars"]["pages"] == {"old": True}
+
+
+def test_save_as_brackets_resume_keeps_previous_items_and_appends():
+    steps = [{"foreach": [1, 2, 3], "as": "item", "steps": [
+        {"tool": "read", "args": {"value": "${item}"}, "save_as": "pages[]"}
+    ]}]
+
+    def answer(args):
+        return "Error: transient" if args["value"] == 2 else str(args["value"])
+
+    failed, _ = run(steps, {"read": answer})
+    assert failed["vars"]["pages"] == [1, "Error: transient"]
+    resumed, calls = run(steps, {"read": lambda args: str(args["value"])},
+                         start_at=failed["failed_path"], variables=failed["vars"])
+    assert "failed_at" not in resumed
+    assert resumed["vars"]["pages"] == [1, "Error: transient", 2, 3]
+    assert calls == [("read", {"value": 2}), ("read", {"value": 3})]
+
+
+@pytest.mark.parametrize("count,expect_omitted", [(100, False), (450, True)])
+def test_collected_vars_size_guard_is_explicit(count, expect_omitted):
+    item = "x" * 2500
+    result, _ = run(
+        [{"foreach": list(range(count)), "as": "item", "steps": [
+            {"tool": "read", "args": {"value": "${item}"}, "save_as": "pages[]"}
+        ]}],
+        {"read": lambda args: item}, output="summary")
+    assert "vars_warning" in result
+    if expect_omitted:
+        assert "pages" not in result["vars"]
+        assert result["vars_omitted"][0]["name"] == "pages"
+        assert result["vars_omitted"][0]["characters"] > 1_000_000
+        assert "smaller" in result["vars_warning"]
+    else:
+        assert len(result["vars"]["pages"]) == count
+        assert "vars_omitted" not in result
+
+
 def test_foreach_with_if_fills_a_form_per_row():
     rows = [{"name": "a", "active": True}, {"name": "b", "active": False}]
     result, calls = run(

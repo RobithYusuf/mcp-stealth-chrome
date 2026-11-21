@@ -816,6 +816,9 @@ async def workflow_run(
     as ${x}, ${x.field} or ${x[0].name}; a string that is exactly one reference keeps its type. ${last.ok},
     ${last.value} and ${last.text} describe the previous step. A reference to something undefined fails the
     step and lists what is defined.
+    To collect across a loop, use `save_as: "name[]"`: each result is appended to a list created on
+    first use, parsed as JSON like plain save_as. An existing non-list `name` is a step error.
+    Collected lists support `${name}` and `${name[0].field}` references and remain whole in vars.
 
     Loop: {"foreach": "${rows}", "as": "row", "steps": [...]} sets ${row} and ${row_index} for each item.
 
