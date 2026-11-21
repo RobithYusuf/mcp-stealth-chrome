@@ -3611,8 +3611,12 @@ async def _reattach_claimed(browser: Any, instance_id: str, profile: Path, recor
                                 "tabs were left as they were, and tab_focus shows this one"
                                 if in_their_window else
                                 "opened in a new tab; the kept tabs were left as they were")
+    elif from_launcher and _target_key(tabs[select]) not in (agents_before | opened_now):
+        # Target-list metadata is enough to report the reattach; do not evaluate the person's page.
+        observed = {"probe_error": "the selected tab belongs to the person and was not read",
+                    "status_note": "no document navigation"}
     else:
-        # Nothing navigated: read back the page the selected tab shows.
+        # Nothing navigated: read back the page the selected agent tab shows.
         observed = await _observe_navigation(tabs[select], None, {"armed": False})
     # The last await is behind: a browser_launch that browser_recover cut short meanwhile takes
     # nothing over, and the browser is given back as it was (_reattach_connected), never ended:
@@ -3765,8 +3769,9 @@ async def _launch_by_reattach(profile: Path, verdict: dict, *, url: str, keep_al
     if "commit_timeout_seconds" in observed:
         return err(_nav_commit_timeout_message(summary, observed))
     action = "Loaded" if url and url != "about:blank" else "Selected tab shows"
-    trip = await _tripwire_after_navigation(tabs[select], observed, doc_state=doc_state,
-                                            headless=bool(record.get("headless")))
+    trip = (await _tripwire_after_navigation(tabs[select], observed, doc_state=doc_state,
+                                             headless=bool(record.get("headless")))
+            if doc_state is not None and _target_key(tabs[select]) in BrowserState.owned_targets else None)
     return _tripwire_render(trip, "browser_launch", _nav_result(
         f"{summary[0].upper()}{summary[1:]}. {action}", observed,
         expect_url=expect_url, expect_status=expect_status, suffix=keep_text + ads_note),

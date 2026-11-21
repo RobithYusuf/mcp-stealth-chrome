@@ -445,7 +445,7 @@ async def _spawn_by_reattach(instance_id: str, profile: Path, verdict: dict, *, 
         return False, _srv._nav_commit_timeout_message(f"Instance {instance_id!r} {summary}", observed)
     trip = (await _srv._tripwire_after_navigation(
                 tabs[select], observed, doc_state=doc_state, headless=bool(record.get("headless")))
-            if url and url != "about:blank" else None)
+            if doc_state is not None and _srv._target_key(tabs[select]) in owned else None)
     return True, _srv._tripwire_render(trip, "spawn_browser", (
         f"instance {instance_id!r} {summary}{keep_text}\n"
         f"{json.dumps(observed, indent=2, default=str)}"), asked_for=url, launched=True)
