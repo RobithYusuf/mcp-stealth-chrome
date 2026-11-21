@@ -108,6 +108,19 @@ Part of the agent guide: [AGENTS.md](../../AGENTS.md) says when to read this. It
 - The page is measured in screen points from the device-pixel `layoutViewport` (`presence.page_size`), not the CSS
   one, which shrinks with zoom (at 125% the lock was 800x442 at an offset over a 1000x553 page). `zoom` goes to the
   overlay for the agent's cursor, which is in CSS pixels.
+- Under a device metrics override (`emulate_device`) Chrome draws the page at the top-left of the content area, 1 CSS
+  px to 1 pt, clipped to the window, and the layout metrics give the emulated size, not where it is drawn. The
+  centred guess put an iphone-15 page (393x852 in a 500x900 window) at (53.5, 48, 393, 852), 39 pt over the toolbar;
+  it is at (0, 87, 393, 813) (Chrome 157). `emulate_device` reads the page's corner before the first override
+  (`presence.before_device_override`) and records the override per tab (`presence._OVERRIDES`, forgotten with the
+  tab and by the desktop preset); `page_place` puts the lock there. The cursor's zoom is then the emulated width over
+  the CSS layout width: a page with no viewport meta tag lays out 980 px wide, zoom 0.401, and the cursor sat on the
+  clicked button (measured). Limits: no overlay attached when the override began means no corner, so the centred
+  guess stays; a toolbar change during the override is not seen until the desktop preset; after a resize during
+  one the lock's width is wrong until the next window read (about a second).
+- The agent's cursor is drawn only inside the page (`cursor_point` returns None outside, the edges inside). It is the
+  agent's last point: after `set_viewport_size(390, 900)` a click made at x 1227 on the desktop layout was drawn 724
+  pt outside the window, over another app. A click outside is taken without a ring, so it never rings later.
 - Each tick reads the window's alpha (`window_alpha`): gone (a Quit) or under 0.5 (macOS fading it out on close, about
   0.3 s, still listed) hides at once; MISSING_FOR stays for a window still there but unseen on another Space (a
   minimized one goes sooner, see `MISSING_QUICK` below). Gone 0.13 s after a Quit (3.35 s before), 0.31 s after a

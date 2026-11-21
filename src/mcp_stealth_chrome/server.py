@@ -7000,6 +7000,7 @@ def _clear_tab_scoped_state(tabs: list[Any]) -> None:
         _NETWORK_CAPTURE_BODIES.pop(key, None)
         _NETWORK_KEPT_BODIES.discard(key)
         _NETWORK_DOC_LOADER.pop(key, None)
+        presence._OVERRIDES.pop(key, None)  # emulate_device's record, for the overlay's lock
     # Interception pauses every matching request until the handler answers it, so
     # it must not survive its target. Left armed, the next launch would inherit a
     # handler bound to a dead tab and the first request would stall with no error.

@@ -1087,3 +1087,23 @@ def test_emulate_device_reads_nothing_more_without_an_overlay(tmp_path, monkeypa
     assert not asyncio.run(devtools.emulate_device("iphone-15")).startswith("Error")
     assert "Page.getLayoutMetrics" not in tab.methods and "Browser.getWindowForTarget" not in tab.methods
     assert presence._OVERRIDES["T-emulated"]["insets"] is None
+
+
+def test_a_closed_tab_takes_its_device_override_record_with_it():
+    """emulate_device records its override per tab for the overlay's lock. The record goes with
+    the tab, as every per-tab cache does."""
+    import types
+
+    from mcp_stealth_chrome import presence, server
+
+    tab = types.SimpleNamespace(target=types.SimpleNamespace(target_id="T-closed"), browser=None)
+    other = types.SimpleNamespace(target=types.SimpleNamespace(target_id="T-open"), browser=None)
+    presence.device_override(tab, (393, 852), (0.0, 87.0))
+    presence.device_override(other, (412, 915), (0.0, 87.0))
+    try:
+        server._clear_tab_scoped_state([tab])
+        assert "T-closed" not in presence._OVERRIDES
+        assert presence._OVERRIDES["T-open"]["width"] == 412.0
+    finally:
+        presence._OVERRIDES.pop("T-closed", None)
+        presence._OVERRIDES.pop("T-open", None)
