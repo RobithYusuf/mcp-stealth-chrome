@@ -245,6 +245,22 @@ def test_an_idle_agent_unlocks_the_page_and_a_take_over_says_what_the_agent_know
         assert "pressed Resume agent" in answer.get("text", ""), answer
         assert _read(agent_file).get("waiting_human") is False
         assert _wait(lambda: not note_line(), 5), "the note line stayed after Resume agent"
+
+        # Done pressed while the agent is not waiting: the bar stops asking and the note line
+        # goes (it kept the keyboard: the next key went into it, not the page), the next call
+        # is told, and a wait started afterwards returns at once.
+        asked = client.call("request_human_help", objective="Tick Agree", timeout=30)
+        assert not asked.failed, asked.text
+        assert _wait(note_line, 5), _windows(overlay_pid)
+        os.kill(overlay_pid, signal.SIGUSR2)  # Done
+        assert _wait(lambda: not note_line(), 3), "the note line stayed after Done"
+        assert _bar_shown(overlay_pid), "the bar went with it: nothing confirms the Done"
+        assert _read(agent_file).get("help") == "Tick Agree"  # no call took it yet
+        told = client.call("get_text")
+        assert "the person pressed Done on the request for help" in told.text, told.text
+        assert _read(agent_file).get("help") is None
+        waited = client.call("wait_for_human", timeout=10, _timeout=30)
+        assert "pressed Done" in waited.text and "after 0." in waited.text, waited.text
     finally:
         client.call("close_all_instances", _timeout=40)
         client.close()

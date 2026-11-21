@@ -444,12 +444,14 @@ def near(b, want, slack=4.0):
     return all(abs(float(p) - float(q)) <= slack for p, q in zip(b, want))
 
 
-def choose_mode(help_text, holder, quiet, waiting):
+def choose_mode(help_text, holder, quiet, waiting, answered=False):
     """help and the person's hold first: their buttons are the only way back, so they outlast any
-    quiet. Then, by the seconds since the agent's last call (0 while one runs): idle past
-    HIDE_AFTER (all faded), resting past IDLE_AFTER (the lock is off, the page is the person's),
-    thinking past QUIET_AFTER, else working."""
-    if help_text:
+    quiet. A request the person answered with Done is `noted` until the agent's next call takes
+    it: the bar kept asking for help after Done, and the note line kept the keyboard, so the
+    next key went into it instead of the page (measured). Then, by the seconds since the agent's
+    last call (0 while one runs): idle past HIDE_AFTER (all faded), resting past IDLE_AFTER (the
+    lock is off, the page is the person's), thinking past QUIET_AFTER, else working."""
+    if help_text and not answered:
         return "help"
     if holder == "person":
         return "person"
@@ -457,6 +459,8 @@ def choose_mode(help_text, holder, quiet, waiting):
         return "idle"
     if waiting == "polite":
         return "polite"
+    if help_text:
+        return "noted"
     if quiet > IDLE_AFTER:
         return "resting"
     if quiet > QUIET_AFTER:
@@ -1650,7 +1654,8 @@ class Overlay:
 
         # A request for help and the person's hold outlast any quiet: their buttons (Done,
         # Resume agent) are the only way back, so they never fade out.
-        mode = choose_mode(help_text, self.control["holder"], quiet, a.get("waiting"))
+        answered = float(self.control.get("help_done") or 0) >= float(a.get("asked_at") or 0) > 0
+        mode = choose_mode(help_text, self.control["holder"], quiet, a.get("waiting"), answered)
         self.mode = mode
 
         if new_key and mode in WORKING:
@@ -1661,7 +1666,7 @@ class Overlay:
                 self.control["person_last_input"] = now
                 self.save()
                 self.nudge("type")
-        if mode in ("resting", "idle") and (new_key or new_click or new_wheel):
+        if mode in ("resting", "idle", "noted") and (new_key or new_click or new_wheel):
             # The agent is not working and the page is open to the person: what they do there
             # goes to the agent's next call, so it reads the page again rather than act on what
             # it saw before. Keys count only with the browser in front, the pointer only over it.
@@ -1720,6 +1725,9 @@ class Overlay:
         elif mode == "polite":
             self.bar.set([("Agent paused", 13, 0.3, WHITE), ("  \u00b7  It goes on in a moment", 13, 0.0, MUTED)],
                          "Take over", "quiet", DOT["polite"], False, show_cursor)
+        elif mode == "noted":
+            self.bar.set([("Done", 13, 0.3, WHITE), ("  \u00b7  The agent goes on at its next step", 13, 0.0, MUTED)],
+                         "Take over", "quiet", DOT["person"], False, show_cursor)
         elif mode == "resting":
             self.bar.set([("Agent idle", 13, 0.3, WHITE), ("  \u00b7  The page is yours until its next step", 13, 0.0, MUTED)],
                          "Take over", "quiet", DOT["resting"], False, show_cursor)
@@ -1826,7 +1834,7 @@ class Overlay:
 
     def button(self):
         now = time.time()
-        if self.mode in WORKING or self.mode == "resting":
+        if self.mode in WORKING or self.mode in ("resting", "noted"):
             self.control.update(holder="person", since=now, reason="button")
         elif self.mode in ("person", "help"):
             note = self.note.take()

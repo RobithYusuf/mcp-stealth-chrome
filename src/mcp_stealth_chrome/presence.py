@@ -417,9 +417,28 @@ async def attach(browser: Any, pid: Optional[int], *, ask: Optional[bool], headl
         overlay.hide_after = float(settings.get("overlay_hide_after"))
     with contextlib.suppress(RuntimeError):
         overlay.follow_task = asyncio.get_running_loop().create_task(_follow_window(overlay))
-    return (" [agent_overlay: on: a light around the window while the agent acts and "
-            "a bar with Take over; while the person holds the browser the tools that act on or "
-            "read the page are refused]")
+    return on_note(style())
+
+
+def on_note(look: dict) -> str:
+    """What the launch result says is over the window: what the person's settings really show.
+    With the bar hidden it said "a bar with Take over" all the same (PROD, 21 Nov 2026)."""
+    parts = []
+    if look.get("light"):
+        parts.append("a light around the window while the agent acts")
+    bar = look.get("bar")
+    if bar == "off":
+        parts.append("no bar (overlay_bar is off in the person's settings: it shows only when the agent "
+                     "asks for help, so there is no Take over button)")
+    elif bar == "hover":
+        parts.append("a bar with Take over while the pointer is over the window")
+    else:
+        parts.append("a bar with Take over")
+    if look.get("lock"):
+        parts.append("a lock over the page while the agent works")
+    held = ("" if bar == "off" else
+            "; while the person holds the browser the tools that act on or read the page are refused")
+    return f" [agent_overlay: on: {', '.join(parts)}{held}]"
 
 
 def stop(browser: Any) -> None:
@@ -553,6 +572,20 @@ def _pass_on(overlay: "Overlay", name: str, last_active: float) -> None:
               "ask them, or call wait_for_human.")
 
 
+def _done_pressed(overlay: Optional["Overlay"]) -> Optional[str]:
+    """The person pressed Done on a request for help that no wait_for_human took: say so in this
+    result and close the request (wait_for_human closes its own before its result gets here).
+    Without it an agent that read the page instead of waiting never learned of the Done."""
+    if overlay is None or not overlay.agent.get("help"):
+        return None
+    done_at = float(overlay.read_control().get("help_done") or 0)
+    if done_at < float(overlay.agent.get("asked_at") or 0) or done_at <= 0:
+        return None
+    overlay.write(help=None)
+    return (f"the person pressed Done on the request for help at {_clock(done_at)}; "
+            "wait_for_human would now return at once.")
+
+
 def take_note(overlay: Optional["Overlay"], since: float) -> Optional[str]:
     """The note the person left with Resume agent or Done after `since`, once."""
     if overlay is None:
@@ -663,7 +696,11 @@ def result_note(session_key: str, result: str, browser: Any = None) -> str:
     """The notes for this call's result, and the person's own note if one waits: every result
     passes here, also those of tools that skip the before-hooks (wait_for_human, web_search)."""
     notes = list(_NOTES.pop(session_key, None) or [])
-    note = take_note(_handle(browser), 0.0) if browser is not None else None
+    overlay = _handle(browser) if browser is not None else None
+    done = _done_pressed(overlay)
+    if done:
+        notes.append(done)
+    note = take_note(overlay, 0.0)
     if note:
         notes.append(note)
     if not notes:

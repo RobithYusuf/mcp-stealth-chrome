@@ -616,6 +616,12 @@ def test_an_idle_agent_leaves_the_page_to_the_person():
     # Help and the person's hold never give way to quiet: their buttons are the way back.
     assert choose("Log in", "agent", 500.0, None) == "help"
     assert choose(None, "person", 500.0, None) == "person"
+    # Done pressed and no call took it yet: not asking any more (the note line let go of the
+    # keyboard only then), and it fades like anything else.
+    assert choose("Log in", "agent", 5.0, None, True) == "noted"
+    assert choose("Log in", "agent", 30.0, None, True) == "noted"
+    assert choose("Log in", "agent", 500.0, None, True) == "idle"
+    assert choose("Log in", "person", 5.0, None, True) == "person"
 
 
 def test_the_bar_says_whether_the_agent_knows_of_a_take_over(made, monkeypatch):
@@ -705,4 +711,35 @@ def test_the_idle_time_reaches_the_overlay(tmp_path, monkeypatch):
     assert presence.overlay_config(tmp_path, 1, False)["idle_after"] == 4.0
     monkeypatch.setenv("MCP_STEALTH_OVERLAY_IDLE_AFTER", "soon")
     assert presence.overlay_config(tmp_path, 1, False)["idle_after"] == presence.IDLE_AFTER
+
+
+
+def test_a_done_no_wait_took_reaches_the_next_result_and_closes_the_request(made, monkeypatch):
+    """Done pressed while the agent read the page instead of waiting: the bar kept asking for
+    help and the agent was never told (PROD, 21 Nov 2026)."""
+    monkeypatch.setattr("mcp_stealth_chrome.state.BrowserState.session_key", classmethod(lambda cls: "s"))
+    browser, overlay = made({"holder": "agent"})
+    asked = presence.ask(browser, "Log in")
+    assert presence.result_note("s", "page text", browser) == "page text"  # not answered yet
+    overlay.control_file.write_text(json.dumps({"holder": "agent", "reason": "help done", "help_done": asked + 3}))
+    text = presence.result_note("s", "page text", browser)
+    assert "the person pressed Done on the request for help at" in text
+    assert json.loads(overlay.agent_file.read_text())["help"] is None
+    assert presence.result_note("s", "again", browser) == "again"  # once
+    # A Done from an earlier request says nothing about a new one.
+    asked = presence.ask(browser, "Tick Agree")
+    overlay.control_file.write_text(json.dumps({"holder": "agent", "reason": "help done", "help_done": asked - 5}))
+    assert presence.result_note("s", "x", browser) == "x"
+    assert json.loads(overlay.agent_file.read_text())["help"] == "Tick Agree"
+
+
+def test_the_launch_note_says_what_the_settings_really_show():
+    full = presence.on_note({"bar": "full", "light": True, "lock": True})
+    assert "a light around the window" in full and "a bar with Take over" in full and "a lock over the page" in full
+    assert "the tools that act on or read the page are refused" in full
+    off = presence.on_note({"bar": "off", "light": True, "lock": False})
+    assert "no bar" in off and "no Take over button" in off and "a lock" not in off
+    assert "a bar with Take over" not in off and "holds the browser" not in off
+    assert "while the pointer is over the window" in presence.on_note({"bar": "hover", "light": False, "lock": True})
+    assert "a light" not in presence.on_note({"bar": "full", "light": False, "lock": True})
 

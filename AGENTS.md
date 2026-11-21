@@ -1336,10 +1336,17 @@ the person (the same target events as Cmd+T, a followed link, a closed tab).
   `KeyPanel` that can take the keyboard without activating the overlay: it does only when its field is clicked). It is
   saved with Resume agent or Done (Enter in it presses that button), at most 500 characters, and reaches the agent
   once: in `wait_for_human`'s answer (`note_for`) or in its next call's result (`take_note`). Measured with real input:
-  the click gave the overlay the keyboard, the typed text reached `wait_for_human`. A line holding the keyboard is
-  ordered out at once rather than faded, which is AppKit's way to hand the keys back to the app in front; that the
-  next key reaches that app is NOT measured: macOS (cooperative activation) let no test process bring an app to the
-  front while the person used another.
+  the click gave the overlay the keyboard while the browser stayed the app in front, and the typed text reached
+  `wait_for_human`. A line holding the keyboard is ordered out at once rather than faded, which is AppKit's way to
+  hand the keys back to the app in front; that the next key then reaches the page is NOT measured (the person's
+  windows and another session's browser covered the test browser, and the hit-tested clicks were refused).
+- A request the person answered with Done is `noted` (`choose_mode(answered=)`: `help_done` at or after the request's
+  `asked_at`) until a call of the agent takes it. Before, the bar went on asking for help with its Done button and the
+  note line stayed, holding the keyboard: on 0.25.16 a key typed after Done did not reach the page (the input still
+  held 1 character), and nothing told an agent that read the page instead of calling `wait_for_human`. Now the note
+  line goes, the bar says "Done, the agent goes on at its next step", and the first result of any tool says the
+  person pressed Done and closes the request (`_done_pressed` in `result_note`); `wait_for_human` started afterwards
+  returns at once (0.0 s, with the note). The headed test presses Done by signal and reads the windows.
 - A window whose alpha falls under 0.5 is closing and is never followed again until it is gone or back at 0.95
   (`closing`): it stays listed and on screen for its 0.3 s close animation, and the same tick took it back and showed
   the overlay over it again. Measured: last seen 0.03 s after the close, never again.
@@ -1688,9 +1695,15 @@ uv run mcp-stealth-chrome --http        # one server for many clients (token req
   hit-tests the point (the topmost window there must belong to the process under test, past the Dock's full-screen
   layer and the overlay's light strips) and refuses otherwise; keys go out only when the focus is known to be in the
   test's own process, and never Enter. A probe without that check sent 32 clicks at fixed coordinates into the
-  person's own app, because the test browser opens behind it (21 Nov 2026). macOS lets no test process bring an app
-  to the front while the person uses another (cooperative activation: `activateWithOptions`, System Events and a
-  self-activating helper all failed), so a real click on a hit-tested window is the way to activate one.
+  person's own app, because the test browser opens behind it (21 Nov 2026). The Dock owns a full-screen window at
+  layer 20 that a hit test has to pass over, so a click is also kept inside `NSScreen.visibleFrame`: three clicks
+  low on the screen went to the Dock's band. Read the app in front with `lsappinfo front`:
+  `NSWorkspace.frontmostApplication()` keeps its first answer in a script that runs no run loop, which made three
+  probes conclude that no app could be brought to the front (it can: `tab_focus` and a click on a hit-tested window
+  both do). Another server's browser may sit at the default window position, over the test window.
+- Tool calls sent in one message run one after another here (the MCP call, then the shell probe), not at the same
+  time: a probe that ran "during" `wait_for_human` started after its timeout and found the bar gone. Start such a
+  probe in the background first and let it say when it is ready.
 - Mutation-check a new guard: reintroduce the bug and confirm the test fails. Two tests in this repo
   passed against a deliberately reintroduced defect and had to be rewritten.
 - After editing `src/`, reinstall (`uv tool install --force .`) and restart the MCP client — a
