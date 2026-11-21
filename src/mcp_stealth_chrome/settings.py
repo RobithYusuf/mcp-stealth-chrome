@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import secrets
 import stat
 from dataclasses import dataclass
@@ -30,7 +31,7 @@ FALSE = ("0", "false", "no", "off")
 class Setting:
     key: str
     env: str
-    kind: str  # "bool", "choice" or "number"
+    kind: str  # "bool", "choice", "number" or "rules"
     default: Any
     help: str
     choices: tuple = ()
@@ -55,6 +56,14 @@ SETTINGS = (
     Setting("dock_icon", "MCP_STEALTH_DOCK_ICON", "bool", False,
             "Run visible browsers from the Beta channel: Chrome Beta with the project icon, Brave Beta "
             "with its own (macOS)"),
+    Setting("antibot_tripwire", "MCP_STEALTH_ANTIBOT_TRIPWIRE", "choice", "pause",
+            "A verification page (a site's bot check) after a navigation or between workflow steps: pause "
+            "(stop and ask the person), warn (say so and go on) or off",
+            choices=("pause", "warn", "off")),
+    Setting("antibot_rules", "MCP_STEALTH_ANTIBOT_RULES", "rules", {},
+            "Your own verification pages, per host: "
+            '{"example.com": {"url": ["^/verify/"], "text": ["Verify to continue"]}}; '
+            "url holds regular expressions searched in the path and query, text plain words of the page"),
 )
 BY_KEY = {s.key: s for s in SETTINGS}
 
@@ -81,6 +90,8 @@ def parse(setting: Setting, raw: Any) -> tuple[bool, Any]:
     if setting.kind == "choice":
         text = str(raw).strip().lower()
         return (True, text) if text in setting.choices else (False, None)
+    if setting.kind == "rules":
+        return parse_rules(raw)
     if setting.kind == "number":
         try:
             value = float(raw)
@@ -90,6 +101,52 @@ def parse(setting: Setting, raw: Any) -> tuple[bool, Any]:
             return False, None
         return True, value
     return False, None
+
+
+RULE_HOSTS = 50        # at most this many hosts in antibot_rules
+RULE_PATTERNS = 20     # patterns in one host's url list, and in its text list
+RULE_LENGTH = 200      # characters in one pattern
+_HOST = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*$")
+
+
+def parse_rules(raw: Any) -> tuple[bool, Any]:
+    """antibot_rules: a JSON object (or its text) {host: {"url": [regex], "text": [words]}}. The
+    whole value is refused when any part is wrong: a rule taken in half would stop runs, or miss
+    pages, in ways nobody asked for. Hosts come back lower case; the lists as given."""
+    data = raw
+    if isinstance(raw, str):
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return False, None
+    if not isinstance(data, dict) or len(data) > RULE_HOSTS:
+        return False, None
+    out: dict = {}
+    for host, rule in data.items():
+        name = str(host).strip().lower()
+        if not _HOST.match(name) or not isinstance(rule, dict) or not rule:
+            return False, None
+        if set(rule) - {"url", "text"}:
+            return False, None
+        kept: dict = {}
+        for key in ("url", "text"):
+            items = rule.get(key, [])
+            if not isinstance(items, list) or len(items) > RULE_PATTERNS:
+                return False, None
+            for item in items:
+                if not isinstance(item, str) or not item.strip() or len(item) > RULE_LENGTH:
+                    return False, None
+                if key == "url":
+                    try:
+                        re.compile(item)
+                    except re.error:
+                        return False, None
+            if items:
+                kept[key] = list(items)
+        if not kept:
+            return False, None
+        out[name] = kept
+    return True, out
 
 
 def read_file(target: Optional[Path] = None) -> dict:
@@ -214,7 +271,11 @@ def set_value(key: str, raw: Any) -> str:
     ok, value = parse(setting, raw)
     if not ok:
         allowed = ("true or false" if setting.kind == "bool" else ", ".join(setting.choices)
-                   if setting.kind == "choice" else f"a number from {setting.low:g} to {setting.high:g}")
+                   if setting.kind == "choice" else
+                   'a JSON object {"host": {"url": ["regex"], "text": ["words"]}} (at most '
+                   f"{RULE_HOSTS} hosts, {RULE_PATTERNS} patterns a list, {RULE_LENGTH} characters a "
+                   "pattern, each regex valid)" if setting.kind == "rules"
+                   else f"a number from {setting.low:g} to {setting.high:g}")
         raise ValueError(f"{raw!r} is not a valid {key}: use {allowed}")
     write({key: value})
     shadowed = os.environ.get(setting.env, "").strip()
@@ -224,6 +285,8 @@ def set_value(key: str, raw: Any) -> str:
 
 
 def _shown(value: Any) -> str:
+    if isinstance(value, dict):
+        return f"{len(value)} host" + ("" if len(value) == 1 else "s")
     if isinstance(value, bool):
         return "on" if value else "off"
     if isinstance(value, float) and value.is_integer():
