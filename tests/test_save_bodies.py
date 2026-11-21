@@ -725,3 +725,55 @@ def test_a_saver_registered_without_the_lock_is_ended_not_left_behind(monkeypatc
     assert stray.ended() and "raced" in stray.end_reason, stray.end_reason
     assert not new.ended() and body_saver._LIVE[stray.ws_url] is new
     asyncio.run(new.stop("test over"))
+
+
+# ── a start that the server's exit overtakes ───────────────────────────────
+
+class _ExitWs:
+    def __init__(self):
+        self.sent, self.closed = [], False
+        self.transport = self
+
+    def get_extra_info(self, name):
+        return None
+
+    async def send(self, text):
+        self.sent.append(json.loads(text))
+
+    async def close(self):
+        self.closed = True
+
+
+def _patch_connect(monkeypatch, on_connect):
+    import websockets.asyncio.client as client
+
+    async def connect(*args, **kwargs):
+        return on_connect()
+    monkeypatch.setattr(client, "connect", connect)
+
+
+def test_a_start_ended_while_connecting_never_attaches(monkeypatch, tmp_path):
+    """shutdown() at the server's exit ends a saver whose start is still connecting: it shuts
+    no socket (none yet) and its release pass can be over. The start must then hold nothing:
+    no Target.setAutoAttach, the connection closed, and it says why."""
+    saver = _saver(tmp_path)
+    ws = _ExitWs()
+
+    def connected():
+        saver._end("the server is exiting")  # shutdown() runs while connect is in flight
+        return ws
+    _patch_connect(monkeypatch, connected)
+    with pytest.raises(RuntimeError, match="the server is exiting"):
+        asyncio.run(saver.start())
+    assert ws.sent == [], ws.sent
+    assert ws.closed
+
+
+def test_a_start_ended_before_it_connects_does_not_connect(monkeypatch, tmp_path):
+    saver = _saver(tmp_path)
+    calls = []
+    _patch_connect(monkeypatch, lambda: calls.append(1) or _ExitWs())
+    saver._end("the server is exiting")
+    with pytest.raises(RuntimeError, match="the server is exiting"):
+        asyncio.run(saver.start())
+    assert calls == []

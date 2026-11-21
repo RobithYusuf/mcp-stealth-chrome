@@ -564,6 +564,13 @@ class Saver:
             self._replies.pop(msg_id, None)
 
     async def start(self) -> None:
+        # Ended before or while connecting (shutdown() at the server's exit, a stop): hold
+        # nothing. shutdown() shuts self._sock only when it is set, and its release pass may
+        # already be over, so a start that went on to Target.setAutoAttach would hold the
+        # browser's new tabs after the exit. The socket is recorded before the second look, so
+        # an end that comes after it shuts this connection and setAutoAttach cannot be sent.
+        if self.ended():
+            raise RuntimeError(self.end_reason or "ended before it started")
         try:
             from websockets.asyncio.client import connect
         except ImportError:  # websockets < 13
@@ -572,6 +579,10 @@ class Saver:
             connect(self.ws_url, max_size=None, ping_interval=None, open_timeout=10), 15)
         with contextlib.suppress(Exception):
             self._sock = self.ws.transport.get_extra_info("socket")
+        if self.ended():
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(self.ws.close(), 2)
+            raise RuntimeError(self.end_reason or "ended while it was starting")
         self._reader = asyncio.ensure_future(self._read())
         reply = await self._send("Target.setAutoAttach", {
             "autoAttach": True, "waitForDebuggerOnStart": True, "flatten": True,

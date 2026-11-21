@@ -6,7 +6,7 @@ The [README](../README.md) has the install commands and the config file for each
 
 Restart your client after changing its config, then ask it:
 
-1. "List the tools from stealth-chrome." You should see 172 tools.
+1. "List the tools from stealth-chrome." You should see 170 tools.
 2. "Launch the browser and open bot.sannysoft.com." Chrome opens and loads the page.
 3. "Take a screenshot." The file lands in `~/.mcp-stealth/screenshots/`.
 4. "Close the browser." The window closes.

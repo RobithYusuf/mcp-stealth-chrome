@@ -7,7 +7,7 @@ working defaults; hard constraints may only be overridden when the developer exp
 
 ## Product and repository map
 
-An MCP server (stdio JSON-RPC) that gives an agent a stealth browser: 172 tools over
+An MCP server (stdio JSON-RPC) that gives an agent a stealth browser: 170 tools over
 [nodriver](https://github.com/ultrafunkamsterdam/nodriver) (direct CDP, no WebDriver), plus a
 browserless HTTP path with a real Chrome TLS fingerprint. Published on PyPI as `mcp-stealth-chrome`.
 
@@ -140,7 +140,7 @@ uvx mcp-stealth-chrome → Python 3.11+ → FastMCP → nodriver → Chrome/Chro
   therefore every PyPI user). Lift the cap only together with a port off FastMCP.
 - Every `@mcp.tool()` is annotated `-> str` and returns through `ok()` / `err()`. Returning a dict
   raises a pydantic error inside FastMCP.
-- That annotation makes FastMCP advertise an output schema requiring `{"result": str}` on all 172 tools, and
+- That annotation makes FastMCP advertise an output schema requiring `{"result": str}` on all 170 tools, and
   `ClientSession.call_tool` raises on a reply without it. A `CallToolResult` built by hand (`ImageResult`,
   `StructuredResult`) must include it. `screenshot`, `screenshot_element` and `inspect_image` failed on every default
   call for this reason, and only a real client shows it: test through `tests/_protocol.py`.
