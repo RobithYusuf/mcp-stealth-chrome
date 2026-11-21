@@ -66,10 +66,9 @@ from Foundation import NSObject, NSRunLoop, NSRunLoopCommonModes, NSTimer
 from Quartz import (CAAnimationGroup, CABasicAnimation, CACurrentMediaTime, CAGradientLayer,
                     CALayer, CAMediaTimingFunction, CAShapeLayer, CATextLayer, CATransaction,
                     CATransition, CGBitmapContextCreate, CGBitmapContextCreateImage,
-                    CGColorSpaceCreateDeviceRGB, CGContextAddPath, CGContextRestoreGState,
-                    CGContextEOFillPath, CGContextSaveGState, CGContextScaleCTM,
-                    CGContextSetLineWidth, CGContextSetRGBFillColor,
-                    CGContextSetRGBStrokeColor, CGContextSetShadowWithColor, CGContextStrokePath,
+                    CGColorSpaceCreateDeviceRGB, CGContextAddPath,
+                    CGContextEOFillPath, CGContextScaleCTM,
+                    CGContextSetRGBFillColor,
                     CGEventSourceSecondsSinceLastEventType,
                     CGPathAddLineToPoint,
                     CGPathCloseSubpath, CGPathCreateMutable, CGPathCreateWithEllipseInRect,
@@ -532,6 +531,160 @@ def visible_at(wins, target, x, y):
         if owner != ME and ordinary and contains(b, x, y):
             return False
     return False
+
+
+# The decisions of Overlay.tick, as plain functions of what it read.
+
+def skip_tick(ticks, force, animating):
+    """With nothing moving (no cursor shown, no click ring, the window not just moved) only every
+    CALM_EVERY-th tick does its work: 10 a second are enough then. A forced tick always does."""
+    return not animating and not force and ticks % CALM_EVERY != 0
+
+
+def closing_over(alpha):
+    """A window seen closing is followed again only once it is gone (None) or back at full alpha
+    (one that dipped for another reason)."""
+    return alpha is None or alpha >= 0.95
+
+
+def window_going(alpha):
+    """The browser's window is gone (None: the browser quit) or fading out as macOS closes it
+    (under 0.5; about 0.3 s, still listed meanwhile): the overlay goes with it at once."""
+    return alpha is None or alpha < 0.5
+
+
+def window_read(pid, scan, moving, have_frame, missing):
+    """How a tick finds the browser's window: "search" (Overlay.browser_window: the window
+    followed, the windows above it on a scan, every window when none is followed), "followed"
+    (that window's own bounds alone: 0.12 ms against 0.47 for every window on screen), or None.
+    None with no browser, and between scans once a scan missed the window: cached bounds must
+    not stand in then, or every tick reset the missing time and MISSING_FOR never ran out (after
+    a Quit the light and the lock, which takes clicks, stayed 3.35 s)."""
+    if not pid:
+        return None
+    if scan or moving or not have_frame:
+        return "search"
+    return None if missing else "followed"
+
+
+def missing_for(since_space_change):
+    """How long the window must stay missing before the light goes. MISSING_FOR keeps a Space
+    change or a full-screen move (a Space of its own) from blinking the overlay; with no Space
+    change around, a window gone from the screen was minimized or hidden: MISSING_QUICK."""
+    return MISSING_FOR if since_space_change < SPACE_GRACE else MISSING_QUICK
+
+
+def checks_start(start, missing, since_check, probing):
+    """Read the start time of the browser's PID now? A window missing for 3 s on a PID that runs:
+    that PID may now be another process's. At most every 5 s, one check at a time."""
+    return bool(start) and missing > 3 and since_check > 5 and not probing
+
+
+def pid_reused(current, start):
+    """The browser's PID runs nothing now (None) or another process (another start time). ""
+    is ps that could not answer, which proves nothing."""
+    return current is None or bool(current and current != start)
+
+
+def happened(since, before):
+    """A key, click or scroll since the last look: the HID system's seconds since the last event
+    of that type fell, as it starts again from 0 at each one."""
+    return since + 0.005 < before
+
+
+def quiet_for(agent, now):
+    """Seconds since the agent's last call. A tool call still running is not quiet, however long
+    it takes (a long wait_for): the server marks it busy from before the call to after it."""
+    return 0.0 if agent.get("busy") else now - float(agent.get("active_at", 0))
+
+
+def help_answered(agent, control):
+    """The person pressed Done on the request for help shown now (help_done at or after its
+    asked_at). With no request asked, nothing is answered."""
+    return float(control.get("help_done") or 0) >= float(agent.get("asked_at") or 0) > 0
+
+
+def used_now(clicked, scrolled, typed):
+    """What the person did on this tick, in the words the agent's next result uses."""
+    return [word for word, did in (("clicked", clicked), ("scrolled", scrolled), ("typed", typed)) if did]
+
+
+def used_since_agent(control, agent, used):
+    """What the person did since the agent's last call, in a fixed order: what was recorded
+    before and what they did now. Recorded before the agent's last call: the agent has acted
+    since, so it starts over."""
+    before = control.get("person_used") or []
+    if float(control.get("person_used_at") or 0) <= float(agent.get("active_at") or 0):
+        before = []  # the agent has acted since: start over
+    return [w for w in ("clicked", "scrolled", "typed") if w in before or w in used]
+
+
+def light_level(mode, light_on):
+    """The light: on while the agent acts or asks for help, dimmed while it thinks or waits for
+    the person's typing to stop, out otherwise, and out when the person turned it off."""
+    if not light_on:
+        return "off"
+    return "on" if mode in ("agent", "help") else "dim" if mode in WORKING else "off"
+
+
+def cursor_point(cursor, page, zoom):
+    """The agent's cursor on screen (global, top-left origin), or None without a cursor or a page.
+    The cursor is in CSS pixels, which the page's zoom scales."""
+    if not (cursor and page):
+        return None
+    try:
+        zoom = float(zoom or 1.0)
+    except (TypeError, ValueError):
+        zoom = 1.0
+    return page[0] + cursor[0] * zoom, page[1] + cursor[1] * zoom
+
+
+def bar_words(mode, agent, control, over, nudging, why):
+    """What the bar says: (first words, the rest, its button, the button's kind, the dot as a key
+    of DOT, whether the dot pulses), or None while idle (the bar keeps its words as it fades).
+    A click, scroll or key that did not take over is explained first; with the pointer over the
+    browser while the agent works, the bar says how to take over."""
+    status = agent.get("status") or "Using the browser"
+    if mode in WORKING and nudging:
+        first = ("Typing does not take over" if why == "type"
+                 else "The page is locked while the agent works")
+        return first, "  ·  Press Take over to use it", "Take over", "primary", mode, mode == "agent"
+    if mode in ("agent", "thinking"):
+        hint = ("  ·  Press Take over to use the browser" if over
+                else "  ·  Thinking about the next step" if mode == "thinking"
+                else f"  ·  {status}")
+        return "Agent working", hint, "Take over", "quiet", mode, mode == "agent"
+    if mode == "polite":
+        return "Agent paused", "  ·  It goes on in a moment", "Take over", "quiet", "polite", False
+    if mode == "noted":
+        return "Done", "  ·  The agent goes on at its next step", "Take over", "quiet", "person", False
+    if mode == "resting":
+        return ("Agent idle", "  ·  The page is yours until its next step", "Take over", "quiet",
+                "resting", False)
+    if mode == "person":
+        return ("You have the browser", f"  ·  {told(agent, control)}", "Resume agent", "primary",
+                "person", False)
+    if mode == "help":
+        return "Your help is needed", f"  ·  {agent.get('help')}", "Done", "primary", "help", True
+    return None
+
+
+def wants_lock(lock_on, mode, page):
+    """The lock over the page: only while the agent works, and only where the page is known. The
+    person's hold, help, an idle or resting agent leave the page to the person."""
+    return lock_on and mode in WORKING and bool(page)
+
+
+def wants_bar(mode, bar_mode, nudging, hovered):
+    """Whether the bar shows. Help, the person's hold and a nudge always show it: their buttons
+    are the way back. Otherwise never while idle; "off" not at all; "hover" while the pointer is
+    over the browser or the bar (and HOVER_LINGER after)."""
+    must_show = mode in ("help", "person") or nudging
+    if bar_mode == "off":
+        return must_show
+    if bar_mode == "hover":
+        return mode != "idle" and (must_show or hovered)
+    return mode != "idle"
 
 
 class Panel(NSPanel):
@@ -1411,101 +1564,131 @@ class Overlay:
             self.ring(s.origin.x + point[0], s.origin.y + point[1], "#94A3B8")
 
     def tick(self, force=False):
+        """One look at the browser's window, the agent's file and the person's input, and the
+        overlay made to match, in this order: the window closing and the end of the browser or
+        the server; where the window is, or how long it has been missing; the light and the bar
+        fitted to it and the level wanted; what the person did; the mode; then the light, the
+        agent's cursor, the bar's words and place, the lock, and last the windows' order."""
         now = time.time()
         self.ticks += 1
-        calm = not (self.pointer.want or self.ripples.visible or now < self.moved_until)
-        if calm and not force and self.ticks % CALM_EVERY:
+        if skip_tick(self.ticks, force, self.pointer.want or self.ripples.visible or now < self.moved_until):
             return  # nothing moves: 10 ticks a second are enough
         a = self.read_agent()
         self.check_settings(now)
-        if self.closing is not None:
-            # A window seen closing is never followed again while it fades: it stays listed and
-            # "on screen" for the 0.3 s of its close animation, and taking it back showed the
-            # light and the lock over it again until it was gone. Only gone, or fully back (an
-            # alpha that dipped for another reason), ends that.
-            closing_alpha = window_alpha(self.closing)
-            if closing_alpha is None or closing_alpha >= 0.95:
-                self.closing = None
+        self.go_with_closing_window(now)
+        if self.leaves(a):
+            return
+        pid = self.browser_pid = a.get("pid")
+        scan = force or now - self.scanned_at >= SCAN_EVERY
+        b = self.find_window(pid, scan, a, now)
+        if b is None:
+            self.window_missing(pid, now)
+            return
+        self.missing_since = None
+        wid, H = self.win, screen_height()
+        self.fit_to_window(b, a, pid, wid, H, now)
+        self.choose_level(b, pid, wid, scan, now)
+        loc, new_key, new_click, new_wheel, over = self.read_input(wid, H)
+        mode = self.mode_now(a, now)
+        self.note_person(a, mode, pid, new_key, new_click, new_wheel, over, now)
+        show_cursor = bool(self.control.get("show_cursor"))
+        self.light(mode, now)
+        page = self.page_rect(b, a) if a.get("viewport") else None
+        self.agent_cursor(a, page, mode, show_cursor, H)
+        self.say(a, mode, over, show_cursor, now)
+        self.bar.place(b[0], H - b[1] - b[3], b[2])
+        want_lock = wants_lock(LOCK_ON, mode, page)
+        if want_lock:
+            self.place_lock(page, H)
+        restack = self.show_parts(want_lock, wid, now)
+        bar_restack, fade_in = self.show_bar(mode, wid, loc, H, now)
+        self.stack_up(restack or bar_restack, scan, wid, now)
+        if fade_in:
+            self.bar.fade(True)
+
+    def go_with_closing_window(self, now):
+        """The browser's window gone (the browser quit) or fading out as macOS closes it: go with
+        it now. MISSING_FOR is for a window that is still there but not seen (another Space, a
+        minimize), where hiding at once would blink. A window seen closing is never followed
+        again while it fades: it stays listed and "on screen" for the 0.3 s of its close
+        animation, and taking it back showed the light and the lock over it again until it was
+        gone. Only gone, or fully back (an alpha that dipped for another reason), ends that."""
+        if self.closing is not None and closing_over(window_alpha(self.closing)):
+            self.closing = None
         alpha = window_alpha(self.win) if self.shown and self.win is not None else 1.0
-        if alpha is None or alpha < 0.5:
-            # The browser's window no longer exists (the browser quit), or is fading out as macOS
-            # closes it: go with it now. MISSING_FOR is for a window that is still there but not
-            # seen (another Space, a minimize), where hiding at once would blink.
+        if window_going(alpha):
             self.hide()
             self.frame = None
             self.missing_since = self.missing_since or now
             self.closing = self.win if alpha is not None else None
             self.win = None
-        if a.get("ended"):
-            leave(True)  # the server removes the folder too; whichever comes first
-            return
-        if os.getppid() != SERVER:
-            leave(True)  # the server is gone
-            return
-        pid = a.get("pid")
-        self.browser_pid = pid
-        scan = force or now - self.scanned_at >= SCAN_EVERY
-        need_bounds = scan or now < self.moved_until or self.frame is None
-        b = None
-        if pid and need_bounds:
+
+    def leaves(self, a):
+        """The server said the browser ended, or the server is gone: leave, removing the folder
+        (the server removes it too; whichever comes first). True when leaving."""
+        if a.get("ended") or os.getppid() != SERVER:
+            leave(True)
+            return True
+        return False
+
+    def find_window(self, pid, scan, a, now):
+        """The browser window's bounds now, or None (window_read says how they are read)."""
+        how = window_read(pid, scan, now < self.moved_until, self.frame is not None,
+                          self.missing_since is not None)
+        if how == "search":
             b = self.browser_window(pid, scan, a.get("window"))
             if scan:
                 self.scanned_at = now
-        elif pid and self.frame is not None and self.missing_since is None:
-            # Between scans, the followed window's own bounds (one window: 0.12 ms, against 0.47
-            # for every window on screen), so a drag or a resize the person starts is followed from
-            # its first frame instead of the next scan (it lagged 0.2 to 0.3 s). Only while the
-            # window is there: once a scan missed it the cached bounds must not stand in, or every
-            # tick reset the missing time and MISSING_FOR never ran out (after a Quit the light and
-            # the lock, which takes clicks, stayed 3.35 s).
-            b = self.followed_bounds(pid)
-        if b is None:
-            # The lock over the page is invisible, so it goes at once: nothing on screen changes,
-            # and clicks where the closed window was are not swallowed during MISSING_FOR. The
-            # light still waits it out (no blinking), and the lock comes back with the window.
-            if self.shield_on:
-                self.shield.orderOut_(None)
-                self.shield_on = False
-            self.missing_since = self.missing_since or now
-            # MISSING_FOR keeps a Space change or a full-screen move (a Space of its own) from
-            # blinking the overlay; with no Space change around, a window gone from the screen
-            # was minimized or hidden, and the light went 0.6 s after it.
-            space_moved = now - self.space_changed_at < SPACE_GRACE
-            if now - self.missing_since > (MISSING_FOR if space_moved else MISSING_QUICK):
-                self.hide()
-                self.frame = None
-            if pid:
-                try:
-                    os.kill(pid, 0)
-                    self.gone_since = None
-                    # A window missing for a while on a PID that runs: that PID may now be
-                    # another process's. Its start time says.
-                    start = CONFIG.get("start")
-                    if (start and now - self.missing_since > 3 and now - self.start_checked > 5
-                            and self.start_probe is None):
-                        # ps on a thread: the tick, which also hides the overlay, never waits
-                        # for a shell.
-                        self.start_checked = now
-                        box = {}
-                        probe = threading.Thread(target=lambda: box.update(value=chrome_start(pid)), daemon=True)
-                        probe.start()
-                        self.start_probe = (probe, box)
-                    if self.start_probe is not None and not self.start_probe[0].is_alive():
-                        box, self.start_probe = self.start_probe[1], None
-                        current = box.get("value")
-                        if current is None or (current and current != start):
-                            leave(True)
-                            return
-                except OSError:
-                    self.gone_since = self.gone_since or now
-                    if now - self.gone_since > 3:
-                        leave(True)  # the browser is gone
-            return
-        self.missing_since = None
+            return b
+        if how == "followed":
+            # Between scans, so a drag or a resize the person starts is followed from its first
+            # frame instead of the next scan (it lagged 0.2 to 0.3 s).
+            return self.followed_bounds(pid)
+        return None
+
+    def window_missing(self, pid, now):
+        """No window of the browser this tick. The lock over the page is invisible, so it goes at
+        once: nothing on screen changes, and clicks where the closed window was are not
+        swallowed during MISSING_FOR. The light still waits it out (no blinking), and the lock
+        comes back with the window."""
+        if self.shield_on:
+            self.shield.orderOut_(None)
+            self.shield_on = False
+        self.missing_since = self.missing_since or now
+        if now - self.missing_since > missing_for(now - self.space_changed_at):
+            self.hide()
+            self.frame = None
+        if pid:
+            self.check_browser(pid, now)
+
+    def check_browser(self, pid, now):
+        """Leave once the browser's PID has been gone 3 s, or runs another process now (its start
+        time says). ps runs on a thread: the tick, which also hides the overlay, never waits for
+        a shell."""
+        try:
+            os.kill(pid, 0)
+            self.gone_since = None
+            start = CONFIG.get("start")
+            if checks_start(start, now - self.missing_since, now - self.start_checked,
+                            self.start_probe is not None):
+                self.start_checked = now
+                box = {}
+                probe = threading.Thread(target=lambda: box.update(value=chrome_start(pid)), daemon=True)
+                probe.start()
+                self.start_probe = (probe, box)
+            if self.start_probe is not None and not self.start_probe[0].is_alive():
+                box, self.start_probe = self.start_probe[1], None
+                if pid_reused(box.get("value"), start):
+                    leave(True)
+        except OSError:
+            self.gone_since = self.gone_since or now
+            if now - self.gone_since > 3:
+                leave(True)  # the browser is gone
+
+    def fit_to_window(self, b, a, pid, wid, H, now):
+        """Fit the light and the bar to the window when it moved, was resized, or entered or left
+        full screen, and follow it at the full rate for MOVING_FOR after."""
         x, y, w, h = b
-        wid = self.win
-        H = screen_height()
-        y_ns = H - y - h
         state = a.get("window_state")
         relayout = b != self.frame
         if b != self.frame or state != self.window_state:
@@ -1524,131 +1707,111 @@ class Overlay:
             self.bar.fit(w)
             self.frame = b
             self.moved_until = now + MOVING_FOR  # follow a dragged window at the full rate
+
+    def choose_level(self, b, pid, wid, scan, now):
+        """Whether the overlay floats (wants_floating), from what the last scan saw: another
+        window over the browser, the browser in front."""
         if scan:
             self.covered = covered(self.wins, wid, b, pid)
-            front = NSWorkspace.sharedWorkspace().frontmostApplication()
-            self.browser_front = front is not None and front.processIdentifier() == pid
+            self.browser_front = self.browser_in_front(pid)
         self.floating = wants_floating(self.covered, self.browser_front, now - self.switched_at)
 
+    def browser_in_front(self, pid):
+        front = NSWorkspace.sharedWorkspace().frontmostApplication()
+        return front is not None and front.processIdentifier() == pid
+
+    def read_input(self, wid, H):
+        """The pointer, whether a key, a click or a scroll happened since the last tick, and
+        whether the pointer is over the browser's window (not over the bar)."""
         loc = NSEvent.mouseLocation()
         key = CGEventSourceSecondsSinceLastEventType(kCGEventSourceStateHIDSystemState, kCGEventKeyDown)
-        new_key = key + 0.005 < self.prev_key
+        new_key = happened(key, self.prev_key)
         self.prev_key = key
         click = CGEventSourceSecondsSinceLastEventType(kCGEventSourceStateHIDSystemState, kCGEventLeftMouseDown)
-        new_click = click + 0.005 < self.prev_click
+        new_click = happened(click, self.prev_click)
         self.prev_click = click
         wheel = CGEventSourceSecondsSinceLastEventType(kCGEventSourceStateHIDSystemState, kCGEventScrollWheel)
-        new_wheel = wheel + 0.005 < self.prev_wheel
+        new_wheel = happened(wheel, self.prev_wheel)
         self.prev_wheel = wheel
         over = not self.bar.contains(loc.x, loc.y) and visible_at(self.wins, wid, loc.x, H - loc.y)
-        # A tool call still running is not quiet, however long it takes (a long wait_for): the
-        # server marks it busy from before the call to after it.
-        quiet = 0.0 if a.get("busy") else now - float(a.get("active_at", 0))
-        help_text = a.get("help")
+        return loc, new_key, new_click, new_wheel, over
 
-        # A request for help and the person's hold outlast any quiet: their buttons (Done,
-        # Resume agent) are the only way back, so they never fade out.
-        answered = float(self.control.get("help_done") or 0) >= float(a.get("asked_at") or 0) > 0
-        mode = choose_mode(help_text, self.control["holder"], quiet, a.get("waiting"), answered)
-        self.mode = mode
+    def mode_now(self, a, now):
+        """The mode (choose_mode). A request for help and the person's hold outlast any quiet:
+        their buttons (Done, Resume agent) are the only way back, so they never fade out."""
+        self.mode = choose_mode(a.get("help"), self.control["holder"], quiet_for(a, now), a.get("waiting"),
+                                help_answered(a, self.control))
+        return self.mode
 
-        if new_key and mode in WORKING:
-            front = NSWorkspace.sharedWorkspace().frontmostApplication()
-            if front is not None and front.processIdentifier() == pid:
-                # A key cannot be held back without taking focus from the browser. Typing never
-                # hands the browser over: the agent pauses, then puts its own text back.
-                self.control["person_last_input"] = now
-                self.save()
-                self.nudge("type")
+    def note_person(self, a, mode, pid, new_key, new_click, new_wheel, over, now):
+        """What the person did with the browser. A key cannot be held back without taking focus
+        from the browser, and typing never hands the browser over: while the agent works it
+        pauses, then puts its own text back. While the agent is not working the page is open to
+        the person, and what they do there goes to the agent's next call, so it reads the page
+        again rather than act on what it saw before. Keys count only with the browser in front,
+        the pointer only over it."""
+        if new_key and mode in WORKING and self.browser_in_front(pid):
+            self.control["person_last_input"] = now
+            self.save()
+            self.nudge("type")
         if mode in ("resting", "idle", "noted") and (new_key or new_click or new_wheel):
-            # The agent is not working and the page is open to the person: what they do there
-            # goes to the agent's next call, so it reads the page again rather than act on what
-            # it saw before. Keys count only with the browser in front, the pointer only over it.
-            front = NSWorkspace.sharedWorkspace().frontmostApplication()
-            in_front = front is not None and front.processIdentifier() == pid
-            used = [word for word, happened in (("clicked", new_click and over), ("scrolled", new_wheel and over),
-                                                ("typed", new_key and in_front)) if happened]
+            in_front = self.browser_in_front(pid)
+            used = used_now(new_click and over, new_wheel and over, new_key and in_front)
             if used:
-                before = self.control.get("person_used") or []
-                if float(self.control.get("person_used_at") or 0) <= float(a.get("active_at") or 0):
-                    before = []  # the agent has acted since: start over
-                self.control["person_used"] = [w for w in ("clicked", "scrolled", "typed") if w in before or w in used]
+                self.control["person_used"] = used_since_agent(self.control, a, used)
                 self.control["person_used_at"] = now
                 if "typed" in used:
                     self.control["person_last_input"] = now
                 self.save()
 
-        show_cursor = bool(self.control.get("show_cursor"))
+    def light(self, mode, now):
+        """The light's colours and level for the mode (light_level)."""
         self.glow.colors(HELP_GLOW if mode == "help" else AGENT_GLOW)
-        self.glow.set(("on" if mode in ("agent", "help") else "dim" if mode in WORKING else "off")
-                      if LIGHT_ON else "off")
+        self.glow.set(light_level(mode, LIGHT_ON))
         self.glow.settle(now)
         if self.glow.back:
             self.glow.back = False
             self.above = None  # order the light's windows back in on this tick
-        cursor, vp = a.get("cursor"), a.get("viewport")
-        page = self.page_rect(b, a) if vp else None
-        if cursor and page:
-            try:
-                zoom = float(a.get("zoom") or 1.0)
-            except (TypeError, ValueError):
-                zoom = 1.0
-            # screen, top-left origin; the cursor is in CSS pixels, which the page's zoom scales
-            cx, cy = page[0] + cursor[0] * zoom, page[1] + cursor[1] * zoom
-            self.pointer.move(cx, H - cy)
-        else:
-            cursor = None
-        self.pointer.show(bool(cursor) and show_cursor and mode in WORKING)
-        if cursor and float(a.get("click_at", 0)) > self.clicks_seen:
+
+    def agent_cursor(self, a, page, mode, show_cursor, H):
+        """The agent's cursor where the server last put it, shown while the agent works if the
+        person asked for it, and a ring at each new click of the agent's."""
+        point = cursor_point(a.get("cursor"), page, a.get("zoom"))
+        if point is not None:
+            self.pointer.move(point[0], H - point[1])
+        self.pointer.show(point is not None and show_cursor and mode in WORKING)
+        if point is not None and float(a.get("click_at", 0)) > self.clicks_seen:
             self.clicks_seen = float(a["click_at"])
             if mode == "agent" and show_cursor:
-                self.ring(cx, H - cy, "#3B82F6")
+                self.ring(point[0], H - point[1], "#3B82F6")
 
-        status = a.get("status") or "Using the browser"
-        if mode in WORKING and now < self.nudge_until:
-            first = ("Typing does not take over" if self.nudge_why == "type"
-                     else "The page is locked while the agent works")
-            self.bar.set([(first, 13, 0.3, WHITE), ("  \u00b7  Press Take over to use it", 13, 0.0, MUTED)],
-                         "Take over", "primary", DOT[mode], mode == "agent", show_cursor)
-        elif mode in ("agent", "thinking"):
-            hint = ("  \u00b7  Press Take over to use the browser" if over
-                    else "  \u00b7  Thinking about the next step" if mode == "thinking"
-                    else f"  \u00b7  {status}")
-            self.bar.set([("Agent working", 13, 0.3, WHITE), (hint, 13, 0.0, MUTED)],
-                         "Take over", "quiet", DOT[mode], mode == "agent", show_cursor)
-        elif mode == "polite":
-            self.bar.set([("Agent paused", 13, 0.3, WHITE), ("  \u00b7  It goes on in a moment", 13, 0.0, MUTED)],
-                         "Take over", "quiet", DOT["polite"], False, show_cursor)
-        elif mode == "noted":
-            self.bar.set([("Done", 13, 0.3, WHITE), ("  \u00b7  The agent goes on at its next step", 13, 0.0, MUTED)],
-                         "Take over", "quiet", DOT["person"], False, show_cursor)
-        elif mode == "resting":
-            self.bar.set([("Agent idle", 13, 0.3, WHITE), ("  \u00b7  The page is yours until its next step", 13, 0.0, MUTED)],
-                         "Take over", "quiet", DOT["resting"], False, show_cursor)
-        elif mode == "person":
-            self.bar.set([("You have the browser", 13, 0.3, WHITE), (f"  \u00b7  {told(a, self.control)}", 13, 0.0, MUTED)],
-                         "Resume agent", "primary", DOT["person"], False, show_cursor)
-        elif mode == "help":
-            self.bar.set([("Your help is needed", 13, 0.3, WHITE), (f"  \u00b7  {help_text}", 13, 0.0, MUTED)],
-                         "Done", "primary", DOT["help"], True, show_cursor)
-        self.bar.place(x, y_ns, w)
+    def say(self, a, mode, over, show_cursor, now):
+        """The bar's words, button and dot (bar_words)."""
+        words = bar_words(mode, a, self.control, over, now < self.nudge_until, self.nudge_why)
+        if words is not None:
+            first, rest, title, kind, dot, alive = words
+            self.bar.set([(first, 13, 0.3, WHITE), (rest, 13, 0.0, MUTED)], title, kind, DOT[dot], alive,
+                         show_cursor)
 
-        want_shield = LOCK_ON and mode in WORKING and bool(page)
-        if want_shield:
-            px, py, pw, ph = page
-            rect = (px, H - py - ph, pw, ph)
-            if rect != self.shield_rect:
-                self.shield.setFrame_display_(NSMakeRect(*rect), False)
-                self.shield_rect = rect
+    def place_lock(self, page, H):
+        """The lock's frame over the page, set only when it changed."""
+        px, py, pw, ph = page
+        rect = (px, H - py - ph, pw, ph)
+        if rect != self.shield_rect:
+            self.shield.setFrame_display_(NSMakeRect(*rect), False)
+            self.shield_rect = rect
 
+    def show_parts(self, want_lock, wid, now):
+        """The overlay is shown from here on: the lock in or out, and the cursor and the click
+        ring on screen while there is something to show. True when the windows must be ordered
+        again over the browser's."""
         restack = not self.shown or wid != self.above
         self.shown = True
-        if want_shield != self.shield_on:
-            self.shield_on = want_shield
-            if not want_shield:
+        if want_lock != self.shield_on:
+            self.shield_on = want_lock
+            if not want_lock:
                 self.shield.orderOut_(None)
             restack = True
-        # The cursor and the click ring: on screen while there is something to show.
         if self.pointer.want and not self.pointer.visible:
             self.pointer.visible = restack = True
         if self.pointer.hide_at is not None and now >= self.pointer.hide_at:
@@ -1658,16 +1821,16 @@ class Overlay:
         if self.ripples.visible and not self.ripples.active():
             self.ripples.panel.orderOut_(None)
             self.ripples.visible = False
-        must_show = mode in ("help", "person") or now < self.nudge_until  # their buttons are the way back
-        if BAR_MODE == "off":
-            want_bar = must_show
-        elif BAR_MODE == "hover":
-            if visible_at(self.wins, wid, loc.x, H - loc.y) or self.bar.contains(loc.x, loc.y):
-                self.hover_until = now + HOVER_LINGER
-            want_bar = mode != "idle" and (must_show or now < self.hover_until)
-        else:
-            want_bar = mode != "idle"
-        fade_in = False
+        return restack
+
+    def show_bar(self, mode, wid, loc, H, now):
+        """The bar in, or faded out and then taken off the screen (wants_bar). Returns (restack,
+        fade_in): it came on screen, and it fades in once the windows are ordered."""
+        if BAR_MODE == "hover" and (visible_at(self.wins, wid, loc.x, H - loc.y)
+                                    or self.bar.contains(loc.x, loc.y)):
+            self.hover_until = now + HOVER_LINGER
+        want_bar = wants_bar(mode, BAR_MODE, now < self.nudge_until, now < self.hover_until)
+        restack = fade_in = False
         if want_bar and not self.bar.visible:
             self.bar.visible = True
             fade_in = restack = True
@@ -1681,8 +1844,12 @@ class Overlay:
             self.bar.panel.orderOut_(None)
             self.bar.visible = False
             self.bar.hide_at = None
-        # While nothing covers the browser, sit in the floating level: the browser coming to the
-        # front then cannot cover the overlay, not even for a frame. Covered, sit just above it.
+        return restack, fade_in
+
+    def stack_up(self, restack, scan, wid, now):
+        """The level, and the windows ordered over the browser's when needed. While nothing covers
+        the browser the overlay sits in the floating level: the browser coming to the front then
+        cannot cover it, not even for a frame. Covered, it sits just above it."""
         level = FLOATING_LEVEL if self.floating else NORMAL_LEVEL
         if level != self.level:
             for p in self.panels:
@@ -1697,8 +1864,6 @@ class Overlay:
             restack = True  # the browser came to the front over the overlay: back over it now
         if restack:
             self.order(stack, wid)
-        if fade_in:
-            self.bar.fade(True)
 
     def button(self):
         now = time.time()

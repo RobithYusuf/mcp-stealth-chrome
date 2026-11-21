@@ -714,3 +714,234 @@ def test_the_launch_note_says_what_the_settings_really_show():
     assert "while the pointer is over the window" in presence.on_note({"bar": "hover", "light": False, "lock": True})
     assert "a light" not in presence.on_note({"bar": "full", "light": False, "lock": True})
 
+
+
+# ── The decisions of the overlay's tick, each a plain function of what the tick read ─────────
+
+
+def _overlay_dict_keys(name):
+    """The keys of one of the overlay's dict constants (DOT), read from its source."""
+    import ast
+    from pathlib import Path
+    tree = ast.parse((Path(presence.__file__).with_name("_agent_overlay.py")).read_text())
+    node = next(n for n in tree.body if isinstance(n, ast.Assign) and len(n.targets) == 1
+                and isinstance(n.targets[0], ast.Name) and n.targets[0].id == name)
+    return {ast.literal_eval(k) for k in node.value.keys}
+
+
+MODES = ("agent", "thinking", "polite", "noted", "resting", "person", "help", "idle")
+
+
+def test_a_calm_tick_works_every_other_time_and_a_forced_or_moving_one_always():
+    """Broken, an app switch would be handled at the next calm tick (the overlay late over the
+    browser the person just brought to the front), a dragged window would be followed at half
+    the rate (the light trailing it), or a calm overlay would never update."""
+    f = _overlay_functions("skip_tick", CALM_EVERY=1)
+    skip, every = f["skip_tick"], f["CALM_EVERY"]
+    assert every >= 2
+    assert [skip(t, False, False) for t in range(1, every + 1)] == [True] * (every - 1) + [False]
+    assert not any(skip(t, True, False) for t in range(1, 2 * every + 1))  # forced
+    assert not any(skip(t, False, True) for t in range(1, 2 * every + 1))  # something moves
+
+
+def test_a_window_seen_closing_is_followed_again_only_once_gone_or_back():
+    """A closing window stays listed and on screen for its 0.3 s close animation: taken back
+    while it faded, the light and the lock showed over it again until it was gone."""
+    over = _overlay_functions("closing_over")["closing_over"]
+    assert over(None)                       # gone
+    assert over(0.95) and over(1.0)         # back: its alpha dipped for another reason
+    assert not any(over(a) for a in (0.1, 0.3, 0.6, 0.9))
+
+
+def test_the_overlay_goes_at_once_with_a_window_that_quits_or_closes():
+    """After a Quit the light and the lock, which takes clicks, stayed 3.35 s over where the
+    window had been; a window under half alpha is macOS fading it out as it closes."""
+    going = _overlay_functions("window_going")["window_going"]
+    assert going(None)                      # the browser quit: the window no longer exists
+    assert going(0.49) and going(0.1)       # closing
+    assert not going(0.5) and not going(1.0)
+
+
+def test_between_scans_only_the_followed_window_is_read_and_a_missed_one_is_not_stood_in_for():
+    """Reading every window on every tick was most of the overlay's CPU; reading none between
+    scans left a drag followed 0.2 to 0.3 s late; and bounds standing in for a window a scan
+    had missed reset the missing time on every tick, so after a Quit the light and the lock
+    stayed 3.35 s."""
+    read = _overlay_functions("window_read")["window_read"]
+    pid = 4321
+    assert read(None, True, True, False, False) is None          # no browser yet
+    assert read(pid, True, False, True, False) == "search"       # a scan
+    assert read(pid, False, True, True, False) == "search"       # the window moves
+    assert read(pid, False, False, False, False) == "search"     # nothing followed yet
+    assert read(pid, False, False, True, False) == "followed"    # calm, between scans
+    assert read(pid, False, False, True, True) is None           # missed: wait for the next scan
+
+
+def test_a_window_gone_with_no_space_change_hides_quickly_and_waits_out_a_space_change():
+    """One way the overlay blinks off and on at every Space change and every move into or out
+    of full screen (a Space of its own); the other way it stays 0.6 s over a window that was
+    just minimized or hidden."""
+    f = _overlay_functions("missing_for", MISSING_FOR=1, MISSING_QUICK=1, SPACE_GRACE=1)
+    missing_for = f["missing_for"]
+    assert f["MISSING_QUICK"] < f["MISSING_FOR"] < f["SPACE_GRACE"]
+    assert missing_for(0.0) == missing_for(f["SPACE_GRACE"] - 0.01) == f["MISSING_FOR"]
+    assert missing_for(f["SPACE_GRACE"]) == missing_for(3600.0) == f["MISSING_QUICK"]
+
+
+def test_the_browsers_start_time_is_checked_only_for_a_window_missing_a_while():
+    """ps runs on a thread: checked on every tick it would start a process 20 times a second;
+    never checked, an overlay process stays behind for good once its browser's PID went to
+    another program."""
+    checks = _overlay_functions("checks_start")["checks_start"]
+    start = "Mon Jan  1 00:00:00 2001"
+    assert checks(start, 3.1, 5.1, False)
+    assert not checks(start, 3.0, 60.0, False)     # missing only 3 s
+    assert not checks(start, 60.0, 5.0, False)     # the last check was 5 s ago
+    assert not checks(start, 60.0, 60.0, True)     # one is running
+    assert not checks("", 60.0, 60.0, False) and not checks(None, 60.0, 60.0, False)  # none recorded
+
+
+def test_the_overlay_leaves_a_pid_that_runs_nothing_or_another_process():
+    """A ps that could not answer taken as gone would end the overlay over a live browser (the
+    light, the bar and Take over gone mid-task); a reused PID taken as the browser leaves the
+    overlay process running for good."""
+    reused = _overlay_functions("pid_reused")["pid_reused"]
+    start = "Mon Jan  1 00:00:00 2001"
+    assert reused(None, start)                          # nothing runs on the PID
+    assert reused("Tue Feb  2 00:00:00 2002", start)    # another process
+    assert not reused(start, start)                     # still the browser
+    assert not reused("", start)                        # ps could not answer: proves nothing
+
+
+def test_a_key_click_or_scroll_is_seen_when_its_counter_starts_again():
+    """Missed, typing while the agent works would not pause it (the person's keys and the
+    agent's mixed in one field), and use of an idle page would not reach the agent; a counter
+    that only grew taken as input would pause the agent on every tick."""
+    happened = _overlay_functions("happened")["happened"]
+    assert happened(0.0, 0.3)            # a new event: seconds-since started again from 0
+    assert happened(0.2, 0.3)
+    assert not happened(0.35, 0.3)       # time only went on
+    assert not happened(0.3, 0.3)
+    assert not happened(0.297, 0.3)      # within 5 ms: the same reading
+
+
+def test_a_call_in_flight_is_never_quiet():
+    """A call longer than HIDE_AFTER (a long wait_for) took the light, the bar and the lock
+    away mid-call."""
+    quiet = _overlay_functions("quiet_for")["quiet_for"]
+    assert quiet({"busy": True, "active_at": 0.0}, 1000.0) == 0.0
+    assert quiet({"busy": False, "active_at": 990.0}, 1000.0) == 10.0
+    assert quiet({"active_at": 400.0}, 1000.0) == 600.0
+
+
+def test_done_answers_only_the_request_on_the_bar():
+    """The bar went on asking for help with its Done button after the person pressed it; and a
+    Done from an earlier request must not close a new one before the person saw it."""
+    answered = _overlay_functions("help_answered")["help_answered"]
+    assert answered({"asked_at": 100.0}, {"help_done": 100.0})
+    assert answered({"asked_at": 100.0}, {"help_done": 150.0})
+    assert not answered({"asked_at": 100.0}, {"help_done": 99.0})   # an earlier request's Done
+    assert not answered({"asked_at": 100.0}, {})
+    assert not answered({}, {"help_done": 150.0})                     # nothing was asked
+
+
+def test_what_the_person_did_on_a_tick_is_named():
+    """The agent's next result names what the person did on the idle page, so it reads the page
+    again; a word lost here and the agent acts on a page that changed under it."""
+    used = _overlay_functions("used_now")["used_now"]
+    assert used(True, False, False) == ["clicked"]
+    assert used(False, True, True) == ["scrolled", "typed"]
+    assert used(False, False, False) == []
+
+
+def test_what_the_person_did_starts_over_once_the_agent_has_acted():
+    """Use from before the agent's last call was news for that call: carried on, the agent would
+    hear of a click again; dropped too early, it would miss what the person did since."""
+    since = _overlay_functions("used_since_agent")["used_since_agent"]
+    kept = {"person_used": ["typed"], "person_used_at": 200.0}
+    assert since(kept, {"active_at": 100.0}, ["clicked"]) == ["clicked", "typed"]
+    old = {"person_used": ["typed"], "person_used_at": 90.0}
+    assert since(old, {"active_at": 100.0}, ["clicked"]) == ["clicked"]
+    assert since({}, {}, ["typed", "clicked"]) == ["clicked", "typed"]  # one fixed order
+
+
+def test_the_light_is_on_while_the_agent_acts_and_dims_between_its_steps():
+    """Lit while the person holds the browser or the agent rests, the light would say the agent
+    still drives; out between two steps it read as switched off (dimmed, measured, it did not)."""
+    f = _overlay_functions("light_level", WORKING=1)
+    level = f["light_level"]
+    assert level("agent", True) == level("help", True) == "on"
+    assert level("thinking", True) == level("polite", True) == "dim"
+    assert {level(m, True) for m in ("resting", "idle", "noted", "person")} == {"off"}
+    assert {level(m, False) for m in MODES} == {"off"}   # the person turned it off
+    assert set(f["WORKING"]) == {"agent", "thinking", "polite"}
+
+
+def test_the_agents_cursor_is_placed_with_the_pages_zoom():
+    """The cursor is in CSS pixels: unscaled at 125% it pointed short of what the agent clicked;
+    and a zoom value that is not a number must not stop the tick."""
+    point = _overlay_functions("cursor_point")["cursor_point"]
+    page = (100.0, 187.0, 1000.0, 553.0)
+    assert point([10, 20], page, None) == (110.0, 207.0)
+    assert point([10, 20], page, 1.25) == (112.5, 212.0)
+    assert point([10, 20], page, "soon") == (110.0, 207.0)
+    assert point(None, page, 1.0) is None and point([], page, 1.0) is None
+    assert point([10, 20], None, 1.0) is None
+
+
+def test_the_bar_says_what_the_agent_does_and_offers_the_way_back():
+    """The bar is how the person learns what the agent does and how to get the browser back:
+    Take over on a browser they hold, or no Done on a request for help, shuts them out; a dot
+    missing from DOT would stop every tick with a KeyError."""
+    f = _overlay_functions("bar_words", "told", WORKING=1)
+    words = f["bar_words"]
+    agent, control = {"status": "Clicking #plus"}, {"since": 0.0}
+    assert words("idle", agent, control, False, False, None) is None
+    assert words("agent", agent, control, False, False, None) == (
+        "Agent working", "  ·  Clicking #plus", "Take over", "quiet", "agent", True)
+    assert words("agent", {}, control, False, False, None)[1] == "  ·  Using the browser"
+    assert words("agent", agent, control, True, False, None)[1] == "  ·  Press Take over to use the browser"
+    assert words("thinking", agent, control, False, False, None)[1:] == (
+        "  ·  Thinking about the next step", "Take over", "quiet", "thinking", False)
+    assert words("agent", agent, control, True, True, "type")[:4] == (
+        "Typing does not take over", "  ·  Press Take over to use it", "Take over", "primary")
+    assert words("polite", agent, control, False, True, "click")[0] == "The page is locked while the agent works"
+    assert words("polite", agent, control, False, False, None) == (
+        "Agent paused", "  ·  It goes on in a moment", "Take over", "quiet", "polite", False)
+    assert words("resting", agent, control, False, True, "click") == (  # a nudge only while working
+        "Agent idle", "  ·  The page is yours until its next step", "Take over", "quiet", "resting", False)
+    assert words("noted", agent, control, False, False, None) == (
+        "Done", "  ·  The agent goes on at its next step", "Take over", "quiet", "person", False)
+    assert words("person", {"waiting_human": True}, {"since": 5.0}, False, False, None) == (
+        "You have the browser", "  ·  The agent is waiting for you", "Resume agent", "primary", "person", False)
+    assert words("help", {"help": "Tick Agree"}, control, False, False, None) == (
+        "Your help is needed", "  ·  Tick Agree", "Done", "primary", "help", True)
+    dots = _overlay_dict_keys("DOT")
+    for mode in MODES[:-1]:
+        for nudging in (False, True):
+            assert words(mode, agent, control, False, nudging, "click")[4] in dots, mode
+
+
+def test_the_lock_is_over_the_page_only_while_the_agent_works():
+    """A lock while the person holds the browser, or while the agent rests, keeps them from
+    their own page; no lock while the agent works lets a stray click or scroll reach it."""
+    f = _overlay_functions("wants_lock", WORKING=1)
+    lock, page = f["wants_lock"], (0.0, 87.0, 1000.0, 553.0)
+    assert all(lock(True, mode, page) is True for mode in f["WORKING"])
+    assert not any(lock(True, mode, page) for mode in ("resting", "idle", "noted", "person", "help"))
+    assert not lock(False, "agent", page)   # turned off, or no bar to take over with
+    assert not lock(True, "agent", None)    # the page's place is not known yet
+
+
+def test_help_and_the_persons_hold_always_show_the_bar():
+    """Done and Resume agent are the only way back: a bar that "off" or "hover" hides while help
+    is asked or the person holds the browser shuts them out of it; a bar shown while idle stays
+    over a page nobody drives."""
+    bar = _overlay_functions("wants_bar")["wants_bar"]
+    for style in ("full", "compact", "hover", "off"):
+        assert bar("help", style, False, False) and bar("person", style, False, False)
+        assert bar("agent", style, True, False)          # a nudge says how to take over
+        assert not bar("idle", style, False, True)
+    assert bar("agent", "full", False, False) and bar("resting", "compact", False, False)
+    assert not bar("agent", "off", False, True)
+    assert not bar("thinking", "hover", False, False) and bar("thinking", "hover", False, True)
