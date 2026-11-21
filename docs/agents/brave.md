@@ -39,7 +39,7 @@ Part of the agent guide: [AGENTS.md](../../AGENTS.md) says when to read this. It
 - Brave reports `Browser.getVersion` product `Chrome/157.0.8103.39` (the engine), but its page hints say Brave with
   every full version reduced to `157.0.0.0` (`fullVersionList`, `uaFullVersion`). `_apply_fingerprint_to_tab` passes
   `product` from the tab's executable (`brave.product_of`), or the headless and `lang` overrides would name Google
-  Chrome next to `navigator.brave`, a pair no real browser shows. An attached browser counts as Chrome.
+  Chrome next to `navigator.brave`, a pair no real browser shows.
 - A browser's product is recorded on it (`brave.mark`). A launch records what it chose, whatever the executable is
   called (`MCP_STEALTH_BRAVE_PATH` may name a wrapper); attach records what it measured: the process on that port when
   its executable is Brave, or Google Chrome or Chromium by name (`_CHROME_EXECUTABLES`), then `navigator.brave` in an

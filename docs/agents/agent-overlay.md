@@ -109,9 +109,10 @@ Part of the agent guide: [AGENTS.md](../../AGENTS.md) says when to read this. It
   one, which shrinks with zoom (at 125% the lock was 800x442 at an offset over a 1000x553 page). `zoom` goes to the
   overlay for the agent's cursor, which is in CSS pixels.
 - Each tick reads the window's alpha (`window_alpha`): gone (a Quit) or under 0.5 (macOS fading it out on close, about
-  0.3 s, still listed) hides at once; MISSING_FOR stays for a window still there but unseen (another Space, a
-  minimize). Gone 0.13 s after a Quit (3.35 s before), 0.31 s after a window close, close animation included. Panels
-  have no system animation (`setAnimationBehavior_(None)`); it shrank them for a third of a second.
+  0.3 s, still listed) hides at once; MISSING_FOR stays for a window still there but unseen on another Space (a
+  minimized one goes sooner, see `MISSING_QUICK` below). Gone 0.13 s after a Quit (3.35 s before), 0.31 s after a
+  window close, close animation included. Panels have no system animation (`setAnimationBehavior_(None)`); it shrank
+  them for a third of a second.
 - A window under 0.5 alpha is closing (`closing`) and is never followed again until gone or back at 0.95: it stays
   listed and on screen through its 0.3 s close animation, and the same tick took it back and showed the overlay over
   it again. Now last seen 0.03 s after the close, never again.
