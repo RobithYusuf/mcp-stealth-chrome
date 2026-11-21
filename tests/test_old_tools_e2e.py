@@ -26,11 +26,20 @@ class _Api(http.server.SimpleHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        if self.path == "/held-capture":
+            self.server.started.set()
+            if not self.server.release.wait(15):
+                self.send_error(504)
+                return
+            self.send_response(302)
+            self.send_header("Location", "/wire-echo?old-capture")
+            self.end_headers()
+            return
         if self.path == "/wire-redirect":
             self.send_response(302)
             self.send_header("Location", "/wire-echo")
             self.end_headers()
-        elif self.path == "/wire-echo":
+        elif self.path.split("?", 1)[0] == "/wire-echo":
             # Only the receiver can say which headers actually arrived.
             body = json.dumps({name: self.headers[name] for name in
                                ("Accept", "Sec-Fetch-Mode", "Sec-Fetch-Dest")}).encode()
@@ -344,6 +353,34 @@ def test_status_names_the_ephemeral_profile(loop, browser):
 def test_viewport_is_read_back(loop, browser):
     out = run(loop, "set_viewport_size", 1000, 700)
     assert out.startswith("window set to 1000x700") and "viewport reads" in out, out
+
+
+@pytest.mark.parametrize("indexed", [True, False])
+def test_capture_restart_drops_in_flight_request_and_redirect(loop, browser, indexed):
+    with http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Api) as srv:
+        srv.started, srv.release = threading.Event(), threading.Event()
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            run(loop, "navigate", f"http://127.0.0.1:{srv.server_port}/wire-echo", auto_verify=False)
+            run(loop, "network_start", capture_bodies=indexed)
+            js(loop, "window.pending = fetch('/held-capture', {headers:{'X-Capture':'old'}})"
+                     ".then(r => r.text()); true")
+            assert srv.started.wait(3)
+            run(loop, "network_start", capture_bodies=indexed)
+            srv.release.set()
+            js(loop, "window.pending")
+            js(loop, "fetch('/wire-echo?new-capture', {headers:{'X-Capture':'new'}}).then(r => r.text())")
+            for full in ([False, True] if indexed else [False]):
+                entries = json.loads(run(loop, "network_get", full=full))
+                assert not any("held-capture" in e["url"] or "old-capture" in e["url"] for e in entries)
+                fresh = [e for e in entries if "new-capture" in e["url"]]
+                if full:
+                    assert [e["request_headers"]["X-Capture"] for e in fresh] == ["new"]
+                else:
+                    assert [e["type"] for e in fresh] == ["request", "response"]
+        finally:
+            srv.release.set()
+            srv.shutdown()
 
 
 def test_capture_reports_the_headers_received_on_the_final_hop(loop, page, tmp_path, monkeypatch):

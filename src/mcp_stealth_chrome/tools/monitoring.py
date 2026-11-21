@@ -11,6 +11,7 @@ out (helpers.mask_body) unless the caller asks with reveal_values="body".
 import asyncio
 import contextlib
 import json
+import time
 from typing import Any, Literal, Optional, Union
 
 from nodriver.cdp import runtime as cdp_runtime
@@ -247,6 +248,9 @@ async def network_start(capture_bodies: bool = True, keep_bodies: bool = False,
                         reveal_values: Union[bool, Literal["body"]] = False) -> str:
     """Begin capturing network requests + responses with full headers.
 
+    Capture covers only this tab's CDP session, not out-of-process iframes, workers or service
+    workers; block_ads and save_bodies use separate connections with their own target coverage.
+
     Args:
         capture_bodies: if True (default), also indexes by request_id so
             network_get(include_body=True) can fetch response bodies on
@@ -406,20 +410,30 @@ async def _start_capture(capture_bodies: bool, keep_bodies: bool) -> str:
         BrowserState.network_logs.clear()
         BrowserState.network_index.clear()
         BrowserState.capture_network = True
-        # The handler is installed once per target, but this option is mutable:
-        # a later network_start(capture_bodies=True) must change what that
-        # existing handler indexes instead of merely claiming that it did.
-        armed = tid in _srv._NETWORK_CAPTURES
+        started_at = time.time()
         tracker = RequestHeaders(_srv.CAPTURE_MAX_INDEXED) if capture_bodies else None
 
         # Bound now, to the instance being armed — see console_start for why
         # reading the class attribute at event time cross-files the capture.
         log_sink = BrowserState.network_logs
         index_sink = BrowserState.network_index
+        # A restart clears the whole instance's sinks, including any previously armed tab.
+        for key, old in tuple(_srv._NETWORK_CAPTURES.items()):
+            if key == tid or old[0] is index_sink:
+                del _srv._NETWORK_CAPTURES[key]
+                _srv._drop_handlers(old[1], old[2])
+
+        # Flat capture has no index: remember enough request IDs to reject completions
+        # (and redirect hops) of requests that started before this generation.
+        seen = index_sink if tracker is not None else {}
 
         async def on_req(event):
             try:
                 rid = str(event.request_id)
+                redirect = getattr(event, "redirect_response", None) is not None
+                if (getattr(event, "wall_time", started_at) < started_at
+                        or (redirect and rid not in seen)):
+                    return
                 req = event.request
                 req_headers = dict(getattr(req, "headers", None) or {})
                 entry = {
@@ -443,10 +457,13 @@ async def _start_capture(capture_bodies: bool, keep_bodies: bool) -> str:
                 if (entry["resource_type"] == "Document" and entry["_loader"]
                         and str(getattr(event, "frame_id", "") or "") == tid):
                     _srv._NETWORK_DOC_LOADER[tid] = entry["_loader"]
-                tracker = _srv._NETWORK_CAPTURES.get(tid)
-                if tracker is not None:
+                if tracker is None:
+                    seen[rid] = None
+                    if len(seen) > _srv.CAPTURE_MAX_EVENTS:
+                        del seen[next(iter(seen))]
+                else:
                     tracker.request(rid, entry, index_sink.get(rid),
-                                    getattr(event, "redirect_response", None) is not None,
+                                    redirect,
                                     getattr(event, "redirect_has_extra_info", False))
                     index_sink[rid] = entry
                     _srv._trim_index(index_sink)
@@ -463,6 +480,10 @@ async def _start_capture(capture_bodies: bool, keep_bodies: bool) -> str:
             try:
                 rid = str(event.request_id)
                 resp = event.response
+                if rid not in seen:
+                    return
+                if tracker is None:
+                    seen.pop(rid)
                 resp_headers = dict(getattr(resp, "headers", None) or {})
                 if rid in index_sink:
                     e = index_sink[rid]
@@ -470,7 +491,6 @@ async def _start_capture(capture_bodies: bool, keep_bodies: bool) -> str:
                     e["response_headers"] = resp_headers
                     e["mime"] = getattr(resp, "mime_type", None)
                     e["size"] = getattr(resp, "encoded_data_length", None)
-                    tracker = _srv._NETWORK_CAPTURES.get(tid)
                     if tracker is not None:
                         tracker.finish(rid, e, getattr(event, "has_extra_info", False))
                 log_sink.append({
@@ -485,27 +505,31 @@ async def _start_capture(capture_bodies: bool, keep_bodies: bool) -> str:
                 pass
 
         async def on_extra(event):
-            tracker = _srv._NETWORK_CAPTURES.get(tid)
             if tracker is not None:
                 tracker.extra(str(event.request_id), event.headers)
 
         async def on_failed(event):
             rid = str(event.request_id)
-            tracker = _srv._NETWORK_CAPTURES.get(tid)
             if tracker is not None and rid in index_sink:
                 tracker.finish(rid, index_sink[rid], True)
+            elif tracker is None:
+                seen.pop(rid, None)
 
-        if armed:
-            _srv._NETWORK_CAPTURES[tid] = tracker
-            return ok(
-                f"network capture started (capture_bodies={capture_bodies}); "
-                f"handler already armed on this tab{kept_note}"
-            )
-        tab.add_handler(cdp_network.RequestWillBeSent, on_req)
-        tab.add_handler(cdp_network.ResponseReceived, on_res)
-        tab.add_handler(cdp_network.RequestWillBeSentExtraInfo, on_extra)
-        tab.add_handler(cdp_network.LoadingFailed, on_failed)
-        _srv._NETWORK_CAPTURES[tid] = tracker
+        # nodriver may already have scheduled a removed callback. Bind the subscription
+        # identity, tracker and sinks here; a stale callback cannot touch the new capture.
+        def guarded(callback):
+            async def deliver(event):
+                if _srv._NETWORK_CAPTURES.get(tid) is subscription:
+                    await callback(event)
+            return deliver
+
+        handlers = tuple((kind, guarded(callback)) for kind, callback in (
+            (cdp_network.RequestWillBeSent, on_req), (cdp_network.ResponseReceived, on_res),
+            (cdp_network.RequestWillBeSentExtraInfo, on_extra), (cdp_network.LoadingFailed, on_failed)))
+        subscription = (index_sink, tab, handlers)
+        for kind, handler in handlers:
+            tab.add_handler(kind, handler)
+        _srv._NETWORK_CAPTURES[tid] = subscription
         return ok(f"network capture started (capture_bodies={capture_bodies}){kept_note}")
     except Exception as e:
         return err(str(e))
@@ -523,6 +547,9 @@ async def network_get(
     max_url_len: int = 200,
 ) -> str:
     """Retrieve captured network events.
+
+    Capture covers only this tab's CDP session, not out-of-process iframes, workers or service
+    workers; block_ads and save_bodies use separate connections with their own target coverage.
 
     Args:
         limit: max entries returned (oldest first within the last `limit`)

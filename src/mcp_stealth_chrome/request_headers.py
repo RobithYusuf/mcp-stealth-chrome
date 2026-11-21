@@ -25,6 +25,7 @@ class RequestHeaders:
         chain = self._chains.get(rid)
         if chain is None:
             chain = self._chains[rid] = _Chain()
+            # Includes ExtraInfo that arrives without a page request. Evict oldest first.
             if len(self._chains) > self._limit:
                 del self._chains[next(iter(self._chains))]
         return chain

@@ -215,8 +215,10 @@ def test_target_key_is_shared_and_console_alias_delegates():
 
 
 def test_per_target_handlers_do_not_duplicate_and_network_mode_reconfigures(monkeypatch):
-    """A replacement Tab wrapper for one CDP target must not stack handlers."""
+    """Re-arming a target fences callbacks already queued on its previous Tab wrapper."""
     import asyncio
+    from collections import defaultdict
+    from nodriver.cdp import network
     from types import SimpleNamespace
 
     from mcp_stealth_chrome import server
@@ -228,16 +230,13 @@ def test_per_target_handlers_do_not_duplicate_and_network_mode_reconfigures(monk
         target = _Target()
 
         def __init__(self):
-            self.handlers = []
+            self.handlers = defaultdict(list)
 
         async def send(self, _command):
             return None
 
         def add_handler(self, event_type, handler):
-            self.handlers.append((event_type, handler))
-
-        async def send(self, _command):
-            return None
+            self.handlers[event_type].append(handler)
 
     first = _Tab()
     replacement = _Tab()
@@ -251,16 +250,15 @@ def test_per_target_handlers_do_not_duplicate_and_network_mode_reconfigures(monk
     server._NETWORK_CAPTURES.clear()
     old_logs = server.BrowserState.network_logs
     old_index = server.BrowserState.network_index
+    server.BrowserState.network_logs = []
+    server.BrowserState.network_index = {}
     try:
         network_start = server.mcp._tool_manager._tools["network_start"].fn
-        asyncio.run(network_start(capture_bodies=False))
-        assert len(first.handlers) == 4
-
         asyncio.run(network_start(capture_bodies=True))
-        assert len(first.handlers) == 4
-        assert replacement.handlers == []
-
-        request_handler = first.handlers[0][1]
+        stale = {kind: handler for kind, (handler,) in first.handlers.items()}
+        asyncio.run(network_start(capture_bodies=True))
+        assert not any(first.handlers.values())
+        current = {kind: handler for kind, (handler,) in replacement.handlers.items()}
         event = SimpleNamespace(
             request_id="request-1",
             request=SimpleNamespace(
@@ -270,8 +268,27 @@ def test_per_target_handlers_do_not_duplicate_and_network_mode_reconfigures(monk
             type_="Document",
             timestamp=1,
         )
-        asyncio.run(request_handler(event))
-        assert "request-1" in server.BrowserState.network_index
+        # A queued callback, rather than a new callback delivered after the reset.
+        asyncio.run(stale[network.RequestWillBeSent](event))
+        assert not server.BrowserState.network_logs and not server.BrowserState.network_index
+        # An event generated before re-arm can also reach the new handler on the socket.
+        event.wall_time = 1
+        asyncio.run(current[network.RequestWillBeSent](event))
+        assert not server.BrowserState.network_logs and not server.BrowserState.network_index
+        del event.wall_time
+        asyncio.run(current[network.RequestWillBeSent](event))
+        extra = SimpleNamespace(request_id="request-1", headers={"X-Capture": "old"})
+        response = SimpleNamespace(request_id="request-1", response=SimpleNamespace(status=200),
+                                   has_extra_info=True)
+        asyncio.run(stale[network.RequestWillBeSentExtraInfo](extra))
+        asyncio.run(stale[network.ResponseReceived](response))
+        entry = server.BrowserState.network_index["request-1"]
+        assert entry["status"] is None
+        asyncio.run(current[network.ResponseReceived](response))
+        assert entry["headers_source"] == "page"
+        extra.headers = {"X-Capture": "new"}
+        asyncio.run(current[network.RequestWillBeSentExtraInfo](extra))
+        assert entry["request_headers"] == {"X-Capture": "new"}
     finally:
         server._NETWORK_CAPTURES.clear()
         server.BrowserState.network_logs = old_logs

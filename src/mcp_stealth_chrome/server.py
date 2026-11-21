@@ -83,7 +83,6 @@ from . import keep_alive as _keep_alive
 from . import tab_record
 from . import instance_notes
 from . import run_marker
-from .request_headers import RequestHeaders
 from .state import data_root as state_data_root
 from .humanize import (
     CURRENT_GESTURE, Gesture, humanized_approach, humanized_move, humanized_mouse_press,
@@ -7454,8 +7453,8 @@ def _now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
-# Registered target -> header tracker, or None when only the flat stream is enabled.
-_NETWORK_CAPTURES: dict[str, RequestHeaders | None] = {}
+# Active subscription per target: owning index, tab wrapper and exact registered callbacks.
+_NETWORK_CAPTURES: dict[str, tuple[dict, Any, tuple]] = {}
 
 
 def _clear_tab_scoped_state(tabs: list[Any]) -> None:

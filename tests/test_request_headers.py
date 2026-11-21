@@ -33,3 +33,15 @@ def test_late_extra_after_eviction_cannot_attach_to_redirect_destination():
     tracker.request("id", final, first, True, True)
     tracker.finish("id", final, True)
     assert final["request_headers"] == {"Accept": "page"}
+
+
+def test_orphan_wire_headers_are_forgotten_at_the_capture_limit():
+    tracker = RequestHeaders(2)
+    for rid in ("old", "second", "third"):
+        tracker.extra(rid, {"X-Wire": rid})
+    entry = {"headers_source": "page"}
+    tracker.request("old", entry, None, False, False)
+    tracker.finish("old", entry, True)
+    assert entry == {"headers_source": "page"}
+    tracker.extra("old", {"X-Wire": "fresh"})
+    assert entry["request_headers"] == {"X-Wire": "fresh"}
