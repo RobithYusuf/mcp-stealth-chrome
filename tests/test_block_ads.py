@@ -956,3 +956,18 @@ def test_a_request_the_page_dropped_before_the_answer_is_not_an_answer_error():
     report = b.report()
     assert report["answer_errors"] == 1 and report["answer_error_samples"] == ["Invalid header: x"]
     assert report["gone_before_answer"] == 2
+
+
+def test_the_release_goes_through_the_name_this_module_binds(monkeypatch):
+    """The release lives in target_release.py, shared with body saving; adblock keeps the name
+    bound here, so a test patching adblock._release_targets reaches every release block_ads
+    makes."""
+    calls = []
+
+    def fake(ws_url, budget, progress):
+        calls.append(ws_url)
+        with progress["lock"]:
+            progress["seen"], progress["finished"] = [], True
+    monkeypatch.setattr(adblock, "_release_targets", fake)
+    assert adblock._release_every_target("ws://bound", 1.0) == ""
+    assert calls == ["ws://bound"]

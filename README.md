@@ -4,7 +4,7 @@
 
 # MCP Stealth Chrome
 
-An MCP server with 169 tools that gives an AI agent a real Chrome browser and an HTTP client with Chrome's TLS fingerprint.
+An MCP server with 170 tools that gives an AI agent a real Chrome browser and an HTTP client with Chrome's TLS fingerprint.
 
 [![PyPI version](https://img.shields.io/pypi/v/mcp-stealth-chrome.svg)](https://pypi.org/project/mcp-stealth-chrome/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -315,7 +315,7 @@ Measured in November 2026 on one Mac (M4 Pro, Chrome 157, headless, a throwaway 
 | Snapshot of the Wikipedia page | 2,405 tokens for the first 100 elements, 100,127 for all | 225,658 tokens |
 | Start the browser and load the first page | 1.07 s | 0.66 s |
 | Memory with one page open | 941 MB in 10 processes | 585 MB in 6 processes |
-| Tool definitions sent to the client | about 32,900 tokens for 169 tools | 7,300 tokens for 32 tools |
+| Tool definitions sent to the client | about 32,900 tokens for the 169 tools of 0.26.0, when this was measured | 7,300 tokens for 32 tools |
 
 - ✅ Faster at opening pages, clicking, filling and reading, and smaller snapshots. A snapshot here lists what can be acted on; the other server's lists the whole accessibility tree including text, so the two are not the same content.
 - ❌ Slower to start, heavier in memory, and its tool list costs a client that loads every definition about four and a half times as much. `profile_mode="light"` brought one page to about 630 MB in 7 processes, at the cost described under Speed, memory and disk.
@@ -794,9 +794,9 @@ Open a group to see its tools.
 </details>
 
 <details>
-<summary><b>Network capture</b> (5)</summary>
+<summary><b>Network capture</b> (6)</summary>
 
-`network_start`, `network_get`, `auth_capture`, `export_curl`, `export_har`
+`network_start`, `network_get`, `network_save_status`, `auth_capture`, `export_curl`, `export_har`
 </details>
 
 <details>
@@ -890,6 +890,8 @@ These run without a browser and without a search API key, and use the stealth br
 
 `network_start` and `network_get` capture requests with headers and, on demand, response bodies. Chrome drops a body when its page navigates away, and `network_get` then says so. `network_start(keep_bodies=True)` has Chrome keep bodies outside the page so they can still be read: they stay in Chrome's memory for that tab until it closes, up to 64 MB in all, the oldest dropped first (`CAPTURE_BODY_BUFFER_BYTES` and `CAPTURE_BODY_MAX_BYTES` change it), and the result says so. It is off by default. Calling `network_start` again forgets the earlier requests, so later calls cannot look up their bodies, and a `network_get` still running across it returns an error instead of an old body. `network_get(resource_type="xhr,fetch")` leaves out documents, scripts and images, and `max_url_len` (default 200, 0 for whole URLs) cuts long URLs and says how much went. A reply over 50,000 characters leaves out the oldest entries and says how many. `export_curl` turns a captured request into a `curl` command and an `http_request` call. Prefer the second, because plain curl sends curl's own TLS fingerprint. `export_har` writes the capture to a HAR file.
 
+`network_start(save_bodies=[{"url_pattern": "*/api/v4/pdp/*", "name": "pdp", "extract": ["data.item.title", "data.item.models[].{name,price}"]}])` writes the response bodies of matching URLs to `~/.mcp-stealth/exports/<date>/<name>.jsonl`, one JSON line per response (`{"meta": {request_url, page_url, ts, status, mime}, "body": ...}`), and nothing of a body to the transcript. It is for the JSON a page loads for itself behind headers only its own scripts can sign, for many pages in a row. It covers every tab and popup of the browser, past navigations and reloads, and also a popup that opens the API URL itself. `extract` keeps only some fields: `a.b` a key at each dot, `a[]` each element of a list, `{x,y}` at the end those keys; a path that finds nothing is null and named in `meta.missing`. The files are masked as `network_get` shows them (`reveal_values` as there), 0600, a new file past 50 MB. A plain `network_start()` leaves saving on; `save_bodies=[]`, closing the browser or the server's exit stop it. `network_save_status()` gives per name what matched, was saved, is pending and was not saved and why, the files with their size, and the last record's meta and top-level keys. Saving is refused in the person's own browser (the launcher's, or one reached with `attach_to_chrome`).
+
 `intercept_start` pauses matching requests at the CDP layer to observe, cancel or mock them, including XHR and anything a page captured before your script ran. It turns itself off after a deadline, so a forgotten intercept cannot hang the page. When Chrome refuses to turn it off, `intercept_stop` is an error and `intercept_log` still shows it active: the handler then lets every request through, and calling `intercept_stop` again, or the deadline, tries again. Starting one on another tab meanwhile is refused. `dry_run` is the preset for exploring a logged-in account: it blocks POST, PUT, PATCH and DELETE and records what each would have sent, while reads keep working.
 </details>
 
@@ -946,7 +948,7 @@ These run without a browser and without a search API key, and use the stealth br
 
 ### API keys
 
-✅ 163 of the 169 tools need no key. These six do:
+✅ 164 of the 170 tools need no key. These six do:
 
 | Tools | Key | Approximate cost |
 |-------|-----|------------------|

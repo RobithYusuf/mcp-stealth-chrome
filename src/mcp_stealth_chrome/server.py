@@ -76,6 +76,7 @@ from . import launch_lock
 from . import profile_gc
 from . import profile_version
 from . import presence
+from . import body_saver
 from . import cookie_migration
 from . import quit_watch
 from . import keep_alive as _keep_alive
@@ -477,6 +478,8 @@ def _socket_dropped(browser: Any) -> bool:
 
 async def _ensure_browser_dead(browser, profile_dir=None, grace: float = 1.5) -> dict:
     presence.stop(browser)  # its overlay goes first: nothing is left over a closing window
+    # Body saving ends before its browser: bodies whose loading finished are written first.
+    await body_saver.stop_for(browser, "its browser was closed")
     """Stop a browser and VERIFY the OS process actually died.
 
     `browser.stop()` talks over CDP. When the websocket is already gone — a
@@ -8429,6 +8432,9 @@ def _stop_all_browsers() -> None:
     with contextlib.suppress(Exception):
         if _adblock_if_loaded() is not None:
             _adblock_if_loaded().shutdown()
+    # Body saving the same way (network_start(save_bodies=...)): it holds new targets too.
+    with contextlib.suppress(Exception):
+        body_saver.shutdown()
     with contextlib.suppress(Exception):
         presence.stop_all()
     for key in BrowserState.session_keys():

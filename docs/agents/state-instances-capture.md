@@ -73,3 +73,37 @@ Part of the agent guide: [AGENTS.md](../../AGENTS.md) says when to read this. It
   reveal_values="body" the warning is `reveal_note`, so the size `note` never replaces it (it did). URLs longer than
   `max_url_len` (200) are cut after masking, with `url_cut` saying how much and how to get it whole; `list_frames` does
   the same.
+
+## Response bodies to files (`network_start(save_bodies=...)`)
+
+- Saving runs on a CDP connection of its own per browser (`body_saver.py`, thread `mcp-stealth-bodies`), not the
+  tab's session: a popup that opens the API URL itself has its body in its first document response, which only a
+  client holding the new target until `Network.enable` is in place sees; the tab's own capture (`network_get`,
+  `keep_bodies`, `intercept_log`, `export_har`) is left as it is; and kept bodies belong to the session that asked.
+  It holds pages (browser level) and out-of-process iframes (page and frame sessions), not workers, with the hold
+  and release rules of `adblock.md`; the release over a new connection is shared (`target_release.py`).
+- On a held target `Network.enable` with buffer sizes answers in 10 to 14 ms and `configureDurableMessages` in 3 to 4
+  (Chrome 157). The hold cost, median of 20, two rounds: `tab_new` 128 ms without saving, 129.5 with; a
+  `window.open` popup's first request 15.2 ms without, 18.4 with.
+- Durable messages are what keep the bodies, not reading at `loadingFinished` on our own session: without them and
+  the buffer sizes, the page that navigates as its fetch resolves lost its body ("No resource with given identifier
+  found", counted `body_gone`) in 2 of 2 runs of the 12-page test; with them 12 of 12.
+- Memory, measured twice: 48 MB of bodies raised Chrome's total RSS by 50 to 52 MB over the same run unsaved
+  (none of it in the browser process), and stopping (the saver detaches every session) gave 46 MB back.
+- A plain `network_start()` never stops saving, settled by the developer: agents call it again out of habit, and a run
+  that stopped there unseen at page 9 of 50 is what the feature exists to prevent. It says `body saving continues`.
+  Saving ends only on `save_bodies=[]`, a new non-empty `save_bodies` (the old run's final counts stay under
+  `previous`), a close of the browser (`_ensure_browser_dead` stops it first, so finished bodies are written), the
+  browser going away, the server's exit (`body_saver.shutdown()` in `_stop_all_browsers`) and the watchdog. An end by
+  itself (watchdog, connection lost while the browser lives) is said once on the session's next tool result.
+- Every matched response is settled exactly once (`_settle_locked` pops it): saved, or a counted reason, and
+  `matched == saved + pending + not_saved` holds in every status. A line is checked, written and counted under one
+  gate that `_end` also takes, so a body is never both written and counted `stopped`. A body being read when its tab
+  closes is left to its read. CORS preflights are not counted. "Matched" is decided at `requestWillBeSent`, so a
+  redirect is one request, and one whose later hop matches counts.
+- The files are masked as `network_get` shows them; the status masks URLs whatever mode the files were written in,
+  since it lands in the transcript. `auth` is itself a secret name: every value under it is hidden, its `user` too.
+- Refused in the person's own browser (the launcher's, or `attach_to_chrome`): saving reads every tab. Filtering to
+  `owned_targets` is the open alternative.
+- `helpers.append_private_line`: two `openat(O_CREAT)` of one new name at once fail now and then with ENOENT on macOS
+  although the folder is open (22 of 600 opens, 4 threads; a plain path open never did), so the open is tried again.
