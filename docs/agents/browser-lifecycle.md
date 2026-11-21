@@ -206,6 +206,11 @@ Part of the agent guide: [AGENTS.md](../../AGENTS.md) says when to read this. It
   too). A client's cancel of the launch still reaches that task. A mark whose task was cancelled counts as
   absent even while the task has not ended, so the session is not refused after the recover; a launch lock
   such a task holds stays held until it ends, and the recover says so.
+- The cleanup after a cancel is bounded too: `_remove_privacy_profile` waits `_HOLDERS_READ_WAIT` (3 s) for
+  each read of the process list (`processes_holding`, `_profile_holders`), and a read that does not answer
+  counts as holders unknown, which keeps the folder (unknown is never gone) and says so. Known limit, as on
+  main: a client's cancel before the browser exists leaves the privacy profile the launch made; profile_gc
+  removes it later.
 - `browser_recover` waits for nothing that can be stuck: it skips the wait for a close of the current
   instance (`_app.RUNS_DURING_A_CLOSE`, with `server_status`, which only reads; every other tool still
   waits). A close that never ended answered every call "still being closed ... or browser_recover if it never

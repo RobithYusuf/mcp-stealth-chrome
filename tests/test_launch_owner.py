@@ -1006,3 +1006,73 @@ def test_a_write_in_a_thread_outlasts_a_cancel_that_comes_again():
             return list(done)
 
     assert asyncio.run(run()) == ["written"]
+
+
+# ── The cleanup after a cancel is bounded ───────────────────────────────────────────────────
+
+
+@pytest.fixture
+def process_list_hangs(monkeypatch):
+    """Both reads of the process list in _remove_privacy_profile block (released at the end, so no
+    thread outlives the test by more than that), and their bound is 0.2 s."""
+    import threading
+    release = threading.Event()
+
+    def holding(_folder):
+        release.wait(10)
+        return []
+
+    def holders(*_a):
+        release.wait(10)
+        return ""
+
+    monkeypatch.setattr(server, "_HOLDERS_READ_WAIT", 0.2)
+    monkeypatch.setattr(state, "processes_holding", holding)
+    monkeypatch.setattr(server, "_profile_holders", holders)
+    yield release  # set it before the loop ends: asyncio.run waits for the executor's threads
+    release.set()
+
+
+def test_a_process_list_that_never_answers_keeps_the_privacy_profile_and_says_so(env, process_list_hangs):
+    """Unknown is never gone: the folder stays, the reason says the list was not read in time, and
+    the removal returns within its bound instead of with the read."""
+    folder = env.privacy_root / "main-hung"
+    folder.mkdir(parents=True)
+
+    async def run():
+        started = time.monotonic()
+        removed = await server._remove_privacy_profile(folder)
+        took = time.monotonic() - started
+        process_list_hangs.set()
+        return removed, took
+
+    removed, took = asyncio.run(run())
+    assert removed is False and folder.exists()
+    assert took < 3, f"it waited {took:.1f} s for a read that does not answer"
+    why = server._PRIVACY_REMOVE_FAILURES[str(folder)]
+    assert "the process list could not be read in 0.2 s" in why, why
+    assert "who holds it is unknown: reading the process list took longer than 0.2 s" in why, why
+
+
+def test_a_cancelled_launch_whose_cleanup_hangs_ends_within_its_bound(owner, monkeypatch, process_list_hangs):
+    """The recover's wait after the cancel can end before the cleanup does, and its text says so;
+    the cleanup then still ends within its bound and releases the mark."""
+    monkeypatch.setattr(server, "_RECOVER_LAUNCH_WAIT", 0.3)
+    monkeypatch.setattr(server, "_first_live_tab", _never)
+
+    async def run():
+        launch = asyncio.ensure_future(_launch_with(owner))
+        await _until_hung()
+        said = await _call("browser_recover", {})
+        pending = not launch.done()
+        answered = time.monotonic()
+        out = await asyncio.wait_for(launch, 8)
+        after = time.monotonic() - answered
+        process_list_hangs.set()
+        return said, pending, after, out
+
+    said, pending, after, out = asyncio.run(run())
+    assert "asked to stop and cancelled, it had still not ended 0.3 s later" in said and pending, said
+    assert after < 3, f"the cleanup ran {after:.1f} s past the recover"
+    assert "it was cancelled at the step it was waiting on" in out and "could not be removed" in out, out
+    assert _no_mark()

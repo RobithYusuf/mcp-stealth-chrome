@@ -1135,6 +1135,10 @@ def _new_privacy_profile(instance_id: str) -> Path:
 _PRIVACY_REMOVE_WAIT = float(os.environ.get(
     "MCP_STEALTH_PROFILE_REMOVE_WAIT", "15" if sys.platform == "win32" else "0"))
 _PRIVACY_REMOVE_DELAYS = (0.1, 0.25, 0.5)
+# How long _remove_privacy_profile waits for one read of the process list (processes_holding,
+# _profile_holders). They only read, so abandoning one is harmless; unbounded, a read that never
+# returned held a cancelled launch, and its launch lock, past browser_recover's wait.
+_HOLDERS_READ_WAIT = float(os.environ.get("MCP_STEALTH_HOLDERS_READ_WAIT", "3"))
 # Why the last removal of a privacy profile failed, by the path the caller passed.
 _PRIVACY_REMOVE_FAILURES: dict[str, str] = {}
 
@@ -1232,11 +1236,18 @@ async def _remove_privacy_profile(profile_dir: Optional[Path]) -> bool:
         # The path as Chrome was given it: resolving can change its spelling (a Windows 8.3
         # short name becomes the long one), and processes_naming tries both. An unreadable
         # browser process counts too (processes_holding).
-        found = await asyncio.to_thread(processes_holding, profile_dir)
+        try:
+            found = await asyncio.wait_for(asyncio.to_thread(processes_holding, profile_dir),
+                                           timeout=_HOLDERS_READ_WAIT)
+            late = False
+        except asyncio.TimeoutError:
+            found, late = None, True
         users = found or []
         if found is None:
             # Unknown is not "none": a helper may still run and write the files back.
-            reason = "the process list could not be read, so it is not known whether Chrome still runs"
+            reason = (f"the process list could not be read in {_HOLDERS_READ_WAIT:g} s, so it is not known "
+                      f"whether Chrome still runs" if late else
+                      "the process list could not be read, so it is not known whether Chrome still runs")
             await asyncio.sleep(delay)
         elif users:
             reason = "a process still runs with it: " + ", ".join(
@@ -1259,8 +1270,12 @@ async def _remove_privacy_profile(profile_dir: Optional[Path]) -> bool:
             return True
         if attempt >= len(_PRIVACY_REMOVE_DELAYS) and time.monotonic() >= deadline:
             break
-    holders = await asyncio.to_thread(
-        _profile_holders, profile_dir, _left_in(target), {pid for pid, _command in users})
+    try:
+        holders = await asyncio.wait_for(asyncio.to_thread(
+            _profile_holders, profile_dir, _left_in(target), {pid for pid, _command in users}),
+            timeout=_HOLDERS_READ_WAIT)
+    except asyncio.TimeoutError:
+        holders = f"who holds it is unknown: reading the process list took longer than {_HOLDERS_READ_WAIT:g} s"
     _PRIVACY_REMOVE_FAILURES[str(profile_dir)] = "; ".join(p for p in (reason, holders) if p)
     return False
 
