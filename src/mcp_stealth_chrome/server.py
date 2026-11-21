@@ -7143,13 +7143,39 @@ async def fill(ref: Optional[str] = None, selector: Optional[str] = None,
     """Clear a field and type into it with real key presses, then read it back.
 
     A value the page only formatted (a card mask adding spaces, a date mask adding "/") is
-    filled and says how it reads; a value the page cut or changed is an error.
+    filled and says how it reads; a value the page cut or changed is an error. Readonly,
+    disabled and contenteditable=false fields are reported as not editable with the value
+    actually read after the attempt.
     """
     try:
         tab = BrowserState.active_tab()
         el = await resolve_ref(ref) if ref else (await tab.query_selector(selector) if selector else None)
         if el is None:
             return err("element not found")
+        restrictions = await el.apply(
+            """function() { return JSON.stringify({
+                readonly: this.readOnly === true,
+                disabled: this.disabled === true,
+                contenteditable_false: this.getAttribute('contenteditable') === 'false'
+            }); }"""
+        )
+        try:
+            restrictions = json.loads(restrictions or "{}")
+        except (TypeError, ValueError):
+            restrictions = {}
+        restriction = next((name for name, present in (
+            ("readonly", restrictions.get("readonly")),
+            ("disabled", restrictions.get("disabled")),
+            ("contenteditable=false", restrictions.get("contenteditable_false")),
+        ) if present), None)
+        if restriction:
+            actual = await el.apply(
+                "function() { return this.isContentEditable ? this.innerText : "
+                "(typeof this.value === 'string' ? this.value : this.innerText); }"
+            )
+            is_secret = (await el.apply("function() { return this.type === 'password'; }")) is True
+            shown = f"{len(actual)} chars" if is_secret and isinstance(actual, str) else repr(actual[:80])
+            return err(f"field is {restriction} (not editable); after the attempted fill it holds {shown}")
         try:
             await el.clear_input()
         except Exception:
@@ -7177,7 +7203,8 @@ async def fill(ref: Optional[str] = None, selector: Optional[str] = None,
         except Exception:
             await el.set_value(value)
         actual = await el.apply(
-            "function() { return this.isContentEditable ? this.innerText : this.value; }"
+            "function() { return this.isContentEditable ? this.innerText : "
+            "(typeof this.value === 'string' ? this.value : this.innerText); }"
         )
         wanted = str(value)
         if multiline:
@@ -7190,8 +7217,8 @@ async def fill(ref: Optional[str] = None, selector: Optional[str] = None,
             is_secret = (await el.apply("function() { return this.type === 'password'; }")) is True
             shown = f"{len(actual)} chars" if is_secret else repr(actual[:80])
             # An input mask that only adds separators kept every character: PXP's card field
-            # reads '4111 1111 1111 1111' and its expiry '12/30', and calling that an error made
-            # a filled checkout look failed. A character dropped or changed is still one.
+            # reads '4111 1111 1111 1111' and its expiry '12/30', and calling that an error made a
+            # filled checkout look failed. A character dropped or changed is still one.
             if _FORMAT_SEPARATORS.sub("", actual) == _FORMAT_SEPARATORS.sub("", wanted) != "":
                 return ok(f"filled; the page formatted it as {shown}")
             return err(

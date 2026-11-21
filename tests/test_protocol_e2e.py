@@ -503,6 +503,23 @@ def test_humanize_type_and_fill_send_real_keys_too(page):
     assert len(events(page, "keydown")) >= 2
 
 
+def test_fill_reports_fields_that_are_not_editable(page):
+    page.evaluate("""(()=>{
+        document.body.insertAdjacentHTML('beforeend',
+          '<input id="readonly-fill" readonly value="FIXED-123">' +
+          '<input id="disabled-fill" disabled value="LOCKED">' +
+          '<div id="ce-false" contenteditable="false">STATIC</div>');
+        return 1;
+    })()""")
+    for selector, name, value in (("#readonly-fill", "readonly", "changed"),
+                                  ("#disabled-fill", "disabled", "changed"),
+                                  ("#ce-false", "contenteditable=false", "changed")):
+        reply = page.call("fill", selector=selector, value=value)
+        assert reply.failed and name in reply.text and "after the attempt" in reply.text, reply.text
+    assert page.evaluate("document.getElementById('readonly-fill').value") == "FIXED-123"
+    assert page.evaluate("document.getElementById('disabled-fill').value") == "LOCKED"
+    assert page.evaluate("document.getElementById('ce-false').textContent") == "STATIC"
+
 def test_typing_keeps_non_ascii_and_newlines(page):
     page.call("click", selector="#ta")
     page.call("type_text", text="é中\nl2")
