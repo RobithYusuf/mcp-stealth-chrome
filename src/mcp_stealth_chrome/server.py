@@ -1416,7 +1416,15 @@ _CF_CHALLENGE_PROBE_INITIAL_JS = """
   const txt = (document.body && document.body.innerText || '').toLowerCase();
   const phrases = ['performing security verification', 'just a moment',
     'checking your browser', 'verify you are human', 'verifying you are human'];
-  const cfText = phrases.some(p => txt.includes(p));
+  // The phrases alone are also what a page ABOUT Cloudflare says: a product landing page quoting
+  // "Just a moment..." read as a challenge, and auto_verify waited and said "CF detected but no
+  // clickable widget found". They count only with the challenge page's own marks, which it carries
+  // before its widget renders: its orchestrate script, its form, or its inline _cf_chl_opt.
+  const cfText = phrases.some(p => txt.includes(p)) && (
+    !!document.querySelector('script[src*="/cdn-cgi/challenge-platform/"][src*="/orchestrate/"], ' +
+                             'form[action*="__cf_chl"]')
+    || Array.from(document.scripts).some(
+      s => !s.src && s.text.length < 20000 && s.text.indexOf('_cf_chl_opt') >= 0));
   // Turnstile-specific markers ONLY. We deliberately exclude the bare
   // [data-sitekey] selector — it matches reCAPTCHA / hCaptcha hosts too,
   // and clicking those checkboxes opens unsolvable image grids. The CF
@@ -3737,9 +3745,12 @@ async def _launch_by_reattach(profile: Path, verdict: dict, *, url: str, keep_al
                                 headless=bool(record.get("headless")),
                                 persons_browser=_persons_browser(browser))
     action = "Loaded" if url and url != "about:blank" else "Selected tab shows"
-    return _nav_result(f"{summary[0].upper()}{summary[1:]}. {action}", observed,
-                       expect_url=expect_url, expect_status=expect_status,
-                       suffix=keep_text + ads_note)
+    trip = await _tripwire_after_navigation(tabs[select], observed,
+                                            headless=bool(record.get("headless")))
+    return _tripwire_render(trip, "browser_launch", _nav_result(
+        f"{summary[0].upper()}{summary[1:]}. {action}", observed,
+        expect_url=expect_url, expect_status=expect_status, suffix=keep_text + ads_note),
+        asked_for=url if url and url != "about:blank" else None, launched=True)
 
 
 # browser_launch / spawn_browser parameters that only shape a new Chrome, with the value that
@@ -4400,10 +4411,13 @@ async def _launch_reuse_running(req: _LaunchRequest) -> Optional[str]:
             if BrowserState.current_profile_dir else None,
             "session_state_source": "reused running browser — profile unchanged",
         }
-        return _nav_result(
+        # A second launch on a browser still on the verification page says so in a line.
+        _trip = await _tripwire_after_navigation(_tab, _observed, doc_state=_doc_state,
+                                                 headless=BrowserState.current_headless)
+        return _tripwire_render(_trip, "browser_launch", _nav_result(
             reuse_head, _observed,
             expect_url=req.expect_url, expect_status=req.expect_status, suffix=_reuse_keep_note,
-        )
+        ), asked_for=req.url if req.url and req.url != "about:blank" else None, launched=True)
     except TabNotUsable as refusal:
         # The browser is fine; only its active tab is not one the tools may use (the
         # person's, or none is selected). Never the stale-handle path below: that ends
@@ -5352,7 +5366,8 @@ async def browser_launch(
         profile_conflict: when another Chrome holds the profile: "fallback" (default) uses a separate
             per-process profile and says so; "fail" refuses with the holding PID; "clone" launches from an
             integrity-checked read-only copy. Nothing on disk is deleted or overwritten.
-        expect_url, expect_status: validate the first load, as in navigate(); an unmeasured value fails.
+        expect_url, expect_status: validate the first load, as in navigate(); an unmeasured value fails. A
+            verification page there answers as in navigate (antibot_tripwire), the browser left running on it.
         profile_mode: "light": no images and no background Chrome services, saving memory and network on
             ordinary pages. Pages can notice the failed images (img.naturalWidth stays 0) and layout or vision
             tools see none, so keep "default" on bot-protected sites or when the look matters.
@@ -5547,13 +5562,20 @@ async def _launch_run(req: _LaunchRequest, launching: _Launching, session: str, 
             await _record_tabs_at_launch(launching.instance_id, launching)
             if (stop := await _launch_settle(req, plan, launching, None)) is not None:
                 return stop
+            # The first page as the tripwire sees it: a verification page the launch reached is
+            # said as one, with the browser running on it (antibot_tripwire).
+            trip = await _tripwire_after_navigation(main, observed, verify_suffix=verify_suffix,
+                                                    headless=req.headless)
 
             await _give_focus_back(plan.previous_app)
             if (stop := await _launch_settle(req, plan, launching, None)) is not None:
                 return stop
-            return _launch_result(req, plan, observed, suffix=suffix, verify_suffix=verify_suffix,
-                                  health_suffix=health_suffix, place_suffix=place_suffix,
-                                  restore_suffix=restore_suffix)
+            return _tripwire_render(
+                trip, "browser_launch",
+                _launch_result(req, plan, observed, suffix=suffix, verify_suffix=verify_suffix,
+                               health_suffix=health_suffix, place_suffix=place_suffix,
+                               restore_suffix=restore_suffix),
+                asked_for=req.url, launched=True)
     except asyncio.CancelledError:
         # A phase with no cancel path of its own: the browser it started still goes.
         if plan is not None and plan.browser is not None and not plan.ended:
@@ -5971,6 +5993,11 @@ async def _arm_document_watch(tab: Tab) -> tuple[dict, Any]:
             state["document_url"] = (
                 str(getattr(response, "url", "") or "") or state["document_url"]
             )
+            # Cloudflare's own word that this document is its challenge page, in any language:
+            # the tripwire then looks at the page (antibot.py).
+            for name, value in dict(getattr(response, "headers", None) or {}).items():
+                if str(name).lower() == "cf-mitigated":
+                    state["cf_mitigated"] = str(value).strip().lower()
         except Exception:
             pass
 
@@ -6190,6 +6217,366 @@ async def _wait_load_complete(tab, timeout: float) -> bool:
         await asyncio.sleep(0.1)
 
 
+# ── The anti-bot tripwire ──────────────────────────────────────────────────────────────────────
+# antibot.py holds the rules and the words; this is the page side: one probe, the request for the
+# person, and what a tool says. It looks after every navigation the tools make and between the
+# steps of workflow_run and batch_actions, and it never solves or bypasses anything.
+
+# The verification page last reported on a tab (its target key): a second tool on it says so in a
+# line, and a check that finds the tab elsewhere withdraws the request the tripwire made for it.
+_TRIPWIRE_SEEN: dict[str, dict[str, Any]] = {}
+# Per session: what the next result says besides (a request the tripwire withdrew).
+_TRIPWIRE_NOTES: dict[str, list[str]] = {}
+# "workflow_run" or "batch_actions" while one runs its steps: a pause there says to resume the run.
+_TRIPWIRE_RUN: contextvars.ContextVar = contextvars.ContextVar("antibot_tripwire_run", default=None)
+TRIPWIRE_HELP_TIMEOUT = 300.0  # a tripwire request waits as long as request_human_help's default
+
+# One read of the page, in the isolated world: its address, the words a rule for its host names
+# (read only on such a host), and, when asked, whether a Cloudflare challenge page is PRESENT. A
+# site merely served through Cloudflare, or a Turnstile widget in a login form, is none: the page
+# must carry the challenge page's own marks, which do not depend on its language (Cloudflare writes
+# the page, title included, in the browser's language), and its widget must not be solved.
+_TRIPWIRE_PROBE_JS = """
+(() => {
+  const out = {href: location.href};
+  const words = %s;
+  const host = (location.hostname || '').toLowerCase();
+  let text = null;
+  for (const h of Object.keys(words)) {
+    if (host !== h && !host.endsWith('.' + h)) continue;
+    if (text === null) text = ((document.body && document.body.innerText) || '').toLowerCase();
+    out.words = (out.words || []).concat(words[h].filter(w => text.includes(w)));
+  }
+  if (%s) {
+    let mark = '';
+    if (document.querySelector('script[src*="/cdn-cgi/challenge-platform/"][src*="/orchestrate/"]')) {
+      mark = 'its challenge script /cdn-cgi/challenge-platform/.../orchestrate/';
+    } else if (document.querySelector('form[action*="__cf_chl_f_tk="]')) {
+      mark = 'its challenge form (__cf_chl_f_tk)';
+    } else {
+      for (const s of document.scripts) {
+        if (!s.src && s.text.length < 20000 && s.text.indexOf('_cf_chl_opt') >= 0) {
+          mark = 'its challenge script (_cf_chl_opt)';
+          break;
+        }
+      }
+    }
+    const inputs = document.querySelectorAll('input[name="cf-turnstile-response"]');
+    let solved = inputs.length > 0;
+    for (const i of inputs) { if (!i.value || i.value.length <= 5) { solved = false; break; } }
+    if (!mark && !solved && /^\\s*just a moment/i.test(document.title || '')
+        && (inputs.length || document.querySelector('iframe[src*="challenges.cloudflare.com"]'))) {
+      mark = "its title 'Just a moment...' (English only) with an unsolved widget";
+    }
+    out.cf = (mark && !solved) ? mark : '';
+  }
+  return JSON.stringify(out);
+})()
+"""
+
+
+@dataclass
+class _Trip:
+    """A verification page the tripwire found, and what it did about it."""
+    mode: str                   # "pause" or "warn"
+    verdict: Any                # antibot.Verdict
+    repeat: bool = False        # the page reported before on this tab, its request still pending
+    where: str = ""             # pause: "bar", "window", "headless" or "pending" (antibot.next_line)
+    again: bool = False         # the earlier request was answered while the tab stayed: asked again
+    auto_verify: str = ""       # what auto_verify said on this page, kept in a Cloudflare pause
+
+
+def _tripwire_settings() -> tuple[str, tuple]:
+    """("pause" | "warn" | "off", the rules): the built-in ones and the person's antibot_rules."""
+    from . import antibot, settings
+    data = settings.read_file()
+    mode = settings.resolve("antibot_tripwire", data)["value"]
+    if mode not in ("pause", "warn"):
+        return "off", ()
+    own = settings.resolve("antibot_rules", data)["value"]
+    return mode, antibot.BUILT_IN + antibot.person_rules(own)
+
+
+async def _tripwire_probe(tab: Tab, rules: tuple, want_cf: bool) -> Optional[dict]:
+    """The probe's answer, or None when the page could not be read."""
+    from . import antibot
+    js = _TRIPWIRE_PROBE_JS % (json.dumps(antibot.text_words(rules)), "true" if want_cf else "false")
+    try:
+        raw = await asyncio.wait_for(evaluate_isolated(tab, js), timeout=3.0)
+    except Exception:
+        return None
+    data = parse_json(raw, None)
+    return data if isinstance(data, dict) and data.get("href") is not None else None
+
+
+def _tripwire_note(text: str) -> None:
+    notes = _TRIPWIRE_NOTES.setdefault(BrowserState.session_key(), [])
+    if text not in notes:
+        notes.append(text)
+
+
+def _tripwire_result_note(session_key: str, result: str) -> str:
+    notes = _TRIPWIRE_NOTES.pop(session_key, None)
+    return f"{result} [antibot_tripwire: {' '.join(notes)}]" if notes else result
+
+
+def _handoff_clock() -> float:
+    """The handoff's monotonic clock: navigation._clock once that module is loaded (tests replace
+    it), so a tripwire request's grace is measured as wait_for_human measures it."""
+    nav = sys.modules.get(f"{__package__}.tools.navigation")
+    return (getattr(nav, "_clock", None) or time.monotonic)()
+
+
+def _record_human_help(tab: Tab, objective: str, timeout: float, *, by: str, clock: float,
+                       baseline: Optional[dict], browser: Any = None) -> dict:
+    """A request for help as request_human_help records it, with every field wait_for_human reads,
+    shown in the overlay's bar when one runs (never bringing the window forward: the caller does
+    that or not). A new request replaces the tab's earlier one. by: "agent" (request_human_help)
+    or "tripwire"; only the tripwire's own request is ever withdrawn by the tripwire. baseline: the
+    page's fingerprint (_page_sig) as the request is made."""
+    key = _target_key(tab)
+    record = {
+        "objective": objective,
+        "baseline": baseline,
+        "requested_at": time.time(),     # a stamp the overlay's answers are compared with
+        "requested_clock": clock,        # where the grace starts
+        "timeout": max(0.0, float(timeout)),
+        "by": by,
+    }
+    _HUMAN_HELP[key] = record  # a new request replaces the tab's earlier one
+    # asked_at: when the bar first showed it, kept for the record. shown_at: its current showing,
+    # None while the bar does not show it; a Done counts from there on. was_shown: it reached the
+    # bar, the only kind a later wait shows again after a timeout.
+    record["asked_at"] = record["shown_at"] = presence.ask(browser or BrowserState.browser, objective)
+    record["was_shown"] = record["asked_at"] is not None
+    return record
+
+
+def _tab_browser(tab: Tab) -> Any:
+    return getattr(tab, "browser", None) or BrowserState.browser
+
+
+async def _tripwire_look(tab: Tab, *, url: Optional[str] = None, want_cf: bool = False,
+                         header: Optional[str] = None,
+                         headless: Optional[bool] = None) -> Optional[_Trip]:
+    """Whether `tab` shows a verification page, with the request for the person made when it does
+    and the tripwire pauses. None when the tripwire is off (nothing read at all) or the page is no
+    verification page as far as was looked; then a request the tripwire made for this tab is
+    withdrawn, and the next result says so. url: the address the caller already observed, so the
+    URL rules need no read of the page; the page is read only for a rule's words on its host or a
+    Cloudflare look (want_cf), or when url is not known."""
+    from . import antibot
+    mode, rules = _tripwire_settings()
+    if mode == "off":
+        return None
+    verdict = antibot.url_verdict(url, rules) if url else None
+    if verdict is None and (want_cf or not url or antibot.wants_text(url, rules)):
+        seen = await _tripwire_probe(tab, rules, want_cf)
+        if seen is None:
+            return None  # unread: nothing known, and nothing withdrawn either
+        href = str(seen.get("href") or url or "")
+        if not url:
+            verdict = antibot.url_verdict(href, rules)
+        if verdict is None and seen.get("words"):
+            verdict = antibot.text_verdict(href, seen["words"], rules)
+        if verdict is None and seen.get("cf"):
+            verdict = antibot.cloudflare_verdict(href, str(seen["cf"]), header)
+    key = _target_key(tab)
+    if verdict is None:
+        _tripwire_left(tab, key)
+        return None
+    trip = _tripwire_seen(key, mode, verdict,
+                          BrowserState.current_headless if headless is None else headless)
+    if trip.where == "ask":
+        _tripwire_ask(tab, trip, await _page_sig(tab))
+    return trip
+
+
+def _tripwire_left(tab: Tab, key: Optional[str]) -> None:
+    """The tab is on no verification page: forget the one reported, and withdraw the request the
+    tripwire made for it (never one the agent made with request_human_help)."""
+    seen = _TRIPWIRE_SEEN.pop(key, None)
+    request = _HUMAN_HELP.get(key)
+    if not request or request.get("by") != "tripwire":
+        return
+    _HUMAN_HELP.pop(key, None)
+    browser = _tab_browser(tab)
+    answered = presence.answered(browser, float(request.get("asked_at") or request.get("requested_at")
+                                                or 0)) if request.get("was_shown") else None
+    if presence.shows_request(browser, request.get("shown_at")):
+        presence.end_help(browser)
+    where = f" ({seen['place']})" if seen else ""
+    if answered == "done":  # the person pressed Done and no wait took it: closed, not withdrawn
+        _tripwire_note(f"the tab is no longer on the verification page{where}; the person had pressed "
+                       "Done on the tripwire's request, which is now closed.")
+        return
+    _tripwire_note(f"the tab is no longer on the verification page{where}, so the request for help "
+                   "the tripwire made was withdrawn.")
+
+
+def _tripwire_seen(key: Optional[str], mode: str, verdict: Any, headless: bool) -> _Trip:
+    """What a verification page found on a tab means: said before or not, and in pause mode where
+    the request stands ("ask": none yet, and _tripwire_ask makes it)."""
+    seen = _TRIPWIRE_SEEN.get(key)
+    same = bool(seen) and seen["host"] == verdict.host and seen["path"] == verdict.path
+    _TRIPWIRE_SEEN[key] = {"host": verdict.host, "path": verdict.path, "place": verdict.place}
+    if mode != "pause":
+        return _Trip(mode, verdict, repeat=same)
+    request = _HUMAN_HELP.get(key)
+    if request is not None:  # still pending: the tripwire's own, or one the agent made
+        where = ("pending" if request.get("by") != "tripwire"
+                 else "bar" if request.get("was_shown") else "window")
+        return _Trip(mode, verdict, repeat=same, where=where)
+    if headless:
+        return _Trip(mode, verdict, repeat=same, where="headless")
+    return _Trip(mode, verdict, where="ask", again=same)
+
+
+def _tripwire_ask(tab: Tab, trip: _Trip, baseline: Optional[dict]) -> None:
+    """The tripwire's request for the person, recorded as request_human_help records it and shown
+    in the overlay's bar when there is one. The window is not brought forward: the agent calls
+    request_human_help itself for that."""
+    record = _record_human_help(
+        tab, f"This site shows a verification page ({trip.verdict.host}). Please complete it, "
+             "then press Done.", TRIPWIRE_HELP_TIMEOUT, by="tripwire", clock=_handoff_clock(),
+        baseline=baseline, browser=_tab_browser(tab))
+    trip.where = "bar" if record["was_shown"] else "window"
+
+
+def _tripwire_after_action(result: str, after: Optional[dict]) -> str:
+    """click, click_text, click_role, press_key and the other clicks know the URL after the action
+    (the fingerprint read it). A verification page there puts one line first, in both modes: the
+    action did happen, so the result stays no error. In pause mode the request is recorded and
+    shown as after a navigation; a workflow then stops before its next step. The URL rules only:
+    this reads nothing more of the page."""
+    from . import antibot
+    url = (after or {}).get("url")
+    if not url or result.startswith("Error:"):
+        return result
+    mode, rules = _tripwire_settings()
+    verdict = antibot.url_verdict(url, rules) if mode != "off" else None
+    if verdict is None:
+        return result
+    try:
+        tab = BrowserState.active_tab()
+        trip = _tripwire_seen(_target_key(tab), mode, verdict, BrowserState.current_headless)
+        if trip.where == "ask":
+            _tripwire_ask(tab, trip, after)
+    except Exception:
+        return result
+    if mode == "warn":
+        return antibot.with_first_line(result, antibot.warning_line(verdict, trip.repeat))
+    return antibot.with_first_line(result, antibot.action_line(verdict, trip.where))
+
+
+_TRIPWIRE_PENDING = {
+    "bar": "the request is pending in the overlay's bar: wait_for_human",
+    "window": ("the request is pending, and no overlay shows it: request_human_help brings the "
+               "window forward, then wait_for_human"),
+    "pending": "a request made with request_human_help is pending on this tab: wait_for_human",
+    "headless": "this browser is headless, so nobody can see a request: a visible browser is needed",
+}
+
+
+def _tripwire_pause(trip: _Trip, lead: str, *, asked_for: Optional[str] = None,
+                    launched: bool = False) -> str:
+    """The pause, as an error a workflow, an agent and a person all read the same way: the status
+    word right after "Error: ", then trigger, page, asked for and next. `lead` is the first line's
+    sentence ("navigate reached a verification page"). A page reported before whose request is
+    still pending is said in one line."""
+    from . import antibot
+    verdict = trip.verdict
+    running = "; the browser is running and stays open on it" if launched else ""
+    if trip.repeat:
+        return err(f"{antibot.PAUSED}: still on the verification page reported before "
+                   f"({verdict.place}){running}; {_TRIPWIRE_PENDING[trip.where]}.")
+    if trip.again:
+        lead += (", again after the request for it was answered (the tripwire does not judge the "
+                 "answer); the person was asked again")
+    elif launched:
+        lead += running
+    elif asked_for:
+        lead += ", not the page asked for"
+    run = _TRIPWIRE_RUN.get()
+    again = "run resume_with" if run else "navigate again"
+    cloudflare = verdict.kind == "cloudflare"
+    return err(f"{antibot.PAUSED}: {lead}.\n" + antibot.pause_lines(
+        verdict, asked_for, antibot.next_line(trip.where, again, cloudflare),
+        trip.auto_verify if cloudflare else ""))
+
+
+def _tripwire_render(trip: Optional[_Trip], tool: str, result: str, *,
+                     asked_for: Optional[str] = None, launched: bool = False) -> str:
+    """A navigation tool's result through the tripwire: its own (nothing found, or off), its own
+    with the warning line first (warn), or the pause in its place (pause). With expect_url or
+    expect_status the pause is the answer: it is the more exact reason."""
+    from . import antibot
+    if trip is None:
+        return result
+    if trip.mode == "warn":
+        return antibot.with_first_line(result, antibot.warning_line(trip.verdict, trip.repeat))
+    return _tripwire_pause(trip, f"{tool} reached a verification page", asked_for=asked_for,
+                           launched=launched)
+
+
+async def _tripwire_after_navigation(tab: Tab, observed: Optional[dict], *,
+                                     verify_suffix: Optional[str] = None,
+                                     doc_state: Optional[dict] = None,
+                                     headless: Optional[bool] = None) -> Optional[_Trip]:
+    """The tripwire's look at the page a navigation reached, from what the navigation observed: no
+    read of the page on a host with no rule. The Cloudflare look runs only where auto_verify left a
+    challenge (its suffix says still present, or no widget found) or the document's response said
+    cf-mitigated: challenge."""
+    header = (doc_state or {}).get("cf_mitigated")
+    left = bool(verify_suffix) and "auto-verify" in str(verify_suffix) \
+        and "challenge gone" not in str(verify_suffix)
+    try:
+        trip = await _tripwire_look(tab, url=(observed or {}).get("final_url"),
+                                    want_cf=left or header == "challenge", header=header,
+                                    headless=headless)
+    except Exception:
+        return None  # a look that failed leaves the navigation's own result, as before it existed
+    if trip is not None and left:
+        # Its own words on what was tried and the tools that fit stay in the pause.
+        trip.auto_verify = str(verify_suffix).strip().removeprefix("[auto-verify:").removesuffix("]").strip()
+    return trip
+
+
+async def _tripwire_step(previous: Optional[str], next_tool: str) -> Optional[str]:
+    """Before a step of workflow_run or batch_actions: the step before may have sent the page away
+    (a click), or reached a Cloudflare challenge a navigation did not look for (auto_verify=False,
+    no header). None to go on, a pause (antibot.PAUSE_PREFIX) to stop before the step, or a warning
+    line. Before a call's first step only a step that is no navigation is looked before: a
+    navigation leaves the page, and looks at the one it reaches. A page said before by the step
+    that led there is not said again in warn mode."""
+    from . import antibot
+    if previous is None and next_tool in antibot.NAVIGATION_TOOLS:
+        return None
+    if not BrowserState.is_up():
+        return None
+    try:
+        tab = BrowserState.active_tab()
+        trip = await _tripwire_look(tab, want_cf=True)
+    except Exception:
+        return None  # no tab to look at, or a look that failed: the step runs as before
+    if trip is None:
+        return None
+    if trip.mode == "warn":
+        return None if trip.repeat else antibot.warning_line(trip.verdict, False)
+    # Whole, also for a page said before (by the click that led there): the run's report names
+    # what fired and where once, and a resume reads it.
+    trip.repeat = False
+    after = f"after the step before ({previous})" if previous else "before the first step"
+    return _tripwire_pause(trip, f"the tab is on a verification page {after}; the run stopped "
+                                 "before its next step")
+
+
+# The note a withdrawn request leaves goes on the next result of the session, whatever tool gave it.
+_app_module.RESULT_FILTERS[:] = [
+    h for h in _app_module.RESULT_FILTERS if getattr(h, "__name__", "") != "_tripwire_result_note"
+] + [_tripwire_result_note]
+
+
 @mcp.tool()
 async def navigate(
     url: str,
@@ -6206,6 +6593,9 @@ async def navigate(
 
     auto_verify: if True (default), detect a Cloudflare / Turnstile challenge after load and click its
     checkbox (CDP-level click, max 2 attempts). False opts out.
+
+    A site's verification page (a bot check that stayed) answers with the antibot_tripwire setting: by
+    default an error starting "antibot_paused:" that says what fired, asking the person in the overlay's bar.
 
     focus: if True, bring the tab's window to the OS foreground after navigating. Off by default, since it
     takes focus from whatever the person is doing; tab_focus does the same on request.
@@ -6243,11 +6633,15 @@ async def navigate(
                 verify_suffix = await asyncio.wait_for(_auto_verify_cf(tab), timeout=30.0)
             except Exception:
                 verify_suffix = ""
-        observed = await _observe_navigation(tab, url, disarm())
-        return _nav_result(
+        doc = disarm()
+        observed = await _observe_navigation(tab, url, doc)
+        result = _nav_result(
             "Navigated", observed,
             expect_url=expect_url, expect_status=expect_status, suffix=verify_suffix,
         )
+        trip = await _tripwire_after_navigation(tab, observed, verify_suffix=verify_suffix,
+                                                doc_state=doc)
+        return _tripwire_render(trip, "navigate", result, asked_for=url)
     except Exception as e:
         return err(str(e))
     finally:
@@ -6635,7 +7029,8 @@ def _click_outcome(head: str, detail: str, before: dict, after: dict) -> str:
     change = (_UNREAD_AFTER_CLICK if element_unread(before, after)
               else _click_change(before, after))
     if change is not None:
-        return ok(f"{head} — {detail}{change}")
+        # A click that led to a site's verification page says so first (antibot_tripwire).
+        return _tripwire_after_action(ok(f"{head} — {detail}{change}"), after)
     return ok(
         f"{head} but NO page change detected — {detail}. The event was dispatched; "
         f"the page did not react (handler not bound, click swallowed, or the change "
@@ -7461,6 +7856,7 @@ def _clear_tab_scoped_state(tabs: list[Any]) -> None:
     for key in keys:
         _page._SNAPSHOT_CACHE.pop(key, None)
         _HUMAN_HELP.pop(key, None)
+        _TRIPWIRE_SEEN.pop(key, None)  # the verification page the tripwire last said on it
         _dialog_pre_action["_registered_tab_ids"].discard(key)
         _DIALOG_AUTO_CFG["_registered_tab_ids"].discard(key)
         _DIALOG_WATCHED.discard(key)

@@ -676,6 +676,7 @@ Results describe what was observed. A tool that reports success when nothing hap
 - ✅ An empty capture says whether anything was being captured
 - ✅ A browser is reported closed only after its process was seen gone
 - ✅ A visible browser stays behind the app you are using
+- ✅ A site's verification page stops the agent and is handed to you (`antibot_paused`); it is never solved for you
 
 <details>
 <summary><b>Every rule, in full</b></summary>
@@ -715,6 +716,20 @@ Results describe what was observed. A tool that reports success when nothing hap
 - ✅ A lost browser connection names the condition and how to recover. `browser_recover` handles a stuck browser and only touches this server's profiles.
 
 ✅ Credentials stay out of tool output, since output lands in the agent's transcript. `cookie_list`, `network_get`, `intercept_log`, `wait_for_request`, `auth_capture`, `export_curl`, `http_request` and `http_request_with_session` hide cookies, credential headers, JSON and form fields, and query parameters unless you pass `reveal_values=True`. A URL in their output, a `Location`, `Content-Location` or `Referer` header, and the URLs `http_session_cookies` and `session_warmup` print also hide a `user:password@` part and secret pairs in the fragment, such as an OAuth `#access_token=`. Ordinary parameters stay as they are. Everything below a credential name is hidden, such as the card details under `gatewayTokens` in a token vault's reply. To read those, `network_get`, `intercept_log`, `wait_for_request`, `auth_capture` and `export_curl` take `reveal_values="body"`: credential headers, URL secrets and every body value whose own name is a credential stay hidden, the rest of the body shows, and the reply says so. Navigation tools (`get_url`, `navigate`, `tab_list` and the like) return the page's URL as it is, because agents use it to keep working. Bodies in other formats pass through unchanged. `export_curl` also returns an `http_request` call that replays the session with the browser's own cookies. Files holding credentials are written mode 600, and so are files taken from a page: screenshots, `save_pdf`, `screenshot_element`, `inspect_image`, traces and heap snapshots. They are written whole to a new private file that then replaces the old one, so nobody reads a half-written file and a symlink in the folder is replaced rather than followed.
+</details>
+
+<details>
+<summary><b>A site's verification page (the anti-bot tripwire)</b></summary>
+
+After every navigation the tools make (`navigate`, `reload`, `go_back`, `go_forward`, `tab_new` with a url, `browser_launch` and `spawn_browser` with a url) the page is checked for a site's verification page, and so it is between the steps of `workflow_run` and `batch_actions`. It only detects and stops: nothing is solved or bypassed.
+
+- What fires: built-in rules for one host each (Shopee: a path `/verify/captcha` or `/verify/traffic`, a query `scene=crawler_*`, or the page text "Verifikasi untuk melanjutkan" or "Geser untuk menyelesaikan puzzle"), your own rules (`antibot_rules`), and a Cloudflare challenge page that is still there after `auto_verify` had its turn. A word alone in a URL ("captcha", "verify", "challenge") never fires, nor does a site that is only served through Cloudflare, nor a Turnstile widget in a login form.
+- `pause` (default): the result is an error that starts `antibot_paused:` and says what fired (`trigger:`), the page's host and path with its query cut short (`get_url` gives it whole), the page asked for, and what to do next. The request for you shows in the overlay's bar with **Done**; the window is not brought forward. Headless, or without the overlay, the result says nobody can see the request. A second tool on the same page says it in one line. After Done the next tool checks the page again, and a page still showing the check pauses again.
+- `browser_launch` and `spawn_browser` say in their first line that the browser is running and stays open on the page.
+- A click, `click_text`, `click_role` or `press_key` that leads to such a page did happen, so its result is no error: a line first names the page, and in `pause` the request is made.
+- `warn`: the tool's own result, with one line first that names the page. `off`: nothing is checked.
+- Measured on a page with no rule for its host: nothing more after a navigation, and about 0.5 ms (median, p90 0.6 ms, headless Chrome 157) between two workflow steps.
+- `workflow_run` and `batch_actions` stop before their next step, whatever `stop_on_error` says, and no page is opened after it. `workflow_run` then returns `status: antibot_paused`, `paused_at`, `paused_path`, `antibot` (trigger, page, next), the whole vars and `resume_with`: it runs again a navigation that reached the page, and starts after a click that did. The stop is not counted as a failure. The field case (five pages, the third redirected to a verification page with a 2 KB tracking id) answers in under 1 KB.
 </details>
 
 ## Tools
@@ -857,7 +872,7 @@ These keep token use down and remove guesswork when an agent drives a page.
 | `paste_text` | Sends the full paste event sequence, for frameworks that ignore a plain input event |
 | `form_introspect` | Per-field detail: label, framework binding, validation state and constraints |
 | `click_and_wait` | Clicks and waits for one outcome: navigation, URL, text, selector, request or network idle |
-| `workflow_run` | Many steps in one call, with `foreach`, `if`, `save_as` and `${var}`. No code runs on the server, and `start_at="3.2.1"` resumes from a nested step. `output="summary"` (default) returns counts per tool, failed steps, the results of readers, of `save_as` steps and of the last step, and only the vars the run changed; `"failures"` returns counts and failed steps, `"full"` lists the steps up to 200 and counts the rest in `completed_omitted`. After a failure all modes keep what a resume needs. A `sleep` step pauses `{"seconds": 3}` or a random `{"min": 6, "max": 11}`, at most 300 s, and `mouse_drift` is allowed as a step |
+| `workflow_run` | Many steps in one call, with `foreach`, `if`, `save_as` and `${var}`. No code runs on the server, and `start_at="3.2.1"` resumes from a nested step. `output="summary"` (default) returns counts per tool, failed steps, the results of readers, of `save_as` steps and of the last step, and only the vars the run changed; `"failures"` returns counts and failed steps, `"full"` lists the steps up to 200 and counts the rest in `completed_omitted`. After a failure all modes keep what a resume needs, and so they do after a stop at a site's verification page (`status: antibot_paused`). A `sleep` step pauses `{"seconds": 3}` or a random `{"min": 6, "max": 11}`, at most 300 s, and `mouse_drift` is allowed as a step |
 | `storage_snapshot`, `storage_diff` | Compare cookies, storage and URL before and after an action |
 | `wait_for` | `frame_url=` waits for a frame whose URL matches a regex, cross-origin frames included. A frame filled by a form post, as 3-D Secure does, has no `src` in the page, so a selector cannot find it |
 | `list_frames` | Every frame with its URL. `max_url_len` (default 200, 0 for whole URLs) cuts a long URL and `url_cut` says how much went |
@@ -1019,6 +1034,14 @@ A change applies to the next launch, and the overlay's bar, light, lock, cursor 
 | `agent_cursor` | on, off | off | The agent's cursor in the overlay (the bar's arrow button turns it on or off for one browser) | `MCP_STEALTH_AGENT_CURSOR` |
 | `overlay_hide_after` | seconds, 1 to 86400 | 90 | Quiet time before the overlay fades out (not while a request for help or your hold shows) | `MCP_STEALTH_OVERLAY_HIDE_AFTER` |
 | `dock_icon` | on, off | off | Visible browsers on new profiles run from Google Chrome Beta with the project icon, or Brave Beta with its own (macOS). See "Own Dock icon" under What tool results tell you | `MCP_STEALTH_DOCK_ICON` |
+| `antibot_tripwire` | pause, warn, off | pause | A site's verification page after a navigation or between workflow steps: stop and ask you, say so and go on, or nothing. See "A site's verification page" under What tool results tell you | `MCP_STEALTH_ANTIBOT_TRIPWIRE` |
+| `antibot_rules` | your rules, per host | none | Your own verification pages, besides the built-in ones. Example below | `MCP_STEALTH_ANTIBOT_RULES` (JSON text) |
+
+Your own verification pages, per host (a host covers its subdomains): `url` holds regular expressions searched in the path and query, never the host; `text` holds words of the page, in any case, read only on that host. At most 50 hosts, 20 patterns a list, 200 characters a pattern; a value with anything wrong is refused whole.
+
+```bash
+uvx mcp-stealth-chrome settings set antibot_rules '{"example.com": {"url": ["^/verify/", "[?&]scene=crawler_"], "text": ["Verify to continue"]}}'
+```
 
 ### Environment variables
 

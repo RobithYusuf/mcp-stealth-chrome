@@ -248,8 +248,8 @@ async def press_key(key: str, verify: bool = True, settle_ms: int = 1000) -> str
             return ok(f"pressed {key} — sent to {target}; effect not checked (verify=False)")
         effect, after = await key_outcome.watch(
             lambda: _srv._page_sig(tab, focused), before, settle_ms)
-        if effect:
-            return ok(f"pressed {key} — sent to {target}; {effect}")
+        if effect:  # a key that led to a site's verification page says so first
+            return _srv._tripwire_after_action(ok(f"pressed {key} — sent to {target}; {effect}"), after)
         if before and not after:
             return ok(f"pressed {key} — sent to {target}; the page stopped answering "
                       f"within {settle_ms}ms, so the effect is unknown (it may be navigating)")

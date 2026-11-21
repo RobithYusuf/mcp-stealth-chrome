@@ -368,13 +368,19 @@ async def _launch_browser_instance(
                                      effective_fingerprint) or _keep_note
     dock_note += _keep_note
     dock_note += _srv._allow_origins_note(browser)
+    # The first page as the tripwire sees it (antibot_tripwire): spawn_browser observes no
+    # navigation, so the page is read once, and only when a url was asked for.
+    trip = None
+    if url and url != "about:blank":
+        with contextlib.suppress(Exception):  # a look that failed leaves the launch's own result
+            trip = await _srv._tripwire_look(main_tab, headless=headless)
     await _srv._give_focus_back(previous_app)
-    return True, (
+    return True, _srv._tripwire_render(trip, "spawn_browser", (
         f"instance {instance_id!r} launched (headless={headless}, "
         f"privacy={privacy}, identity={identity_source}, "
         f"profile={profile_path.name if profile_path else '(ephemeral Chrome temp)'})"
         f"{dock_note}{restore_text}"
-    )
+    ), asked_for=url, launched=True)
 
 
 async def _spawn_by_reattach(instance_id: str, profile: Path, verdict: dict, *, url: str,
@@ -427,8 +433,12 @@ async def _spawn_by_reattach(instance_id: str, profile: Path, verdict: dict, *, 
     keep_text += await presence.attach(browser, _srv._browser_process_pid(browser), ask=agent_overlay,
                                  headless=bool(verdict["record"].get("headless")),
                                  persons_browser=_srv._persons_browser(browser))
-    return True, (f"instance {instance_id!r} {summary}{keep_text}\n"
-                  f"{json.dumps(observed, indent=2, default=str)}")
+    trip = (await _srv._tripwire_after_navigation(tabs[select], observed,
+                                                  headless=bool(record.get("headless")))
+            if url and url != "about:blank" else None)
+    return True, _srv._tripwire_render(trip, "spawn_browser", (
+        f"instance {instance_id!r} {summary}{keep_text}\n"
+        f"{json.dumps(observed, indent=2, default=str)}"), asked_for=url, launched=True)
 
 
 @mcp.tool()

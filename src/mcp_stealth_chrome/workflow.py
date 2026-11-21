@@ -14,6 +14,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional
 
+from .antibot import PAUSE_PREFIX, PAUSED, details as pause_details
+
 BRANCHES_VAR = "__branches__"
 MAX_EXECUTED_STEPS = 2000
 MAX_FOREACH_ITEMS = 1000
@@ -47,6 +49,11 @@ _ANY_REF = re.compile(r"\$\{([^{}]+)\}")
 _SEGMENT = re.compile(r"([^.\[\]]+)|\[(-?\d+)\]")
 
 Dispatch = Callable[[str, dict], Awaitable[Any]]
+# Awaited before each tool step with (the tool of the step before it in this call, or None, the
+# step's own tool): None to go on, a pause (text starting PAUSE_PREFIX) to stop before the step, or
+# a warning line the report lists. The anti-bot tripwire is one: a click may send the page to a
+# site's verification page, and the next step must not open more pages into it.
+Checkpoint = Callable[[Optional[str], str], Awaitable[Optional[str]]]
 
 
 class WorkflowError(ValueError):
@@ -218,6 +225,16 @@ class _Run:
     # Failed or ignored entries past the cap (the first MAX_LATE_FAILURES), and how many more.
     late_failures: list[dict] = field(default_factory=list)
     late_failures_omitted: int = 0
+    # The anti-bot tripwire: the checkpoint, the tool of the last step run, the pause that stopped
+    # the run (never an ordinary failure, whatever stop_on_error says), and warnings (warn mode).
+    checkpoint: Optional[Checkpoint] = None
+    previous_tool: Optional[str] = None
+    pause: Optional[dict] = None
+    warnings: list[dict] = field(default_factory=list)
+
+    @property
+    def stopped(self) -> bool:
+        return self.failure is not None or self.pause is not None
 
 
 def _dotted(path: list[int]) -> str:
@@ -225,14 +242,16 @@ def _dotted(path: list[int]) -> str:
 
 
 def _record(run: _Run, entry: dict) -> None:
-    if not entry.get("ok") and not entry.get("ignored"):
+    if not entry.get("ok") and not entry.get("ignored") and not entry.get("paused"):
         # Kept apart from the capped list, or a failure past the cap would vanish.
         run.failed_paths.append(str(entry.get("index")))
     if "tool" in entry:  # a step, not the record of a branch taken
         run.last = entry
         name = entry["tool"] if isinstance(entry["tool"], str) else "(no tool)"
-        kind = "ok" if entry.get("ok") else "ignored" if entry.get("ignored") else "failed"
-        run.tally.setdefault(name, {"ok": 0, "failed": 0, "ignored": 0})[kind] += 1
+        kind = ("ok" if entry.get("ok") else "ignored" if entry.get("ignored")
+                else "paused" if entry.get("paused") else "failed")
+        if kind != "paused" or entry.get("ran"):  # a step stopped before it ran is no step run
+            run.tally.setdefault(name, {"ok": 0, "failed": 0, "ignored": 0, "paused": 0})[kind] += 1
     if len(run.entries) < MAX_REPORTED_ENTRIES:
         run.entries.append(entry)
         return
@@ -277,8 +296,36 @@ def _preview(text: str) -> str:
     return text[:cut] + CUT_MARK.format(left=len(text) - cut)
 
 
+def _stop_at_pause(run: _Run, path: list[int], step: dict, text: str, ran: bool) -> None:
+    """Stop the run at a verification page: before this step (ran=False, it runs on resume) or at
+    this navigation step, which reached it (ran=True, run again on resume: it opens the page that
+    stopped). Named as the pause, never counted as a failure, and no copy of the step's result: the
+    report's antibot part says it once."""
+    found = pause_details(text)
+    found.pop("asked_for", None)  # the step itself says what it asked for
+    first = text.splitlines()[0][len("Error: "):] if text.startswith("Error: ") else text
+    # One line: where (the query and the rest are in the report's antibot part, once).
+    one = (f"{PAUSED} at {found['page'].split('?', 1)[0].split(' [', 1)[0]}"
+           if "page" in found else first)
+    run.variables["last"] = {"ok": False, "value": None, "text": one}
+    entry = {"index": path[0] if len(path) == 1 else _dotted(path), "tool": step.get("tool"),
+             "paused": "antibot", "ran": ran}
+    if step.get("label"):
+        entry["label"] = step["label"]
+    _record(run, entry)
+    run.pause = {"path": path, "first": first, "details": found}
+
+
 async def _run_tool(run: _Run, step: dict, path: list[int]) -> None:
     tool = step["tool"]
+    if run.checkpoint is not None and isinstance(tool, str):
+        said = await run.checkpoint(run.previous_tool, tool)
+        if said and said.startswith(PAUSE_PREFIX):
+            _stop_at_pause(run, path, step, said, ran=False)
+            return
+        if said and len(run.warnings) < MAX_LATE_FAILURES:
+            run.warnings.append({"before": path[0] if len(path) == 1 else _dotted(path),
+                                 "warning": said})
     if not run.allowed(tool):
         _fail(run, path, step, f"unknown or non-allowlisted tool: {tool}")
         return
@@ -295,7 +342,12 @@ async def _run_tool(run: _Run, step: dict, path: list[int]) -> None:
     try:
         text = str(await run.dispatch(tool, args))
     except Exception as exc:
+        run.previous_tool = tool
         _fail(run, path, step, str(exc) or type(exc).__name__)
+        return
+    run.previous_tool = tool
+    if text.startswith(PAUSE_PREFIX):  # a navigation reached a verification page and said so
+        _stop_at_pause(run, path, step, text, ran=True)
         return
     failed = text.startswith("Error:")
     value = step_value(text)
@@ -327,7 +379,7 @@ async def _run_block(run: _Run, steps: Any, prefix: list[int], resume: list[int]
             f"{len(steps)} steps at that level"
         )
     for i in range(start, len(steps)):
-        if run.failure is not None:
+        if run.stopped:
             return
         step = steps[i]
         path = prefix + [i]
@@ -382,7 +434,7 @@ async def _run_foreach(run: _Run, step: dict, path: list[int], resume: list[int]
             f"{len(items)} items"
         )
     for n in range(start, len(items)):
-        if run.failure is not None:
+        if run.stopped:
             return
         run.variables[name] = items[n]
         run.variables[f"{name}_index"] = n
@@ -400,9 +452,12 @@ async def run_workflow(
     stop_on_error: bool = True,
     variables: Optional[dict] = None,
     output: str = "full",
+    checkpoint: Optional[Checkpoint] = None,
 ) -> dict:
-    """Run steps and return {completed, total, vars, ...}, plus failed_at on failure.
-    output="summary" or "failures" returns the shorter form _shorten makes of that report."""
+    """Run steps and return {completed, total, vars, ...}, plus failed_at on failure, or status
+    antibot_paused, paused_at and resume_with when the checkpoint or a step stopped it at a site's
+    verification page. output="summary" or "failures" returns the shorter form _shorten makes of
+    that report."""
     if output not in OUTPUT_MODES:
         raise WorkflowError(f"output must be one of {', '.join(OUTPUT_MODES)}, got {output!r}; nothing ran")
     # Taken before any step runs: a step may change in place an object it was handed (a whole
@@ -411,7 +466,7 @@ async def run_workflow(
     # Input objects reach steps by reference, so a step may change the caller's own object. Left
     # so on purpose: over MCP each call parses its own JSON, and no caller keeps that object.
     run = _Run(dispatch=dispatch, allowed=allowed, stop_on_error=stop_on_error,
-               variables=dict(variables or {}))
+               variables=dict(variables or {}), checkpoint=checkpoint)
     start = parse_start(start_at)
     await _run_block(run, steps, [], start)
     result: dict[str, Any] = {"completed": run.entries, "total": len(steps)}
@@ -422,8 +477,8 @@ async def run_workflow(
         result["failed_paths"] = run.failed_paths[:100]
     # `last` is included: resuming into a step or condition that reads it needs it.
     public_vars = dict(run.variables)
-    if run.failure is None:
-        # Only a resume needs it, and a resume only follows a failure.
+    if not run.stopped:
+        # Only a resume needs it, and a resume only follows a failure or a pause.
         public_vars.pop(BRANCHES_VAR, None)
     if public_vars:
         result["vars"] = public_vars
@@ -441,6 +496,21 @@ async def run_workflow(
             "hint": "fix the underlying issue, then re-run with that start_at to retry "
                     "this step. Variables are not kept between calls, so pass vars back.",
         })
+    if run.pause is not None:
+        path = run.pause["path"]
+        where = path[0] if len(path) == 1 else _dotted(path)
+        result = {"status": PAUSED, **result}  # first, where a reader looks
+        result.update({
+            "paused_at": path[0],
+            "paused_path": _dotted(path),
+            "antibot": run.pause["details"] or {"said": run.pause["first"]},
+            "resume_with": (
+                f"workflow_run(steps=..., start_at={where!r}"
+                + (", vars=<the vars above>)" if public_vars else ")")
+            ),
+        })
+    if run.warnings:
+        result["antibot_warnings"] = run.warnings
     return result if output == "full" else _shorten(result, run, output, given)
 
 
@@ -487,6 +557,7 @@ _NOTES = {
 }
 # What a resume needs, kept whole whatever the output: resume_with says to pass these vars back.
 _RESUME_KEYS = ("vars", "failed_at", "failed_path", "failure_context", "resume_with", "hint")
+_PAUSE_KEYS = ("vars", "paused_at", "paused_path", "antibot", "resume_with")
 
 
 def _shorten(full: dict, run: _Run, output: str, given: dict[str, Optional[str]]) -> dict:
@@ -503,9 +574,18 @@ def _shorten(full: dict, run: _Run, output: str, given: dict[str, Optional[str]]
                 or str(entry.get("index")) in run.saved)
 
     shown = [entry for entry in reported if kept(entry)]
-    out: dict[str, Any] = {"output": output, "note": _NOTES[output], "total": full["total"],
-                           "counts": _counts(run.tally), "shown": shown}
-    if len(shown) < len(reported):
+    counts = _counts(run.tally)
+    if run.pause is not None:
+        # A pause is said short (the field's failed run was 8 KB): the stopped step is in shown,
+        # what fired in antibot, so neither the note, the counts per tool, their sum nor a 0.
+        counts = {k: v for k, v in counts.items() if k not in ("by_tool", "steps") and v}
+        counts["paused"] = 1
+        out: dict[str, Any] = {"status": PAUSED, "output": output, "total": full["total"],
+                               "counts": counts, "shown": shown}
+    else:
+        out = {"output": output, "note": _NOTES[output], "total": full["total"],
+               "counts": counts, "shown": shown}
+    if len(shown) < len(reported) and run.pause is None:
         out["not_shown"] = len(reported) - len(shown)
     # Past the cap: the failed or ignored steps (the first MAX_LATE_FAILURES), and the last step
     # (in failures only when it failed). They ran after every reported entry, so order is kept.
@@ -519,11 +599,13 @@ def _shorten(full: dict, run: _Run, output: str, given: dict[str, Optional[str]]
     shown.extend(late)
     if cut:
         out["failed_or_ignored_not_shown"] = cut
-    for key in ("completed_omitted", "failed_count", "failed_paths"):
+    for key in ("completed_omitted", "failed_count", "failed_paths", "antibot_warnings"):
         if key in full:
             out[key] = full[key]
     if "failed_at" in full:
         out.update((key, full[key]) for key in _RESUME_KEYS if key in full)
+    elif run.pause is not None:
+        out.update((key, full[key]) for key in _PAUSE_KEYS if key in full)
     elif output == "summary" and full.get("vars"):
         changed = {k: v for k, v in full["vars"].items() if not _unchanged(k, v, given)}
         # Any failed or ignored step, with or without a stop (failed_at): last stays whole.
@@ -550,11 +632,13 @@ def _last_once(last: dict) -> dict:
 
 
 def _counts(tally: dict[str, dict[str, int]]) -> dict:
-    totals = {kind: sum(c[kind] for c in tally.values()) for kind in ("ok", "failed", "ignored")}
+    totals = {kind: sum(c.get(kind, 0) for c in tally.values()) for kind in ("ok", "failed", "ignored")}
+    paused = sum(c.get("paused", 0) for c in tally.values())
     by_tool = {name: {"ok": c["ok"], "failed": c["failed"],
-                      **({"ignored": c["ignored"]} if c["ignored"] else {})}
+                      **({"ignored": c["ignored"]} if c["ignored"] else {}),
+                      **({"paused": c["paused"]} if c.get("paused") else {})}
                for name, c in tally.items()}
-    return {"steps": sum(totals.values()), **totals, "by_tool": by_tool}
+    return {"steps": sum(totals.values()) + paused, **totals, "by_tool": by_tool}
 
 
 def _seconds(value: Any) -> Optional[float]:

@@ -173,20 +173,11 @@ async def request_human_help(objective: str, timeout: float = 300) -> str:
                 "human help unavailable: no foreground action succeeded, so the "
                 "browser window could not be confirmed visible"
             )
-        key = _srv._target_key(tab)
-        record = {
-            "objective": objective,
-            "baseline": await _srv._page_sig(tab),
-            "requested_at": time.time(),     # a stamp the overlay's answers are compared with
-            "requested_clock": _clock(),     # where the grace starts
-            "timeout": max(0.0, float(timeout)),
-        }
-        _srv._HUMAN_HELP[key] = record  # a new request replaces the tab's earlier one
-        # asked_at: when the bar first showed it, kept for the record. shown_at: its current
-        # showing, None while the bar does not show it; a Done counts from there on. was_shown:
-        # it reached the bar, the only kind a later wait shows again after a timeout.
-        record["asked_at"] = record["shown_at"] = presence.ask(BrowserState.browser, objective)
-        record["was_shown"] = record["asked_at"] is not None
+        # The record (shared with the anti-bot tripwire's own requests) replaces the tab's earlier
+        # one and shows in the overlay's bar when one runs.
+        record = _srv._record_human_help(tab, objective, timeout, by="agent", clock=_clock(),
+                                         baseline=await _srv._page_sig(tab),
+                                         browser=BrowserState.browser)
         if record["asked_at"] is not None:
             how = ("Call wait_for_human next. The overlay's bar shows the request with a Done "
                    "button: the wait ends when the person presses it, or on done_url_contains or "
@@ -522,6 +513,7 @@ async def _history_navigation(
     requested_url: Optional[str],
     expect_url: Optional[str],
     expect_status: Optional[int],
+    tool: str = "go_back",
 ) -> str:
     """Shared body for go_back / go_forward / reload.
 
@@ -540,10 +532,13 @@ async def _history_navigation(
             await _srv._wait_load_complete(tab, 10)
         except Exception:
             pass  # settle is best-effort; the postcondition probe is the truth
-        observed = await _srv._observe_navigation(tab, requested_url, disarm())
-        return _srv._nav_result(
+        doc = disarm()
+        observed = await _srv._observe_navigation(tab, requested_url, doc)
+        result = _srv._nav_result(
             action, observed, expect_url=expect_url, expect_status=expect_status,
         )
+        trip = await _srv._tripwire_after_navigation(tab, observed, doc_state=doc)
+        return _srv._tripwire_render(trip, tool, result, asked_for=requested_url)
     except Exception as e:
         return err(str(e))
     finally:
@@ -559,7 +554,7 @@ async def go_back(
     ready_state observed afterwards; requested_url is null because history
     decides the destination. See navigate() for the expect_* rules."""
     return await _history_navigation(
-        "Went back", lambda tab: tab.back(), None, expect_url, expect_status,
+        "Went back", lambda tab: tab.back(), None, expect_url, expect_status, "go_back",
     )
 
 
@@ -571,7 +566,7 @@ async def go_forward(
     """Go forward in history. Reports the observed postconditions; see
     navigate() for the expect_* rules."""
     return await _history_navigation(
-        "Went forward", lambda tab: tab.forward(), None, expect_url, expect_status,
+        "Went forward", lambda tab: tab.forward(), None, expect_url, expect_status, "go_forward",
     )
 
 
@@ -590,7 +585,7 @@ async def reload(
     except Exception:
         before = ""
     return await _history_navigation(
-        "Reloaded", lambda tab: tab.reload(), before or None, expect_url, expect_status,
+        "Reloaded", lambda tab: tab.reload(), before or None, expect_url, expect_status, "reload",
     )
 
 
@@ -744,7 +739,8 @@ async def tab_new(
                     await _srv._wait_load_complete(new_tab, 10)
                 except Exception:
                     pass
-            observed = await _srv._observe_navigation(new_tab, url, disarm())
+            doc = disarm()
+            observed = await _srv._observe_navigation(new_tab, url, doc)
         finally:
             disarm()
         problem = await _srv._tab_list_problem()
@@ -763,10 +759,14 @@ async def tab_new(
                      else "in its own window, behind the app in use")
         else:
             where = "as a tab"
-        return _srv._nav_result(
+        result = _srv._nav_result(
             f"opened tab [{BrowserState.active_tab_index}] {where}", observed,
             expect_url=expect_url, expect_status=expect_status,
         )
+        if url == "about:blank":
+            return result
+        trip = await _srv._tripwire_after_navigation(new_tab, observed, doc_state=doc)
+        return _srv._tripwire_render(trip, "tab_new", result, asked_for=url)
     except Exception as e:
         return err(str(e))
 

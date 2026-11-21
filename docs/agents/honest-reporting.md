@@ -138,3 +138,42 @@ conclusions. Each rule below replaced a real lie.
   what changed (the URL from what to what, or the content's counts), says the page may have done it, and leaves the
   request pending, as a timeout does. Dropping it made the next wait say request_human_help had not been called.
   Only the bar's answer, the selector or the URL close a request.
+
+## A site's verification page (the anti-bot tripwire)
+
+- A navigation that reached a site's verification page is never a success. With `antibot_tripwire` on pause (the
+  default) its result is an error that starts `antibot_paused:`, the status right after "Error: ", so a workflow, a
+  batch and an agent all count it the same way. It says "not the page asked for" and replaces the navigation's body,
+  whose redirect chain held the 2 KB tracking URL; with expect_url or expect_status given the pause is the answer and
+  the mismatch is not added.
+- A launch (`browser_launch`, `spawn_browser`) that reached one says in its first line that the browser is running and
+  stays open on that page: an agent that reads "Error:" from a launch tends to launch again.
+- A pause in `workflow_run` or `batch_actions` is not a failure: no `failed_at`, not in `failed_count`. It stops the run
+  whatever stop_on_error or continue_on_error say, opens no page after it, and is named with `paused_at`,
+  `paused_path`, `resume_with` and the whole vars. resume_with runs again a navigation that reached the page, and
+  starts after a click that did (the click is not repeated).
+- A click or key that led to one did happen, so its result stays no error: one line goes first. In warn mode the line
+  goes first too, after "Error: " for an error, so counting by that prefix still counts it.
+- A page said before on the same tab (host and path) is said in one line; a workflow's or batch's report says it
+  whole, since that report is read alone.
+- Unknown is not clean: a look whose page read failed withdraws nothing and says nothing. A look that raised leaves the
+  tool's own result as it was before the tripwire existed.
+- It hands over, it does not judge the answer. After Done the next look checks the page again; still on it means
+  asked again, and the result says the earlier request was answered, so it does not read as a failed Done.
+- The tripwire withdraws only a request it made itself (`_HUMAN_HELP[...]["by"] == "tripwire"`), when a later look
+  finds the tab elsewhere, and says so in the next result. A request made with request_human_help is never withdrawn
+  or replaced by it.
+- No rule fires on a word alone in a URL: a built-in rule names a host, and a page's words are read only on a host
+  whose rule asks for them. A Cloudflare challenge counts only with the challenge page's own marks, which do not depend
+  on the page's language (its inline `_cf_chl_opt` script, its `/cdn-cgi/challenge-platform/.../orchestrate/` script,
+  a `__cf_chl_f_tk` form), and with its widget not solved; a site served through Cloudflare (its `jsd` script) or a
+  Turnstile in a login form never fires. The English title "Just a moment..." counts only with an unsolved widget.
+  Known limit: a challenge page without those marks (a Cloudflare redesign) is missed, which is the old behaviour; a
+  false stop of a long run is not acceptable.
+- The challenge phrases ("just a moment", "checking your browser", "verify you are human") are also what a page ABOUT
+  Cloudflare says. A product landing page quoting them, with no widget, made auto_verify wait 2 s and say "CF detected
+  but no clickable widget found" (field report, 21 Nov 2026). `_CF_CHALLENGE_PROBE_INITIAL_JS` (auto_verify's first
+  look) counts them only with the challenge page's own marks; the widget's own DOM marks count as before. The ACTIVE
+  probe still counts the phrases alone (open item).
+- The page line cuts the query and says how much and that get_url gives it whole: navigation URLs are never masked, and
+  the cut is for length only.

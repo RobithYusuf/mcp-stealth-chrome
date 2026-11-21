@@ -8,6 +8,7 @@ reaches the code.
 
 from typing import Optional
 
+from .. import antibot
 from .. import server as _srv
 from .._app import mcp
 from . import page as _page
@@ -27,6 +28,8 @@ async def batch_actions(actions: list[dict]) -> str:
     The six short names (click, fill, type, press, wait, navigate) pass every other key on
     to their tool, and a key the tool does not take fails that action by name.
     Add "stop_on_error": true to an action to stop there if it fails.
+    A site's verification page (antibot_tripwire, default pause) stops the batch before its next action:
+    an error starting "antibot_paused:" with what fired and resume_with.
     Example: [{"type":"click","ref":"e3"},{"type":"fill","ref":"e4","value":"x"}]
 
     For branching, loops or using one step's result in another, use workflow_run.
@@ -41,31 +44,79 @@ async def batch_actions(actions: list[dict]) -> str:
         return err("batch_actions: no actions given; nothing ran")
     _srv._register_workflow_tools()
     results = []
-    for i, act in enumerate(actions):
-        if not isinstance(act, dict):
-            results.append(f"[{i}] ?: ERR not an action object but {type(act).__name__}: "
-                           f"{str(act)[:80]}")
-            continue
-        atype = act.get("type")
-        try:
-            tool, args = _batch_action_call(act)
-            if tool is None:
-                r = err(f"unknown action type: {atype}")
-            else:
-                r = (_srv._inner_arguments_error(tool, args) or presence.refusal(tool, BrowserState.browser)
-                     or await _srv._WORKFLOW_TOOLS[tool](**args))
-            results.append(f"[{i}] {atype}: {str(r)[:160]}")
-            # A tool can return an "Error: ..." string WITHOUT raising — honor
-            # stop_on_error for those too, not just for exceptions.
-            if isinstance(r, str) and r.startswith("Error:") and act.get("stop_on_error"):
-                break
-        except Exception as e:
-            results.append(f"[{i}] {atype}: ERR {e}")
-            if act.get("stop_on_error"):
-                break
+    previous = None  # the tool of the last action run, for the anti-bot tripwire
+    paused = None    # (index, tool, the pause's text, whether that action ran)
+    run = _srv._TRIPWIRE_RUN.set("batch_actions")
+    try:
+        for i, act in enumerate(actions):
+            if not isinstance(act, dict):
+                results.append(f"[{i}] ?: ERR not an action object but {type(act).__name__}: "
+                               f"{str(act)[:80]}")
+                continue
+            atype = act.get("type")
+            try:
+                tool, args = _batch_action_call(act)
+                warning = ""
+                if tool is not None:
+                    # A click before may have sent the page to a verification page: stop before
+                    # this action, whatever stop_on_error says.
+                    said = await _srv._tripwire_step(previous, tool)
+                    if said and said.startswith(antibot.PAUSE_PREFIX):
+                        paused = (i, atype, said, False)
+                        results.append(f"[{i}] {atype}: not run, paused (antibot) before it")
+                        break
+                    warning = f"\n    {said}" if said else ""
+                if tool is None:
+                    r = err(f"unknown action type: {atype}")
+                else:
+                    r = (_srv._inner_arguments_error(tool, args) or presence.refusal(tool, BrowserState.browser)
+                         or await _srv._WORKFLOW_TOOLS[tool](**args))
+                    previous = tool
+                if isinstance(r, str) and r.startswith(antibot.PAUSE_PREFIX):
+                    paused = (i, atype, r, True)
+                    results.append(f"[{i}] {atype}: paused (antibot): it reached a verification page")
+                    break
+                # A warning (antibot_tripwire=warn) goes after the line: a failure stays countable.
+                results.append(f"[{i}] {atype}: {str(r)[:160]}{warning}")
+                # A tool can return an "Error: ..." string WITHOUT raising — honor
+                # stop_on_error for those too, not just for exceptions.
+                if isinstance(r, str) and r.startswith("Error:") and act.get("stop_on_error"):
+                    break
+            except Exception as e:
+                results.append(f"[{i}] {atype}: ERR {e}")
+                if act.get("stop_on_error"):
+                    break
+    finally:
+        _srv._TRIPWIRE_RUN.reset(run)
     n_failed = sum(1 for ln in results if ": Error:" in ln or ": ERR " in ln)
+    if paused is not None:
+        return _paused_batch(paused, results, n_failed, len(actions))
     header = f"{len(results)} actions, {n_failed} failed" if n_failed else f"{len(results)} actions OK"
     return ok(header + "\n" + "\n".join(results))
+
+
+def _paused_batch(paused: tuple, results: list, n_failed: int, total: int) -> str:
+    """A batch stopped at a site's verification page: the pause first (status word right after
+    "Error: "), its trigger, page and next, then resume_with and each action's line. Not counted
+    as a failure: the action named as the pause either reached the page (it runs again on resume)
+    or was not run (the action before it, a click, is not repeated)."""
+    index, atype, text, ran = paused
+    lines = text.splitlines()
+    detail = "\n".join(lines[1:])
+    if ran:
+        head = f"batch_actions stopped at action [{index}] ({atype}): it reached a verification page"
+        resume = (f"resume_with: batch_actions with actions[{index}:], once the person is done "
+                  f"(action [{index}] runs again)")
+    else:
+        head = (f"batch_actions stopped before action [{index}] ({atype}): the tab is on a "
+                "verification page")
+        resume = (f"resume_with: batch_actions with actions[{index}:], once the person is done "
+                  f"(the actions before it are not repeated)")
+    if not detail:  # said in one line: a page reported before, its request still pending
+        head += f" ({lines[0][len(antibot.PAUSE_PREFIX):].strip()})"
+    out = [f"{antibot.PAUSED}: {head}."] + ([detail] if detail else []) + [
+        resume, f"{index} of {total} actions ran before it, {n_failed} failed"] + results
+    return err("\n".join(out))
 
 
 # The six legacy batch names and the defaults they always had. Every other key of the action
