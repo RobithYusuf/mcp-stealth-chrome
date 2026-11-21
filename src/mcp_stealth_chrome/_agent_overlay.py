@@ -96,6 +96,10 @@ BORDERLESS, NONACTIVATING, BUFFERED = 0, 1 << 7, 2
 ABOVE = 1
 NORMAL_LEVEL, FLOATING_LEVEL = 0, 3
 ALL_SPACES, IGNORES_CYCLE, FULLSCREEN_AUX = 1 << 0, 1 << 6, 1 << 8
+# NSWindowCollectionBehaviorTransient: hidden while Mission Control shows. Without it Mission Control
+# drew the light's edge windows as windows of their own, left where they were, apart from the browser
+# window it had moved (the person saw the top, bottom and left strips stuck on the desktop).
+TRANSIENT = 1 << 3
 TRACK = 0x01 | 0x80 | 0x200  # entered/exited, always, in visible rect
 IMAGE_ONLY = 1
 TRUNCATE_TAIL = 4
@@ -711,7 +715,7 @@ def panel(frame, takes_clicks, shadow=False):
     p.setIgnoresMouseEvents_(not takes_clicks)  # set explicitly: transparent areas then count too
     p.setHidesOnDeactivate_(False)
     p.setBecomesKeyOnlyIfNeeded_(True)
-    p.setCollectionBehavior_(ALL_SPACES | IGNORES_CYCLE | FULLSCREEN_AUX)
+    p.setCollectionBehavior_(ALL_SPACES | TRANSIENT | IGNORES_CYCLE | FULLSCREEN_AUX)
     p.setReleasedWhenClosed_(False)
     # No system animation on ordering in or out (a panel's default shrank the strips and the lock
     # for a third of a second after the browser had gone): the overlay goes when the window goes.

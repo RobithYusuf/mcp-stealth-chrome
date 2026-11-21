@@ -1135,3 +1135,38 @@ def test_the_liveness_probe_sends_no_signal_on_windows(monkeypatch):
     monkeypatch.setattr(state, "_pid_alive", lambda pid: pid == 4242)
     assert presence._pid_alive(4242) is True
     assert presence._pid_alive(4243) is False
+
+
+def test_every_overlay_window_hides_while_mission_control_shows():
+    """Opened over a working overlay, Mission Control drew the light's edge windows as windows of their
+    own, left at their old place apart from the browser window it had moved. Every overlay window comes
+    from panel(), and panel() marks it transient (hidden in Mission Control), on every Space and beside a
+    full-screen window as before."""
+    import ast
+    from pathlib import Path
+    source = (Path(presence.__file__).with_name("_agent_overlay.py")).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    consts = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+            if not names and isinstance(node.targets[0], ast.Tuple):
+                names = [e.id for e in node.targets[0].elts]
+                values = node.value.elts
+            else:
+                values = [node.value]
+            for name, value in zip(names, values):
+                try:
+                    consts[name] = eval(compile(ast.Expression(value), "c", "eval"))
+                except Exception:
+                    pass
+    assert consts["TRANSIENT"] == 1 << 3
+    panel = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "panel")
+    calls = [c for c in ast.walk(panel) if isinstance(c, ast.Call) and ast.unparse(c.func).endswith("setCollectionBehavior_")]
+    assert len(calls) == 1
+    flags = {n.id for n in ast.walk(calls[0].args[0]) if isinstance(n, ast.Name)}
+    assert flags == {"ALL_SPACES", "TRANSIENT", "IGNORES_CYCLE", "FULLSCREEN_AUX"}
+    # Every NSPanel the overlay makes goes through panel().
+    made = [c for c in ast.walk(tree) if isinstance(c, ast.Call)
+            and "initWithContentRect_styleMask_backing_defer_" in ast.unparse(c.func)]
+    assert len(made) == 1

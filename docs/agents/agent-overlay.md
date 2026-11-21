@@ -180,6 +180,11 @@ Part of the agent guide: [AGENTS.md](../../AGENTS.md) says when to read this. It
 
 ## Window level and app switches
 
+- Every overlay window is transient (`NSWindowCollectionBehaviorTransient`, set in `panel()`): hidden while Mission
+  Control shows. A panel at the normal level with no Exposé behaviour is a managed window, and Mission Control laid
+  each of the six out as a thumbnail of its own, apart from the browser's: the person saw the light's strips left
+  on the desktop. Measured (macOS 26, a 900x700 window): the strips at 22x172 and 279x22, the bar at 186x12; with
+  the flag each is 1x1 there, and back at its size and place after.
 - The overlay takes the floating level (3) only when no switch can leave it over another app (`wants_floating`):
   nothing covers the browser, another app is in front (with the browser in front, level 0 just above its window looks
   the same and the next app covers both at once), and no app came to the front in the last `SWITCH_SETTLE` (0.3 s,
