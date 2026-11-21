@@ -33,7 +33,8 @@ Part of the agent guide: [AGENTS.md](../../AGENTS.md) says when to read this. It
   the top of every pass, so also while the person holds the browser and on a selector or URL wait; only one that
   cannot come back lets a page change count, and the result says the bar ended. A hold whose overlay cannot come
   back ends the wait as an error (Resume agent is gone with it). A browser or tab that is gone ends the wait as an
-  error (`_gone`). Shopee
+  error (`_gone`); a tab counts as gone only when a non-empty list of Chrome's pages, read then or `TARGETS_AGAIN`
+  (0.3 s) later, lacks it, since an empty or unread list proves nothing. Shopee
   moves its login page to `/buyer/login/qr` by itself a moment after loading, and a wait measured from the
   request called that a finished handoff after 0.0 s. A timeout takes the request off the bar, so the person never
   reads "Your help is needed" while the agent does something else, but the agent keeps it (`shown_at` None): the

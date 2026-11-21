@@ -149,6 +149,7 @@ HANDOFF_POLL = 0.25  # seconds between reads while wait_for_human waits
 # kept for the stamps shared with the overlay process (asked_at, help_done, since).
 _clock = time.monotonic
 _pause = asyncio.sleep
+TARGETS_AGAIN = 0.3  # seconds before a target list that came back empty or unread is read again
 
 
 @mcp.tool()
@@ -313,17 +314,35 @@ BAR_ENDED = ("the overlay's bar showed this request but ended during the wait (i
              "and could not be started again), so the person had no Done button")
 
 
+async def _tab_listed(browser, tab) -> Optional[bool]:
+    """Whether Chrome lists the tab's page; None when the list could not be read or came back
+    empty, which proves nothing (a page moving between renderer processes is not the tab closing)."""
+    try:
+        pages = await asyncio.wait_for(_srv._page_targets(browser), timeout=2)
+    except Exception:
+        return None
+    if not pages:
+        return None
+    key = _srv._target_key(tab)
+    return any(target_id == key for target_id, _url in pages)
+
+
 async def _gone(tab, browser) -> Optional[str]:
-    """Why the page can no longer answer, or None: the browser quit or lost its connection, or
-    Chrome no longer lists the tab. Asked only once a read of the page failed."""
+    """Why the page can no longer answer, or None: the browser quit or lost its connection, or a
+    non-empty list of Chrome's pages, read now or once more after TARGETS_AGAIN, lacks the tab.
+    Asked only once a read of the page failed; unknown is not gone, and the wait goes on."""
     if browser is None:
         return "no browser is attached any more"
     up = (connection_alive(browser) if getattr(browser, "_process", None) is None
           else not getattr(browser, "stopped", True))
     if not up:
         return "the browser is gone (its process ended or its connection closed)"
-    if await _target_gone(browser, tab):
-        return "the tab is gone (Chrome no longer lists it)"
+    listed = await _tab_listed(browser, tab)
+    if listed is None:
+        await _pause(TARGETS_AGAIN)
+        listed = await _tab_listed(browser, tab)
+    if listed is False:
+        return "the tab is gone (Chrome listed its pages and this one was not among them)"
     return None
 
 

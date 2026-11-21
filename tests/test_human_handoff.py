@@ -69,6 +69,8 @@ class Page:
         self.selector_from = None
         self.reads = 0
         self.closed = None  # "browser" or "tab"
+        self.target_reads = 0
+        self.target_answers: list = []  # "empty", "unread", "without", "with", one per list read
 
     def close(self, what: str) -> None:
         self.closed = what
@@ -144,8 +146,16 @@ def handoff(monkeypatch, clock, tmp_path):
         return tab.sig().get("url") or ""
 
     async def page_targets(browser):
+        """Chrome's page list: this tab while it is open, another page once it closed, or the
+        answer the test queued (an empty list, a read that fails)."""
         page = BrowserState.active_tab()
-        return [] if page.closed else [(KEY, page.sig().get("url") or "")]
+        page.target_reads += 1
+        answer = page.target_answers.pop(0) if page.target_answers else (
+            "without" if page.closed else "with")
+        if answer == "unread":
+            raise ConnectionError("Target.getTargets did not answer")
+        return {"empty": [], "without": [("OTHER-TAB", "about:blank")],
+                "with": [(KEY, LOGIN)]}[answer]
 
     monkeypatch.setattr(server, "_HUMAN_HELP", {})
     monkeypatch.setattr(server, "_page_sig", page_sig)
@@ -336,6 +346,39 @@ def test_a_browser_or_tab_gone_mid_wait_ends_it_as_an_error(handoff, clock, monk
     assert f"the {what} is gone" in result and "nothing was completed" in result, result
     assert "timeout" not in result and clock.elapsed() < 9.0
     assert KEY not in server._HUMAN_HELP
+
+
+@pytest.mark.parametrize("answer", ["empty", "unread"])
+def test_a_target_list_empty_or_unread_is_no_gone_tab(handoff, clock, answer):
+    """Page reads fail from 7 s, the connection stays up, and every list of Chrome's pages comes
+    back empty or fails: that is unknown, so the wait goes on to its timeout, reading the list
+    twice per failed page read."""
+    page = handoff((0, LOGIN, 400))
+    ask()
+
+    def unreadable():
+        page.closed = "unreadable"
+        page.target_answers[:] = [answer] * 1000
+    clock.hooks.append((7.0, unreadable))
+    result = wait(timeout=10)
+    assert result.startswith("Error: timeout after 10"), result
+    assert "is gone" not in result and KEY in server._HUMAN_HELP
+    assert page.target_reads >= 2 and page.target_reads % 2 == 0, page.target_reads
+
+
+def test_a_tab_missing_from_the_list_read_again_is_gone(handoff, clock):
+    """The first list after the failed read is empty, the one read TARGETS_AGAIN later is not and
+    lacks the tab: gone."""
+    page = handoff((0, LOGIN, 400))
+    ask()
+
+    def closed():
+        page.closed = "tab"
+        page.target_answers[:] = ["empty", "without"]
+    clock.hooks.append((7.0, closed))
+    result = wait(timeout=30)
+    assert result.startswith("Error: wait_for_human stopped after 7.0"), result
+    assert "the tab is gone" in result and page.target_reads == 2, result
 
 
 @pytest.mark.parametrize("asked", [True, False])
