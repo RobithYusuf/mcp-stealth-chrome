@@ -219,6 +219,18 @@ def test_a_launch_that_fails_after_the_start_ends_its_browser_as_every_close_doe
     assert _privacy_folders(env) == []
 
 
+def test_a_failed_privacy_launch_leaves_no_privacy_profile_to_clean_up(env, monkeypatch):
+    """The profile is published with the handle (current_privacy among it); once the failed launch
+    removed that folder, the instance does not name a privacy profile any more, so browser_close
+    does not claim to remove one."""
+    _fail_after_the_start(monkeypatch, "storage_state")
+    out = _launch(privacy=True, storage_state_path="/nowhere/state.json")
+    assert "storage_state load failed" in out and _privacy_folders(env) == [], out
+    assert server.BrowserState.current_privacy is False
+    closed = asyncio.run(_close_through_a_tool_call())
+    assert "Browser was not running." in closed and "privacy profile removed" not in closed, closed
+
+
 @pytest.mark.parametrize("where", ["storage_state", "navigation"])
 def test_a_browser_that_could_not_be_ended_after_a_failed_start_is_kept_and_said(env, monkeypatch, where):
     said = _fail_after_the_start(monkeypatch, where)

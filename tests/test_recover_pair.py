@@ -9,6 +9,7 @@ recover's own await (the 2 s after SIGTERM), the "orphan Chrome" it signals is a
 this test started, never reaped before the recover is done, so its PID cannot go to anyone else."""
 import asyncio
 import contextlib
+import pathlib
 import subprocess
 import sys
 import time
@@ -109,7 +110,8 @@ async def _recover_in_the_background(stale):
 def test_a_switch_while_browser_recover_waits_leaves_the_instance_switched_in_alone(owner, stale_pid):
     """A switch_instance during the recover's own await: resetting by what is current then reset
     the instance switched in. Now nothing of it is reset, and the result says main was not."""
-    main_browser = _Browser(tabs=[_Tab()], stopped=False, config=None)
+    # Started on the recorded profile, so the recover scans it (and signals the sleeper).
+    main_browser = _Browser(tabs=[_Tab()], stopped=False, config=SimpleNamespace(user_data_dir=str(stale_pid.profile)))
     server.BrowserState.browser = main_browser
     server.BrowserState.tabs = list(main_browser.tabs)
 
@@ -162,3 +164,57 @@ def test_a_handle_a_cut_short_launch_kept_while_browser_recover_waits_is_not_dro
     assert current.browser is owner.started[0], "the recover dropped the handle on a browser still running"
     folders = _privacy_folders(owner)
     assert len(folders) == 1 and current.current_profile_dir == folders[0] and current.current_privacy
+
+
+# ── browser_recover scans only a profile proved to be its browser's ────────────────────────
+
+
+@pytest.fixture
+def scanned(owner, monkeypatch):
+    """The profiles browser_recover looks for Chrome PIDs in (none found)."""
+    paths = []
+    monkeypatch.setattr(state, "find_chrome_pids_by_profile", lambda path: paths.append(path) or [])
+    return paths
+
+
+def test_a_recover_during_a_launch_scans_the_launch_s_own_profile(owner, scanned, monkeypatch, tmp_path):
+    """The launch moves the instance from an old profile to its own. The handle and the profile are
+    published in one step, so a recover in between scans the new profile, never the old one
+    with the new browser (it signalled the PIDs of whichever Chrome had the old folder)."""
+    from test_launch_owner import _At, _Recover, _instrument, _launch_with
+    old_profile = tmp_path / "the-profile-before"
+    server.BrowserState.current_profile_dir = old_profile
+    real_start = server._start_chrome
+
+    async def start(config):
+        browser = await real_start(config)
+        browser.config = config  # started on the launch's own folder, as nodriver's Browser is
+        return browser
+
+    monkeypatch.setattr(server, "_start_chrome", start)
+    recover = _Recover()
+    at = _At("in:_first_live_tab", recover.start)
+    _instrument(monkeypatch, at)
+
+    async def run():
+        out = await _launch_with(owner)
+        return out, await recover.said()
+
+    out, said = asyncio.run(run())
+    folder = owner.started[0].config.user_data_dir
+    assert scanned == [pathlib.Path(folder)], (scanned, folder)
+    assert old_profile not in scanned
+    assert "recovered:" in said, said
+
+
+def test_a_recover_scans_no_profile_that_is_not_proved_to_be_its_browser_s(owner, scanned, tmp_path):
+    """A browser in hand whose recorded profile is not the folder it was started on: no PIDs are
+    looked for, and the result says why."""
+    browser = _Browser(tabs=[_Tab()], stopped=False, config=SimpleNamespace(user_data_dir=str(tmp_path / "its-own")))
+    server.BrowserState.browser = browser
+    server.BrowserState.tabs = list(browser.tabs)
+    server.BrowserState.current_profile_dir = tmp_path / "someone-elses"
+    said = asyncio.run(_call("browser_recover", {}))
+    assert scanned == [], scanned
+    assert (f"no Chrome PIDs looked for: the recorded profile {tmp_path / 'someone-elses'} is not proved to be "
+            f"this browser's") in said, said

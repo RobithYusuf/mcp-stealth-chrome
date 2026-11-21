@@ -4835,6 +4835,11 @@ async def _launch_remove_privacy(plan: _LaunchPlan) -> str:
     the instance is still the current one: its removal awaits."""
     iid = plan.launching.instance_id if plan.launching is not None else BrowserState.current_instance_id
     if await _remove_privacy_profile(plan.privacy_profile):
+        # Published with the handle (_launch_ready_browser): an instance still naming the folder
+        # just removed no longer has a privacy profile to clean up.
+        if (plan.privacy_profile is not None and BrowserState.current_instance_id == iid
+                and BrowserState.current_profile_dir == plan.privacy_profile):
+            BrowserState.current_privacy = False
         return ""
     note = (f" The privacy profile could not be removed: {plan.privacy_profile}"
             f"{_removal_failure(plan.privacy_profile)}")
@@ -4886,9 +4891,7 @@ async def _launch_cancelled(plan: _LaunchPlan) -> None:
     if (BrowserState.current_instance_id == plan.launching.instance_id
             and BrowserState.browser is plan.browser):
         BrowserState.reset()
-    if not await _remove_privacy_profile(plan.privacy_profile):
-        plan.cancel_note = (f" Its privacy profile could not be removed: {plan.privacy_profile}"
-                            f"{_removal_failure(plan.privacy_profile)}.")
+    plan.cancel_note = await _launch_remove_privacy(plan)
 
 
 def _launch_recover_cancelled(launching: _Launching) -> str:
@@ -4919,7 +4922,11 @@ async def _launch_ready_browser(req: _LaunchRequest, plan: _LaunchPlan, browser:
     navigation is put there: the ad blocker, the overlay, the moved cookies, the storage state.
 
     Returns an error result (the browser closed or stopped first), or None to go on."""
+    # The handle and its profile in one step, no await between: a browser_recover reading the
+    # instance in between paired the new browser with the old profile, and signalled the PIDs
+    # of whichever Chrome had that folder.
     BrowserState.browser = browser
+    BrowserState.current_profile_dir, BrowserState.current_privacy = plan.profile_path, req.privacy
     plan.adopted = True
     # Before the first navigation, so its own requests are already looked at.
     if ads_pending is not None:
@@ -5559,6 +5566,17 @@ async def _browser_close_now(forget_tabs: bool) -> str:
               else f"{head}.{_kill_note(_kill)}{tabs_note}")
 
 
+def _profile_is_browsers(browser: Any, profile: Any) -> bool:
+    """Whether `profile` is the folder this browser was started on (its Config.user_data_dir)."""
+    folder = getattr(getattr(browser, "config", None), "user_data_dir", None)
+    if not folder:
+        return False
+    try:
+        return os.path.realpath(str(folder)) == os.path.realpath(str(profile))
+    except Exception:
+        return False
+
+
 async def _recover_stops_launch(launching: _Launching) -> str:
     """browser_recover's step for a launch of its instance still running, once marked to stop.
     It is given _RECOVER_LAUNCH_WAIT to end by itself (its next look cuts it short and ends its
@@ -5644,7 +5662,14 @@ async def browser_recover() -> str:
         pass
 
     # 2. SIGTERM/SIGKILL orphan Chrome PIDs that match this profile. Skips
-    #    silently if no profile dir is recorded (attached browser, etc).
+    #    silently if no profile dir is recorded (attached browser, etc). With a browser
+    #    in hand, only a profile proved to be that browser's (its --user-data-dir) is
+    #    scanned: another path is no identity of its process.
+    if (target_profile is not None and target_browser is not None
+            and not _profile_is_browsers(target_browser, target_profile)):
+        steps.append(f"no Chrome PIDs looked for: the recorded profile {target_profile} is not proved to "
+                     f"be this browser's")
+        target_profile = None
     if target_profile is not None:
         try:
             from .state import find_chrome_pids_by_profile

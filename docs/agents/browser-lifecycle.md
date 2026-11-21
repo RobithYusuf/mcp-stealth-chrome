@@ -175,6 +175,13 @@ Part of the agent guide: [AGENTS.md](../../AGENTS.md) says when to read this. It
   the launch is cut short. A browser that could not be ended keeps a handle on its instance, naming its
   profile, as every close path keeps one. Known limit: a recover that began on that same browser then
   resets it, as it resets any browser it could not end, after signalling that browser's PIDs.
+- A launch publishes its browser and that browser's profile and privacy flag in one step with no await
+  between (`_launch_ready_browser`; the other places that publish a handle already did): a recover in
+  between paired the new browser with the old profile path and signalled the PIDs of whichever Chrome had
+  that folder. With a browser in hand, `browser_recover` looks for PIDs only in a profile proved to be that
+  browser's (`_profile_is_browsers`: its `Config.user_data_dir`), else in none, and says so. Known limit,
+  from before: on an empty slot it still scans the profile the instance last recorded, for orphans, though
+  another Chrome may hold that folder by now.
 - A launch hung on an await that never returns never reaches its next look. So the recover gives the
   launch it marked `_RECOVER_LAUNCH_WAIT` (2 s) to end by itself, then cancels its task and waits as long
   again; its result says which. The cancel paths stop the launch's browser (`_launch_cancelled`: stop()
