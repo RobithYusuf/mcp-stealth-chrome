@@ -65,6 +65,13 @@ _RECOVERED = "browser_recover asked this launch to stop while it ran."
 
 
 def _text(result):
+    """The text a client reads from a tool call. str() of the result was its repr, which doubles
+    every backslash: a Windows path in the text then never matched the path a test built."""
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], dict) and "result" in result[1]:
+        return str(result[1]["result"])
+    content = result[0] if isinstance(result, tuple) else result
+    if isinstance(content, (list, tuple)):
+        return "\n".join(getattr(part, "text", str(part)) for part in content)
     return str(result)
 
 
@@ -1027,6 +1034,10 @@ def process_list_hangs(monkeypatch):
         return ""
 
     monkeypatch.setattr(server, "_HOLDERS_READ_WAIT", 0.2)
+    # The bound under test is the one on each read. The retry window around them is another
+    # matter: 15 s on Windows, which cannot delete an open file (test_privacy_removal.py), 0
+    # elsewhere; at its Windows default these tests measured 16 s there.
+    monkeypatch.setattr(server, "_PRIVACY_REMOVE_WAIT", 0.0)
     monkeypatch.setattr(state, "processes_holding", holding)
     monkeypatch.setattr(server, "_profile_holders", holders)
     yield release  # set it before the loop ends: asyncio.run waits for the executor's threads
