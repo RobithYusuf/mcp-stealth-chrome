@@ -68,3 +68,13 @@ def test_active_eviction_marks_header_loss_instead_of_page_silence():
     tracker.request("new", {}, None, False, False)
     assert active["headers_source"] == "page"
     assert "discarded because" in active["headers_note"]
+
+
+def test_finished_without_wire_keeps_the_original_missing_header_note():
+    tracker = RequestHeaders(1)
+    entry = {"headers_source": "page", "headers_note": "Wire request headers were not observed"}
+    tracker.request("finished", entry, None, False, False)
+    tracker.finish("finished", entry, True)
+    tracker.request("new", {}, None, False, False)
+    assert entry["headers_source"] == "page"
+    assert entry["headers_note"] == "Wire request headers were not observed"

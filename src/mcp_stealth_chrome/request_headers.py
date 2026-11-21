@@ -33,7 +33,8 @@ class RequestHeaders:
         chain = min(candidates or list(self._chains.values()), key=lambda c: c.order)
         rid = next(key for key, value in self._chains.items() if value is chain)
         self._chains.pop(rid, None)
-        if chain.entry is not None and chain.entry.get("headers_source") != "wire":
+        if (chain.entry is not None and not chain.finished
+                and chain.entry.get("headers_source") != "wire"):
             chain.entry["headers_source"] = "page"
             chain.entry["headers_note"] = PAGE_HEADERS_DROPPED_NOTE
 
