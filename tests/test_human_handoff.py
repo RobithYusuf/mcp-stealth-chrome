@@ -411,6 +411,33 @@ def test_a_selector_wait_that_times_out_says_whether_the_bar_ended(handoff, cloc
         assert "the person did not press Done in the overlay's bar" in result, result
 
 
+def test_a_revive_whose_start_fails_is_bounded_and_backs_off(handoff, clock, monkeypatch):
+    """_spawn raises every time. Each attempt counts, failed ones too, and none comes within
+    REVIVE_BACKOFF of the last; once RESTARTS are spent the bar has ended and stays ended, and only
+    then may the page change (at 6 s, held) count, as weak evidence that names the ended bar."""
+    page = handoff((0, LOGIN, 400), (6, HOME, 900), overlay=True)
+    overlay = presence._handle(page.browser)
+    tried: list = []
+
+    def spawn(*_a, **_k):
+        tried.append(clock.elapsed())
+        raise OSError("no PyObjC here")
+    monkeypatch.setattr(presence, "_same_chrome", lambda pid, start: True)
+    monkeypatch.setattr(presence, "_spawn", spawn)
+    monkeypatch.setattr(presence, "_monotonic", clock)
+    ask()
+    clock.hooks.append((3.0, lambda: _kill(overlay)))
+    result = wait(timeout=60)
+    assert len(tried) == presence.RESTARTS, tried
+    assert all(b - a >= presence.REVIVE_BACKOFF for a, b in zip(tried, tried[1:])), tried
+    assert result.startswith("page changed after"), result
+    assert "the overlay's bar showed this request but ended during the wait" in result, result
+    assert clock.elapsed() >= tried[-1] + nav.HANDOFF_SETTLE  # no verdict while it could come back
+    assert overlay.recover() == "ended"
+    result = wait(timeout=5)  # the same handoff: no new attempt
+    assert len(tried) == presence.RESTARTS and result.startswith("Error: timeout after 5"), result
+
+
 def test_without_an_overlay_a_change_that_does_not_hold_does_not_count(handoff, clock):
     """After the grace the page changes every second, as a carousel or a redirect chain would."""
     steps = [(0, LOGIN, 400)] + [(6 + i, f"{HOME}?step={i}", 500 + i) for i in range(20)]

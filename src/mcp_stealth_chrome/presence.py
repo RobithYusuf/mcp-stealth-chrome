@@ -40,6 +40,10 @@ HIDE_AFTER = 90.0     # with no tool call for this long the overlay fades out (n
 POINTER_EVERY = 1 / 30
 READY_WAIT = 3.0      # a new overlay must say it is up within this, or the result says so
 RESTARTS = 3          # an overlay that dies while its browser lives is started again this often
+                      # (every attempt counts, one whose start failed too)
+REVIVE_BACKOFF = 3.0  # after a failed start, no new attempt for this long: a start that keeps
+                      # failing was tried on every tool call and every 0.25 s of wait_for_human
+_monotonic = time.monotonic  # the backoff's clock; tests replace it
 TRUE = {"1", "true", "yes", "on"}
 NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 
@@ -232,7 +236,8 @@ class Overlay:
         self.folder = folder
         self.proc = proc
         self.cursor = cursor
-        self.restarts = 0
+        self.restarts = 0       # attempts to start it again, failed ones included
+        self.revive_after = 0.0  # no attempt before this (_monotonic), after a failed one
         self.agent_file = folder / "agent.json"
         self.control_file = folder / "control.json"
         self.agent: dict = {"pid": pid, "active_at": 0.0, "busy": False, "status": "", "help": None,
@@ -280,19 +285,33 @@ class Overlay:
 
     def revive(self) -> bool:
         """Start the overlay again when it died while its browser still runs: it keeps who held
-        the browser. At most RESTARTS times; True when one runs."""
+        the browser. True when one runs (`recover`)."""
+        return self.recover() == "running"
+
+    def recover(self) -> str:
+        """"running" (it runs, started again if its process had exited), "waiting" (not now: a
+        start failed less than REVIVE_BACKOFF ago, or Chrome's identity cannot be read) or "ended"
+        (its browser is gone, or RESTARTS attempts are spent, a failed start counting as one, so
+        it stays ended)."""
         if self.alive():
-            return True
+            return "running"
         if self.restarts >= RESTARTS or not self.folder.is_dir():
-            return False
-        if _same_chrome(self.pid, self.start) is not True:
-            return False  # its browser is gone, or its PID now runs something else
+            return "ended"
+        if _monotonic() < self.revive_after:
+            return "waiting"
+        same = _same_chrome(self.pid, self.start)
+        if same is False:
+            return "ended"  # its browser is gone, or its PID now runs something else
+        if same is None:
+            self.revive_after = _monotonic() + REVIVE_BACKOFF
+            return "waiting"
+        self.restarts += 1
         try:
             self.proc = _spawn(self.folder, self.pid, self.cursor, self.start)
         except Exception:
-            return False
-        self.restarts += 1
-        return True
+            self.revive_after = _monotonic() + REVIVE_BACKOFF
+            return "ended" if self.restarts >= RESTARTS else "waiting"
+        return "running"
 
     def stop(self) -> None:
         """Ask it to end, then make sure: the server ignores SIGTERM and children inherit that,
@@ -838,14 +857,12 @@ def show_again(browser: Any, objective: str) -> Optional[float]:
     return ask(browser, objective)
 
 
-def keep_running(browser: Any) -> Optional[bool]:
-    """Whether the browser's overlay runs, starting it again first if its process exited
-    (`revive`; the new process reads agent.json and control.json, so the request and the holder
-    stay): None when the browser has no overlay, False when it cannot come back."""
+def keep_running(browser: Any) -> Optional[str]:
+    """The browser's overlay, started again first if its process exited (`Overlay.recover`; the
+    new process reads agent.json and control.json, so the request and the holder stay):
+    "running", "waiting" (it may come back, not yet), "ended", or None with no overlay."""
     overlay = _handle(browser)
-    if overlay is None:
-        return None
-    return overlay.alive() or overlay.revive()
+    return None if overlay is None else overlay.recover()
 
 
 def bar_state(browser: Any, shown_at: Optional[float]) -> str:

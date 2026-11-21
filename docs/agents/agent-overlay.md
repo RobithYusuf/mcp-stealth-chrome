@@ -46,8 +46,9 @@ Part of the agent guide: [AGENTS.md](../../AGENTS.md) says when to read this. It
   click fallback, and each step of `batch_actions` and `workflow_run` (`presence.refusal`). `fill`'s JS-value fallback
   re-raises `PersonHasBrowser` instead of writing the value anyway.
 - Fails closed: `refusal` and `before_input` act on the overlay's handle whether its process runs or not. A dead one
-  is restarted (`revive`, at most `RESTARTS` 3, only while Chrome's PID still runs with the start time recorded at
-  attach, as PIDs are handed out again) and keeps the holder, since the new process reads `control.json` first. Held
+  is restarted (`revive`, at most `RESTARTS` 3 attempts, a failed start counting too and followed by `REVIVE_BACKOFF`
+  3 s without one, only while Chrome's PID still runs with the start time recorded at attach, as PIDs are handed out
+  again) and keeps the holder, since the new process reads `control.json` first. Held
   with no overlay to show Resume agent, every tool is refused except `browser_launch(agent_overlay=False)`, which
   stops it: the one way out, named in the refusal.
 - The button is the only way to take over, so help (Done) and the person's hold (Resume agent) always show it and are

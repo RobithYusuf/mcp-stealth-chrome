@@ -400,10 +400,12 @@ async def _wait_for_human_loop(tab, key, browser, request, unasked, timeout,
         # awaited (their Done and Resume agent are on it).
         bar = None
         if not overlay_ended:
-            running = presence.keep_running(browser)  # None: this browser has no overlay
-            overlay_ended = running is False or (reached and running is None)
-            if running and reached:
+            state = presence.keep_running(browser)  # None: this browser has no overlay
+            overlay_ended = state == "ended" or (reached and state is None)
+            if state == "running" and reached:
                 bar = presence.bar_state(browser, shown_at)  # "shown" or "replaced"
+            elif state == "waiting" and reached:
+                bar = "waiting"  # its overlay may come back: no page verdict meanwhile
         bar_ended = reached and overlay_ended
         answer = presence.answered(browser, asked_since)
         if answer:
@@ -445,7 +447,7 @@ async def _wait_for_human_loop(tab, key, browser, request, unasked, timeout,
                             f"{done_selector!r} appeared{unasked}")
         # While the bar shows the request the person has its Done button, so a page change is
         # no answer: the page may move by itself, and the person's own steps change it.
-        if watch is not None and bar != "shown":
+        if watch is not None and bar not in ("shown", "waiting"):
             sig = await _srv._page_sig(tab)
             if not sig and (ended := await stopped(elapsed)):
                 return ended
