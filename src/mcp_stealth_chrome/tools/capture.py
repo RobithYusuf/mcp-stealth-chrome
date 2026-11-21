@@ -11,7 +11,6 @@ import base64
 import fnmatch
 import json
 import os
-import re
 import sys
 import threading
 import time
@@ -20,8 +19,8 @@ from typing import Any, Literal, Optional, Union
 from .. import __version__
 from .._app import mcp
 from ..helpers import (
-    BODY_REVEAL_NOTE, confined_output_path, err, mask_request_entry, ok, reveal_mode, target_key,
-    ts_filename,
+    BODY_REVEAL_NOTE, cdp_glob, confined_output_path, err, mask_request_entry, ok, reveal_mode,
+    target_key, ts_filename,
 )
 from .. import server as _srv
 from ..state import EXPORT_DIR, BrowserState, ensure_dirs
@@ -65,18 +64,8 @@ _ADS_NOTE = (" block_ads is on in this browser, so its Fetch session answers for
              "leaves ad blocking on.")
 
 
-def _cdp_glob(pattern: str) -> "re.Pattern[str]":
-    """Fetch.RequestPattern.urlPattern as a regex: * any run, ? one character, \\ escapes."""
-    out, i = [], 0
-    while i < len(pattern):
-        ch = pattern[i]
-        if ch == "\\" and i + 1 < len(pattern):
-            out.append(re.escape(pattern[i + 1]))
-            i += 2
-            continue
-        out.append(".*" if ch == "*" else "." if ch == "?" else re.escape(ch))
-        i += 1
-    return re.compile("^" + "".join(out) + "$", re.DOTALL)
+# Fetch.RequestPattern.urlPattern as a regex; shared with body saving (helpers.cdp_glob).
+_cdp_glob = cdp_glob
 
 
 def _broker_rule(state: dict, token: object):

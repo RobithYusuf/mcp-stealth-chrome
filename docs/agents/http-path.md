@@ -12,6 +12,8 @@ Part of the agent guide: [AGENTS.md](../../AGENTS.md) says when to read this. It
   curl sends a curl TLS fingerprint, and a request that worked in the browser fails for reasons no header diff explains.
 - Volatile headers (`Content-Length`, `Host`, `:authority`) are dropped, not replayed stale; a mismatched Content-Length
   is itself a bot signal.
+- An API that needs a header only the page's own scripts can sign is not replayed here: the page calls it and
+  `network_start(save_bodies=[...])` writes what it got to files (`state-instances-capture.md`).
 
 ## Redirects and cookies in `http_request`
 

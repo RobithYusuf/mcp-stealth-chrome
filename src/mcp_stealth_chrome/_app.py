@@ -29,8 +29,9 @@ _RUNS_DESPITE_DIALOG = frozenset({
     "http_request_cancel", "http_request_retry", "http_request_with_session",
     "http_session_cookies", "list_chrome_profiles", "clone_chrome_profile", "list_external_chrome",
     "profile_report", "profile_cleanup", "identity_pin", "identity_show", "console_get",
-    "get_page_errors", "network_get", "intercept_log", "intercept_stop", "export_har", "export_curl",
-    "request_human_help", "wait_for_human", "web_search", "deep_research", "github_read", "youtube_read",
+    "get_page_errors", "network_get", "network_save_status", "intercept_log", "intercept_stop",
+    "export_har", "export_curl", "request_human_help", "wait_for_human", "web_search",
+    "deep_research", "github_read", "youtube_read",
 })
 # Called with the tool's name after every tool call, inside the caller's session. server.py adds
 # the saved-tabs writer here. Each must be cheap and must not await; one that raises is ignored.
@@ -174,9 +175,10 @@ def without_titles(schema: Any) -> Any:
 
     pydantic gives every property a title made from its name ("js_fallback" becomes "Js Fallback")
     and the model one too ("clickArguments"). They say nothing the names do not, and they were 30%
-    of the input schemas the server advertises (15.9 of 53.4 KB over 169 tools), which a client
-    hands to its model with every session. A property that is itself called "title" stays: it is
-    a key under "properties", and only a schema node's own "title" string goes.
+    of the input schemas the server advertised (15.9 of 53.4 KB, measured over the 169 tools of
+    0.26.0), which a client hands to its model with every session. A property that is itself
+    called "title" stays: it is a key under "properties", and only a schema node's own "title"
+    string goes.
     """
     if not isinstance(schema, dict):
         return schema
