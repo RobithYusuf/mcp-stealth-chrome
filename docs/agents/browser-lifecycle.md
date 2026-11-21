@@ -164,8 +164,8 @@ Part of the agent guide: [AGENTS.md](../../AGENTS.md) says when to read this. It
   a workflow tool: `batch_actions` and `workflow_run` call tools without the gates.
 - `browser_recover` is never refused: it is the way out of a stuck state, and a launch hung on an await
   nobody bounded would otherwise leave the session no exit but a restart. It does what it did (stops the
-  current browser, signals its profile's PIDs, resets), marks the launch (`ended_by`) before its first
-  await, and its result says the launch was still running. After every await `browser_launch` looks
+  current browser, signals its profile's PIDs, resets), marks the launch (`ended_by`) before it stops or
+  resets anything, and its result says the launch was still running. After every await `browser_launch` looks
   (`_launch_settle`): a launch cut short ends as an error naming `browser_recover`, ends the browser it
   started or took over through `_ensure_browser_dead`, once, removes its privacy profile, and records
   nothing more: no handle for a browser that ended, no tabs, no watcher, no keep_alive record. An error the

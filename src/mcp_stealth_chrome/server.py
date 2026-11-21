@@ -5537,8 +5537,8 @@ async def browser_recover() -> str:
 
     # Never refused during a launch: the way out of a stuck state must not depend on what is
     # stuck. A browser_launch of this instance still running ends as an error and records
-    # nothing more (_launch_settle looks after each of its awaits). Marked before the first
-    # await here, so the launch cannot record what this recover is about to reset.
+    # nothing more (_launch_settle looks after each of its awaits). Marked before anything is
+    # stopped or reset here, so the launch cannot record what this recover is about to reset.
     launching = _launching()
     if launching is not None and launching.instance_id == BrowserState.current_instance_id:
         launching.ended_by = "browser_recover"
