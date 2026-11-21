@@ -55,7 +55,6 @@ from .helpers import (
     ok,
     PageReadError,
     parse_json,
-    select_tab,
     target_key,
     transport_lost,
 )
@@ -99,7 +98,7 @@ from .state import data_root as state_data_root
 from .workflow import WorkflowError, run_workflow
 from .humanize import (
     CURRENT_GESTURE, Gesture, humanized_approach, humanized_move, humanized_mouse_press,
-    humanized_scroll, move_pointer,
+    move_pointer,
 )
 from .state import (
     PRIMARY_SESSION,
@@ -6662,7 +6661,7 @@ async def _outside_viewport(tab, x: float, y: float) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 10. JAVASCRIPT
+# 10. JAVASCRIPT — moved to tools/scripting.py
 # ══════════════════════════════════════════════════════════════════════════
 
 
@@ -6672,216 +6671,9 @@ def _js_exception_text(details: Any) -> str:
                or getattr(details, "text", "exception"))
 
 
-def _remote_value_text(remote: Any) -> str:
-    """The result of Runtime.evaluate as text. JSON for anything JSON can say."""
-    value = getattr(remote, "value", None)
-    if value is not None:
-        return value if isinstance(value, str) else json.dumps(value, indent=2, default=str)
-    if getattr(remote, "unserializable_value", None) is not None:  # NaN, Infinity, 5n
-        return str(remote.unserializable_value)
-    kind = str(getattr(getattr(remote, "type_", None), "value", getattr(remote, "type_", "")))
-    if kind == "undefined":
-        return "undefined"
-    if getattr(remote, "subtype", None) == "null" or kind in ("", "object") and not remote.description:
-        return "null"
-    return str(remote.description)  # a function or symbol has a description, not a value
-
-
-@mcp.tool()
-async def evaluate(
-    expression: str,
-    await_promise: bool = True,
-    timeout_ms: int = 30000,
-    survive_navigation: bool = False,
-    tab: Optional[int] = None,
-) -> str:
-    """Execute JavaScript with an explicit bounded timeout.
-
-    ``survive_navigation`` explicitly retries once after a navigation interruption;
-    callers must only use it for idempotent expressions because arbitrary JavaScript
-    may have side effects before navigation starts.
-    """
-    if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int) or not 1 <= timeout_ms <= 600_000:
-        return err("timeout_ms must be an integer between 1 and 600000")
-    page = None
-    try:
-        page = select_tab(tab)
-        with contextlib.suppress(Exception):
-            await _watch_dialogs(page)
-        attempts = 2 if survive_navigation else 1
-        for attempt in range(attempts):
-            try:
-                # Not Tab.evaluate: it also asks for deep serialization, and then Chrome
-                # leaves `value` empty for any object or array, which read as null.
-                remote, thrown = await _wait(
-                    page.send(cdp_runtime.evaluate(
-                        expression=expression, user_gesture=True, await_promise=await_promise,
-                        return_by_value=True, allow_unsafe_eval_blocked_by_csp=True,
-                    )),
-                    timeout=timeout_ms / 1000,
-                    what="evaluate",
-                )
-                if thrown:
-                    return err(f"JavaScript threw: {_js_exception_text(thrown)}")
-                return ok(_remote_value_text(remote))
-            except RuntimeError as exc:
-                message = str(exc).lower()
-                interrupted = "interrupted by target navigation" in message
-                if not interrupted or attempt + 1 >= attempts:
-                    raise
-                await _wait(
-                    page.evaluate("document.readyState === 'complete' || document.readyState === 'interactive'", return_by_value=True),
-                    timeout=min(timeout_ms / 1000, 30),
-                    what="navigation recovery",
-                )
-        return err("evaluate did not produce a result")
-    except Exception as e:
-        return err(str(e) + (_dialog_note(page) if page is not None else ""))
-
-
-@mcp.tool()
-async def wait_for_function(
-    expression: str,
-    timeout_ms: int = 120000,
-    poll_ms: int = 500,
-    tab: Optional[int] = None,
-) -> str:
-    """Poll a JavaScript predicate and return its truthy value.
-
-    The expression is evaluated in the selected tab without changing active focus.
-    It must be a predicate or a side-effect-free value expression.
-    """
-    if (isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int)
-            or not 1 <= timeout_ms <= 600_000):
-        return err("timeout_ms must be an integer between 1 and 600000")
-    if (isinstance(poll_ms, bool) or not isinstance(poll_ms, int)
-            or not 10 <= poll_ms <= 60_000):
-        return err("poll_ms must be an integer between 10 and 60000")
-    try:
-        page = select_tab(tab)
-        deadline = time.monotonic() + timeout_ms / 1000
-        wrapped = ("(async () => { const value = await (" + expression + "); "
-                   "return JSON.stringify({truthy: Boolean(value), value: value ?? null}); })()")
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return err(f"wait_for_function timed out after {timeout_ms}ms")
-            try:
-                raw = await _wait(
-                    page.evaluate(wrapped, await_promise=True, return_by_value=True),
-                    timeout=min(remaining, max(0.1, poll_ms / 1000)),
-                    what="wait_for_function",
-                )
-            except TimeoutError:
-                continue
-            if isinstance(raw, cdp_runtime.ExceptionDetails):
-                return err(f"wait_for_function: the predicate threw: {_js_exception_text(raw)}")
-            raw = raw.value if hasattr(raw, "value") and not isinstance(raw, (str, dict)) else raw
-            state = parse_json(raw)
-            if not isinstance(state, dict):
-                return err("wait_for_function predicate returned an unserializable value")
-            if state.get("truthy"):
-                value = state.get("value")
-                return ok(json.dumps(value, indent=2, default=str) if isinstance(value, (dict, list)) else str(value))
-            await asyncio.sleep(min(poll_ms / 1000, max(0, deadline - time.monotonic())))
-    except Exception as e:
-        return err(str(e))
-
-
-@mcp.tool()
-async def inject_init_script(script: str) -> str:
-    """Register a script that runs before page scripts on every navigation of
-    the CURRENT tab. Scope is the active tab/target only — it is NOT auto-applied
-    to other open tabs or to tabs opened later; re-run per tab if needed."""
-    try:
-        tab = BrowserState.active_tab()
-        from nodriver.cdp import page as cdp_page
-        # Without the Page domain the script registers and then never runs.
-        await tab.send(cdp_page.enable())
-        await tab.send(cdp_page.add_script_to_evaluate_on_new_document(source=script))
-        return ok("init script registered")
-    except Exception as e:
-        return err(str(e))
-
-
 # ══════════════════════════════════════════════════════════════════════════
-# 13. BATCH
+# 13. BATCH — moved to tools/batch.py
 # ══════════════════════════════════════════════════════════════════════════
-
-
-@mcp.tool()
-async def batch_actions(actions: list[dict]) -> str:
-    """Execute a flat list of actions in order and report each one.
-
-    Each action: {type: click|fill|type|wait|press|navigate, ...params}, or the name
-    of any workflow_run tool with its arguments alongside, such as
-    {"type": "select_option", "selector": "#c", "value": "x"}.
-    The six short names (click, fill, type, press, wait, navigate) pass every other key on
-    to their tool, and a key the tool does not take fails that action by name.
-    Add "stop_on_error": true to an action to stop there if it fails.
-    Example: [{"type":"click","ref":"e3"},{"type":"fill","ref":"e4","value":"x"}]
-
-    For branching, loops or using one step's result in another, use workflow_run.
-    """
-    if not isinstance(actions, list):
-        actions = parse_json(actions, None)
-    # A default of [] turned unparseable input into "0 actions OK": nothing ran, reported
-    # as a batch that worked.
-    if not isinstance(actions, list):
-        return err("batch_actions: actions must be a JSON list of action objects; nothing ran")
-    if not actions:
-        return err("batch_actions: no actions given; nothing ran")
-    _register_workflow_tools()
-    results = []
-    for i, act in enumerate(actions):
-        if not isinstance(act, dict):
-            results.append(f"[{i}] ?: ERR not an action object but {type(act).__name__}: "
-                           f"{str(act)[:80]}")
-            continue
-        atype = act.get("type")
-        try:
-            tool, args = _batch_action_call(act)
-            if tool is None:
-                r = err(f"unknown action type: {atype}")
-            else:
-                r = (_inner_arguments_error(tool, args) or presence.refusal(tool, BrowserState.browser)
-                     or await _WORKFLOW_TOOLS[tool](**args))
-            results.append(f"[{i}] {atype}: {str(r)[:160]}")
-            # A tool can return an "Error: ..." string WITHOUT raising — honor
-            # stop_on_error for those too, not just for exceptions.
-            if isinstance(r, str) and r.startswith("Error:") and act.get("stop_on_error"):
-                break
-        except Exception as e:
-            results.append(f"[{i}] {atype}: ERR {e}")
-            if act.get("stop_on_error"):
-                break
-    n_failed = sum(1 for ln in results if ": Error:" in ln or ": ERR " in ln)
-    header = f"{len(results)} actions, {n_failed} failed" if n_failed else f"{len(results)} actions OK"
-    return ok(header + "\n" + "\n".join(results))
-
-
-# The six legacy batch names and the defaults they always had. Every other key of the action
-# is passed on too: "wait" dropped frame_url and "navigate" expect_url, unsaid.
-_BATCH_ALIASES = {
-    "click": ("click", {"ref": None, "selector": None, "humanize": False}),
-    "fill": ("fill", {"ref": None, "selector": None, "value": ""}),
-    "type": ("type_text", {"text": "", "humanize": False}),
-    "press": ("press_key", {"key": "Enter"}),
-    "wait": ("wait_for", {"selector": None, "text": None, "timeout": 5.0}),
-    "navigate": ("navigate", {"url": None}),
-}
-
-
-def _batch_action_call(act: dict) -> tuple[Optional[str], dict]:
-    """Map a batch action to (tool, args). The six legacy names keep their defaults."""
-    atype = act.get("type")
-    rest = {k: v for k, v in act.items() if k not in ("type", "stop_on_error")}
-    if atype in _BATCH_ALIASES:
-        tool, defaults = _BATCH_ALIASES[atype]
-        return tool, {**defaults, **rest}
-    if atype in _WORKFLOW_TOOLS:
-        return atype, rest
-    return None, {}
 
 
 def _inner_arguments_error(tool: str, args: dict) -> Optional[str]:
@@ -6893,228 +6685,13 @@ def _inner_arguments_error(tool: str, args: dict) -> Optional[str]:
     return _app.unknown_arguments_error(tool, registered, args)
 
 
-@mcp.tool()
-async def fill_form(fields: list[dict], submit_ref: Optional[str] = None) -> str:
-    """Fill multiple fields then optionally submit.
-
-    fields: [{ref: "e1", value: "..."}, {selector: "#email", value: "..."}]
-    """
-    if not isinstance(fields, list):
-        fields = parse_json(fields, [])
-    if not fields:
-        return err("fill_form: no fields given")
-    results = []
-    failed = 0
-    for f in fields:
-        if "value" not in f:
-            # Filling with a default would silently empty a field the caller never meant to.
-            failed += 1
-            results.append(f"{f.get('ref') or f.get('selector')}: Error: no value given")
-            continue
-        r = str(await fill(ref=f.get("ref"), selector=f.get("selector"), value=f["value"]))
-        failed += r.startswith("Error:")
-        results.append(f"{f.get('ref') or f.get('selector')}: {r}")
-    if failed:
-        if submit_ref:
-            results.append("submit: not clicked, because a field failed")
-        return err(f"{failed} of {len(fields)} field(s) failed\n" + "\n".join(results))
-    if submit_ref:
-        r = str(await click(ref=submit_ref))
-        results.append(f"submit: {r}")
-        if r.startswith("Error:"):
-            return err("the fields were filled but the submit failed\n" + "\n".join(results))
-    return ok("\n".join(results))
-
-
-@mcp.tool()
-async def navigate_and_snapshot(
-    url: str,
-    expect_url: Optional[str] = None,
-    expect_status: Optional[int] = None,
-) -> str:
-    """Navigate then immediately snapshot — common pattern.
-
-    The navigation's observed postconditions are kept above the snapshot: a
-    snapshot of a page you were redirected to reads exactly like a snapshot of
-    the page you asked for. A failed expect_url / expect_status aborts before
-    the snapshot rather than describing the wrong page. See navigate().
-    """
-    nav = await navigate(url, expect_url=expect_url, expect_status=expect_status)
-    if str(nav).startswith("Error:"):
-        return nav
-    snapshot = await _page.browser_snapshot()
-    if str(snapshot).startswith("Error:"):
-        # A failed snapshot does not make the navigation unobserved — keep its
-        # postconditions rather than dropping them with the failure.
-        return err(f"navigated, then the snapshot failed.\n{nav}\n{snapshot}")
-    return ok(f"{nav}\n\n{snapshot}")
-
-
 # ══════════════════════════════════════════════════════════════════════════
-# 14. VIEWPORT + SCROLL
+# 14. VIEWPORT + SCROLL — moved to tools/viewport.py
 # ══════════════════════════════════════════════════════════════════════════
 
 
-@mcp.tool()
-async def get_viewport_size() -> str:
-    """Return the viewport size (innerWidth, innerHeight) and scroll position."""
-    try:
-        tab = BrowserState.active_tab()
-        result = await tab.evaluate(
-            "JSON.stringify({width: innerWidth, height: innerHeight, "
-            "scrollX: scrollX, scrollY: scrollY})",
-            return_by_value=True,
-        )
-        return ok(str(result))
-    except Exception as e:
-        return err(str(e))
-
-
-@mcp.tool()
-async def set_viewport_size(width: int, height: int) -> str:
-    """Resize the browser window, and report the viewport that results.
-
-    The size given is the whole window, so with a visible browser the viewport comes out
-    smaller by the height of its toolbars. emulate_device sets an exact viewport.
-    """
-    if width <= 0 or height <= 0:
-        return err(f"set_viewport_size: width and height must be positive, got {width}x{height}")
-    try:
-        tab = BrowserState.active_tab()
-        # set_window_size defaults to the top left corner, which moves the window.
-        left, top = 0, 0
-        with contextlib.suppress(Exception):
-            _window, bounds = await tab.get_window()
-            left, top = bounds.left or 0, bounds.top or 0
-        await tab.set_window_size(left=left, top=top, width=width, height=height)
-        await asyncio.sleep(0.15)
-        inner = await tab.evaluate("innerWidth + 'x' + innerHeight", return_by_value=True)
-        inner = inner.value if hasattr(inner, "value") and not isinstance(inner, str) else inner
-        return ok(f"window set to {width}x{height}; viewport reads {inner}")
-    except Exception as e:
-        return err(str(e))
-
-
-@mcp.tool()
-async def scroll(
-    direction: str = "down",
-    amount: int = 500,
-    humanize: bool = True,
-) -> str:
-    """Scroll page via REAL mouseWheel CDP events (not JS scrollBy).
-
-    humanize=True (default): variable chunks 50-150px + micro-pauses + 20%
-    reading-pause chance — bypasses DataDome/PerimeterX behavioral detection.
-    humanize=False: instant scroll (faster, less stealthy).
-
-    Directions: up | down | top | bottom
-
-    Reports how far the window really moved. "did not move" means it is already at that
-    end, cannot scroll, or the wheel went to a scrollable element under the pointer.
-    """
-    if direction not in ("up", "down", "top", "bottom"):
-        return err(f"scroll: direction must be up, down, top or bottom, not {direction!r}")
-    try:
-        tab = BrowserState.active_tab()
-        before = await _eval_checked(tab, "window.scrollY")
-        await presence.before_input(tab)  # refuses once the person took over
-        if direction == "top":
-            await _eval_checked(tab, "window.scrollTo(0,0)")
-            how = "to top"
-        elif direction == "bottom":
-            await _eval_checked(tab, "window.scrollTo(0, document.documentElement.scrollHeight)")
-            how = "to bottom"
-        else:
-            dy = amount if direction == "down" else -amount
-            if humanize:
-                sent = await humanized_scroll(tab, dy)
-                how = f"{direction} {sent}px (humanized wheel events)"
-            else:
-                # Instant mode — single wheel dispatch (still real event)
-                from nodriver.cdp import input_ as cdp_input
-                await tab.send(cdp_input.dispatch_mouse_event(
-                    type_="mouseWheel", x=500, y=400, delta_x=0, delta_y=dy,
-                ))
-                how = f"{direction} {amount}px (instant wheel)"
-        # The wheel is applied after the dispatch returns.
-        after = before
-        for _ in range(8):
-            after = await _eval_checked(tab, "window.scrollY")
-            if after != before:
-                await asyncio.sleep(0.05)
-                after = await _eval_checked(tab, "window.scrollY")
-                break
-            await asyncio.sleep(0.05)
-        if after == before:
-            return ok(f"scroll {how}: the window did not move (scrollY stays {before})")
-        return ok(f"scrolled {how}; scrollY {before}→{after}")
-    except Exception as e:
-        return err(str(e))
-
-
-@mcp.tool()
-async def scroll_to(
-    ref: Optional[str] = None,
-    selector: Optional[str] = None,
-    block: str = "center",
-    smooth: bool = True,
-) -> str:
-    """Smooth-scroll a specific element into viewport.
-
-    Args:
-        ref: snapshot ref (e.g. "e7") from browser_snapshot
-        selector: CSS selector alternative
-        block: "start" | "center" | "end" | "nearest" — vertical alignment
-        smooth: CSS smooth scroll (default) vs instant jump
-
-    Works even if element is far off-screen (pages of scroll away).
-    """
-    if not ref and not selector:
-        return err("ref or selector required")
-    if block not in ("start", "center", "end", "nearest"):
-        return err(f"scroll_to: block must be start, center, end or nearest, not {block!r}")
-    try:
-        tab = BrowserState.active_tab()
-        behavior = "smooth" if smooth else "auto"
-        el = await resolve_ref(ref) if ref else await tab.query_selector(selector)
-        if el is None:
-            return err(f"element not found: {selector}")
-        if await el.apply("function() { return this.getClientRects().length === 0; }") is True:
-            return err(f"{ref or selector} is not rendered, so it cannot be scrolled into view")
-        await presence.before_input(el.tab)  # refuses once the person took over
-        await el.apply(
-            f"function() {{ this.scrollIntoView("
-            f"{{block:{json.dumps(block)}, behavior:{json.dumps(behavior)}}}); }}"
-        )
-        # A smooth scroll is still moving when this returns; the next tool
-        # would otherwise measure a position that is already out of date. On a busy machine a
-        # smooth scroll stalls between frames for longer than two readings, and macOS CI saw
-        # it reported done 58 px short; four still readings (160 ms) ride that out.
-        quiet = 4 if smooth else 2
-        await _settled_position(el, quiet)
-        in_view = ("function() { const r = this.getBoundingClientRect(); return r.bottom > 0 "
-                   "&& r.right > 0 && r.top < innerHeight && r.left < innerWidth; }")
-        visible = await el.apply(in_view)
-        if visible is not True and smooth:
-            # On a busy machine a smooth scroll can sit still for longer than the two quiet
-            # frames _settled_position waits for before its first step, which reads as settled
-            # where the element was. macOS CI refused that way in 2 of 2 runs. Wait for it to
-            # arrive, bounded, and let it settle there.
-            deadline = time.monotonic() + 2.0
-            while visible is not True and time.monotonic() < deadline:
-                await asyncio.sleep(0.05)
-                visible = await el.apply(in_view)
-            if visible is True:
-                await _settled_position(el, quiet)
-        if visible is not True:
-            return err(f"{ref or selector} is still outside the viewport after scrolling")
-        return ok(f"scrolled {ref or selector} into view (block={block})")
-    except Exception as e:
-        return err(str(e))
-
-
 # ══════════════════════════════════════════════════════════════════════════
-# 15. DIALOG + ACCESSIBILITY
+# 15. DIALOG + ACCESSIBILITY — moved to tools/dialogs.py
 # ══════════════════════════════════════════════════════════════════════════
 
 # Read-at-fire-time config so re-arming with a new action/text updates the
@@ -7122,72 +6699,6 @@ async def scroll_to(
 _dialog_pre_action: dict[str, Any] = {
     "action": None, "text": None, "_registered_tab_ids": set(),
 }
-
-
-def _instance_dialog_cfg(kind: str) -> dict:
-    """Dialog settings of the current instance.
-
-    A handler captures this when armed and is armed once per tab. Keyed by instance, not
-    by session: otherwise an instance handed to another session keeps obeying its previous
-    owner, while the new owner is told its setting was applied. Instance names are unique
-    across sessions, so no session can reach another's settings.
-    """
-    return _DIALOG_INSTANCE_CFG.setdefault((BrowserState.current_instance_id, kind), {
-        "action": "accept", "text": "", "enabled": False, "types": None,
-    })
-
-
-_DIALOG_INSTANCE_CFG: dict[tuple[str, str], dict] = {}
-
-
-@mcp.tool()
-async def dialog_handle(action: str = "accept", text: Optional[str] = None) -> str:
-    """Answer the next alert/confirm/prompt. Call BEFORE the action that triggers it.
-
-    A click that opened a dialog with nothing armed reports it; call this then too, and
-    the dialog that is already open gets the answer.
-    """
-    if action not in ("accept", "dismiss"):
-        return err(f"dialog_handle: action must be 'accept' or 'dismiss', not {action!r}")
-    pre_cfg = _instance_dialog_cfg("pre")
-    try:
-        tab = BrowserState.active_tab()
-        answered = await _answer_open_dialog(tab, action, text)
-        if answered:
-            return answered
-        pre_cfg["action"] = action
-        pre_cfg["text"] = text
-        pre_cfg["pending"] = True
-        from nodriver.cdp import page as cdp_page
-        tid = _target_key(tab)
-        if tid in _dialog_pre_action["_registered_tab_ids"]:
-            # Handler already armed on this tab — config updated above; don't
-            # stack a second handler (which would accumulate every call).
-            return ok(f"dialog handler re-armed ({action})")
-
-        async def handle(_event):
-            # Armed for the NEXT dialog only. Answering every later one would accept a
-            # destructive confirm nobody decided on.
-            if not pre_cfg.get("pending"):
-                return
-            pre_cfg["pending"] = False
-            try:
-                await tab.send(cdp_page.handle_java_script_dialog(
-                    accept=(pre_cfg["action"] == "accept"),
-                    prompt_text=pre_cfg["text"] or "",
-                ))
-            except Exception:
-                pass
-
-        # nodriver up to 0.48 enabled the domain for a registered handler; 0.50 does not,
-        # and without this the dialog event never arrives. Bounded, because the renderer
-        # cannot answer while a dialog this server never saw is open.
-        await _wait(tab.send(cdp_page.enable()), timeout=5.0, what="dialog_handle")
-        tab.add_handler(cdp_page.JavascriptDialogOpening, handle)
-        _dialog_pre_action["_registered_tab_ids"].add(tid)
-        return ok(f"dialog handler armed ({action})")
-    except Exception as e:
-        return err(str(e))
 
 
 # ── dialog_auto_handle (persistent, type-filterable) ──────────────────────
@@ -7268,119 +6779,6 @@ def _clear_tab_scoped_state(tabs: list[Any]) -> None:
     except Exception:
         # The module can be unavailable during partial import/startup failure.
         pass
-
-
-@mcp.tool()
-async def dialog_auto_handle(
-    action: str = "accept",
-    enabled: bool = True,
-    types: Optional[list[str]] = None,
-    text: str = "",
-) -> str:
-    """Install a PERSISTENT auto-handler for native browser dialogs.
-    Unlike dialog_handle (one-shot, action baked in at arm time), this
-    one stays armed across many dialogs and reads its config at fire
-    time — call again with new action/types to update without re-arming.
-
-    Args:
-        action: "accept" (Leave / OK) or "dismiss" (Cancel / Stay)
-        enabled: True to arm, False to disable (config preserved)
-        types: optional list to scope handling — any of:
-               ["alert", "confirm", "prompt", "beforeunload"]
-               None (default) = handle all types.
-        text: prompt response when action="accept" on prompt() dialogs;
-              also basic-auth "user:pass" for HTTP 401.
-
-    Common patterns:
-        # Form pages with "unsaved changes" guard — auto-leave forever
-        dialog_auto_handle(action="accept", types=["beforeunload"])
-
-        # Pages that spam alert() — auto-OK
-        dialog_auto_handle(action="accept", types=["alert"])
-
-        # Disable when done
-        dialog_auto_handle(enabled=False)
-
-    Native dialogs only (Chrome's own card UI). HTML/CSS modal overlays
-    are regular DOM — use click_text("Cancel") / click_role for those.
-    """
-    if action not in ("accept", "dismiss"):
-        return err(f"dialog_auto_handle: action must be 'accept' or 'dismiss', not {action!r}")
-    unknown = set(types or ()) - {"alert", "confirm", "prompt", "beforeunload"}
-    if unknown:
-        return err(f"dialog_auto_handle: unknown dialog type(s) {sorted(unknown)}; "
-                   f"use alert, confirm, prompt or beforeunload")
-    auto_cfg = _instance_dialog_cfg("auto")
-    auto_cfg["enabled"] = bool(enabled)
-    auto_cfg["action"] = action
-    auto_cfg["text"] = text or ""
-    auto_cfg["types"] = set(types) if types else None
-
-    if not enabled:
-        return ok("dialog auto-handle disabled (config preserved — re-enable to resume)")
-
-    try:
-        tab = BrowserState.active_tab()
-        tab_id = _target_key(tab)
-        await _answer_open_dialog(tab, action, text)
-        if tab_id in _DIALOG_AUTO_CFG["_registered_tab_ids"]:
-            return ok(
-                f"auto-handle config updated (action={action}, "
-                f"types={list(types) if types else 'all'}); already armed on this tab"
-            )
-
-        from nodriver.cdp import page as cdp_page
-
-        async def auto_handler(event):
-            cfg = auto_cfg
-            if not cfg["enabled"]:
-                return
-            ev_type = getattr(event, "type_", None) or getattr(event, "type", None)
-            type_str = getattr(ev_type, "value", str(ev_type)) if ev_type else ""
-            if cfg["types"] and type_str not in cfg["types"]:
-                return
-            try:
-                await tab.send(cdp_page.handle_java_script_dialog(
-                    accept=(cfg["action"] == "accept"),
-                    prompt_text=cfg["text"] or "",
-                ))
-            except Exception:
-                pass
-
-        await _wait(tab.send(cdp_page.enable()), timeout=5.0, what="dialog_auto_handle")
-        tab.add_handler(cdp_page.JavascriptDialogOpening, auto_handler)
-        _DIALOG_AUTO_CFG["_registered_tab_ids"].add(tab_id)
-        return ok(
-            f"dialog auto-handle armed (action={action}, "
-            f"types={list(types) if types else 'all'})"
-        )
-    except Exception as e:
-        return err(str(e))
-
-
-@mcp.tool()
-async def accessibility_snapshot(interesting_only: bool = True) -> str:
-    """Return ARIA accessibility tree of current page."""
-    try:
-        tab = BrowserState.active_tab()
-        from nodriver.cdp import accessibility as cdp_a11y
-        result = await _wait(tab.send(cdp_a11y.get_full_ax_tree()), what="accessibility_snapshot")
-        # Filter to meaningful nodes
-        nodes = result if isinstance(result, list) else []
-        filtered = []
-        for n in nodes[:500]:
-            node_dict = {
-                "role": getattr(getattr(n, "role", None), "value", None),
-                "name": getattr(getattr(n, "name", None), "value", None),
-                "value": getattr(getattr(n, "value", None), "value", None),
-            }
-            if interesting_only:
-                if not node_dict["name"] and not node_dict["value"]:
-                    continue
-            filtered.append(node_dict)
-        return ok(json.dumps(filtered, indent=2, default=str))
-    except Exception as e:
-        return err(str(e))
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -12506,6 +11904,18 @@ from .tools import mouse_kit as _mouse_kit  # noqa: E402,F401  -- registers the 
 
 
 from .tools import stealth as _stealth  # noqa: E402,F401  -- registers identity, session, captcha and verify tools
+
+
+from .tools import scripting as _scripting  # noqa: E402,F401  -- registers evaluate, wait_for_function, inject_init_script
+
+
+from .tools import batch as _batch  # noqa: E402,F401  -- registers batch_actions, fill_form, navigate_and_snapshot
+
+
+from .tools import viewport as _viewport  # noqa: E402,F401  -- registers the viewport and scroll tools
+
+
+from .tools import dialogs as _dialogs  # noqa: E402,F401  -- registers dialog_handle, dialog_auto_handle, accessibility_snapshot
 
 
 # ══════════════════════════════════════════════════════════════════════════

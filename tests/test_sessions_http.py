@@ -275,20 +275,21 @@ def test_a_snapshot_name_cannot_reach_another_session():
 def test_dialog_policy_follows_the_instance_through_a_handoff():
     """The new owner was told its setting applied while the old handler kept accepting."""
     from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import dialogs
 
     token = BrowserState.in_session(state.POOL_SESSION)
     try:
         BrowserState.current_instance_id = "handed-over"
-        cfg_old_owner = server._instance_dialog_cfg("auto")
+        cfg_old_owner = dialogs._instance_dialog_cfg("auto")
     finally:
         BrowserState.unbind_session(token)
     previous = BrowserState.current_instance_id
     BrowserState.current_instance_id = "handed-over"
     try:
-        assert server._instance_dialog_cfg("auto") is cfg_old_owner
+        assert dialogs._instance_dialog_cfg("auto") is cfg_old_owner
     finally:
         BrowserState.current_instance_id = previous
-    assert server._instance_dialog_cfg("auto") is not cfg_old_owner
+    assert dialogs._instance_dialog_cfg("auto") is not cfg_old_owner
 
 
 @pytest.mark.parametrize("owner_state", ["foreign", "locked", "running"])
