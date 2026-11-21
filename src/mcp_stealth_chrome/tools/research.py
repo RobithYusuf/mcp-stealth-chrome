@@ -742,21 +742,17 @@ async def web_search(
     use_browser: Literal["auto", "off", "on"] = "auto",
     proxy: Optional[str] = None,
 ) -> str:
-    """Web search WITHOUT a browser or paid API — replaces tavily/exa discovery.
+    """Web search without a browser or paid API, for discovery in place of tavily/exa. Escalation:
+      1. curl_cffi SERP (browserless, light): Bing by default (mkt=en-US), DuckDuckGo fallback.
+      2. If that is soft-blocked or empty AND a browser is running, a browser-driven SERP (real Chrome
+         fingerprint, live DOM). use_browser="on" forces it, "off" disables it.
+      2b. engine="brave": Brave's own index via the browser SERP, the richest results (AI answer, Reddit
+          discussions with vote counts, videos); needs a browser (browser_launch). Best single engine for
+          research-grade discovery.
+      3. engine="exa": Exa neural search (BYO EXA_API_KEY), reliable and semantic.
 
-    Escalation ladder ("use every scenario"):
-      1. curl_cffi SERP (browserless, headless/API-mode, light) — Bing default
-         (mkt=en-US), DuckDuckGo fallback.
-      2. If that is soft-blocked/empty AND a browser is running, escalate to a
-         browser-driven SERP (real Chrome fingerprint + live DOM) — set
-         use_browser="on" to force it, "off" to disable.
-      2b. engine="brave" → Brave's own index via the browser SERP: RICHEST results
-          (AI answer + Reddit discussions with vote counts + videos). Needs a browser
-          (browser_launch); best single engine for research-grade discovery.
-      3. engine="exa" → Exa neural search (BYO EXA_API_KEY) — reliable + semantic.
-
-    proxy: route through a residential/mobile proxy (or set RESEARCH_PROXY env) —
-    the only thing that beats IP-level blocks (rate-limited SERPs, datacenter bans).
+    proxy: a residential/mobile proxy (or the RESEARCH_PROXY env), the only thing that beats IP-level blocks
+    (rate-limited SERPs, datacenter bans).
 
     Returns {query, engine, count, via:"http"|"browser", results:[{title,url,snippet}]}.
     """
@@ -1562,44 +1558,30 @@ async def social_research(
     read_posts: int = 0,
     proxy: Optional[str] = None,
 ) -> str:
-    """Social-media market/competitor research — WHO sells/makes X + HOW loud.
+    """Social-media market/competitor research: WHO sells or makes X, and HOW loud the buzz is.
 
-    Give a topic/niche → sweeps social platforms + the web to surface who is
-    selling/making/discussing it and how busy the buzz is, using OSINT:
-    Google/Bing `site:<platform>` dorks (no login, clean, NON-personalized) +
-    optional NATIVE in-platform search when a browser session exists.
+    Sweeps social platforms and the web for a topic with OSINT: Google/Bing `site:<platform>` dorks (no login,
+    clean, NON-personalized), plus native in-platform search when a browser session exists, which adds recall,
+    engagement (likes/views) and recent posts but is personalized to your account. Use both.
 
-    STRONGLY RECOMMENDED — import your session cookies first for login-walled
-    platforms (Threads / Facebook / X / Instagram):
+    For login-walled platforms (Threads / Facebook / X / Instagram) import session cookies first, then call
+    this with use_browser=True. Reddit works without login.
         browser_launch()
         cookie_import(file_path="cookies.json")   # export via Cookie-Editor while logged in
-    then call this with use_browser=True. Native search then returns fresher
-    posts + engagement (likes/views) the logged-out `site:` dork can't reach.
-    Reddit works without login.
 
-    CRASH-RESILIENT: pass cookie_files="threads.json,x.json,fb.txt" to
-    auto-(re)import those session files at the start of EVERY call. A browser
-    crash/restart drops the in-memory session — this re-applies it automatically
-    so you never manually re-import after a recover.
+    Args:
+        platforms: comma list of reddit,threads,facebook,x,instagram,tiktok,linkedin.
+        cookie_files: e.g. "threads.json,x.json,fb.txt", re-imported at the start of EVERY call, so a browser
+            crash or restart (which drops the session) needs no manual re-import.
+        scroll: times to scroll each native feed to load more posts (default 3); e.g. 6-8 for deeper coverage,
+            0 for a fast above-the-fold read.
+        read_posts: 0-5 (default 0). When >0, opens the top-N dork posts per platform and reads each post's full
+            content and visible comments/replies, one extra navigation per post. 0 = listings only.
 
-    Two lenses (use both): `site:` dork = precision + clean + non-personalized;
-    native + cookies = recall + engagement + recent (but personalized to your acct).
-
-    platforms: comma list of reddit,threads,facebook,x,instagram,tiktok,linkedin.
-    scroll: how many times to scroll each native feed (default 3) to load MORE
-    posts from the infinite scroll — raise it (e.g. 6-8) for deeper coverage,
-    lower to 0 for a fast above-the-fold-only read.
-    read_posts: 0-5 (default 0). When >0, DRILL INTO the top-N dork posts per
-    platform and read each post's FULL content + visible COMMENTS/replies
-    (opt-in — each post is one extra navigation, so it's slower). 0 = listings only.
-
-    Three lenses per platform: dork_results (titles+links, clean/precise) +
-    native_excerpt (feed text + ENGAGEMENT likes/votes/comments) + posts (full
-    body + comments of the top posts, when read_posts>0).
-
-    Returns {topic, platforms:[{name, dork_results:[{title,url,snippet}],
-    native_excerpt, posts:[{title,url,content}], needs_cookies}], cookies_hint,
-    method}.
+    Returns {topic, platforms:[{name, dork_results:[{title,url,snippet}], native_excerpt,
+    posts:[{title,url,content}], needs_cookies}], cookies_hint, method}: dork_results are titles and links,
+    native_excerpt the feed text with engagement (likes/votes/comments), posts the top posts' body and
+    comments when read_posts>0.
     """
     t = (topic or "").strip()
     if not t:

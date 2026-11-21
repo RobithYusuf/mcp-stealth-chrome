@@ -761,32 +761,25 @@ async def screenshot_element(
     tab: Optional[int] = None,
     output: OutputMode = "artifact",
 ) -> str:
-    """Capture exactly one element's box — scroll- and DPR-correct.
+    """Capture exactly one element's box, correct for scroll and DPR.
 
-    `screenshot(region_selector=...)` measures the element for you but the clip
-    is built here, in page coordinates: CDP's clip is page-space (scroll
-    included), so a bare getBoundingClientRect() rect captures the wrong strip
-    on any scrolled page — and the wrong strip still looks like a screenshot.
-
-    The result is verified against the box that was requested. If the capture
-    comes back viewport-sized (the classic silent degradation), this fails and
-    says so instead of handing you a browser-window screenshot labelled as an
-    element.
+    `screenshot(region_selector=...)` also measures the element, but here the clip is built in page
+    coordinates (CDP's clip includes scroll), where a bare getBoundingClientRect() rect captures the wrong
+    strip on a scrolled page. The capture is checked against the requested box: one that comes back
+    viewport-sized fails and says so.
 
     Args:
         selector: CSS selector for the element. Or pass `ref` from browser_snapshot.
-        exact_bounds: clip to the element's exact border box (default). False
-            rounds outward to whole CSS pixels and honours `padding`.
+        exact_bounds: clip to the element's exact border box (default). False rounds outward to whole CSS
+            pixels and honours `padding`.
         padding: extra CSS px of context on each side (needs exact_bounds=False)
-        scroll_into_view: scroll the element to the middle of the viewport first.
-            Off-viewport elements still capture correctly either way; scrolling
-            mainly matters for lazy-loaded images and hover/sticky layouts.
+        scroll_into_view: scroll the element to the middle of the viewport first. Off-viewport elements capture
+            correctly either way; it matters for lazy-loaded images and hover/sticky layouts.
         scale: multiplies the captured resolution on top of the page's DPR
-        tab: tab index (from tab_list) to capture WITHOUT switching to it.
-            Chrome throttles background renderers, so a background tab may hand
-            back its last painted frame.
-        output: "artifact" (default: compact text + a resource link),
-            "inline_image" (an MCP image block), "path", or "base64".
+        tab: tab index (from tab_list) to capture without switching to it. Chrome throttles background
+            renderers, so a background tab may hand back its last painted frame.
+        output: "artifact" (default: compact text + a resource link), "inline_image" (an MCP image block),
+            "path", or "base64".
 
     Returns the saved path, the native pixel size, the CSS box, and the checksum.
     """
@@ -848,34 +841,25 @@ async def inspect_image(
     max_bytes: int = ASSET_MAX_BYTES,
     timeout_s: float = 60.0,
 ) -> str:
-    """Fetch an image's NATIVE bytes — not a screenshot of the page showing it.
-
-    Opening a PNG in Chrome and calling screenshot() gives you a viewport-sized
-    picture of a browser window with the asset scaled inside it: the wrapper is
-    in the pixels and the asset's real size is nowhere in the result. This
-    fetches the bytes the page fetched (in-page `fetch` with the session's
-    cookies, so authenticated assets work) and reports what they actually are.
-
-    fit="none" (default) saves the bytes byte-for-byte: the checksum in the
-    result is the checksum of the file on disk and of the asset itself. Nothing
-    is resized, re-encoded, or re-compressed. fit="contain" only affects an
-    inline copy, never the saved file.
+    """Fetch an image's NATIVE bytes, not a screenshot of a page showing it (screenshot() of an opened PNG is a
+    browser window with the asset scaled inside). The bytes are fetched in the page (`fetch` with the
+    session's cookies, so authenticated assets work), and the result reports what they actually are.
 
     Args:
         url: absolute or page-relative image URL. `data:` and `file:` work too.
-        selector: CSS selector of an <img> (or any element with src/href) to
-            read the URL from — also reports displayed vs native size.
-        tab: tab index to read from WITHOUT switching to it
+        selector: CSS selector of an <img> (or any element with src/href) to read the URL from; also reports
+            displayed vs native size.
+        tab: tab index to read from without switching to it
         filename: name under ~/.mcp-stealth/assets/ (default derived from the URL)
-        fit: "none" keeps every pixel (default); "contain" allows the inline copy
-            to be downscaled to max_dimension
+        fit: "none" (default) saves the bytes byte-for-byte, so the result's checksum is that of the file and
+            of the asset: nothing is resized, re-encoded or re-compressed. fit="contain" lets the inline copy
+            be downscaled to max_dimension, never the saved file.
         max_dimension: longest side for the inline copy when fit="contain"
         output: "artifact" (default), "inline_image", "path", or "base64"
-        max_bytes: refuse assets larger than this rather than marshalling them
-            through CDP
+        max_bytes: refuse assets larger than this rather than marshalling them through CDP
 
-    Returns: source URL, HTTP status, MIME (from the bytes, not just the header),
-    native width×height, byte size, sha256, and the saved path.
+    Returns: source URL, HTTP status, MIME (from the bytes, not just the header), native width×height, byte
+    size, sha256, and the saved path.
     """
     from .server import TOOL_ACTION_TIMEOUT
 

@@ -51,23 +51,19 @@ def _status_profile() -> str:
 async def server_status() -> str:
     """Diagnostic info about the server, browser, and CDP compatibility patches.
 
-    `compat_patches` is the one worth reading when captures come back empty: a
-    nodriver compatibility patch that failed to apply does not crash anything —
-    it makes the CDP event listener die on the first mismatched payload, so
-    console/network capture returns nothing and looks like a quiet page.
+    `compat_patches`: read it when captures come back empty. A nodriver patch that failed to apply crashes
+    nothing but leaves console/network capture empty, which looks like a quiet page.
 
-    `dock_icon` says whether visible browsers get their own Dock icon (macOS): off,
-    beta-ready (they run from Chrome Beta with the project icon), beta-missing,
-    icon-missing or unavailable, with the reason. Reading it changes nothing.
+    `dock_icon`: whether visible browsers get their own Dock icon (macOS): off, beta-ready (they run from
+    Chrome Beta with the project icon), beta-missing, icon-missing or unavailable, with the reason. Reading
+    it changes nothing.
 
-    `block_ads` lists, per browser launched with block_ads=True, the requests looked at,
-    blocked and allowed, by type and host, the targets covered and any that could not be,
-    and the age of the filter lists.
+    `block_ads`: per browser launched with block_ads=True, the requests looked at, blocked and allowed by
+    type and host, the targets covered and any that could not be, and the filter lists' age.
 
-    `profile_gc` is the startup pass over leftover privacy-profiles/* and profile-pid<N>
-    folders: what it removed, what it kept because it holds data, what was in use, and
-    errors. A fallback with cookies, logins, storage, extensions or bookmarks is never
-    removed by it; `fallback_profiles_left` counts those for profile_report and
+    `profile_gc`: the startup pass over leftover privacy-profiles/* and profile-pid<N> folders: what it
+    removed, kept because it holds data, found in use, and errors. It never removes a fallback with cookies,
+    logins, storage, extensions or bookmarks; `fallback_profiles_left` counts those for profile_report and
     profile_cleanup.
     """
     if BrowserState.browser is not None:
@@ -471,30 +467,21 @@ async def export_curl(
 ) -> str:
     """Turn a captured browser request into a runnable curl AND an http_request call.
 
-    The browser→script bridge. After network_start() + the action you care about,
-    hand this a request and get back the command that reproduces it outside the
-    browser. Credentials are hidden unless reveal_values=True, because tool output lands
-    in the transcript; the http_request form still replays the session, since it takes the
-    cookies from the browser itself.
-
-    The `http_request` variant is the one that matters here: replaying a captured
-    request with plain curl sends a curl TLS fingerprint, which is exactly what
-    anti-bot systems key on — the request that worked in the browser then fails
-    on the command line for reasons the headers do not explain. Routing it
-    through http_request(impersonate="chrome") keeps a genuine Chrome JA3, so the
-    replay looks like the browser it came from.
+    After network_start() and the action you care about, get the command that reproduces a request outside
+    the browser. Use the `http_request` form: anti-bot systems key on plain curl's TLS fingerprint and block
+    a request that passed in the browser; http_request(impersonate="chrome") keeps Chrome's JA3. Credentials
+    are hidden unless reveal_values=True (tool output lands in the transcript); the http_request form still
+    replays the session, since it takes the cookies from the browser.
 
     Args:
         request_id: id from network_get(). Omit to search by url_contains.
-        url_contains: pick the most recent captured request whose URL contains
-            this substring — usually easier than copying an id.
-        method: additionally require this HTTP method (e.g. "POST") when searching.
-        include_cookies: attach the browser's current cookies for that URL.
-            Turn off to produce a shareable command with no session in it.
-        reveal_values: put real cookie and credential values in the output, which makes
-            the curl string runnable as shown. "body" shows the request body's values under
-            a secret-named parent; headers, cookies, URL secrets and body values whose own
-            key is secret-named stay hidden.
+        url_contains: pick the most recent captured request whose URL contains this substring.
+        method: also require this HTTP method (e.g. "POST") when searching.
+        include_cookies: attach the browser's current cookies for that URL; off gives a shareable command with
+            no session in it.
+        reveal_values: real cookie and credential values in the output, so the curl string runs as shown.
+            "body" shows the request body's values under a secret-named parent; headers, cookies, URL secrets
+            and body values whose own key is secret-named stay hidden.
 
     Returns the matched request, a `curl` string, and an `http_request` call.
     """

@@ -248,32 +248,27 @@ async def cookie_import(
     default_domain: Optional[str] = None,
     clear_first: bool = False,
 ) -> str:
-    """Bulk-import cookies. Three input modes — pick whichever is easiest:
+    """Bulk-import cookies. Three input modes:
 
-    1. cookies=[{...}]            inline array of dicts (DevTools / EditThisCookie shape)
-    2. file_path="..."            JSON file (array OR storage_state {"cookies":[...]})
-    3. raw_text="..."             paste any of these and we auto-parse:
-                                    • JSON array / object (same shapes as 1+2)
-                                    • Header string: "name=val; name2=val2" or
-                                      "Cookie: name=val; name2=val2"
-                                    • Netscape cookies.txt (tab-separated)
-                                    • curl --cookie / -b argument string
-       NOTE: header / netscape formats lack domain — pass default_domain=".example.com"
-       (or call this AFTER navigate so the active tab's URL provides it).
+    1. cookies=[{...}]   inline array of dicts (DevTools / EditThisCookie shape)
+    2. file_path="..."   JSON file (array OR storage_state {"cookies":[...]})
+    3. raw_text="..."    any of these, auto-parsed: JSON array / object (as in 1 and 2); a header string
+       "name=val; name2=val2" or "Cookie: name=val; name2=val2"; Netscape cookies.txt (tab-separated); a
+       curl --cookie / -b argument. Header and Netscape formats lack a domain: pass
+       default_domain=".example.com", or call this AFTER navigate so the active tab's URL provides it.
 
     Per-cookie fields (when JSON):
-      {"name":"...", "value":"...", "domain":".example.com", "path":"/",
-       "expires":1234567890, "secure":true, "httpOnly":false, "sameSite":"Lax"}
+      {"name":"...", "value":"...", "domain":".example.com", "path":"/", "expires":1234567890,
+       "secure":true, "httpOnly":false, "sameSite":"Lax"}
 
     Args:
         cookies: inline array
         file_path: JSON file
-        raw_text: any cookie text — format auto-detected
-        default_domain: fallback domain for header / netscape cookies (or auto-uses
-            current tab URL's host)
+        raw_text: any cookie text, format auto-detected
+        default_domain: fallback domain for header / Netscape cookies (else the current tab URL's host)
         clear_first: wipe all existing cookies before import (default False)
 
-    For full cookies + localStorage + sessionStorage restore, use storage_state_load.
+    For cookies + localStorage + sessionStorage together, use storage_state_load.
     """
     try:
         if not BrowserState.browser:

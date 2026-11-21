@@ -202,30 +202,22 @@ async def intercept_start(
     auto_disable_after: float = 180.0,
     max_events: int = 500,
 ) -> str:
-    """See a request — and optionally stop it — BEFORE the server ever gets it.
-
-    Answers "what would this button actually send?" without sending it. The usual
-    alternative is patching window.fetch by hand, which misses XHR, misses
-    anything the page captured before your script ran, and cannot stop a request
-    that is already in flight. This works at the CDP layer, so it sees every
-    request regardless of timing.
+    """See a request, and optionally stop it, BEFORE the server gets it: "what would this button actually
+    send?" without sending it. A hand patch of window.fetch misses XHR and anything the page captured before
+    your script ran, and cannot stop a request in flight; this works at the CDP layer and sees every request.
 
     Args:
         url_pattern: CDP glob, e.g. "*/api/*" or "*delete*". "*" matches all.
-        action: what to do with matching requests —
-            "observe" lets them through and records them;
-            "cancel"  aborts them (the page sees a network failure);
-            "mock"    answers them locally with mock_status/mock_body.
-        methods: comma list to target, e.g. "POST,DELETE". Non-matching methods
-            are always let through untouched. Omit to target every method.
+        action: "observe" lets matching requests through and records them; "cancel" aborts them (the page sees
+            a network failure); "mock" answers them locally with mock_status/mock_body.
+        methods: comma list to target, e.g. "POST,DELETE"; other methods pass untouched. Omit for all.
         mock_status / mock_body / mock_content_type: the canned response.
-        auto_disable_after: seconds before interception turns itself off. This is
-            a safety net, not a nicety: an interception left on with a dead
+        auto_disable_after: seconds before interception turns itself off, since one left on with a dead
             handler wedges the page silently. 0 disables the timer.
         max_events: ring-buffer size for the log.
 
-    Pair with intercept_log() to read what was seen and intercept_stop() to end
-    it early. See dry_run() for the common "explore without mutating" preset.
+    Read what was seen with intercept_log(), end it early with intercept_stop(). dry_run() is the preset for
+    exploring without mutating.
     """
     try:
         tab = BrowserState.active_tab()
@@ -500,23 +492,17 @@ async def dry_run(
 ) -> str:
     """Explore a logged-in account without changing anything.
 
-    Blocks every mutating request (POST/PUT/PATCH/DELETE by default) and records
-    what would have been sent — method, URL, headers, body. Reads still work, so
-    the app is fully navigable while nothing can be created, edited or deleted.
-
-    This is the safe way to answer "which endpoint does the delete button call?"
-    on a real account: click it, read intercept_log(), and see the exact request
-    that was stopped. GET and HEAD are untouched, so the page keeps working.
+    Blocks every mutating request (POST/PUT/PATCH/DELETE by default) and records what would have been sent:
+    method, URL, headers, body. GET and HEAD are untouched, so the app stays navigable while nothing can be
+    created, edited or deleted. To see which endpoint a delete button calls, click it and read the stopped
+    request in intercept_log(). The page shows blocked calls as network errors: the intended signal, not a bug.
 
     Args:
         enable: False turns dry-run off (same as intercept_stop).
         url_pattern: narrow to one API surface, e.g. "*/api/*".
-        methods: which methods to block. Widen or narrow as needed.
-        auto_disable_after: seconds before it lifts itself, so a forgotten
-            dry-run does not silently break later work.
-
-    The page will surface blocked calls as network errors — that is the intended,
-    visible signal that a mutation was prevented, not a bug.
+        methods: which methods to block.
+        auto_disable_after: seconds before it lifts itself, so a forgotten dry-run does not silently break later
+            work.
     """
     if not enable:
         return await intercept_stop()
