@@ -6,6 +6,8 @@ import json
 import os
 import re
 import secrets
+import stat
+import threading
 import time
 from pathlib import Path
 from urllib.parse import unquote_plus, urlsplit
@@ -14,6 +16,11 @@ from typing import Any, Iterator
 from nodriver import Tab
 
 from .state import BrowserState, TabNotUsable
+
+try:
+    import fcntl as _fcntl
+except ImportError:  # Windows
+    _fcntl = None  # type: ignore[assignment]
 
 
 # Names whose values are credentials. Matched as whole words, so "author" and the
@@ -89,9 +96,10 @@ def _mask_json(node: Any) -> Any:
     return node
 
 
-def mask_json_value(value: Any) -> Any:
-    """Credential fields hidden in an already parsed JSON document."""
-    return _mask_json(value)
+def mask_json_value(value: Any, *, own_keys_only: bool = False) -> Any:
+    """Credential fields hidden in an already parsed JSON document. own_keys_only is
+    reveal_values="body", as for mask_body."""
+    return _mask_own_keys(value) if own_keys_only else _mask_json(value)
 
 
 def _mask_pairs(text: str, *, url: bool = False) -> str | None:
@@ -244,6 +252,138 @@ def write_private(path: Path, data: bytes | str) -> None:
         with contextlib.suppress(OSError):
             tmp.unlink()
         raise
+
+
+def append_private_line(folder: Path, filename: str, line: bytes,
+                        max_bytes: int | None = None, lock_timeout: float = 5.0) -> bool:
+    """Append one whole line to folder/filename, a file readable by this user only.
+
+    For records taken from a page, one after another (network_start(save_bodies=...)). The
+    guarantees of write_private, for a file that grows: the folder is opened O_DIRECTORY and
+    O_NOFOLLOW and the file relative to it (dir_fd) with O_APPEND, O_CREAT 0600, O_NOFOLLOW
+    and O_NONBLOCK, so a link planted at either is refused, never written through, and a FIFO
+    there cannot block the open. The file must then be a regular file of this user with one
+    link (a hard link to a file elsewhere is refused) and is set to 0600. Under an exclusive
+    flock the line goes out in one write(); a short write or an error truncates the file back
+    to where it was, so it only ever holds whole lines. A reader that stops at the last
+    newline, or takes a shared flock, never sees half a record. A lock another writer holds
+    past lock_timeout is an OSError, not a wait without end. Returns False, writing
+    nothing, when the file already holds data and this line would take it past max_bytes:
+    the caller goes on to its next file. Raises OSError (or ValueError for a bad name).
+
+    Windows has no O_NOFOLLOW, no dir_fd for open and no flock: there the folder and the file
+    are checked not to be links just before the open (a link planted between that check and
+    the open is followed), only writers in this process are kept apart (a lock), and the user
+    profile's ACLs protect the file, as for write_private.
+    """
+    if not filename or filename in (".", "..") or "/" in filename or "\\" in filename:
+        raise ValueError(f"not a file name: {filename!r}")
+    if not line.endswith(b"\n") or b"\n" in line[:-1]:
+        raise ValueError("append_private_line takes exactly one line, ending in a newline")
+    posix = (hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY")
+             and os.open in os.supports_dir_fd and _fcntl is not None)
+    if not posix:
+        return _append_line_without_dir_fd(Path(folder), filename, line, max_bytes)
+    dir_fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        flags = (os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+                 | os.O_CLOEXEC)
+        for attempt in range(20):
+            try:
+                fd = os.open(filename, flags, 0o600, dir_fd=dir_fd)
+                break
+            except FileNotFoundError:
+                # macOS: two openat(O_CREAT) of one new name at once, and one may fail with
+                # ENOENT although its folder is open here (22 of 600 opens, 4 threads; a plain
+                # path open never did). Tried again; a folder really gone fails each time.
+                if attempt == 19:
+                    raise
+                time.sleep(0.001)
+        try:
+            _check_private_file(fd)
+            ends = time.monotonic() + lock_timeout
+            while True:
+                try:
+                    _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= ends:
+                        raise OSError(f"{filename} stayed locked by another writer for "
+                                      f"{lock_timeout:g} s; nothing was written") from None
+                    time.sleep(0.01)
+            return _append_locked(fd, line, max_bytes)
+        finally:
+            os.close(fd)  # the flock goes with it
+    finally:
+        os.close(dir_fd)
+
+
+# Windows only: append_private_line's writers in this process, per file.
+_APPEND_LOCKS: dict[str, threading.Lock] = {}
+_APPEND_LOCKS_GUARD = threading.Lock()
+
+
+def _check_private_file(fd: int) -> None:
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        raise OSError("refused: not a regular file")
+    if st.st_nlink != 1:
+        raise OSError(f"refused: the file has {st.st_nlink} links")
+    if hasattr(os, "getuid") and st.st_uid != os.getuid():
+        raise OSError("refused: the file belongs to another user")
+    if hasattr(os, "fchmod") and stat.S_IMODE(st.st_mode) != 0o600:
+        os.fchmod(fd, 0o600)
+
+
+def _append_locked(fd: int, line: bytes, max_bytes: int | None) -> bool:
+    size = os.fstat(fd).st_size
+    if max_bytes is not None and size > 0 and size + len(line) > max_bytes:
+        return False
+    try:
+        written = os.write(fd, line)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.ftruncate(fd, size)
+        raise
+    if written != len(line):
+        with contextlib.suppress(OSError):
+            os.ftruncate(fd, size)
+        raise OSError(f"short write: {written} of {len(line)} bytes; the line was taken back")
+    return True
+
+
+def _append_line_without_dir_fd(folder: Path, filename: str, line: bytes,
+                                max_bytes: int | None) -> bool:
+    """append_private_line where there is no O_NOFOLLOW, dir_fd or flock (Windows)."""
+    path = folder / filename
+    with _APPEND_LOCKS_GUARD:
+        lock = _APPEND_LOCKS.setdefault(str(path).lower(), threading.Lock())
+    with lock:
+        for place in (folder, path):
+            if place.is_symlink() or (hasattr(os.path, "isjunction") and os.path.isjunction(place)):
+                raise OSError(f"refused: {place} is a link")
+        flags = (os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_BINARY", 0)
+                 | getattr(os, "O_NOINHERIT", 0) | getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(path, flags, 0o600)
+        try:
+            _check_private_file(fd)
+            return _append_locked(fd, line, max_bytes)
+        finally:
+            os.close(fd)
+
+
+def cdp_glob(pattern: str) -> "re.Pattern[str]":
+    """Fetch.RequestPattern.urlPattern as a regex: * any run, ? one character, \\ escapes."""
+    out, i = [], 0
+    while i < len(pattern):
+        ch = pattern[i]
+        if ch == "\\" and i + 1 < len(pattern):
+            out.append(re.escape(pattern[i + 1]))
+            i += 2
+            continue
+        out.append(".*" if ch == "*" else "." if ch == "?" else re.escape(ch))
+        i += 1
+    return re.compile("^" + "".join(out) + "$", re.DOTALL)
 
 
 @contextlib.contextmanager

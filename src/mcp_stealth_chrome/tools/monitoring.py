@@ -1,5 +1,6 @@
 """Console and network capture: console_start, console_get, network_start and network_get,
-with the body keeping that goes with network capture.
+with the body keeping that goes with network capture, and network_save_status for the bodies
+network_start(save_bodies=...) writes to files (body_saver.py).
 
 Moved out of server.py unchanged. The capture state (armed tabs, the buffers, the set of kept
 bodies, the document loaders) stays in server.py and is reached here as _srv.<name> at call time,
@@ -14,10 +15,17 @@ from typing import Any, Literal, Optional, Union
 
 from nodriver.cdp import runtime as cdp_runtime
 
+from .. import _app as _app_module
+from .. import body_saver
 from .._app import mcp
 from ..helpers import cut_url, err, mask_body, mask_request_entry, reveal_mode, ok
-from ..state import BrowserState
+from ..state import EXPORT_DIR, BrowserState
 from .. import server as _srv
+
+# The notice of a body saving that stopped by itself (watchdog, connection lost), once, on the
+# session's next tool result.
+if body_saver.result_notice not in _app_module.RESULT_FILTERS:
+    _app_module.RESULT_FILTERS.append(body_saver.result_notice)
 
 
 def _console_target_key(tab) -> str:
@@ -233,7 +241,9 @@ async def _configure_kept_bodies(tab: Any, keep: bool, tid: str) -> str:
 
 
 @mcp.tool()
-async def network_start(capture_bodies: bool = True, keep_bodies: bool = False) -> str:
+async def network_start(capture_bodies: bool = True, keep_bodies: bool = False,
+                        save_bodies: Optional[list[dict[str, Any]]] = None,
+                        reveal_values: Union[bool, Literal["body"]] = False) -> str:
     """Begin capturing network requests + responses with full headers.
 
     Args:
@@ -245,7 +255,130 @@ async def network_start(capture_bodies: bool = True, keep_bodies: bool = False) 
             returns). Off by default: Chrome then drops a body with its document. The cost:
             kept bodies stay in Chrome's memory for this tab until it closes, up to
             CAPTURE_BODY_BUFFER_BYTES (64 MB), and nothing frees them earlier.
+        save_bodies: write response bodies to files instead of the transcript, in every tab and
+            popup of this browser, past navigations: [{"url_pattern": "*/api/item*", "name": "item",
+            "extract": ["data.title"]}]. Each match is one JSON line {"meta": {request_url, page_url,
+            ts, status, mime}, "body": ...} in ~/.mcp-stealth/exports/<date>/<name>.jsonl, masked
+            as network_get shows it. extract paths: "a.b" a key at each dot, "a[]" each element of
+            a list, "{x,y}" last keeps those keys; a path that finds nothing is null, named in
+            meta.missing. A plain network_start() leaves saving on; save_bodies=[] stops it.
+            Counts: network_save_status().
+        reveal_values: save_bodies only: True writes the files unmasked, "body" shows values
+            under a secret-named parent, as network_get(reveal_values=...) does.
     """
+    entries = None
+    if save_bodies is not None:
+        try:
+            entries = body_saver.parse_entries(save_bodies)
+        except ValueError as exc:
+            return err(f"network_start: {exc}; nothing was started")
+    try:
+        reveal = reveal_mode(reveal_values)
+    except ValueError as exc:
+        return err(f"network_start: {exc}; nothing was started")
+    if reveal != "none" and not entries:
+        return err("network_start: reveal_values applies to the files of save_bodies; the "
+                   "capture itself is read unmasked with network_get(reveal_values=...). "
+                   "Nothing was started")
+    if entries:
+        refusal = _save_refusal()
+        if refusal:
+            return err(f"network_start: {refusal}; nothing was started")
+    result = await _start_capture(capture_bodies, keep_bodies)
+    if save_bodies is None:
+        running = body_saver.saver_for(BrowserState.browser)
+        if running is not None:
+            # Saving goes on: agents call network_start again out of habit, and a run that
+            # stopped there unseen is what save_bodies exists to prevent.
+            result += f"; body saving continues: {running.saved_total()} saved, network_save_status()"
+        return result
+    if entries and result.startswith("Error"):
+        return result + "; body saving was not started either"
+    return await _start_or_stop_saving(result, entries, reveal)
+
+
+def _save_refusal() -> Optional[str]:
+    """Why save_bodies may not run in the current browser, or None. Saving holds and reads
+    every tab of the browser, so it stays out of the person's own."""
+    if _srv._persons_browser(BrowserState.browser):
+        return ("save_bodies is refused in this browser: the person opened it from the launcher, "
+                "and saving would read every one of their tabs. It works in a browser this server "
+                "launched (browser_launch or spawn_browser)")
+    if BrowserState.current_instance_id in _srv._ATTACHED_BROWSERS:
+        return ("save_bodies is refused in a browser reached with attach_to_chrome: it is the "
+                "person's own, with their tabs, and saving would read every one of them. It works "
+                "in a browser this server launched (browser_launch or spawn_browser)")
+    if _srv.CAPTURE_BODY_BUFFER_BYTES <= 0:
+        return "save_bodies needs CAPTURE_BODY_BUFFER_BYTES above 0: Chrome keeps the bodies in it"
+    return None
+
+
+def _saved_summary(report: Optional[dict]) -> str:
+    if not report:
+        return "no counts were read"
+    parts = []
+    for name, item in (report.get("names") or {}).items():
+        lost = sum((item.get("not_saved") or {}).values())
+        parts.append(f"{name} {item.get('saved')} of {item.get('matched')} saved"
+                     + (f", {lost} not saved" if lost else ""))
+    return "; ".join(parts) or "nothing matched"
+
+
+_MODE_TEXT = {
+    "none": "masked as network_get shows them",
+    "body": ("masked as network_get(reveal_values=\"body\") shows them: values under a "
+             "secret-named parent are revealed at the caller's request"),
+    "all": "written as they are (reveal_values=True): credentials in them are not hidden",
+}
+
+
+async def _start_or_stop_saving(result: str, entries: list, reveal: str) -> str:
+    browser = BrowserState.browser
+    old = body_saver.saver_for(browser)
+    if not entries:
+        if old is None:
+            return f"{result}; no body saving was running"
+        report = await body_saver.stop_for(browser, "network_start(save_bodies=[])")
+        return (f"{result}; body saving stopped: {_saved_summary(report)}. "
+                f"network_save_status() has the final counts")
+    try:
+        plan = body_saver.file_plan(body_saver.day_folder(EXPORT_DIR), entries)
+    except (OSError, ValueError) as exc:
+        return err(f"{result}; body saving did NOT start, its folder is unusable "
+                   f"({type(exc).__name__}: {exc}). Nothing is being saved")
+    try:
+        saver = await body_saver.start(
+            browser, instance_id=BrowserState.current_instance_id,
+            session_key=BrowserState.session_key(), entries=entries, mode=reveal,
+            export_dir=EXPORT_DIR, max_body_bytes=_srv.CAPTURE_BODY_MAX_BYTES,
+            buffer_bytes=_srv.CAPTURE_BODY_BUFFER_BYTES)
+    except Exception as exc:
+        return err(f"{result}; body saving did NOT start ({exc}). Nothing is being saved")
+    replaced = old.report() if old is not None else None  # final: start() ended it
+    lines = [result, f"saving response bodies to files, {_MODE_TEXT[reveal]}:"]
+    for item in plan:
+        entry = item["entry"]
+        state = "new file" if item["bytes"] is None else f"appending to {item['bytes']} bytes"
+        extract = f"; extract: {len(entry.paths)} path{'s' if len(entry.paths) != 1 else ''}" if entry.paths else ""
+        lines.append(f"  {entry.name}: {entry.pattern} -> {item['path']} ({state}{extract})")
+    buffer_mb = _srv.CAPTURE_BODY_BUFFER_BYTES // 2**20
+    tail = ("in every tab and popup of this browser until network_start(save_bodies=[]) or the "
+            "browser closes (a plain network_start() leaves it on); nothing of a body comes back "
+            f"here. Chrome keeps the response bodies of each tab for this, up to {buffer_mb} MB a "
+            "tab, until saving stops.")
+    report = saver.report()
+    if report.get("targets_not_covered"):
+        tail += (f" {len(report['targets_not_covered'])} tab(s) could not be set up and are not "
+                 "covered, see network_save_status().")
+    if replaced is not None:
+        tail += (f" The earlier saving run ended ({_saved_summary(replaced)}); its counts stay "
+                 "under previous.")
+    lines.append(tail + " Counts: network_save_status().")
+    return ok("\n".join(lines))
+
+
+async def _start_capture(capture_bodies: bool, keep_bodies: bool) -> str:
+    """network_start's capture on the active tab, as it was before save_bodies."""
     if keep_bodies and not capture_bodies:
         return err("network_start: keep_bodies=True needs capture_bodies=True, which is what "
                    "lets network_get read a body; nothing was started")
@@ -470,6 +603,16 @@ async def network_get(
         selected = [mask_request_entry(l, body_mode=body_mode) for l in selected]
     selected = [cut_url(l, max_url_len) for l in selected]
     return ok(_srv._bounded_entries(selected, extra))
+
+
+@mcp.tool()
+async def network_save_status() -> str:
+    """What network_start(save_bodies=...) saved in this instance: per name the responses
+    matched, saved, pending and not saved by reason, each file and its size, and the last
+    record in short (meta and the body's top-level keys, no values). Reads nothing from the
+    page."""
+    report = body_saver.status(BrowserState.session_key(), BrowserState.current_instance_id)
+    return ok(json.dumps(report, ensure_ascii=False, default=str))
 
 
 def _lost_body_text(exc: Exception, entry: dict, tid: str) -> str:

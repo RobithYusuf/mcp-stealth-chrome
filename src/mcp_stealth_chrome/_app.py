@@ -29,8 +29,9 @@ _RUNS_DESPITE_DIALOG = frozenset({
     "http_request_cancel", "http_request_retry", "http_request_with_session",
     "http_session_cookies", "list_chrome_profiles", "clone_chrome_profile", "list_external_chrome",
     "profile_report", "profile_cleanup", "identity_pin", "identity_show", "console_get",
-    "get_page_errors", "network_get", "intercept_log", "intercept_stop", "export_har", "export_curl",
-    "request_human_help", "wait_for_human", "web_search", "deep_research", "github_read", "youtube_read",
+    "get_page_errors", "network_get", "network_save_status", "intercept_log", "intercept_stop",
+    "export_har", "export_curl", "request_human_help", "wait_for_human", "web_search",
+    "deep_research", "github_read", "youtube_read",
 })
 # Called with the tool's name after every tool call, inside the caller's session. server.py adds
 # the saved-tabs writer here. Each must be cheap and must not await; one that raises is ignored.
