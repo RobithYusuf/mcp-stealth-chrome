@@ -1439,6 +1439,9 @@ _CF_CHALLENGE_PROBE_INITIAL_JS = """
     '[data-sitekey^="0x"], input[name="cf-turnstile-response"], ' +
     'script[src*="challenges.cloudflare.com"]'
   );
+  // A sign-in form owns its widget. Leave it to the person instead of trying to click it.
+  if (!cfText && Array.from(responseInputs).some(i => i.form?.querySelector(
+      'input[name="user"], input[type="email"], input[type="password"], input[autocomplete="username"]'))) return false;
   return cfText || cfDom;
 })()
 """
@@ -6004,6 +6007,7 @@ async def _arm_document_watch(tab: Tab) -> tuple[dict, Any]:
             for name, value in dict(getattr(response, "headers", None) or {}).items():
                 if str(name).lower() == "cf-mitigated":
                     state["cf_mitigated"] = str(value).strip().lower()
+                    state["cf_loader"] = str(getattr(event, "loader_id", "") or "")
         except Exception:
             pass
 
@@ -6253,21 +6257,17 @@ _TRIPWIRE_PROBE_JS = """
     if (text === null) text = ((document.body && document.body.innerText) || '').toLowerCase();
     out.words = (out.words || []).concat(words[h].filter(w => text.includes(w)));
   }
-  // Child-frame URLs are readable cross-origin; same-origin frame text is bounded and filtered
-  // to the host rules, so a hostile page cannot make this walk unbounded.
+  // Only committed child documents readable from this origin. src can still name a page
+  // that redirected elsewhere, so it is not evidence for a pause.
   out.frames = [];
-  for (const frame of Array.from(document.querySelectorAll('iframe')).slice(0, 16)) {
-    const item = {href: frame.src || '', words: []};
+  for (let n = 0; n < Math.min(window.length, 16); n++) {
     try {
-      const doc = frame.contentDocument;
-      const fhost = (new URL(item.href || doc.location.href)).hostname.toLowerCase();
-      const body = ((doc.body && doc.body.innerText) || '').slice(0, 20000).toLowerCase();
-      for (const h of Object.keys(words)) {
-        if (fhost !== h && !fhost.endsWith('.' + h)) continue;
-        item.words = item.words.concat(words[h].filter(w => body.includes(w)));
-      }
-    } catch (_) { /* cross-origin: the URL is still useful */ }
-    if (item.href) out.frames.push(item);
+      const child = window.frames[n], href = child.location.href;
+      const host = child.location.hostname.toLowerCase();
+      const patterns = Object.keys(words).filter(h => host === h || host.endsWith('.' + h));
+      const text = patterns.length ? (child.document.body?.innerText || '').slice(0, 20000).toLowerCase() : '';
+      out.frames.push({href, words: patterns.flatMap(h => words[h].filter(w => text.includes(w)))});
+    } catch (_) { /* cross-origin or detached */ }
   }
   if (%s) {
     let mark = '';
@@ -6291,6 +6291,7 @@ _TRIPWIRE_PROBE_JS = """
       mark = "its title 'Just a moment...' (English only) with an unsolved widget";
     }
     out.cf = (mark && !solved) ? mark : '';
+    out.solved = solved;
   }
   return JSON.stringify(out);
 })()
@@ -6350,13 +6351,13 @@ def _handoff_clock() -> float:
 
 
 def _record_human_help(tab: Tab, objective: str, timeout: float, *, by: str, clock: float,
-                       baseline: Optional[dict], browser: Any = None) -> dict:
+                       baseline: Optional[dict], browser: Any = None, target: Optional[str] = None) -> dict:
     """A request for help as request_human_help records it, with every field wait_for_human reads,
     shown in the overlay's bar when one runs (never bringing the window forward: the caller does
     that or not). A new request replaces the tab's earlier one. by: "agent" (request_human_help)
     or "tripwire"; only the tripwire's own request is ever withdrawn by the tripwire. baseline: the
     page's fingerprint (_page_sig) as the request is made."""
-    key = _target_key(tab)
+    key = target or _target_key(tab)
     record = {
         "objective": objective,
         "baseline": baseline,
@@ -6379,14 +6380,13 @@ def _tab_browser(tab: Tab) -> Any:
 
 
 async def _tripwire_look(tab: Tab, *, url: Optional[str] = None, want_cf: bool = False,
-                         header: Optional[str] = None,
+                         header: Optional[str] = None, loader: Optional[str] = None, settle_text: bool = False,
                          headless: Optional[bool] = None) -> Optional[_Trip]:
     """Whether `tab` shows a verification page, with the request for the person made when it does
     and the tripwire pauses. None when the tripwire is off (nothing read at all) or the page is no
     verification page as far as was looked; then a request the tripwire made for this tab is
-    withdrawn, and the next result says so. url: the address the caller already observed, so the
-    URL rules need no read of the page; the page is read only for a rule's words on its host or a
-    Cloudflare look (want_cf), or when url is not known."""
+    withdrawn, and the next result says so. After a URL miss a single probe also checks the
+    first 16 direct same-origin frames. It does not follow cross-origin or nested documents."""
     from . import antibot
     mode, rules = _tripwire_settings()
     if mode == "off":
@@ -6398,13 +6398,24 @@ async def _tripwire_look(tab: Tab, *, url: Optional[str] = None, want_cf: bool =
         seen = await _tripwire_probe(tab, rules, want_cf)
         if seen is None:
             return None  # unread: nothing known, and nothing withdrawn either
+        if (settle_text and url and antibot.wants_text(url, rules) and not seen.get("words")
+                and not seen.get("cf") and not seen.get("frames")):
+            await asyncio.sleep(0.3)
+            seen = await _tripwire_probe(tab, rules, want_cf)
+            if seen is None:
+                return None
         href = str(seen.get("href") or url or "")
-        if not url:
-            verdict = antibot.url_verdict(href, rules)
+        verdict = antibot.url_verdict(href, rules)
         if verdict is None and seen.get("words"):
             verdict = antibot.text_verdict(href, seen["words"], rules)
         if verdict is None and seen.get("cf"):
             verdict = antibot.cloudflare_verdict(href, str(seen["cf"]), header)
+        if verdict is None and header == "challenge" and loader and seen.get("solved") is False:
+            # A new document, even at the same URL, cannot inherit the old challenge header.
+            from nodriver.cdp import page as cdp_page
+            tree = await asyncio.wait_for(tab.send(cdp_page.get_frame_tree()), timeout=1)
+            if str(tree.frame.loader_id) == loader:
+                verdict = antibot.cloudflare_verdict(href, "current document", header)
         if verdict is None:
             for frame in seen.get("frames") or ():
                 if not isinstance(frame, dict):
@@ -6416,7 +6427,6 @@ async def _tripwire_look(tab: Tab, *, url: Optional[str] = None, want_cf: bool =
                 if frame_verdict is not None:
                     verdict = replace(frame_verdict,
                                       trigger=frame_verdict.trigger + " (in child frame)")
-                    href = frame_url
                     break
     key = _target_key(tab)
     if verdict is None:
@@ -6469,14 +6479,14 @@ def _tripwire_seen(key: Optional[str], mode: str, verdict: Any, headless: bool) 
     return _Trip(mode, verdict, where="ask", again=same)
 
 
-def _tripwire_ask(tab: Tab, trip: _Trip, baseline: Optional[dict]) -> None:
+def _tripwire_ask(tab: Tab, trip: _Trip, baseline: Optional[dict], *, target: Optional[str] = None) -> None:
     """The tripwire's request for the person, recorded as request_human_help records it and shown
     in the overlay's bar when there is one. The window is not brought forward: the agent calls
     request_human_help itself for that."""
     record = _record_human_help(
         tab, f"This site shows a verification page ({trip.verdict.host}). Please complete it, "
              "then press Done.", TRIPWIRE_HELP_TIMEOUT, by="tripwire", clock=_handoff_clock(),
-        baseline=baseline, browser=_tab_browser(tab))
+        baseline=baseline, browser=_tab_browser(tab), target=target)
     trip.where = "bar" if record["was_shown"] else "window"
 
 
@@ -6493,11 +6503,11 @@ def _tripwire_after_action(result: str, after: Optional[dict]) -> str:
     url = (after or {}).get("url")
     if url:
         candidates.append((None, url))
-    before_pages = (after or {}).get("before_pages") or {}
+    before_pages = (after or {}).get("before_pages")
     pages = (after or {}).get("pages") or {}
     if isinstance(before_pages, dict) and isinstance(pages, dict):
         candidates.extend((target, page_url) for target, page_url in pages.items()
-                          if target not in before_pages)
+                          if target not in before_pages and target in (after.get("opened_here") or ()))
     verdict = None
     target = None
     for candidate_target, candidate_url in candidates:
@@ -6510,13 +6520,14 @@ def _tripwire_after_action(result: str, after: Optional[dict]) -> str:
     if verdict is None:
         return result
     try:
-        tab = next((candidate for candidate in BrowserState.tabs
-                    if target is not None and _target_key(candidate) == str(target)), None)
-        tab = tab or BrowserState.active_tab()
+        tab = BrowserState.active_tab()
         key = str(target) if target is not None else _target_key(tab)
         trip = _tripwire_seen(key, mode, verdict, BrowserState.current_headless)
         if trip.where == "ask":
-            _tripwire_ask(tab, trip, after)
+            _tripwire_ask(tab, trip, None if target else after, target=target)
+        run = _TRIPWIRE_RUN.get()
+        if target and mode == "pause" and run:
+            run["popup"] = trip
     except Exception:
         return result
     if mode == "warn":
@@ -6578,17 +6589,16 @@ async def _tripwire_after_navigation(tab: Tab, observed: Optional[dict], *,
                                      verify_suffix: Optional[str] = None,
                                      doc_state: Optional[dict] = None,
                                      headless: Optional[bool] = None) -> Optional[_Trip]:
-    """The tripwire's look at the page a navigation reached, from what the navigation observed: no
-    read of the page on a host with no rule. The Cloudflare look runs only where auto_verify left a
-    challenge (its suffix says still present, or no widget found) or the document's response said
-    cf-mitigated: challenge."""
+    """Look at the reached document, retaining the main response's challenge evidence. A launch
+    with a supplied URL also checks the current DOM when there was no observed response."""
     header = (doc_state or {}).get("cf_mitigated")
     left = bool(verify_suffix) and "auto-verify" in str(verify_suffix) \
         and "challenge gone" not in str(verify_suffix)
     try:
         trip = await _tripwire_look(tab, url=(observed or {}).get("final_url"),
-                                    want_cf=left or header == "challenge", header=header,
-                                    headless=headless)
+                                    want_cf=left or header == "challenge" or headless is not None,
+                                    header=header, loader=(doc_state or {}).get("cf_loader"),
+                                    settle_text=True, headless=headless)
     except Exception:
         return None  # a look that failed leaves the navigation's own result, as before it existed
     if trip is not None and left:
@@ -6611,7 +6621,8 @@ async def _tripwire_step(previous: Optional[str], next_tool: str) -> Optional[st
         return None
     try:
         tab = BrowserState.active_tab()
-        trip = await _tripwire_look(tab, want_cf=True)
+        run = _TRIPWIRE_RUN.get()
+        trip = (run.pop("popup", None) if run else None) or await _tripwire_look(tab, want_cf=True)
     except Exception:
         return None  # no tab to look at, or a look that failed: the step runs as before
     if trip is None:
@@ -6894,11 +6905,10 @@ async def _page_sig(tab, el=None, pages: bool = False) -> dict:
     if pages and sig:
         from nodriver.cdp import target as cdp_target
         with contextlib.suppress(Exception):
-            sig["pages"] = {
-                str(info.target_id): str(info.url)
-                for info in await tab.send(cdp_target.get_targets())
-                if info.type_ == "page"
-            }
+            infos = await tab.send(cdp_target.get_targets())
+            sig["pages"] = {str(info.target_id): str(info.url) for info in infos if info.type_ == "page"}
+            sig["opened_here"] = [str(info.target_id) for info in infos if info.type_ == "page"
+                                  and str(getattr(info, "opener_id", "")) == _target_key(tab)]
     return sig
 
 

@@ -493,7 +493,7 @@ def test_an_unread_page_withdraws_nothing(page, monkeypatch):
 
 def test_the_words_and_cloudflare_are_read_only_when_needed(page):
     tab = page("https://example.com/a")
-    assert look(tab, url=tab.url) is None and tab.probes == 0  # a host with no rule: nothing read
+    assert look(tab, url=tab.url) is None and tab.probes == 1  # child frames may have their own rules
     tab = page("https://shopee.co.id/product/1", words=["verifikasi untuk melanjutkan"])
     trip = look(tab, url=tab.url)
     assert tab.probes == 1 and "page text 'Verifikasi untuk melanjutkan'" in trip.verdict.trigger
@@ -567,3 +567,10 @@ def test_the_step_check_skips_only_a_first_navigation(page):
     # Said whole again: the run's report needs what fired, also for a page said before.
     again = asyncio.run(server._tripwire_step(None, "click"))
     assert "\ntrigger: shopee.co.id built-in rule" in again
+
+
+def test_batch_budget_keeps_resume_with_long_unicode_details():
+    text = _pause_text().replace("trigger: ", "trigger: " + "界" * 1200)
+    out = batch._paused_batch((100, "navigate", text, True), ["界" * 160] * 101, 2, 105)
+    assert len(out.encode()) < 1024 and "actions[100:]" in out
+    assert "2 failed" in out and "next:" in out and "previews omitted" in out

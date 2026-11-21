@@ -71,6 +71,11 @@ PAGES = {
                   "data-sitekey='0x4AAAAAAAAAAAAAAA'></div><input type=hidden "
                   "name='cf-turnstile-response' value=''><button>Sign in</button></form>"),
     "/start": "<h1>Start</h1><a id=go href='/p3'>to product 3</a>",
+    "/frame-path": "<iframe src='/p3'></iframe>",
+    "/frame-words": "<iframe src='/words'></iframe>",
+    "/popup": "<a id=open target=_blank href='/verify/captcha'>Open</a>",
+    "/late-text": ("<body><p>Loading</p><script>onload=()=>setTimeout(()=>"
+                   "document.querySelector('p').textContent='Verifikasi untuk melanjutkan',180)</script>"),
     # A site merely served through Cloudflare: its bot-detection script and parameters on an
     # ordinary page (served from here, never from Cloudflare).
     "/cf-served": ("<title>Just a moment of your time</title><h1>Shop</h1><script>"
@@ -129,6 +134,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                    "<p>Geser untuk menyelesaikan puzzle</p>")
         if path == "/words":  # no URL rule fires here; only the page's words do
             return self._send(200, "<title>Shopee</title><div>Verifikasi untuk melanjutkan</div>")
+        if path == "/cf-header":
+            return self._send(403, "<title>Un instant</title>", (("cf-mitigated", "challenge"),))
         if path == "/cf-interstitial":
             # The marks of a Cloudflare challenge page that do not depend on its language: the
             # response header and its inline options script, with its widget not solved. The title
@@ -281,9 +288,7 @@ def test_batch_actions_stops_too(loop, site, rules):
     assert out.startswith("Error: antibot_paused: batch_actions stopped at action [2] (navigate)"), out
     assert "resume_with: batch_actions with actions[2:]" in out, out
     assert not SITE.seen("/p4") and not SITE.seen("/p5"), SITE.requests
-    # The pause itself is short; each action's line after it is the batch's own (160 characters).
-    pause = out.split("\n[0] ", 1)[0]
-    assert TRACKING not in out and len(pause.encode()) < 700, (len(pause.encode()), pause)
+    assert TRACKING not in out and len(out.encode()) < 1024, (len(out.encode()), out)
 
 
 def test_the_page_words_fire_only_on_a_host_with_a_rule(loop, site, rules):
@@ -394,3 +399,42 @@ def test_the_check_between_steps_costs_little_on_a_page_with_no_rule(loop, site,
     print(f"\ntripwire between steps, host with no rule: median {statistics.median(times):.2f} ms, "
           f"p90 {times[int(len(times) * 0.9)]:.2f} ms, max {times[-1]:.2f} ms")
     assert statistics.median(times) < 20
+
+
+@pytest.mark.parametrize("path,mark", [("/frame-path", "path /verify/captcha"),
+                                       ("/frame-words", "page text"), ("/late-text", "page text")])
+def test_verification_in_loaded_document(loop, site, rules, path, mark):
+    out = run(loop, tool("navigate")(site + path, auto_verify=False))
+    assert out.startswith("Error: antibot_paused:") and mark in out, out
+    if path.startswith("/frame"):
+        assert "in child frame" in out, out
+
+
+def test_login_with_default_verification_is_left_alone(loop, site, rules):
+    out = run(loop, tool("navigate")(site + "/cf-login"))
+    assert out.startswith("Navigated:") and "auto-verify" not in out and "antibot" not in out, out
+
+
+def test_popup_stops_batch_before_next_request(loop, site, rules):
+    out = run(loop, tool("batch_actions")([{"type": "navigate", "url": site + "/popup", "auto_verify": False},
+                                        {"type": "click", "selector": "#open"},
+                                        {"type": "navigate", "url": site + "/p4"}]))
+    assert out.startswith("Error: antibot_paused:") and "in opened tab" in out, out
+    assert "actions[2:]" in out and not SITE.seen("/p4"), out
+
+
+@pytest.mark.parametrize("launch", ["spawn_browser", "browser_launch"])
+def test_fresh_launch_reports_current_challenge_header(loop, site, rules, launch, monkeypatch):
+    from mcp_stealth_chrome.tools import instances
+    if launch == "spawn_browser":
+        monkeypatch.setattr(instances, "ok", lambda msg: "OK: " + msg)
+        try:
+            out = run(loop, tool(launch)(instance_id="tripwire", headless=True, persistent=False,
+                                         url=site + "/cf-header"))
+        finally:
+            run(loop, tool("close_instance")(instance_id="tripwire"))
+    else:
+        run(loop, tool("browser_close")())  # exercise a fresh launch, not reuse
+        out = run(loop, tool(launch)(headless=True, persistent=False, auto_verify=False, url=site + "/cf-header"))
+    assert out.startswith(f"Error: antibot_paused: {launch} reached") and "running" in out, out
+    assert "response header cf-mitigated: challenge" in out, out

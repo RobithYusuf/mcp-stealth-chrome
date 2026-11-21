@@ -884,7 +884,7 @@ async def workflow_run(
 
     # The anti-bot tripwire looks between steps: a click may have sent the page to a site's
     # verification page, and the run stops there before its next step, whatever stop_on_error says.
-    run = _srv._TRIPWIRE_RUN.set("workflow_run")
+    run = _srv._TRIPWIRE_RUN.set({"tool": "workflow_run"})
     try:
         result = await run_workflow(
             steps, dispatch, lambda name: name in _srv._WORKFLOW_TOOLS,

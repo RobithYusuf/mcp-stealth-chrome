@@ -44,6 +44,15 @@ class _Quiet(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *_args):
         pass
 
+    def do_GET(self):
+        if self.path == "/verification":
+            self.send_response(403)
+            self.send_header("cf-mitigated", "challenge")
+            self.end_headers()
+            self.wfile.write(b"<title>Verification</title>")
+            return
+        super().do_GET()
+
 
 class World:
     def __init__(self, base: str, root: pathlib.Path):
@@ -213,6 +222,31 @@ def test_spawn_browser_keeps_and_reattaches_a_named_instance(world):
         assert not client.call("close_instance", instance_id="acct", _timeout=40).failed
         assert _wait_gone(pid, 10)
         assert world.no_record()
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("method", ["spawn_browser", "browser_launch"])
+def test_reattach_returns_pause_for_the_new_document(world, method):
+    # A named, disposable profile, not the person's main profile.
+    kwargs = {"instance_id": "acct"} if method == "spawn_browser" else {"user_data_dir": str(world.root / "acct")}
+    if method == "browser_launch":
+        (world.root / "acct").mkdir()
+    client = Client(env=world.env())
+    try:
+        opened = client.call(method, headless=True, url=world.urls[0], keep_alive=True,
+                             extra_args=SAFE_ARGS, **kwargs)
+        assert not opened.failed, opened.text
+        pid = world.record()["pid"]
+    finally:
+        client.close()
+    client = Client(env=world.env())
+    try:
+        url = world.urls[0].rsplit("/", 1)[0] + "/verification"
+        out = client.call(method, headless=True, keep_alive=False, url=url,
+                          extra_args=SAFE_ARGS, **kwargs)
+        assert out.text.startswith(f"Error: antibot_paused: {method} reached"), out.text
+        assert "response header cf-mitigated: challenge" in out.text and _alive(pid), out.text
     finally:
         client.close()
 

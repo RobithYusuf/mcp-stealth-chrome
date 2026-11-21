@@ -46,7 +46,7 @@ async def batch_actions(actions: list[dict]) -> str:
     results = []
     previous = None  # the tool of the last action run, for the anti-bot tripwire
     paused = None    # (index, tool, the pause's text, whether that action ran)
-    run = _srv._TRIPWIRE_RUN.set("batch_actions")
+    run = _srv._TRIPWIRE_RUN.set({"tool": "batch_actions"})
     try:
         for i, act in enumerate(actions):
             if not isinstance(act, dict):
@@ -99,7 +99,7 @@ def _utf8_prefix(text: str, limit: int) -> str:
     data = text.encode("utf-8")
     if len(data) <= limit:
         return text
-    return data[:max(0, limit)].decode("utf-8", "ignore")
+    return data[:limit - 3].decode("utf-8", "ignore") + "..."
 
 
 def _paused_batch(paused: tuple, results: list, n_failed: int, total: int) -> str:
@@ -118,20 +118,20 @@ def _paused_batch(paused: tuple, results: list, n_failed: int, total: int) -> st
                   f"(the actions before it are not repeated)")
     if not detail:
         head += f" ({lines[0][len(antibot.PAUSE_PREFIX):].strip()})"
-    base = [f"{antibot.PAUSED}: {head}"] + ([detail] if detail else []) + [
-        resume, f"{index} of {total} actions ran before it, {n_failed} failed"]
-    limit = 1015  # leave room for err()'s ``Error: `` prefix and stay below 1 KiB
-    payload = "\n".join(base)
-    if len(("Error: " + payload).encode("utf-8")) < 1024:
-        for line in results:
-            short = line if len(line) <= 160 else line[:160]
-            candidate = payload + "\n" + short
-            if len(("Error: " + candidate).encode("utf-8")) >= 1024:
-                break
-            payload = candidate
-        return err(payload)
-    payload = _utf8_prefix(payload, limit)
-    return err(payload)
+    # Preserve resume and counts even when a person's rule has a long Unicode description.
+    # Keep the whole text if it fits; otherwise the counts stand in for all action previews.
+    header = f"{antibot.PAUSED}: {_utf8_prefix(head, 230)}."
+    footer = f"{resume}\n{index} of {total} actions ran before it, {n_failed} failed"
+    summary = "/ action previews omitted"
+    budget = 1023 - len(err(f"{header}\n\n{footer}\n{summary}").encode())
+    if len(detail.encode()) > budget:
+        fields = antibot.details(text)
+        detail = "\n".join(f"{k}: {_utf8_prefix(fields[k], cap)}" for k, cap in
+                           (("trigger", 170), ("page", 160), ("next", 170)) if k in fields)
+    base = err(f"{header}\n{_utf8_prefix(detail, budget)}\n{footer}")
+    if sum(len(line.encode()) + 1 for line in results) + len(base.encode()) < 1024:
+        return base + "\n" + "\n".join(results)
+    return base + "\n" + summary
 
 
 # The six legacy batch names and the defaults they always had. Every other key of the action

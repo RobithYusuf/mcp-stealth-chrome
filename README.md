@@ -728,7 +728,7 @@ After every navigation the tools make (`navigate`, `reload`, `go_back`, `go_forw
 - `browser_launch` and `spawn_browser` say in their first line that the browser is running and stays open on the page.
 - A click, `click_text`, `click_role` or `press_key` that leads to such a page did happen, so its result is no error: a line first names the page, and in `pause` the request is made.
 - `warn`: the tool's own result, with one line first that names the page. `off`: nothing is checked.
-- Measured on a page with no rule for its host: nothing more after a navigation, and about 0.5 ms (median, p90 0.6 ms, headless Chrome 157) between two workflow steps.
+- After a URL miss, the tripwire checks the top document and up to 16 direct same-origin frames. It checks their current URLs and, on hosts with text rules, searches the first 20,000 characters of frame text. Nested and cross-origin frames are not inspected. A verified click also checks the new tab URL when Chrome identifies the clicked tab as its opener; it does not select that tab or wait for a later redirect.
 - `workflow_run` and `batch_actions` stop before their next step, whatever `stop_on_error` says, and no page is opened after it. `workflow_run` then returns `status: antibot_paused`, `paused_at`, `paused_path`, `antibot` (trigger, page, next), the whole vars and `resume_with`: it runs again a navigation that reached the page, and starts after a click that did. The stop is not counted as a failure. The field case (five pages, the third redirected to a verification page with a 2 KB tracking id) answers in under 1 KB.
 </details>
 
