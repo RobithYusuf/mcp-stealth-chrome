@@ -4033,6 +4033,879 @@ async def _reopen_saved_tabs(
     return done(summary)
 
 
+@dataclass(frozen=True)
+class _LaunchRequest:
+    """What the caller of browser_launch asked for, as `_launch_check_arguments` left it: a
+    --user-data-dir in extra_args is user_data_dir here. Every phase reads it, none changes it.
+
+    A reattach names what it cannot apply from these fields (`_reattach_ignored(vars(req))`),
+    which hold the same values browser_launch's own locals held at that point."""
+    url: str
+    headless: bool
+    proxy: Optional[str]
+    user_agent: Optional[str]
+    window_width: int
+    window_height: int
+    lang: str
+    extra_args: Optional[list[str]]
+    storage_state_path: Optional[str]
+    testing_mode: bool
+    auto_verify: bool
+    user_data_dir: Optional[str]
+    profile_directory: Optional[str]
+    fingerprint: Optional[dict]
+    privacy: bool
+    profile_conflict: str
+    expect_url: Optional[str]
+    expect_status: Optional[int]
+    profile_mode: str
+    restore_tabs: bool
+    keep_alive: Optional[bool]
+    vertical_tabs: Optional[str]
+    block_ads: bool
+    brave_lean: Optional[bool]
+    agent_overlay: Optional[bool]
+    product: str
+    brave_executable: Any
+
+
+@dataclass
+class _LaunchPlan:
+    """What a new launch decides before Chrome starts, handed from phase to phase of
+    browser_launch. Each field is set by the phase named beside it and read by later ones.
+
+    `persistent` ends as the result reports it: privacy=True and an explicit user_data_dir
+    turn it off."""
+    persistent: Any
+    # Effective extra_args: the profile phases may inject --profile-directory into them.
+    merged_extra_args: list
+    effective_proxy: Optional[str] = None  # _launch_privacy_and_identity
+    effective_fingerprint: Optional[dict] = None
+    identity_source: str = ""
+    # Why a browser kept alive on the profile asked for was not taken over, for the result.
+    kept_note: str = ""  # _launch_kept_browser
+    explicit_udd: Optional[Path] = None  # _launch_explicit_profile
+    profile_path: Optional[Path] = None  # the profile phases; _launch_config for privacy
+    used_fallback: bool = False
+    profile_info: Optional[dict] = None  # _launch_server_profile: the resolver's answer
+    tidy_profile: Optional[Path] = None
+    # Decided before anything writes to the profile; see _launch_choice.
+    launch_choice: Optional[_LaunchChoice] = None
+    privacy_profile: Optional[Path] = None  # _launch_config
+    final_udd: Optional[str] = None
+    config: Optional[Config] = None
+    dock_note: str = ""  # _launch_prepare_profile on: notes for the result
+    cookie_move: Any = None  # _launch_prepare_profile
+    previous_app: Optional[int] = None  # _launch_keep_keyboard
+
+
+def _launch_check_arguments(browser: str, vertical_tabs: Optional[str], user_data_dir: Optional[str],
+                            extra_args: Optional[list[str]]) -> tuple:
+    """browser_launch, first: refuse a request that cannot work, before anything else runs.
+
+    Returns (product, brave_executable, user_data_dir, extra_args, problem). A --user-data-dir
+    in extra_args comes back as user_data_dir, so every later check looks at the folder the
+    browser gets."""
+    product, brave_executable, problem = brave_mode.check_request(browser, vertical_tabs)
+    if problem:
+        return product, brave_executable, user_data_dir, extra_args, problem
+    user_data_dir, extra_args, problem = _profile_from_extra_args(user_data_dir, extra_args, "user_data_dir")
+    if problem:
+        return product, brave_executable, user_data_dir, extra_args, problem
+    return product, brave_executable, user_data_dir, extra_args, _mock_keychain_refusal(extra_args)
+
+
+def _launch_default_persistent(persistent: Optional[bool], testing_mode: bool) -> tuple:
+    """persistent left unset is True, except under testing_mode. Returns (persistent, source)."""
+    # Local testing wants a clean room by default: a testing_mode run that
+    # silently accumulated state in the real login profile was both a surprise
+    # and a slow way to make tests depend on each other.
+    if persistent is None:
+        persistent = not testing_mode
+        persistent_source = (
+            "default (testing_mode → ephemeral; pass persistent=true to keep state)"
+            if testing_mode else "default"
+        )
+    else:
+        persistent_source = "explicit"
+    return persistent, persistent_source
+
+
+async def _launch_end_stale_browser() -> Optional[str]:
+    """Before the launch lock: end a browser whose handle outlived its tabs, and remove the
+    privacy profile the last browser left. Returns an error result, or None to go on."""
+    if (not BrowserState.is_up() and BrowserState.browser is not None
+            and BrowserState.current_instance_id not in _ATTACHED_BROWSERS):
+        # is_up() false does not mean Chrome stopped: closing the last tab empties tabs while
+        # the process runs and holds its profile. Launching over it loses the only handle,
+        # and a privacy profile deleted now is one that Chrome simply writes back.
+        _stale_dir, _stale_privacy = BrowserState.current_profile_dir, BrowserState.current_privacy
+        _reap = await _ensure_browser_dead(BrowserState.browser, _stale_dir)
+        if _close_incomplete(_reap):
+            return err(f"the previous browser could not be ended: {_close_failure(_reap)}. "
+                       f"Its handle and profile were kept.")
+        _stale_tabs = list(BrowserState.tabs)
+        BrowserState.reset()
+        _clear_tab_scoped_state(_stale_tabs)
+        if _stale_privacy:
+            BrowserState.current_profile_dir, BrowserState.current_privacy = _stale_dir, True
+    if not BrowserState.is_up() and BrowserState.current_privacy and BrowserState.current_profile_dir:
+        stale_profile = BrowserState.current_profile_dir
+        if not await _remove_privacy_profile(stale_profile):
+            return err(f"could not remove stale privacy profile before relaunch: {stale_profile}"
+                       f"{_removal_failure(stale_profile)}")
+        BrowserState.current_privacy = False
+        BrowserState.current_headless = False
+        BrowserState.current_fingerprint = {}
+        BrowserState.current_proxy = None
+    return None
+
+
+async def _launch_reuse_running(req: _LaunchRequest) -> Optional[str]:
+    """Inside the launch lock: answer from the browser already running, once CDP answers.
+
+    Returns the result, or None to start a new browser: none runs, or its handle was stale
+    and that browser was ended."""
+    # Re-check inside the lock (race with another concurrent call).
+    # Reusing a live browser is not just an optimisation: starting a second
+    # Chrome against the same profile is what produces "CDP unreachable",
+    # and the half-started process is what gets orphaned.
+    if not BrowserState.is_up():
+        return None
+    _running = brave_mode.product_of(BrowserState.browser)
+    if _running != req.product and _running != brave_mode.UNKNOWN:
+        return err(
+            f"{brave_mode.name(_running)} is already running as instance "
+            f"{BrowserState.current_instance_id!r}; browser={req.product!r} was not applied and "
+            f"nothing changed. browser_close() first, or spawn_browser(instance_id=..., "
+            f"browser={req.product!r}) for one alongside it.")
+    _answered = False
+    try:
+        # is_up() only proves a handle exists. The socket can be gone
+        # while Chrome still runs, so make CDP actually answer.
+        _tab = BrowserState.active_tab()
+        await _wait(_tab.evaluate("1", return_by_value=True),
+                    timeout=5, what="reuse probe")
+        _answered = True
+        reuse_head = f"reusing the running browser ({len(BrowserState.tabs)} tab(s))"
+        if req.restore_tabs:
+            reuse_head += ("; restore_tabs NOT applied, the running browser keeps its own "
+                           "tabs and nothing was reopened")
+        if req.profile_mode != "default":
+            reuse_head += (f"; profile_mode={req.profile_mode!r} NOT applied, it only "
+                           f"takes effect on a new launch")
+        _reuse_keep_note = _keep_alive_on_reuse(req.keep_alive)
+        if req.vertical_tabs is not None:
+            reuse_head += (f"; vertical_tabs={req.vertical_tabs!r} NOT applied, it only "
+                           f"takes effect on a new launch")
+        if req.brave_lean is not None:
+            reuse_head += (f"; brave_lean={req.brave_lean!r} NOT applied, it only "
+                           f"takes effect on a new launch")
+        if req.block_ads:
+            reuse_head += _adblock_module().reuse_note(req.block_ads, BrowserState.browser)
+        reuse_head += await presence.attach(
+            BrowserState.browser, _browser_process_pid(BrowserState.browser),
+            ask=req.agent_overlay, headless=BrowserState.current_headless,
+            persons_browser=_persons_browser(BrowserState.browser))
+        _doc_state, _disarm = await _arm_document_watch(_tab)
+        try:
+            if req.url and req.url != "about:blank":
+                # Honour the caller's url. Returning "already running" while
+                # silently ignoring it left them on the wrong page believing
+                # the navigation had happened.
+                await _wait(_tab.get(req.url), what="reuse navigate")
+                try:
+                    await _wait(_tab.wait(), timeout=10, what="reuse settle")
+                except Exception:
+                    pass
+            # The reuse path is a navigation too: its redirects were
+            # exactly as invisible as a fresh launch's.
+            _observed = await _observe_navigation(_tab, req.url, _disarm())
+        finally:
+            _disarm()
+        _observed["profile"] = {
+            "actual_profile": str(BrowserState.current_profile_dir)
+            if BrowserState.current_profile_dir else None,
+            "session_state_source": "reused running browser — profile unchanged",
+        }
+        return _nav_result(
+            reuse_head, _observed,
+            expect_url=req.expect_url, expect_status=req.expect_status, suffix=_reuse_keep_note,
+        )
+    except TabNotUsable as refusal:
+        # The browser is fine; only its active tab is not one the tools may use (the
+        # person's, or none is selected). Never the stale-handle path below: that ends
+        # the browser, and on one the person opened it is theirs.
+        return await _reuse_without_an_agent_tab(str(refusal), req.url, req.expect_url,
+                                                 req.expect_status, req.keep_alive)
+    except Exception as e:
+        # The browser answered, so what failed was the navigation: a bad or slow
+        # URL. Ending it here would lose every tab over a typo.
+        if _answered and not transport_lost(str(e)):
+            return err(
+                f"the running browser could not load {req.url}: {_exc_text(e)}. "
+                f"It was left open, with its tabs."
+            )
+        # The handle is stale. Relaunching on top of a half-dead Chrome
+        # is exactly the collision to avoid, so end it first.
+        _stale_privacy = (BrowserState.current_profile_dir
+                          if BrowserState.current_privacy else None)
+        _reap = await _ensure_browser_dead(
+            BrowserState.browser, BrowserState.current_profile_dir)
+        if _reap.get("still_alive"):
+            return err(
+                f"a previous browser is unreachable ({type(e).__name__}: {e}) and its "
+                f"PID(s) {_reap['still_alive']} could not be ended. Kill them, then "
+                f"retry — relaunching now would collide with them."
+            )
+        BrowserState.reset()
+        if _stale_privacy is not None and not await _remove_privacy_profile(_stale_privacy):
+            BrowserState.current_profile_dir, BrowserState.current_privacy = _stale_privacy, True
+            return err(f"could not remove stale privacy profile before relaunch: {_stale_privacy}"
+                       f"{_removal_failure(_stale_privacy)}")
+    return None
+
+
+def _launch_privacy_and_identity(req: _LaunchRequest, plan: _LaunchPlan) -> Optional[str]:
+    """Refuse privacy mode over a caller's profile, and settle the proxy and fingerprint this
+    browser gets (plan.effective_*). Returns an error result, or None to go on."""
+    if req.privacy and (req.user_data_dir or req.profile_directory or any(
+        (arg or "").startswith("--user-data-dir=") for arg in plan.merged_extra_args
+    )):
+        return err("privacy mode cannot reuse user_data_dir or profile_directory")
+    if req.privacy:
+        plan.persistent = False
+    try:
+        plan.effective_proxy, plan.effective_fingerprint, plan.identity_source = _launch_identity(
+            BrowserState.current_instance_id,
+            proxy=req.proxy,
+            user_agent=req.user_agent,
+            fingerprint=req.fingerprint,
+            privacy=req.privacy,
+        )
+    except Exception as e:
+        return err(f"identity setup failed: {e}")
+    return None
+
+
+async def _launch_explicit_profile(req: _LaunchRequest, plan: _LaunchPlan) -> Optional[str]:
+    """The caller's user_data_dir: it must exist and be free (or held by a browser of ours that
+    was kept, which is taken over), its sub-profile must exist, and the browser chosen for it
+    must pass `_profile_version_refusal`. Nothing is written to the folder here.
+
+    Returns the reattach's result or a refusal, or None to go on with the plan filled in."""
+    explicit_udd = plan.explicit_udd = Path(req.user_data_dir).expanduser()
+    if not explicit_udd.exists():
+        return err(
+            f"user_data_dir does not exist: {explicit_udd}. "
+            "Check the path. Common defaults: "
+            "~/Library/Application Support/Google/Chrome (macOS), "
+            "~/.config/google-chrome (Linux), "
+            "%LOCALAPPDATA%/Google/Chrome/User Data (Windows). "
+            "Use list_chrome_profiles to discover."
+        )
+    holder_pid = chrome_lock_holder_pid(explicit_udd)
+    if holder_pid is not None:
+        kept = _kept_verdict(explicit_udd, req.product)
+        if kept and kept.get("ok"):
+            return await _launch_by_reattach(
+                explicit_udd, kept, url=req.url, keep_alive=req.keep_alive,
+                ignored=_reattach_ignored(vars(req)), expect_url=req.expect_url,
+                expect_status=req.expect_status,
+                block_ads=req.block_ads, agent_overlay=req.agent_overlay)
+        return err(
+            f"user_data_dir {explicit_udd} is currently in use by Chrome PID {holder_pid}. "
+            "Close that Chrome window first (a single Chrome process locks the whole "
+            "user-data-dir, regardless of profile_directory). "
+            "Or use clone_chrome_profile to take a snapshot copy of the profile, "
+            "or attach_to_chrome(port=...) if Chrome was started with --remote-debugging-port."
+            + _not_reattached_note(explicit_udd, kept)
+        )
+    # Validate sub-profile if specified
+    if req.profile_directory:
+        try:
+            pd_path = _direct_child(
+                explicit_udd, req.profile_directory, "profile_directory"
+            )
+        except ValueError as e:
+            return err(str(e))
+        if not pd_path.exists():
+            avail = [p.name for p in explicit_udd.iterdir()
+                     if p.is_dir() and (p / "Preferences").exists()][:15]
+            return err(
+                f"profile_directory {req.profile_directory!r} not found inside {explicit_udd}. "
+                f"Available: {avail}"
+            )
+        plan.merged_extra_args.append(f"--profile-directory={req.profile_directory}")
+    else:
+        plan.merged_extra_args.extend(_profile_directory_args(explicit_udd, plan.merged_extra_args))
+    plan.launch_choice = _launch_choice(explicit_udd, req.headless, plan.merged_extra_args,
+                                        req.brave_executable)
+    refused = _profile_version_refusal(explicit_udd, plan.launch_choice.executable, req.product)
+    if refused:
+        return err(refused)
+    plan.persistent = False  # we're managing user_data_dir ourselves; skip default profile flow
+    plan.profile_path = explicit_udd
+    plan.used_fallback = False
+    return None
+
+
+async def _launch_kept_browser(req: _LaunchRequest, plan: _LaunchPlan) -> Optional[str]:
+    """No user_data_dir: refuse a --user-data-dir in extra_args that another Chrome holds, and
+    take over a browser a previous server of ours kept on the profile this launch asks for.
+
+    Returns the reattach's result or a refusal, or None to go on to the profile resolver;
+    plan.kept_note says why a kept browser was not taken over."""
+    # Validate user-supplied --user-data-dir BEFORE launch (saves a 30s timeout).
+    # Many users pass a Chrome profile path in extra_args that's currently
+    # held by their daily Chrome — fail fast with actionable advice.
+    custom_udd: Optional[Path] = None
+    for arg in plan.merged_extra_args:
+        if arg.startswith("--user-data-dir="):
+            custom_udd = Path(arg.split("=", 1)[1]).expanduser()
+            break
+    if custom_udd is not None:
+        holder_pid = chrome_lock_holder_pid(custom_udd) if custom_udd.exists() else None
+        if holder_pid is not None:
+            kept = _kept_verdict(custom_udd, req.product)
+            if kept and kept.get("ok"):
+                return await _launch_by_reattach(
+                    custom_udd, kept, url=req.url, keep_alive=req.keep_alive,
+                    ignored=_reattach_ignored(vars(req)), expect_url=req.expect_url,
+                    expect_status=req.expect_status,
+                    block_ads=req.block_ads, agent_overlay=req.agent_overlay)
+            return err(
+                f"Profile directory is locked by another Chrome process: "
+                f"{custom_udd} (PID {holder_pid}). Close that Chrome window first, "
+                f"OR use clone_chrome_profile to make a snapshot copy, "
+                f"OR use the user_data_dir parameter (with same fail-fast lock check), "
+                f"OR omit --user-data-dir to use the default MCP profile, "
+                f"OR use attach_to_chrome(port=...) if Chrome was started with debug port."
+                + _not_reattached_note(custom_udd, kept)
+            )
+
+    # A browser a previous server of ours kept alive on the profile this launch asks
+    # for is taken over, not raced: falling back would hide its tabs and logins.
+    if plan.persistent and custom_udd is None:
+        _own_folder = _server_profile_for(BrowserState.current_instance_id, req.product)
+        for _candidate in _kept_candidates(BrowserState.current_instance_id, req.product):
+            # Only the folder the server chose itself: a caller's --user-data-dir that
+            # became main's affinity after a custom reattach is never taken as an orphan.
+            _adopt = (BrowserState.current_instance_id
+                      if _keep_alive.profile_key(_candidate) == _own_folder else None)
+            _kept = _kept_verdict(_candidate, req.product, adopt_orphan_for=_adopt)
+            if _kept and _kept.get("ok"):
+                _taken = await _launch_by_reattach(
+                    _candidate, _kept, url=req.url, keep_alive=req.keep_alive,
+                    ignored=_reattach_ignored(vars(req)), expect_url=req.expect_url,
+                    expect_status=req.expect_status,
+                    block_ads=req.block_ads, agent_overlay=req.agent_overlay)
+                if not (_taken.startswith("Error") and _orphan_given_back(_candidate, _kept)):
+                    return _taken
+                # An orphan that could not be taken over: the launch goes on as it did
+                # before the takeover existed (a fallback, saying so), not an error on
+                # every launch until that Chrome ends.
+                plan.kept_note += (f" [a browser of ours left running on {_candidate} could not "
+                                   f"be taken over: {_taken[len('Error: '):][:300]}]")
+                continue
+            plan.kept_note += _not_reattached_note(_candidate, _kept)
+    return None
+
+
+def _launch_server_profile(req: _LaunchRequest, plan: _LaunchPlan, resolved_profile: Optional[Path],
+                           profile_info: dict) -> Optional[str]:
+    """The profile the resolver chose for this instance: main's affinity, then for a persistent
+    one the lock, the browser chosen for it and `_profile_version_refusal`. Nothing is written
+    to the folder here.
+
+    Returns a refusal, or None to go on with the plan filled in."""
+    plan.profile_info = profile_info
+    if profile_info.get("error"):
+        return err(profile_info["error"])
+    # None for an ephemeral launch. Recording the shared profile here instead made
+    # browser_close scan it and signal whichever Chrome really was using it: the
+    # browser of another session, with its logins.
+    plan.profile_path = resolved_profile
+    plan.used_fallback = bool(plan.persistent) and "conflict_with_pid" in profile_info
+    if plan.persistent and BrowserState.current_instance_id == "main" and req.product == brave_mode.CHROME:
+        from .state import set_profile_affinity
+        set_profile_affinity(plan.profile_path)
+
+    # Friendly upfront check on the default profile too (after resolve_default_profile
+    # has potentially picked a fallback). If somehow the resolved one is still locked
+    # by a live process, refuse with actionable error rather than hanging.
+    if plan.persistent:
+        holder_pid = chrome_lock_holder_pid(plan.profile_path)
+        if holder_pid is not None:
+            return err(
+                f"Default MCP profile is locked by PID {holder_pid}. "
+                f"This usually means another mcp-stealth-chrome instance is running. "
+                f"Run `pkill -f mcp-stealth-chrome` then retry, or use persistent=False "
+                f"for an ephemeral throwaway profile."
+            )
+        # Before the window-state wipe below writes to it: a refused profile stays as it was.
+        plan.launch_choice = _launch_choice(plan.profile_path, req.headless, plan.merged_extra_args,
+                                            req.brave_executable)
+        refused = _profile_version_refusal(plan.profile_path, plan.launch_choice.executable, req.product)
+        if refused:
+            return err(refused)
+        # clean_profile_state and the window-state wipe write to the profile, so they
+        # wait until the cookie checks below have passed: a refusal writes nothing.
+        plan.tidy_profile = plan.profile_path
+    return None
+
+
+def _launch_config(req: _LaunchRequest, plan: _LaunchPlan) -> None:
+    """The folder the browser gets (a privacy launch makes its new profile here) and the flags
+    it starts with, into plan.config."""
+    # Determine final user_data_dir for Config (None = nodriver picks a temp dir).
+    if req.privacy:
+        plan.privacy_profile = _new_privacy_profile(BrowserState.current_instance_id)
+        plan.profile_path = plan.privacy_profile
+        plan.final_udd = str(plan.privacy_profile)
+    elif plan.explicit_udd is not None:
+        plan.final_udd = str(plan.explicit_udd)
+    elif plan.persistent:
+        plan.final_udd = str(plan.profile_path)
+    else:
+        plan.final_udd = None
+
+    # nodriver 0.50 never passes Config.lang on, and macOS Chrome ignores --lang. The
+    # override applied to the tab below is what actually changes it.
+    if req.lang and req.lang != "en-US" and not plan.effective_fingerprint.get("accept_language"):
+        plan.effective_fingerprint = {**plan.effective_fingerprint, "accept_language": req.lang}
+    config = plan.config = Config(
+        user_data_dir=plan.final_udd,
+        headless=req.headless,
+        lang=(plan.effective_fingerprint.get("accept_language", "").split(",")[0] or req.lang),
+        browser_args=list(plan.merged_extra_args),
+    )
+    # Extra flags to suppress any first-run / restore / notification interrupts
+    config.add_argument("--hide-crash-restore-bubble")
+    config.add_argument("--disable-session-crashed-bubble")
+    config.add_argument("--disable-restore-session-state")
+    config.add_argument("--no-default-browser-check")
+    for _flag in _LEAN_FLAGS:
+        config.add_argument(_flag)
+    if plan.effective_fingerprint.get("user_agent"):
+        config.add_argument(f"--user-agent={plan.effective_fingerprint['user_agent']}")
+    if plan.effective_proxy:
+        config.add_argument(f"--proxy-server={plan.effective_proxy}")
+    config.add_argument(f"--window-size={req.window_width},{req.window_height}")
+    if req.headless:
+        _screen_arg = _headless_screen_arg(req.window_width, req.window_height, plan.merged_extra_args)
+        if _screen_arg:
+            config.add_argument(_screen_arg)
+    # Force a deterministic on-screen position. Without this, Chrome
+    # restores its last saved position from the persistent profile —
+    # which after a macOS sleep/wake cycle is often off-screen or 0×0,
+    # making the window invisible and CDP Browser.getWindowForTarget
+    # return -32000 "window not found". Override unless the user
+    # already supplied their own --window-position via extra_args.
+    if not any((a or "").startswith("--window-position=")
+                for a in plan.merged_extra_args):
+        config.add_argument("--window-position=100,100")
+    if req.profile_mode == "light":
+        for _flag in LIGHT_MODE_FLAGS:
+            config.add_argument(_flag)
+    if req.testing_mode:
+        for _flag in (
+            "--blink-settings=imagesEnabled=false",
+            _disable_features_arg(config, ("Translate", "BackForwardCache", "AcceptCHFrame")),
+            "--disable-background-timer-throttling",
+            "--disable-renderer-backgrounding",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-ipc-flooding-protection",
+            "--disable-notifications",
+            "--autoplay-policy=user-gesture-required",
+            "--mute-audio",
+        ):
+            config.add_argument(_flag)
+
+
+async def _launch_prepare_profile(req: _LaunchRequest, plan: _LaunchPlan) -> Optional[str]:
+    """Pick the executable (the Dock icon's Beta or not), refuse it when it may not open the
+    profile, prepare the cookie move (it writes nothing in the profile), and write the
+    vertical tabs and brave_lean settings. The notes go to plan.dock_note.
+
+    Returns a refusal (the privacy profile removed), or None to go on."""
+    config = plan.config
+    if plan.launch_choice is None:
+        plan.launch_choice = _launch_choice(plan.profile_path, req.headless, plan.merged_extra_args,
+                                            req.brave_executable)
+    plan.dock_note = await _use_dock_icon_browser(config, req.headless, plan.launch_choice)
+    refused = _profile_version_refusal(plan.profile_path, config.browser_executable_path, req.product)
+    if refused:
+        await _remove_privacy_profile(plan.privacy_profile)
+        return err(refused)
+    with contextlib.suppress(Exception):
+        plan.dock_note += profile_version.upgrade_note(plan.profile_path, config.browser_executable_path)
+    cookie_move = plan.cookie_move = await _prepare_cookie_move(plan.profile_path, config)
+    if cookie_move.refuse:
+        await _remove_privacy_profile(plan.privacy_profile)
+        return err(cookie_move.refuse)
+    if cookie_move.flag:
+        config.add_argument(_cookie_flag_arg(config))
+    if not cookie_move.backup:
+        plan.dock_note += cookie_move.note
+    try:
+        plan.dock_note += _browser_note(config, req.product) + brave_mode.write_vertical_tabs(
+            Path(config.user_data_dir), config.browser_args, req.product, req.vertical_tabs)
+    except Exception as e:
+        await _remove_privacy_profile(plan.privacy_profile)
+        return err(f"vertical_tabs could not be written into the profile, so nothing was "
+                   f"started: {_exc_text(e)}")
+    plan.dock_note += _apply_brave_lean(config, req.product, req.brave_lean,
+                                        server_chosen=plan.explicit_udd is None)
+    return None
+
+
+async def _launch_keep_keyboard(req: _LaunchRequest, plan: _LaunchPlan) -> None:
+    """A headed browser must not take the keyboard: note the app in front, to give it back,
+    and start without a window of its own."""
+    # Read before Chrome starts, while the person's app is still the frontmost one.
+    plan.previous_app = None if req.headless else await asyncio.to_thread(_frontmost_pid)
+    if not req.headless:
+        for _flag in _BACKGROUND_WINDOW_FLAGS:
+            plan.config.add_argument(_flag)
+
+
+async def _launch_commit_profile(plan: _LaunchPlan) -> Optional[str]:
+    """The first writes to the profile: the cookie move's commit, then the tidy-up of locks and
+    window state, only once every check has passed. Returns a refusal, or None to go on."""
+    # The preflight, the commit and the tidy-up stay in this order: a refusal writes nothing.
+    refused = await _cookie_preflight(plan.profile_path, plan.cookie_move) \
+        or await _commit_cookie_move(plan.profile_path, plan.cookie_move)
+    if refused:
+        await _remove_privacy_profile(plan.privacy_profile)
+        return err(refused)
+    if plan.tidy_profile is not None:
+        clean_profile_state(plan.tidy_profile)  # only clears stale locks
+        # Selectively wipe corrupt window-placement / session-restore state. Idempotent and
+        # cheap (a few file writes), preserves cookies and logins. Saves us from "window
+        # 0x0, hidden" bugs that survive macOS sleep/wake cycles. See state.wipe_window_state.
+        with contextlib.suppress(Exception):
+            from .state import wipe_window_state as _wws
+            _wws(plan.tidy_profile)
+    return None
+
+
+async def _launch_start_chrome(req: _LaunchRequest, plan: _LaunchPlan) -> tuple:
+    """Start the browser on plan.config, after a last look at the profile's cookie databases.
+
+    Returns (error result or None, the browser, the ad blocker waiting for it). A start that
+    failed ends what it started and removes the privacy profile."""
+    # The last look, as close to the start as this server can make it; Chrome takes the lock
+    # about half a second later, and that gap is a known limit (no lock it honours can be
+    # held across it).
+    refused = await _cookie_preflight(plan.profile_path, plan.cookie_move)
+    if refused:
+        return err(refused), None, None
+    ads_pending = (_adblock_module().begin(req.block_ads, plan.config.browser_executable_path)
+                   if req.block_ads else None)
+    browser: Optional[Browser] = None
+    try:
+        browser = await _start_chrome(plan.config)
+        _mark_allow_origins(browser, plan.config)
+        brave_mode.mark(browser, req.product)
+        if not req.headless:
+            await _open_background_window(browser, req.window_width, req.window_height)
+    except asyncio.TimeoutError:
+        await _safe_stop_browser(browser)
+        await _remove_privacy_profile(plan.privacy_profile)
+        return err(
+            f"launch timed out after {BROWSER_LAUNCH_TIMEOUT}s — "
+            f"profile {plan.profile_path} may be locked by another Chrome, or "
+            f"Chrome is hung. Kill any stale Chrome processes and retry."
+        ), None, None
+    except asyncio.CancelledError:
+        await _safe_stop_browser(browser)
+        await _remove_privacy_profile(plan.privacy_profile)
+        raise
+    except Exception as e:
+        # "CDP unreachable" means the process very likely STARTED and only
+        # the websocket failed — so _safe_stop_browser, which speaks CDP,
+        # cannot end it. Reaping our own PID here is the difference between
+        # a failed launch and a failed launch plus an orphan nobody owns.
+        reap = getattr(e, "reap_report", {})
+        await _remove_privacy_profile(plan.privacy_profile)
+        # Diagnose common nodriver "Failed to connect to browser" — usually
+        # means Chrome started but its CDP websocket couldn't be reached
+        # (profile locked, port collision, AV interference).
+        msg = str(e)
+        hint = ""
+        if "Failed to connect" in msg or "websocket" in msg.lower() or "connection refused" in msg.lower():
+            holder = chrome_lock_holder_pid(plan.profile_path) if plan.persistent else None
+            ext = find_external_chrome_pids()
+            parts = [f"launch failed (Chrome started but CDP unreachable): {msg}"]
+            if reap.get("killed"):
+                parts.append(
+                    f"→ Reaped the Chrome this launch started (PID(s) {reap['killed']}), "
+                    f"so it is not left behind.")
+            if reap.get("still_alive"):
+                parts.append(
+                    f"→ WARNING: PID(s) {reap['still_alive']} survived and are orphaned.")
+            if holder is not None:
+                parts.append(f"→ Profile {plan.profile_path} is locked by PID {holder}.")
+            elif ext:
+                parts.append(f"→ Other Chrome processes running: PIDs {ext[:5]}{'...' if len(ext)>5 else ''}.")
+            parts.append(
+                "Retried once. Chrome did not open its debugging port in time, which "
+                "usually means the machine is busy or Chrome is updating, so trying "
+                "again shortly often works."
+                + (" If this profile is in use, persistent=False or "
+                   "clone_chrome_profile gives an isolated one." if plan.persistent else "")
+            )
+            hint = " ".join(parts)
+        return err(hint or f"launch failed: {e}"), None, None
+    return None, browser, ads_pending
+
+
+async def _launch_ready_browser(req: _LaunchRequest, plan: _LaunchPlan, browser: Any,
+                                ads_pending: Any) -> Optional[str]:
+    """The started browser becomes this instance's, and what must be in place before its first
+    navigation is put there: the ad blocker, the overlay, the moved cookies, the storage state.
+
+    Returns an error result (the browser closed or stopped first), or None to go on."""
+    BrowserState.browser = browser
+    # Before the first navigation, so its own requests are already looked at.
+    if ads_pending is not None:
+        plan.dock_note += await _adblock_module().attach(
+            ads_pending, browser, BrowserState.current_instance_id, BrowserState.session_key())
+    plan.dock_note += await presence.attach(browser, _browser_process_pid(browser), ask=req.agent_overlay,
+                                            headless=req.headless)
+
+    if plan.cookie_move.backup is not None:
+        moved, moved_text = await _finish_cookie_move(browser, Path(str(plan.profile_path)), plan.cookie_move)
+        if not moved:
+            # Left running, the next browser_launch reuses it and never tries the move again.
+            return err(f"its cookies were not all moved: {moved_text}. "
+                       f"{await _close_after_cookie_failure(browser, plan.profile_path)}")
+        plan.dock_note += moved_text
+
+    if req.storage_state_path:
+        try:
+            await _apply_storage_state(BrowserState.browser, req.storage_state_path)
+        except asyncio.CancelledError:
+            await _safe_stop_browser(BrowserState.browser)
+            BrowserState.reset()
+            await _remove_privacy_profile(plan.privacy_profile)
+            raise
+        except Exception as e:
+            await _safe_stop_browser(BrowserState.browser)
+            BrowserState.reset()
+            await _remove_privacy_profile(plan.privacy_profile)
+            return err(f"storage_state load failed: {e}")
+    return None
+
+
+async def _launch_first_page(req: _LaunchRequest, plan: _LaunchPlan) -> tuple:
+    """The identity goes on the first tab, and the caller's url loads there.
+
+    Returns (error result or None, the tab, what the load observed). On an error the browser
+    was stopped and the privacy profile removed."""
+    try:
+        await asyncio.sleep(0.5)
+        main = await _first_live_tab(BrowserState.browser)
+        await _apply_fingerprint_to_tab(main, plan.effective_fingerprint)
+        if req.profile_mode == "light" or req.testing_mode:
+            # The first document after startup still loads images despite the flag;
+            # every later one obeys it.
+            await asyncio.wait_for(main.get("about:blank"), timeout=BROWSER_NAV_TIMEOUT)
+        _doc_state, _disarm = await _arm_document_watch(main)
+        try:
+            await asyncio.wait_for(main.get(req.url), timeout=BROWSER_NAV_TIMEOUT)
+            await _wait_load_complete(main, 3)  # best effort; ready_state is reported
+            # Saying "Loaded /admin" after a redirect to /login leaves the caller
+            # reading a page it never asked for, and expect_* went unchecked.
+            _launch_observed = await _observe_navigation(main, req.url, _disarm())
+        finally:
+            _disarm()
+    except asyncio.TimeoutError:
+        await _safe_stop_browser(BrowserState.browser)
+        BrowserState.reset()
+        await _remove_privacy_profile(plan.privacy_profile)
+        return err(
+            f"initial nav timed out after {BROWSER_NAV_TIMEOUT}s — Chrome "
+            f"started but couldn't load {req.url}. Check network/proxy."
+        ), None, None
+    except asyncio.CancelledError:
+        await _safe_stop_browser(BrowserState.browser)
+        BrowserState.reset()
+        await _remove_privacy_profile(plan.privacy_profile)
+        raise
+    except Exception as e:
+        await _safe_stop_browser(BrowserState.browser)
+        BrowserState.reset()
+        await _remove_privacy_profile(plan.privacy_profile)
+        return err(f"initial nav failed: {e}"), None, None
+    return None, main, _launch_observed
+
+
+def _launch_record_browser(req: _LaunchRequest, plan: _LaunchPlan, browser: Any, main: Any) -> None:
+    """The instance's state names the new browser: its tab, profile, identity, idle timeout,
+    and for a headed one the watch for its windows."""
+    BrowserState.tabs = [main]
+    BrowserState.own(BrowserState.tabs)  # opened or taken over by this server
+    BrowserState.active_tab_index = 0
+    BrowserState.current_profile_dir = plan.profile_path
+    BrowserState.current_headless = req.headless
+    BrowserState.current_privacy = req.privacy
+    BrowserState.current_fingerprint = dict(plan.effective_fingerprint)
+    BrowserState.current_proxy = plan.effective_proxy
+    # A stdio browser_launch is not idle-reaped: it is what the person is looking at,
+    # and the server exits with its client anyway. The timeout has to be cleared and not
+    # merely the reaper left off, because any spawn_browser starts the reaper, which
+    # then closed this browser too. Over HTTP a client can vanish, so the reaper is what
+    # eventually ends its browser.
+    BrowserState.current_idle_timeout = (DEFAULT_IDLE_TIMEOUT if BrowserState.http_mode()
+                                         and not _persons_browser(BrowserState.browser) else 0)
+    if BrowserState.http_mode():
+        _ensure_idle_reaper_running()
+    BrowserState.window_closed.pop(BrowserState.current_instance_id, None)
+    if not req.headless:
+        _watch_windows(browser)
+
+
+def _launch_keep_alive(req: _LaunchRequest, plan: _LaunchPlan, browser: Any) -> str:
+    """keep_alive for the new browser (its record written when asked), and the notes on the
+    profile: the fallback, a kept browser not taken over, the allowed origins."""
+    suffix = (
+        f" [{plan.profile_info.get('session_state_source')}]"
+        if plan.used_fallback else ""
+    )
+    suffix += plan.kept_note
+    _keep, _keep_note = _keep_alive_decision(req.keep_alive, plan.final_udd, req.privacy, req.headless)
+    if _keep:
+        _failed = _arm_keep_alive(browser, plan.final_udd, BrowserState.current_instance_id,
+                                  req.headless, plan.effective_fingerprint)
+        _keep_note = _failed or _keep_note
+        if not _failed and plan.used_fallback:
+            _keep_note += (f" [it runs on the fallback profile {plan.final_udd}, which no later default "
+                           f"launch asks for: reattach with user_data_dir={plan.final_udd!r}]")
+    suffix += _keep_note
+    suffix += _allow_origins_note(browser)
+    return suffix
+
+
+async def _launch_window_health(req: _LaunchRequest, main: Any) -> str:
+    """A headed window that came up degenerate, nudged once and reported. Returns the note."""
+    # Post-launch health check — degenerate window detection.
+    # After a macOS sleep/wake cycle (or some persistent-profile state
+    # corruption) Chrome can come up with outerWidth==0, position
+    # off-screen, or visibilityState=='hidden'. Tools work but every
+    # mouse_click_xy / set_viewport_size fails with cryptic CDP errors.
+    # Detect once + try a single bring_to_front; report rather than fix
+    # silently so the caller knows when to call browser_recover().
+    health_suffix = ""
+    if not req.headless:
+        try:
+            probe = await _wait(main.evaluate(
+                "JSON.stringify({w:window.outerWidth,h:window.outerHeight,"
+                "v:document.visibilityState,sx:window.screenX,sy:window.screenY})"
+            ), timeout=2.0, what="health probe")
+            hv = json.loads(probe) if isinstance(probe, str) else (probe or {})
+            if hv.get("w", 1) == 0 or hv.get("h", 1) == 0 or hv.get("v") == "hidden":
+                # One nudge — restore the window without raising it, and re-probe. Taking
+                # the foreground to check on a window is what this launch must not do.
+                with contextlib.suppress(Exception):
+                    _window_id, _bounds = await main.get_window()
+                    await main.set_window_state(state="normal")
+                try:
+                    probe2 = await _wait(main.evaluate(
+                        "JSON.stringify({w:window.outerWidth,h:window.outerHeight,"
+                        "v:document.visibilityState})"
+                    ), timeout=2.0, what="health re-probe")
+                    hv2 = json.loads(probe2) if isinstance(probe2, str) else (probe2 or {})
+                except Exception:
+                    hv2 = hv
+                if hv2.get("w", 1) == 0 or hv2.get("h", 1) == 0 or hv2.get("v") == "hidden":
+                    health_suffix = (
+                        f" [⚠ window degenerate (w={hv2.get('w')},h={hv2.get('h')},"
+                        f"v={hv2.get('v')}) — likely sleep/wake corruption. "
+                        f"Run browser_recover() then browser_launch() to recover.]"
+                    )
+        except Exception:
+            pass  # health probe is best-effort; never block launch
+    return health_suffix
+
+
+async def _launch_auto_verify(req: _LaunchRequest, main: Any) -> str:
+    """auto_verify: a Cloudflare challenge on the first page, answered once. Returns the note."""
+    verify_suffix = ""
+    if req.auto_verify:
+        try:
+            verify_suffix = await asyncio.wait_for(_auto_verify_cf(main), timeout=30.0)
+        except Exception:
+            verify_suffix = ""
+    return verify_suffix
+
+
+async def _launch_place_window(req: _LaunchRequest, plan: _LaunchPlan, main: Any) -> str:
+    """The window goes back where this instance's was last time. Returns the note."""
+    # Put the window back where it was last time. Headless has no window to
+    # place, and an explicit --window-position means the caller has already
+    # decided — neither should be overridden.
+    place_suffix = ""
+    if not req.headless and not any(
+        (a or "").startswith("--window-position=") for a in plan.merged_extra_args
+    ):
+        try:
+            asked = ((req.window_width, req.window_height)
+                     if (req.window_width, req.window_height) != _DEFAULT_WINDOW else None)
+            placed = await _restore_window_bounds(
+                BrowserState.current_instance_id, main, size=asked)
+            if placed.get("restored"):
+                act = placed.get("actual") or {}
+                place_suffix = (
+                    f" [window {'clamped to a connected display' if placed.get('clamped') else 'restored'}"
+                    f" at ({act.get('left')},{act.get('top')}) {act.get('width')}x{act.get('height')}"
+                    + (", the size asked for on this launch" if asked else "") + "]"
+                )
+        except Exception:
+            pass  # placement is a convenience; never fail a launch over it
+    return place_suffix
+
+
+async def _launch_restore_tabs(req: _LaunchRequest, plan: _LaunchPlan, browser: Any, main: Any,
+                               observed: dict) -> tuple:
+    """restore_tabs: the saved tabs reopen beside the first one. Returns (the note, what the
+    launch observed, with the restore's report added when it ran)."""
+    restore_suffix = ""
+    if req.restore_tabs:
+        try:
+            _all_tabs, _select, _report, restore_suffix = await _reopen_saved_tabs(
+                BrowserState.current_instance_id, browser, main, plan.profile_path, req.privacy,
+                req.headless, plan.effective_fingerprint, req.url, req.window_width, req.window_height)
+            BrowserState.tabs = _all_tabs
+            BrowserState.own(BrowserState.tabs)  # opened or taken over by this server
+            BrowserState.active_tab_index = _select
+            observed = {**observed, "restore_tabs": _report}
+        except Exception as e:
+            restore_suffix = f" [restore_tabs: failed: {_exc_text(e)}]"
+    return restore_suffix, observed
+
+
+def _launch_result(req: _LaunchRequest, plan: _LaunchPlan, observed: dict, *, suffix: str,
+                   verify_suffix: str, health_suffix: str, place_suffix: str, restore_suffix: str) -> str:
+    """The launch's result: the fallback warning first, what was launched and what the first
+    load observed (checked against expect_url and expect_status), then every note."""
+    profile_info = plan.profile_info
+    return _nav_result(
+        (f"WARNING: EMPTY FALLBACK PROFILE, your saved logins are NOT here "
+         f"({profile_info.get('holder') or 'another Chrome'} holds "
+         f"{profile_info.get('desired_profile')}); do not log in again here, that splits the "
+         f"logins over two folders. "
+         if plan.used_fallback and str(profile_info.get("session_state_source") or "").startswith("FALLBACK")
+         else "") +
+        f"Browser launched (headless={req.headless}, persistent={plan.persistent}, "
+        f"privacy={req.privacy}, identity={plan.identity_source}). Loaded",
+        observed,
+        expect_url=req.expect_url, expect_status=req.expect_status,
+        suffix=f"{suffix}{verify_suffix}{health_suffix}{place_suffix}{restore_suffix}{plan.dock_note}",
+    )
+
+
 @mcp.tool()
 @instance_notes.names_the_instance
 async def browser_launch(
@@ -4201,54 +5074,27 @@ async def browser_launch(
             unless set (`mcp-stealth-chrome settings`, or MCP_STEALTH_AGENT_OVERLAY=1). Needs the os-cursor extra (PyObjC); without it, headless, or on a
             browser the person opened from the launcher, the result says it is off and why.
     """
-    product, brave_executable, problem = brave_mode.check_request(browser, vertical_tabs)
+    product, brave_executable, user_data_dir, extra_args, problem = _launch_check_arguments(
+        browser, vertical_tabs, user_data_dir, extra_args)
     if problem:
         return err(problem)
-    user_data_dir, extra_args, problem = _profile_from_extra_args(user_data_dir, extra_args, "user_data_dir")
-    if problem:
-        return err(problem)
-    problem = _mock_keychain_refusal(extra_args)
-    if problem:
-        return err(problem)
-    # Local testing wants a clean room by default: a testing_mode run that
-    # silently accumulated state in the real login profile was both a surprise
-    # and a slow way to make tests depend on each other.
-    if persistent is None:
-        persistent = not testing_mode
-        persistent_source = (
-            "default (testing_mode → ephemeral; pass persistent=true to keep state)"
-            if testing_mode else "default"
-        )
-    else:
-        persistent_source = "explicit"
+    persistent, _persistent_source = _launch_default_persistent(persistent, testing_mode)
+    req = _LaunchRequest(
+        url=url, headless=headless, proxy=proxy, user_agent=user_agent, window_width=window_width,
+        window_height=window_height, lang=lang, extra_args=extra_args,
+        storage_state_path=storage_state_path, testing_mode=testing_mode, auto_verify=auto_verify,
+        user_data_dir=user_data_dir, profile_directory=profile_directory, fingerprint=fingerprint,
+        privacy=privacy, profile_conflict=profile_conflict, expect_url=expect_url,
+        expect_status=expect_status, profile_mode=profile_mode, restore_tabs=restore_tabs,
+        keep_alive=keep_alive, vertical_tabs=vertical_tabs, block_ads=block_ads,
+        brave_lean=brave_lean, agent_overlay=agent_overlay, product=product,
+        brave_executable=brave_executable)
     # No early "already running" return here. It short-circuited the reuse path
     # below — the one that probes CDP and honours the caller's url — so a launch
     # against a live browser answered "already running" and left the caller on
     # whatever page happened to be open, believing the navigation had happened.
-    if (not BrowserState.is_up() and BrowserState.browser is not None
-            and BrowserState.current_instance_id not in _ATTACHED_BROWSERS):
-        # is_up() false does not mean Chrome stopped: closing the last tab empties tabs while
-        # the process runs and holds its profile. Launching over it loses the only handle,
-        # and a privacy profile deleted now is one that Chrome simply writes back.
-        _stale_dir, _stale_privacy = BrowserState.current_profile_dir, BrowserState.current_privacy
-        _reap = await _ensure_browser_dead(BrowserState.browser, _stale_dir)
-        if _close_incomplete(_reap):
-            return err(f"the previous browser could not be ended: {_close_failure(_reap)}. "
-                       f"Its handle and profile were kept.")
-        _stale_tabs = list(BrowserState.tabs)
-        BrowserState.reset()
-        _clear_tab_scoped_state(_stale_tabs)
-        if _stale_privacy:
-            BrowserState.current_profile_dir, BrowserState.current_privacy = _stale_dir, True
-    if not BrowserState.is_up() and BrowserState.current_privacy and BrowserState.current_profile_dir:
-        stale_profile = BrowserState.current_profile_dir
-        if not await _remove_privacy_profile(stale_profile):
-            return err(f"could not remove stale privacy profile before relaunch: {stale_profile}"
-                       f"{_removal_failure(stale_profile)}")
-        BrowserState.current_privacy = False
-        BrowserState.current_headless = False
-        BrowserState.current_fingerprint = {}
-        BrowserState.current_proxy = None
+    if (stop := await _launch_end_stale_browser()) is not None:
+        return stop
 
     if _LAUNCH_LOCK.locked():
         return err("another launch is already in progress — wait for it to finish")
@@ -4258,650 +5104,65 @@ async def browser_launch(
     async with _LAUNCH_LOCK, launch_lock.reserve(_reserved, BROWSER_LAUNCH_TIMEOUT) as _busy:
         if _busy:
             return err(_busy)
-        # Re-check inside the lock (race with another concurrent call).
-        # Reusing a live browser is not just an optimisation: starting a second
-        # Chrome against the same profile is what produces "CDP unreachable",
-        # and the half-started process is what gets orphaned.
-        if BrowserState.is_up():
-            _running = brave_mode.product_of(BrowserState.browser)
-            if _running != product and _running != brave_mode.UNKNOWN:
-                return err(
-                    f"{brave_mode.name(_running)} is already running as instance "
-                    f"{BrowserState.current_instance_id!r}; browser={product!r} was not applied and "
-                    f"nothing changed. browser_close() first, or spawn_browser(instance_id=..., "
-                    f"browser={product!r}) for one alongside it.")
-            _answered = False
-            try:
-                # is_up() only proves a handle exists. The socket can be gone
-                # while Chrome still runs, so make CDP actually answer.
-                _tab = BrowserState.active_tab()
-                await _wait(_tab.evaluate("1", return_by_value=True),
-                            timeout=5, what="reuse probe")
-                _answered = True
-                reuse_head = f"reusing the running browser ({len(BrowserState.tabs)} tab(s))"
-                if restore_tabs:
-                    reuse_head += ("; restore_tabs NOT applied, the running browser keeps its own "
-                                   "tabs and nothing was reopened")
-                if profile_mode != "default":
-                    reuse_head += (f"; profile_mode={profile_mode!r} NOT applied, it only "
-                                   f"takes effect on a new launch")
-                _reuse_keep_note = _keep_alive_on_reuse(keep_alive)
-                if vertical_tabs is not None:
-                    reuse_head += (f"; vertical_tabs={vertical_tabs!r} NOT applied, it only "
-                                   f"takes effect on a new launch")
-                if brave_lean is not None:
-                    reuse_head += (f"; brave_lean={brave_lean!r} NOT applied, it only "
-                                   f"takes effect on a new launch")
-                if block_ads:
-                    reuse_head += _adblock_module().reuse_note(block_ads, BrowserState.browser)
-                reuse_head += await presence.attach(
-                    BrowserState.browser, _browser_process_pid(BrowserState.browser),
-                    ask=agent_overlay, headless=BrowserState.current_headless,
-                    persons_browser=_persons_browser(BrowserState.browser))
-                _doc_state, _disarm = await _arm_document_watch(_tab)
-                try:
-                    if url and url != "about:blank":
-                        # Honour the caller's url. Returning "already running" while
-                        # silently ignoring it left them on the wrong page believing
-                        # the navigation had happened.
-                        await _wait(_tab.get(url), what="reuse navigate")
-                        try:
-                            await _wait(_tab.wait(), timeout=10, what="reuse settle")
-                        except Exception:
-                            pass
-                    # The reuse path is a navigation too: its redirects were
-                    # exactly as invisible as a fresh launch's.
-                    _observed = await _observe_navigation(_tab, url, _disarm())
-                finally:
-                    _disarm()
-                _observed["profile"] = {
-                    "actual_profile": str(BrowserState.current_profile_dir)
-                    if BrowserState.current_profile_dir else None,
-                    "session_state_source": "reused running browser — profile unchanged",
-                }
-                return _nav_result(
-                    reuse_head, _observed,
-                    expect_url=expect_url, expect_status=expect_status, suffix=_reuse_keep_note,
-                )
-            except TabNotUsable as refusal:
-                # The browser is fine; only its active tab is not one the tools may use (the
-                # person's, or none is selected). Never the stale-handle path below: that ends
-                # the browser, and on one the person opened it is theirs.
-                return await _reuse_without_an_agent_tab(str(refusal), url, expect_url,
-                                                         expect_status, keep_alive)
-            except Exception as e:
-                # The browser answered, so what failed was the navigation: a bad or slow
-                # URL. Ending it here would lose every tab over a typo.
-                if _answered and not transport_lost(str(e)):
-                    return err(
-                        f"the running browser could not load {url}: {_exc_text(e)}. "
-                        f"It was left open, with its tabs."
-                    )
-                # The handle is stale. Relaunching on top of a half-dead Chrome
-                # is exactly the collision to avoid, so end it first.
-                _stale_privacy = (BrowserState.current_profile_dir
-                                  if BrowserState.current_privacy else None)
-                _reap = await _ensure_browser_dead(
-                    BrowserState.browser, BrowserState.current_profile_dir)
-                if _reap.get("still_alive"):
-                    return err(
-                        f"a previous browser is unreachable ({type(e).__name__}: {e}) and its "
-                        f"PID(s) {_reap['still_alive']} could not be ended. Kill them, then "
-                        f"retry — relaunching now would collide with them."
-                    )
-                BrowserState.reset()
-                if _stale_privacy is not None and not await _remove_privacy_profile(_stale_privacy):
-                    BrowserState.current_profile_dir, BrowserState.current_privacy = _stale_privacy, True
-                    return err(f"could not remove stale privacy profile before relaunch: {_stale_privacy}"
-                               f"{_removal_failure(_stale_privacy)}")
+        if (stop := await _launch_reuse_running(req)) is not None:
+            return stop
 
         ensure_dirs()
 
-        # Build effective extra_args (we may inject --profile-directory into them).
-        merged_extra_args = list(extra_args or [])
-        if privacy and (user_data_dir or profile_directory or any(
-            (arg or "").startswith("--user-data-dir=") for arg in merged_extra_args
-        )):
-            return err("privacy mode cannot reuse user_data_dir or profile_directory")
-        if privacy:
-            persistent = False
-        try:
-            effective_proxy, effective_fingerprint, identity_source = _launch_identity(
-                BrowserState.current_instance_id,
-                proxy=proxy,
-                user_agent=user_agent,
-                fingerprint=fingerprint,
-                privacy=privacy,
-            )
-        except Exception as e:
-            return err(f"identity setup failed: {e}")
-
-        # Why a browser kept alive on the profile asked for was not taken over, for the result.
-        kept_note = ""
+        plan = _LaunchPlan(persistent=persistent, merged_extra_args=list(extra_args or []))
+        if (stop := _launch_privacy_and_identity(req, plan)) is not None:
+            return stop
+        # The launch choice and every refusal come before anything writes to the profile.
         # If the user passed user_data_dir explicitly, that takes precedence over
         # both `persistent` and any --user-data-dir already in extra_args.
-        explicit_udd: Optional[Path] = None
-        tidy_profile: Optional[Path] = None
-        # Decided before anything writes to the profile; see _launch_choice.
-        launch_choice: Optional[_LaunchChoice] = None
         if user_data_dir:
-            explicit_udd = Path(user_data_dir).expanduser()
-            if not explicit_udd.exists():
-                return err(
-                    f"user_data_dir does not exist: {explicit_udd}. "
-                    "Check the path. Common defaults: "
-                    "~/Library/Application Support/Google/Chrome (macOS), "
-                    "~/.config/google-chrome (Linux), "
-                    "%LOCALAPPDATA%/Google/Chrome/User Data (Windows). "
-                    "Use list_chrome_profiles to discover."
-                )
-            holder_pid = chrome_lock_holder_pid(explicit_udd)
-            if holder_pid is not None:
-                kept = _kept_verdict(explicit_udd, product)
-                if kept and kept.get("ok"):
-                    return await _launch_by_reattach(
-                        explicit_udd, kept, url=url, keep_alive=keep_alive,
-                        ignored=_reattach_ignored(locals()), expect_url=expect_url,
-                        expect_status=expect_status,
-                        block_ads=block_ads, agent_overlay=agent_overlay)
-                return err(
-                    f"user_data_dir {explicit_udd} is currently in use by Chrome PID {holder_pid}. "
-                    "Close that Chrome window first (a single Chrome process locks the whole "
-                    "user-data-dir, regardless of profile_directory). "
-                    "Or use clone_chrome_profile to take a snapshot copy of the profile, "
-                    "or attach_to_chrome(port=...) if Chrome was started with --remote-debugging-port."
-                    + _not_reattached_note(explicit_udd, kept)
-                )
-            # Validate sub-profile if specified
-            if profile_directory:
-                try:
-                    pd_path = _direct_child(
-                        explicit_udd, profile_directory, "profile_directory"
-                    )
-                except ValueError as e:
-                    return err(str(e))
-                if not pd_path.exists():
-                    avail = [p.name for p in explicit_udd.iterdir()
-                             if p.is_dir() and (p / "Preferences").exists()][:15]
-                    return err(
-                        f"profile_directory {profile_directory!r} not found inside {explicit_udd}. "
-                        f"Available: {avail}"
-                    )
-                merged_extra_args.append(f"--profile-directory={profile_directory}")
-            else:
-                merged_extra_args.extend(_profile_directory_args(explicit_udd, merged_extra_args))
-            launch_choice = _launch_choice(explicit_udd, headless, merged_extra_args, brave_executable)
-            refused = _profile_version_refusal(explicit_udd, launch_choice.executable, product)
-            if refused:
-                return err(refused)
-            persistent = False  # we're managing user_data_dir ourselves; skip default profile flow
-            profile_path = explicit_udd
-            used_fallback = False
+            stop = await _launch_explicit_profile(req, plan)
         else:
-            # Validate user-supplied --user-data-dir BEFORE launch (saves a 30s timeout).
-            # Many users pass a Chrome profile path in extra_args that's currently
-            # held by their daily Chrome — fail fast with actionable advice.
-            custom_udd: Optional[Path] = None
-            for arg in merged_extra_args:
-                if arg.startswith("--user-data-dir="):
-                    custom_udd = Path(arg.split("=", 1)[1]).expanduser()
-                    break
-            if custom_udd is not None:
-                holder_pid = chrome_lock_holder_pid(custom_udd) if custom_udd.exists() else None
-                if holder_pid is not None:
-                    kept = _kept_verdict(custom_udd, product)
-                    if kept and kept.get("ok"):
-                        return await _launch_by_reattach(
-                            custom_udd, kept, url=url, keep_alive=keep_alive,
-                            ignored=_reattach_ignored(locals()), expect_url=expect_url,
-                            expect_status=expect_status,
-                            block_ads=block_ads, agent_overlay=agent_overlay)
-                    return err(
-                        f"Profile directory is locked by another Chrome process: "
-                        f"{custom_udd} (PID {holder_pid}). Close that Chrome window first, "
-                        f"OR use clone_chrome_profile to make a snapshot copy, "
-                        f"OR use the user_data_dir parameter (with same fail-fast lock check), "
-                        f"OR omit --user-data-dir to use the default MCP profile, "
-                        f"OR use attach_to_chrome(port=...) if Chrome was started with debug port."
-                        + _not_reattached_note(custom_udd, kept)
-                    )
-
-            # A browser a previous server of ours kept alive on the profile this launch asks
-            # for is taken over, not raced: falling back would hide its tabs and logins.
-            if persistent and custom_udd is None:
-                _own_folder = _server_profile_for(BrowserState.current_instance_id, product)
-                for _candidate in _kept_candidates(BrowserState.current_instance_id, product):
-                    # Only the folder the server chose itself: a caller's --user-data-dir that
-                    # became main's affinity after a custom reattach is never taken as an orphan.
-                    _adopt = (BrowserState.current_instance_id
-                              if _keep_alive.profile_key(_candidate) == _own_folder else None)
-                    _kept = _kept_verdict(_candidate, product, adopt_orphan_for=_adopt)
-                    if _kept and _kept.get("ok"):
-                        _taken = await _launch_by_reattach(
-                            _candidate, _kept, url=url, keep_alive=keep_alive,
-                            ignored=_reattach_ignored(locals()), expect_url=expect_url,
-                            expect_status=expect_status,
-                            block_ads=block_ads, agent_overlay=agent_overlay)
-                        if not (_taken.startswith("Error") and _orphan_given_back(_candidate, _kept)):
-                            return _taken
-                        # An orphan that could not be taken over: the launch goes on as it did
-                        # before the takeover existed (a fallback, saying so), not an error on
-                        # every launch until that Chrome ends.
-                        kept_note += (f" [a browser of ours left running on {_candidate} could not "
-                                      f"be taken over: {_taken[len('Error: '):][:300]}]")
-                        continue
-                    kept_note += _not_reattached_note(_candidate, _kept)
-            # Each instance has one deterministic profile, and a conflict over it is
-            # settled by the caller's profile_conflict. Only "main" takes part in
-            # process affinity: a second HTTP session must not repoint it, or the
-            # primary's next launch lands on a different cookie jar and its logins
-            # look wiped.
-            resolved_profile, profile_info = _resolve_launch_profile(
-                BrowserState.current_instance_id,
-                persistent=bool(persistent),
-                profile_conflict=profile_conflict,
-                browser=product,
-            )
-            if profile_info.get("error"):
-                return err(profile_info["error"])
-            # None for an ephemeral launch. Recording the shared profile here instead made
-            # browser_close scan it and signal whichever Chrome really was using it: the
-            # browser of another session, with its logins.
-            profile_path = resolved_profile
-            used_fallback = bool(persistent) and "conflict_with_pid" in profile_info
-            if persistent and BrowserState.current_instance_id == "main" and product == brave_mode.CHROME:
-                from .state import set_profile_affinity
-                set_profile_affinity(profile_path)
-
-            # Friendly upfront check on the default profile too (after resolve_default_profile
-            # has potentially picked a fallback). If somehow the resolved one is still locked
-            # by a live process, refuse with actionable error rather than hanging.
-            if persistent:
-                holder_pid = chrome_lock_holder_pid(profile_path)
-                if holder_pid is not None:
-                    return err(
-                        f"Default MCP profile is locked by PID {holder_pid}. "
-                        f"This usually means another mcp-stealth-chrome instance is running. "
-                        f"Run `pkill -f mcp-stealth-chrome` then retry, or use persistent=False "
-                        f"for an ephemeral throwaway profile."
-                    )
-                # Before the window-state wipe below writes to it: a refused profile stays as it was.
-                launch_choice = _launch_choice(profile_path, headless, merged_extra_args,
-                                               brave_executable)
-                refused = _profile_version_refusal(profile_path, launch_choice.executable, product)
-                if refused:
-                    return err(refused)
-                # clean_profile_state and the window-state wipe write to the profile, so they
-                # wait until the cookie checks below have passed: a refusal writes nothing.
-                tidy_profile = profile_path
-
-        # Determine final user_data_dir for Config (None = nodriver picks a temp dir).
-        privacy_profile: Optional[Path] = None
-        if privacy:
-            privacy_profile = _new_privacy_profile(BrowserState.current_instance_id)
-            profile_path = privacy_profile
-            final_udd = str(privacy_profile)
-        elif explicit_udd is not None:
-            final_udd: Optional[str] = str(explicit_udd)
-        elif persistent:
-            final_udd = str(profile_path)
-        else:
-            final_udd = None
-
-        # nodriver 0.50 never passes Config.lang on, and macOS Chrome ignores --lang. The
-        # override applied to the tab below is what actually changes it.
-        if lang and lang != "en-US" and not effective_fingerprint.get("accept_language"):
-            effective_fingerprint = {**effective_fingerprint, "accept_language": lang}
-        config = Config(
-            user_data_dir=final_udd,
-            headless=headless,
-            lang=(effective_fingerprint.get("accept_language", "").split(",")[0] or lang),
-            browser_args=list(merged_extra_args),
-        )
-        # Extra flags to suppress any first-run / restore / notification interrupts
-        config.add_argument("--hide-crash-restore-bubble")
-        config.add_argument("--disable-session-crashed-bubble")
-        config.add_argument("--disable-restore-session-state")
-        config.add_argument("--no-default-browser-check")
-        for _flag in _LEAN_FLAGS:
-            config.add_argument(_flag)
-        if effective_fingerprint.get("user_agent"):
-            config.add_argument(f"--user-agent={effective_fingerprint['user_agent']}")
-        if effective_proxy:
-            config.add_argument(f"--proxy-server={effective_proxy}")
-        config.add_argument(f"--window-size={window_width},{window_height}")
-        if headless:
-            _screen_arg = _headless_screen_arg(window_width, window_height, merged_extra_args)
-            if _screen_arg:
-                config.add_argument(_screen_arg)
-        # Force a deterministic on-screen position. Without this, Chrome
-        # restores its last saved position from the persistent profile —
-        # which after a macOS sleep/wake cycle is often off-screen or 0×0,
-        # making the window invisible and CDP Browser.getWindowForTarget
-        # return -32000 "window not found". Override unless the user
-        # already supplied their own --window-position via extra_args.
-        if not any((a or "").startswith("--window-position=")
-                    for a in merged_extra_args):
-            config.add_argument("--window-position=100,100")
-        if profile_mode == "light":
-            for _flag in LIGHT_MODE_FLAGS:
-                config.add_argument(_flag)
-        if testing_mode:
-            for _flag in (
-                "--blink-settings=imagesEnabled=false",
-                _disable_features_arg(config, ("Translate", "BackForwardCache", "AcceptCHFrame")),
-                "--disable-background-timer-throttling",
-                "--disable-renderer-backgrounding",
-                "--disable-backgrounding-occluded-windows",
-                "--disable-ipc-flooding-protection",
-                "--disable-notifications",
-                "--autoplay-policy=user-gesture-required",
-                "--mute-audio",
-            ):
-                config.add_argument(_flag)
-
-        browser: Optional[Browser] = None
-        if launch_choice is None:
-            launch_choice = _launch_choice(profile_path, headless, merged_extra_args, brave_executable)
-        dock_note = await _use_dock_icon_browser(config, headless, launch_choice)
-        refused = _profile_version_refusal(profile_path, config.browser_executable_path, product)
-        if refused:
-            await _remove_privacy_profile(privacy_profile)
-            return err(refused)
-        with contextlib.suppress(Exception):
-            dock_note += profile_version.upgrade_note(profile_path, config.browser_executable_path)
-        cookie_move = await _prepare_cookie_move(profile_path, config)
-        if cookie_move.refuse:
-            await _remove_privacy_profile(privacy_profile)
-            return err(cookie_move.refuse)
-        if cookie_move.flag:
-            config.add_argument(_cookie_flag_arg(config))
-        if not cookie_move.backup:
-            dock_note += cookie_move.note
-        try:
-            dock_note += _browser_note(config, product) + brave_mode.write_vertical_tabs(
-                Path(config.user_data_dir), config.browser_args, product, vertical_tabs)
-        except Exception as e:
-            await _remove_privacy_profile(privacy_profile)
-            return err(f"vertical_tabs could not be written into the profile, so nothing was "
-                       f"started: {_exc_text(e)}")
-        dock_note += _apply_brave_lean(config, product, brave_lean, server_chosen=explicit_udd is None)
-        # Read before Chrome starts, while the person's app is still the frontmost one.
-        previous_app = None if headless else await asyncio.to_thread(_frontmost_pid)
-        if not headless:
-            for _flag in _BACKGROUND_WINDOW_FLAGS:
-                config.add_argument(_flag)
-        refused = await _cookie_preflight(profile_path, cookie_move) \
-            or await _commit_cookie_move(profile_path, cookie_move)
-        if refused:
-            await _remove_privacy_profile(privacy_profile)
-            return err(refused)
-        if tidy_profile is not None:
-            clean_profile_state(tidy_profile)  # only clears stale locks
-            # Selectively wipe corrupt window-placement / session-restore state. Idempotent and
-            # cheap (a few file writes), preserves cookies and logins. Saves us from "window
-            # 0x0, hidden" bugs that survive macOS sleep/wake cycles. See state.wipe_window_state.
-            with contextlib.suppress(Exception):
-                from .state import wipe_window_state as _wws
-                _wws(tidy_profile)
-        # The last look, as close to the start as this server can make it; Chrome takes the lock
-        # about half a second later, and that gap is a known limit (no lock it honours can be
-        # held across it).
-        refused = await _cookie_preflight(profile_path, cookie_move)
-        if refused:
-            return err(refused)
-        ads_pending = _adblock_module().begin(block_ads, config.browser_executable_path) if block_ads else None
-        try:
-            browser = await _start_chrome(config)
-            _mark_allow_origins(browser, config)
-            brave_mode.mark(browser, product)
-            if not headless:
-                await _open_background_window(browser, window_width, window_height)
-        except asyncio.TimeoutError:
-            await _safe_stop_browser(browser)
-            await _remove_privacy_profile(privacy_profile)
-            return err(
-                f"launch timed out after {BROWSER_LAUNCH_TIMEOUT}s — "
-                f"profile {profile_path} may be locked by another Chrome, or "
-                f"Chrome is hung. Kill any stale Chrome processes and retry."
-            )
-        except asyncio.CancelledError:
-            await _safe_stop_browser(browser)
-            await _remove_privacy_profile(privacy_profile)
-            raise
-        except Exception as e:
-            # "CDP unreachable" means the process very likely STARTED and only
-            # the websocket failed — so _safe_stop_browser, which speaks CDP,
-            # cannot end it. Reaping our own PID here is the difference between
-            # a failed launch and a failed launch plus an orphan nobody owns.
-            reap = getattr(e, "reap_report", {})
-            await _remove_privacy_profile(privacy_profile)
-            # Diagnose common nodriver "Failed to connect to browser" — usually
-            # means Chrome started but its CDP websocket couldn't be reached
-            # (profile locked, port collision, AV interference).
-            msg = str(e)
-            hint = ""
-            if "Failed to connect" in msg or "websocket" in msg.lower() or "connection refused" in msg.lower():
-                holder = chrome_lock_holder_pid(profile_path) if persistent else None
-                ext = find_external_chrome_pids()
-                parts = [f"launch failed (Chrome started but CDP unreachable): {msg}"]
-                if reap.get("killed"):
-                    parts.append(
-                        f"→ Reaped the Chrome this launch started (PID(s) {reap['killed']}), "
-                        f"so it is not left behind.")
-                if reap.get("still_alive"):
-                    parts.append(
-                        f"→ WARNING: PID(s) {reap['still_alive']} survived and are orphaned.")
-                if holder is not None:
-                    parts.append(f"→ Profile {profile_path} is locked by PID {holder}.")
-                elif ext:
-                    parts.append(f"→ Other Chrome processes running: PIDs {ext[:5]}{'...' if len(ext)>5 else ''}.")
-                parts.append(
-                    "Retried once. Chrome did not open its debugging port in time, which "
-                    "usually means the machine is busy or Chrome is updating, so trying "
-                    "again shortly often works."
-                    + (" If this profile is in use, persistent=False or "
-                       "clone_chrome_profile gives an isolated one." if persistent else "")
+            stop = await _launch_kept_browser(req, plan)
+            if stop is None:
+                # Each instance has one deterministic profile, and a conflict over it is
+                # settled by the caller's profile_conflict. Only "main" takes part in
+                # process affinity: a second HTTP session must not repoint it, or the
+                # primary's next launch lands on a different cookie jar and its logins
+                # look wiped.
+                resolved_profile, profile_info = _resolve_launch_profile(
+                    BrowserState.current_instance_id,
+                    persistent=bool(plan.persistent),
+                    profile_conflict=profile_conflict,
+                    browser=product,
                 )
-                hint = " ".join(parts)
-            return err(hint or f"launch failed: {e}")
+                stop = _launch_server_profile(req, plan, resolved_profile, profile_info)
+        if stop is not None:
+            return stop
 
-        BrowserState.browser = browser
-        # Before the first navigation, so its own requests are already looked at.
-        if ads_pending is not None:
-            dock_note += await _adblock_module().attach(
-                ads_pending, browser, BrowserState.current_instance_id, BrowserState.session_key())
-        dock_note += await presence.attach(browser, _browser_process_pid(browser), ask=agent_overlay,
-                                     headless=headless)
+        _launch_config(req, plan)
+        if (stop := await _launch_prepare_profile(req, plan)) is not None:
+            return stop
+        await _launch_keep_keyboard(req, plan)
+        # The cookie move: prepared above, then preflight, commit, tidy-up, preflight, start.
+        if (stop := await _launch_commit_profile(plan)) is not None:
+            return stop
+        stop, started, ads_pending = await _launch_start_chrome(req, plan)
+        if stop is not None:
+            return stop
+        if (stop := await _launch_ready_browser(req, plan, started, ads_pending)) is not None:
+            return stop
+        stop, main, observed = await _launch_first_page(req, plan)
+        if stop is not None:
+            return stop
 
-        if cookie_move.backup is not None:
-            moved, moved_text = await _finish_cookie_move(browser, Path(str(profile_path)), cookie_move)
-            if not moved:
-                # Left running, the next browser_launch reuses it and never tries the move again.
-                return err(f"its cookies were not all moved: {moved_text}. "
-                           f"{await _close_after_cookie_failure(browser, profile_path)}")
-            dock_note += moved_text
-
-        if storage_state_path:
-            try:
-                await _apply_storage_state(BrowserState.browser, storage_state_path)
-            except asyncio.CancelledError:
-                await _safe_stop_browser(BrowserState.browser)
-                BrowserState.reset()
-                await _remove_privacy_profile(privacy_profile)
-                raise
-            except Exception as e:
-                await _safe_stop_browser(BrowserState.browser)
-                BrowserState.reset()
-                await _remove_privacy_profile(privacy_profile)
-                return err(f"storage_state load failed: {e}")
-
-        try:
-            await asyncio.sleep(0.5)
-            main = await _first_live_tab(BrowserState.browser)
-            await _apply_fingerprint_to_tab(main, effective_fingerprint)
-            if profile_mode == "light" or testing_mode:
-                # The first document after startup still loads images despite the flag;
-                # every later one obeys it.
-                await asyncio.wait_for(main.get("about:blank"), timeout=BROWSER_NAV_TIMEOUT)
-            _doc_state, _disarm = await _arm_document_watch(main)
-            try:
-                await asyncio.wait_for(main.get(url), timeout=BROWSER_NAV_TIMEOUT)
-                await _wait_load_complete(main, 3)  # best effort; ready_state is reported
-                # Saying "Loaded /admin" after a redirect to /login leaves the caller
-                # reading a page it never asked for, and expect_* went unchecked.
-                _launch_observed = await _observe_navigation(main, url, _disarm())
-            finally:
-                _disarm()
-        except asyncio.TimeoutError:
-            await _safe_stop_browser(BrowserState.browser)
-            BrowserState.reset()
-            await _remove_privacy_profile(privacy_profile)
-            return err(
-                f"initial nav timed out after {BROWSER_NAV_TIMEOUT}s — Chrome "
-                f"started but couldn't load {url}. Check network/proxy."
-            )
-        except asyncio.CancelledError:
-            await _safe_stop_browser(BrowserState.browser)
-            BrowserState.reset()
-            await _remove_privacy_profile(privacy_profile)
-            raise
-        except Exception as e:
-            await _safe_stop_browser(BrowserState.browser)
-            BrowserState.reset()
-            await _remove_privacy_profile(privacy_profile)
-            return err(f"initial nav failed: {e}")
-        BrowserState.tabs = [main]
-        BrowserState.own(BrowserState.tabs)  # opened or taken over by this server
-        BrowserState.active_tab_index = 0
-        BrowserState.current_profile_dir = profile_path
-        BrowserState.current_headless = headless
-        BrowserState.current_privacy = privacy
-        BrowserState.current_fingerprint = dict(effective_fingerprint)
-        BrowserState.current_proxy = effective_proxy
-        # A stdio browser_launch is not idle-reaped: it is what the person is looking at,
-        # and the server exits with its client anyway. The timeout has to be cleared and not
-        # merely the reaper left off, because any spawn_browser starts the reaper, which
-        # then closed this browser too. Over HTTP a client can vanish, so the reaper is what
-        # eventually ends its browser.
-        BrowserState.current_idle_timeout = (DEFAULT_IDLE_TIMEOUT if BrowserState.http_mode()
-                                             and not _persons_browser(BrowserState.browser) else 0)
-        if BrowserState.http_mode():
-            _ensure_idle_reaper_running()
-        BrowserState.window_closed.pop(BrowserState.current_instance_id, None)
-        if not headless:
-            _watch_windows(browser)
-        suffix = (
-            f" [{profile_info.get('session_state_source')}]"
-            if used_fallback else ""
-        )
-        suffix += kept_note
-        _keep, _keep_note = _keep_alive_decision(keep_alive, final_udd, privacy, headless)
-        if _keep:
-            _failed = _arm_keep_alive(browser, final_udd, BrowserState.current_instance_id,
-                                      headless, effective_fingerprint)
-            _keep_note = _failed or _keep_note
-            if not _failed and used_fallback:
-                _keep_note += (f" [it runs on the fallback profile {final_udd}, which no later default "
-                               f"launch asks for: reattach with user_data_dir={final_udd!r}]")
-        suffix += _keep_note
-        suffix += _allow_origins_note(browser)
-
-        # Post-launch health check — degenerate window detection.
-        # After a macOS sleep/wake cycle (or some persistent-profile state
-        # corruption) Chrome can come up with outerWidth==0, position
-        # off-screen, or visibilityState=='hidden'. Tools work but every
-        # mouse_click_xy / set_viewport_size fails with cryptic CDP errors.
-        # Detect once + try a single bring_to_front; report rather than fix
-        # silently so the caller knows when to call browser_recover().
-        health_suffix = ""
-        if not headless:
-            try:
-                probe = await _wait(main.evaluate(
-                    "JSON.stringify({w:window.outerWidth,h:window.outerHeight,"
-                    "v:document.visibilityState,sx:window.screenX,sy:window.screenY})"
-                ), timeout=2.0, what="health probe")
-                hv = json.loads(probe) if isinstance(probe, str) else (probe or {})
-                if hv.get("w", 1) == 0 or hv.get("h", 1) == 0 or hv.get("v") == "hidden":
-                    # One nudge — restore the window without raising it, and re-probe. Taking
-                    # the foreground to check on a window is what this launch must not do.
-                    with contextlib.suppress(Exception):
-                        _window_id, _bounds = await main.get_window()
-                        await main.set_window_state(state="normal")
-                    try:
-                        probe2 = await _wait(main.evaluate(
-                            "JSON.stringify({w:window.outerWidth,h:window.outerHeight,"
-                            "v:document.visibilityState})"
-                        ), timeout=2.0, what="health re-probe")
-                        hv2 = json.loads(probe2) if isinstance(probe2, str) else (probe2 or {})
-                    except Exception:
-                        hv2 = hv
-                    if hv2.get("w", 1) == 0 or hv2.get("h", 1) == 0 or hv2.get("v") == "hidden":
-                        health_suffix = (
-                            f" [⚠ window degenerate (w={hv2.get('w')},h={hv2.get('h')},"
-                            f"v={hv2.get('v')}) — likely sleep/wake corruption. "
-                            f"Run browser_recover() then browser_launch() to recover.]"
-                        )
-            except Exception:
-                pass  # health probe is best-effort; never block launch
-
-        verify_suffix = ""
-        if auto_verify:
-            try:
-                verify_suffix = await asyncio.wait_for(_auto_verify_cf(main), timeout=30.0)
-            except Exception:
-                verify_suffix = ""
-
-        # Put the window back where it was last time. Headless has no window to
-        # place, and an explicit --window-position means the caller has already
-        # decided — neither should be overridden.
-        place_suffix = ""
-        if not headless and not any(
-            (a or "").startswith("--window-position=") for a in merged_extra_args
-        ):
-            try:
-                asked = ((window_width, window_height)
-                         if (window_width, window_height) != _DEFAULT_WINDOW else None)
-                placed = await _restore_window_bounds(
-                    BrowserState.current_instance_id, main, size=asked)
-                if placed.get("restored"):
-                    act = placed.get("actual") or {}
-                    place_suffix = (
-                        f" [window {'clamped to a connected display' if placed.get('clamped') else 'restored'}"
-                        f" at ({act.get('left')},{act.get('top')}) {act.get('width')}x{act.get('height')}"
-                        + (", the size asked for on this launch" if asked else "") + "]"
-                    )
-            except Exception:
-                pass  # placement is a convenience; never fail a launch over it
-
-        restore_suffix = ""
-        if restore_tabs:
-            try:
-                _all_tabs, _select, _report, restore_suffix = await _reopen_saved_tabs(
-                    BrowserState.current_instance_id, browser, main, profile_path, privacy,
-                    headless, effective_fingerprint, url, window_width, window_height)
-                BrowserState.tabs = _all_tabs
-                BrowserState.own(BrowserState.tabs)  # opened or taken over by this server
-                BrowserState.active_tab_index = _select
-                _launch_observed = {**_launch_observed, "restore_tabs": _report}
-            except Exception as e:
-                restore_suffix = f" [restore_tabs: failed: {_exc_text(e)}]"
+        _launch_record_browser(req, plan, started, main)
+        suffix = _launch_keep_alive(req, plan, started)
+        health_suffix = await _launch_window_health(req, main)
+        verify_suffix = await _launch_auto_verify(req, main)
+        place_suffix = await _launch_place_window(req, plan, main)
+        restore_suffix, observed = await _launch_restore_tabs(req, plan, started, main, observed)
         await _record_tabs_at_launch(BrowserState.current_instance_id)
 
-        await _give_focus_back(previous_app)
-        return _nav_result(
-            (f"WARNING: EMPTY FALLBACK PROFILE, your saved logins are NOT here "
-             f"({profile_info.get('holder') or 'another Chrome'} holds "
-             f"{profile_info.get('desired_profile')}); do not log in again here, that splits the "
-             f"logins over two folders. "
-             if used_fallback and str(profile_info.get("session_state_source") or "").startswith("FALLBACK")
-             else "") +
-            f"Browser launched (headless={headless}, persistent={persistent}, "
-            f"privacy={privacy}, identity={identity_source}). Loaded",
-            _launch_observed,
-            expect_url=expect_url, expect_status=expect_status,
-            suffix=f"{suffix}{verify_suffix}{health_suffix}{place_suffix}{restore_suffix}{dock_note}",
-        )
+        await _give_focus_back(plan.previous_app)
+        return _launch_result(req, plan, observed, suffix=suffix, verify_suffix=verify_suffix,
+                              health_suffix=health_suffix, place_suffix=place_suffix,
+                              restore_suffix=restore_suffix)
 
 
 def _forget_tabs_note(instance_id: str, profile: Any, privacy: bool) -> str:
