@@ -52,6 +52,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import urlsplit
 
+from . import target_release as _target_release
 from .helpers import ADBLOCK_MISSING, adblock_package_note, mask_url
 
 # Lists in the order they are added to the engine. Both are published under GPLv3 or
@@ -1066,97 +1067,20 @@ def result_notice(session_key: str, result: str) -> str:
     return f"{result}\n[{text}]"
 
 
-def _release_targets(ws_url: str, budget: float, progress: dict) -> None:
-    """The release itself: attach, Runtime.runIfWaitingForDebugger (a no-op on a running
-    target), detach, for every target, scanning again until a pass finds none it has not
-    released, since a popup can open meanwhile. Writes what it saw and did into progress."""
-    from websockets.sync.client import connect
-    ends = time.monotonic() + budget
-    next_id = [0]
-
-    def call(ws, method: str, params: Optional[dict] = None, sid: Optional[str] = None) -> dict:
-        next_id[0] += 1
-        message: dict[str, Any] = {"id": next_id[0], "method": method, "params": params or {}}
-        if sid:
-            message["sessionId"] = sid
-        ws.send(json.dumps(message))
-        while True:
-            left = ends - time.monotonic()
-            if left <= 0:
-                raise TimeoutError("release budget spent")
-            reply = json.loads(ws.recv(timeout=left))
-            if reply.get("id") == next_id[0]:
-                return reply
-
-    lock = progress["lock"]
-    with connect(ws_url, max_size=None, open_timeout=max(0.05, min(3.0, budget)),
-                 close_timeout=1) as ws:
-        tried: set = set()
-        while True:
-            infos = (call(ws, "Target.getTargets").get("result") or {}).get("targetInfos") or []
-            ids = [t.get("targetId") for t in infos if t.get("type") in _FETCH_TYPES]
-            with lock:
-                progress["seen"] = list(dict.fromkeys((progress["seen"] or []) + ids))
-            new = [i for i in ids if i not in tried]
-            if not new:
-                break
-            for target_id in new:
-                tried.add(target_id)
-                try:
-                    attached = call(ws, "Target.attachToTarget", {"targetId": target_id, "flatten": True})
-                    sid = (attached.get("result") or {}).get("sessionId")
-                    if sid:
-                        call(ws, "Runtime.runIfWaitingForDebugger", {}, sid)
-                        call(ws, "Target.detachFromTarget", {"sessionId": sid})
-                    with lock:
-                        progress["released"].add(target_id)
-                except TimeoutError:
-                    raise
-                except Exception:
-                    pass
-        with lock:
-            progress["finished"] = True  # what is left is the close, which changes nothing
+# The release of held targets lives in target_release.py, shared with body saving
+# (body_saver.py), which holds new targets the same way. The names stay bound here: block_ads
+# calls them through this module's globals, so a test patching adblock._release_targets or
+# adblock._release_every_target still reaches every call.
+_release_targets = _target_release.release_targets
+_browser_answers = _target_release.browser_answers
 
 
 def _release_every_target(ws_url: str, budget: float) -> str:
-    """Start every target that may still be held, over a new connection. Bounded as a whole:
-    it runs on a thread of its own, so a connect, send, receive or close that never returns
-    cannot keep the caller past the budget. Never raises. Returns "" when every target it saw
-    was released, or how many and which were not, or that it could not tell which."""
-    progress: dict[str, Any] = {"lock": threading.Lock(), "seen": None, "released": set(),
-                                "finished": False, "error": None}
-
-    def run() -> None:
-        try:
-            _release_targets(ws_url, budget, progress)
-        except Exception as exc:
-            with progress["lock"]:
-                progress["error"] = f"{type(exc).__name__}: {exc}"[:120]
-
-    worker = threading.Thread(target=run, name="adblock-release", daemon=True)
-    worker.start()
-    worker.join(budget + 0.5)
-    with progress["lock"]:
-        seen, released = progress["seen"], set(progress["released"])
-        finished, error = progress["finished"], progress["error"]
-    left = [i for i in (seen or []) if i not in released]
-    if finished and not left:
-        return ""
-    why = error or (f"not finished within {budget:g} s" if worker.is_alive() else "stopped")
-    if seen is None:
-        return f"could not release held targets ({why}); which are left is unknown, no target list was read"
-    shown = ", ".join(left[:10]) + (f" and {len(left) - 10} more" if len(left) > 10 else "")
-    return f"could not release every held target ({why}): {len(left)} target(s) not released: {shown}"
-
-
-def _browser_answers(ws_url: str, timeout: float) -> bool:
-    """Whether the browser behind ws_url still answers on its debugging port. Blocking."""
-    parts = urlsplit(ws_url)
-    try:
-        with urllib.request.urlopen(f"http://{parts.netloc}/json/version", timeout=timeout) as reply:
-            return reply.status == 200
-    except Exception:
-        return False
+    """Start every target that may still be held, over a new connection (see
+    target_release.release_every_target). Never raises."""
+    return _target_release.release_every_target(
+        ws_url, budget, lambda url, left, progress: _release_targets(url, left, progress),
+        thread_name="adblock-release")
 
 
 def _ws_url(browser: Any) -> Optional[str]:
