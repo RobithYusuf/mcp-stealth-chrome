@@ -126,7 +126,7 @@ Part of the agent guide: [AGENTS.md](../../AGENTS.md) says when to read this. It
   facts under Chrome, CDP and nodriver), failing 14 of 32 runs (`tab_new` erring or hanging past 60 s, or `tab_select`
   reading the empty list as "tab 0 out of range").
 - A sweep closing an instance registers it in `_app.INSTANCE_CLOSING`; a call on it, `switch_instance` to it and
-  `close_instance` of it wait for the close. After each await the sweep checks its candidate is still where it found
+  `close_instance` of it wait for the close, all but `browser_recover` and `server_status` (see below). After each await the sweep checks its candidate is still where it found
   it (`_still_held`): with one switched in mid-close, the close's `reset()` wiped whichever instance was current.
   `close_instance`, `close_all_instances` and `browser_close` register too, before their first await, and both sweeps
   skip a registered instance, or a stored one could be closed twice at once. So does a `browser_launch` that fails
@@ -172,6 +172,17 @@ Part of the agent guide: [AGENTS.md](../../AGENTS.md) says when to read this. It
   step had already reached stays first; a success it reached does not count. The start does not begin once
   the launch is cut short. A browser that could not be ended keeps a handle on the instance the recover
   emptied, naming its profile, as every close path keeps one.
+- `browser_recover` waits for nothing that can be stuck: it skips the wait for a close of the current
+  instance (`_app.RUNS_DURING_A_CLOSE`, with `server_status`, which only reads; every other tool still
+  waits). A close that never ended answered every call "still being closed ... or browser_recover if it never
+  ends", and the recover met the same wait and gave the same answer. It takes the instance and the browser
+  it acts on before its first await and, after its awaits (a person's browser probe, the 2 s after SIGTERM),
+  resets only that pair: still the current instance, holding the same browser or none. A `switch_instance`
+  meanwhile, or a cut-short launch that kept a handle on a browser it could not end (the recover found the
+  instance empty), used to be reset by what was current: the instance switched in, or the only handle on a
+  live Chrome. Then nothing of the current instance is reset or cleared, and the result is an error saying
+  which and what was done. A recover that found the launch's browser and still finds it resets it, as it
+  resets any browser it could not end.
 - Inside the steps each acts on the launch's own instance and browser (`plan.launching`, `plan.browser`),
   never on what is current by then: the failure cleanup (`_launch_end_started_browser`), a cancel
   (`_launch_cancelled`), the saved tabs (recorded only while the launch still holds its instance), the
@@ -179,10 +190,9 @@ Part of the agent guide: [AGENTS.md](../../AGENTS.md) says when to read this. It
   record names its old server again, nothing ends it): it may be the person's, opened from the launcher.
   Once recorded it is the launch's browser, and the recover ended it as the current one.
 - The idle reaper and the window sweep skip the launching instance; their next tick sees it.
-- A call on an instance being closed waits for the close (`INSTANCE_CLOSING`), `browser_recover` included.
-  So a switch or a recover sent during the close of a failed launch runs after the launch has returned. A
-  close still running after 60 s answers "still being closed ... or browser_recover if it never ends", and
-  that recover meets the same wait: a gap left open, since a close is bounded by `_ensure_browser_dead`.
+- A call on an instance being closed waits for the close (`INSTANCE_CLOSING`), so a switch sent during the
+  close of a failed launch runs after the launch has returned. A recover sent then does not wait: it marks
+  the launch and resets the instance, and the close finds the instance no longer holding its browser.
 
 ## Headed focus
 

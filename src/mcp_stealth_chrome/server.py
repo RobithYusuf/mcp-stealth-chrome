@@ -5524,13 +5524,21 @@ async def browser_recover() -> str:
     again to start fresh.
     """
     steps: list[str] = []
+    # The instance and the browser this recover acts on, taken before its first await. It does
+    # not wait for a close (_app.RUNS_DURING_A_CLOSE), and between its awaits a switch_instance
+    # can make another instance current, or a launch it cut short can keep a handle on a browser
+    # it could not end: resetting by what is current then reset the instance switched in, or
+    # dropped the only handle on a live Chrome. So it resets only that pair (step 3).
+    target_iid, target_browser = BrowserState.current_instance_id, BrowserState.browser
+    target_profile = BrowserState.current_profile_dir
+    target_tabs = list(BrowserState.tabs)
     # A browser the person opened from the launcher that still answers is not stuck: whatever
     # the agent could not do (a tab that is not its own, most likely) is no reason to end it.
-    if BrowserState.browser is not None and _persons_browser(BrowserState.browser):
+    if target_browser is not None and _persons_browser(target_browser):
         from nodriver.cdp import browser as cdp_browser
         with contextlib.suppress(Exception):
-            await asyncio.wait_for((getattr(BrowserState.browser, "connection", None)
-                                    or BrowserState.browser).send(cdp_browser.get_version()), timeout=3)
+            await asyncio.wait_for((getattr(target_browser, "connection", None)
+                                    or target_browser).send(cdp_browser.get_version()), timeout=3)
             return err("browser_recover did not end this browser: the person opened it from the "
                        "launcher and it answers, so it is not stuck. tab_new opens a tab of the "
                        "agent's; tab_select picks one of the person's on purpose; the person quits it.")
@@ -5540,18 +5548,15 @@ async def browser_recover() -> str:
     # nothing more (_launch_settle looks after each of its awaits). Marked before anything is
     # stopped or reset here, so the launch cannot record what this recover is about to reset.
     launching = _launching()
-    if launching is not None and launching.instance_id == BrowserState.current_instance_id:
+    if launching is not None and launching.instance_id == target_iid:
         launching.ended_by = "browser_recover"
         steps.append(f"browser_launch of instance {launching.instance_id!r} was still running: it "
                      f"ends as an error and records nothing more")
 
-    # 1. Best-effort stop. Capture profile dir BEFORE reset so step 2 can
+    # 1. Best-effort stop. The profile dir was taken above, so step 2 can
     #    target only Chrome PIDs that belong to this profile.
-    target_profile = BrowserState.current_profile_dir
-    target_tabs = list(BrowserState.tabs)
-    target_iid = BrowserState.current_instance_id
     try:
-        b = BrowserState.browser
+        b = target_browser
         if b and not getattr(b, "stopped", False):
             try:
                 b.stop()
@@ -5597,18 +5602,30 @@ async def browser_recover() -> str:
         else:
             steps.append("no orphan chrome PIDs")
 
-    # 3. Reset state regardless
-    try:
-        BrowserState.reset()
-        steps.append("state reset")
-    except Exception as e:
-        steps.append(f"state reset failed: {type(e).__name__}: {e}")
+    # 3. Reset the instance this recover began on, while it is still the current one and holds
+    #    the same browser, or none (a close that finished meanwhile left it empty). Otherwise
+    #    nothing of the current instance is reset or cleared, and the result says so.
+    if BrowserState.current_instance_id != target_iid:
+        not_reset = (f"instance {target_iid!r} stopped being the current one while this recover ran, so "
+                     f"nothing of the current instance ({BrowserState.current_instance_id!r}) was reset; "
+                     f"switch_instance({target_iid!r}) and browser_recover again to reset it")
+    elif BrowserState.browser is not target_browser and BrowserState.browser is not None:
+        not_reset = (f"instance {target_iid!r} holds another browser than when this recover began (one "
+                     f"a launch kept or started meanwhile), so it was not reset; browser_recover again "
+                     f"acts on the browser it holds now")
+    else:
+        not_reset = ""
+        try:
+            BrowserState.reset()
+            steps.append("state reset")
+        except Exception as e:
+            steps.append(f"state reset failed: {type(e).__name__}: {e}")
 
-    # 4. Clear only this instance's tab state. Clearing the global sets here
-    # silently de-armed background instances and made their next start call
-    # stack duplicate handlers on top of the still-live ones.
-    _clear_tab_scoped_state(target_tabs)
-    _ATTACHED_BROWSERS.discard(target_iid)
+        # 4. Clear only this instance's tab state. Clearing the global sets here
+        # silently de-armed background instances and made their next start call
+        # stack duplicate handlers on top of the still-live ones.
+        _clear_tab_scoped_state(target_tabs)
+        _ATTACHED_BROWSERS.discard(target_iid)
 
     # 5. Sweep stale locks + wipe corrupt window-state across all known profile
     #    dirs. Selective wipe (NOT a full nuke) — preserves cookies/login but
@@ -5653,6 +5670,8 @@ async def browser_recover() -> str:
         f"{healed['sessions']} sessions, {healed['files']} blobs"
     )
 
+    if not_reset:
+        return err(f"browser_recover did not reset: {not_reset}. Done: " + " | ".join(steps))
     return ok("recovered: " + " | ".join(steps))
 
 

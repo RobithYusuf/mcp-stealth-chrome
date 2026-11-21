@@ -113,6 +113,9 @@ conclusions. Each rule below replaced a real lie.
   this launch ran. Its browser was ended." An error the step had already reached stays first, with that
   sentence after it; the recover's own result says the launch was still running. A tool refused during a
   launch says it was not done and to call it again once the launch has returned, nothing about when.
+  A `browser_recover` whose instance stopped being the current one, or came to hold another browser, while
+  it ran resets nothing and is an error saying which ("browser_recover did not reset: instance 'main'
+  stopped being the current one while this recover ran, ..."), then what it did; never "recovered".
 - `fill_form` fails when a field fails, and then does not click submit. `batch_actions` counts failures by the `Error:`
   prefix, so a failure reported through `ok()` counts as success. Non-list or empty input is an error, not
   `0 actions OK`; a non-object item is a counted failure.

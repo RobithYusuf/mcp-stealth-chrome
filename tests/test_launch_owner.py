@@ -330,22 +330,23 @@ def test_after_a_recover_the_next_launch_starts_afresh(owner, monkeypatch, point
 
 
 def test_a_recover_during_the_close_of_a_failed_launch_keeps_its_error_and_says_so(owner, monkeypatch):
-    """A step that already failed closes its browser. A browser_recover already under way when
-    that close began (it marks the launch, then resets the instance after its own awaits) leaves
-    the step's own error first, with what happened after it; the browser is closed once, not
-    again by the cut-short launch, and nothing is recorded. (A recover sent once the close is
-    registered waits for it, as every call on the instance does, and runs after the launch.)"""
+    """A step that already failed closes its browser. A browser_recover sent through the call
+    wrapper during that close does not wait for it (_app.RUNS_DURING_A_CLOSE): it marks the
+    launch and resets the instance. The launch keeps the step's own error first, with what
+    happened after it; the browser is closed once, not again by the cut-short launch, and
+    nothing is recorded."""
     async def broken(_browser, _path, tab=None):
         raise ValueError("no cookies key in the file")
 
     monkeypatch.setattr(server, "_apply_storage_state", broken)
+    said = {}
 
-    async def recover_already_under_way():
-        server._launching().ended_by = "browser_recover"
-        server.BrowserState.reset()
+    async def recover_meanwhile():
+        said["recover"] = await _call("browser_recover", {})
 
-    owner.during_close = recover_already_under_way
+    owner.during_close = recover_meanwhile
     out = asyncio.run(_launch_with(owner))
+    assert "recovered:" in said["recover"] and "was still running" in said["recover"], said
     assert out == f"Error: storage_state load failed: no cookies key in the file. {_RECOVERED}", out
     assert [b for b, _p in owner.closes] == owner.started
     assert server.BrowserState.browser is None and _privacy_folders(owner) == []

@@ -46,6 +46,12 @@ RESULT_FILTERS: list = []
 # the call's result and the tool does not run. agent_overlay adds the refusal while the person
 # holds the browser. Each must be cheap and must not await; one that raises lets the call through.
 CALL_GATES: list = []
+# Tools that never wait for a close of the current instance (wait_while_closing). The way out of
+# a stuck state must not depend on what is stuck: a close that never ends answered every call
+# "still being closed ... or browser_recover if it never ends", and browser_recover met the same
+# wait and gave the same answer. browser_recover acts on its own instance and browser
+# (server.py), and server_status only reads. Every other tool still waits.
+RUNS_DURING_A_CLOSE = frozenset({"browser_recover", "server_status"})
 # The arguments of the tool call running in this context, for hooks that describe it (the
 # overlay's bar names what is clicked or opened). Never the place to change them.
 CALL_ARGUMENTS: contextvars.ContextVar = contextvars.ContextVar("mcp_call_arguments", default=None)
@@ -227,9 +233,10 @@ class StealthMCP(FastMCP):
         arguments_token = CALL_ARGUMENTS.set(arguments)
         _CALLS_IN_FLIGHT[key] = _CALLS_IN_FLIGHT.get(key, 0) + 1
         try:
-            still = await wait_while_closing(key, BrowserState.current_instance_id)
-            if still:
-                return tool.fn_metadata.convert_result(still)
+            if name not in RUNS_DURING_A_CLOSE:
+                still = await wait_while_closing(key, BrowserState.current_instance_id)
+                if still:
+                    return tool.fn_metadata.convert_result(still)
             _touch_current()
             for gate in CALL_GATES:
                 try:
