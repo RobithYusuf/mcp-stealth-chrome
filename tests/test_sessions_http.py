@@ -237,7 +237,9 @@ def test_browser_launch_actually_calls_the_resolver():
 
     from mcp_stealth_chrome import server
 
-    assert "_resolve_launch_profile(" in inspect.getsource(server.browser_launch)
+    # browser_launch runs its steps in a task of its own (_launch_run), which browser_recover can cancel.
+    assert "_launch_run(" in inspect.getsource(server.browser_launch)
+    assert "_resolve_launch_profile(" in inspect.getsource(server._launch_run)
 
 
 def test_spawning_one_name_from_two_sessions_is_refused(monkeypatch):
