@@ -1091,7 +1091,7 @@ CI runs on macOS, Ubuntu and Windows:
 
 Tests that need a visible window or Chrome Beta run only on a developer's Mac.
 
-[AGENTS.md](AGENTS.md) records the rules and platform facts behind the code.
+[AGENTS.md](AGENTS.md) and the topic guides in [docs/agents/](docs/agents/) record the rules and platform facts behind the code.
 
 ## Related
 
