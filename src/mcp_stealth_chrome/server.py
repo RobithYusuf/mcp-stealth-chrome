@@ -4672,8 +4672,14 @@ async def _launch_ready_browser(req: _LaunchRequest, plan: _LaunchPlan, browser:
         moved, moved_text = await _finish_cookie_move(browser, Path(str(plan.profile_path)), plan.cookie_move)
         if not moved:
             # Left running, the next browser_launch reuses it and never tries the move again.
-            return err(f"its cookies were not all moved: {moved_text}. "
-                       f"{await _close_after_cookie_failure(browser, plan.profile_path)}")
+            closed = await _close_after_cookie_failure(browser, plan.profile_path)
+            if BrowserState.browser is browser:
+                # It could not be ended, so its handle stays. Naming its profile lets
+                # browser_close or the next launch end it, and remove a privacy profile then.
+                BrowserState.current_profile_dir, BrowserState.current_privacy = plan.profile_path, req.privacy
+            else:
+                await _remove_privacy_profile(plan.privacy_profile)
+            return err(f"its cookies were not all moved: {moved_text}. {closed}")
         plan.dock_note += moved_text
 
     if req.storage_state_path:

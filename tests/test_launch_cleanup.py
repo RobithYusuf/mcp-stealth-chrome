@@ -96,3 +96,28 @@ def test_a_refusal_at_the_last_look_removes_the_privacy_profile(env):
     assert out.startswith("Error") and "changed after this launch read it" in out, out
     assert "start" not in env.order, env.order
     assert _privacy_folders(env) == [], "the refused privacy launch left its profile behind"
+
+
+def test_a_cookie_move_left_unfinished_removes_the_privacy_profile_once_the_browser_is_gone(env, tmp_path):
+    env.move = server._CookieMove(plan=None, backup=tmp_path / "backup.json")
+    env.finish = (False, "2 cookies read back differently")
+    out = _launch(privacy=True)
+    assert "its cookies were not all moved: 2 cookies read back differently" in out, out
+    assert "The browser was closed" in out, out
+    assert [b for b, _p in env.closes] == env.started, "the browser was not ended"
+    assert _privacy_folders(env) == [], "the failed privacy launch left its profile behind"
+
+
+def test_a_browser_left_running_by_an_unfinished_move_keeps_its_privacy_profile_and_names_it(env, tmp_path):
+    """A profile deleted under a live Chrome is written back, so it stays; the handle that is kept
+    names it, so browser_close or the next launch ends that browser and then removes it."""
+    env.move = server._CookieMove(plan=None, backup=tmp_path / "backup.json")
+    env.finish = (False, "1 cookie missing")
+    env.close_report = dict(_ALIVE)
+    out = _launch(privacy=True)
+    assert "could not be closed" in out and "4321" in out, out
+    folders = _privacy_folders(env)
+    assert len(folders) == 1, "a privacy profile was deleted under a Chrome still running"
+    assert server.BrowserState.browser is env.started[0], "the only handle on a live Chrome was dropped"
+    assert server.BrowserState.current_profile_dir == folders[0] and server.BrowserState.current_privacy, \
+        "the kept handle does not name its profile, so nothing would remove it"
