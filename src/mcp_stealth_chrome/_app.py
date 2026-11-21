@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import inspect
 import time
 from typing import Any
 
@@ -193,9 +194,12 @@ class StealthMCP(FastMCP):
 
     async def list_tools(self):
         """The tools as advertised: FastMCP's list with the made-up titles left out of each
-        schema. The tool itself keeps its full schema (`tool.parameters`), which the argument
-        check and FastMCP's own validation read."""
+        schema, and each description without its docstring's indentation (FastMCP hands on the
+        raw docstring: 9.1 of 96.9 KB was leading spaces; `inspect.cleandoc` keeps the indent of
+        one line against another). The tool itself keeps its full schema (`tool.parameters`),
+        which the argument check and FastMCP's own validation read."""
         return [tool.model_copy(update={
+            "description": inspect.cleandoc(tool.description) if tool.description else tool.description,
             "inputSchema": without_titles(tool.inputSchema),
             "outputSchema": without_titles(tool.outputSchema),
         }) for tool in await super().list_tools()]

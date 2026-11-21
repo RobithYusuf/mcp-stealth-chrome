@@ -296,3 +296,23 @@ def test_only_a_schemas_own_title_goes():
     }
     assert repr(schema) == before  # a new object: the tool's own schema is not changed
     assert without_titles(None) is None
+
+
+def test_listed_descriptions_carry_no_docstring_indentation(mcp):
+    """FastMCP hands on the raw docstring, so every line after the first began with the four
+    spaces of its function body (9% of all description text). What a client lists has the common
+    indentation removed and nothing else: an argument's continuation lines stay indented under it."""
+    import inspect
+    from mcp_stealth_chrome.server import mcp as server
+    listed = _listed_tools(mcp)
+    indented_before = 0
+    for tool in listed:
+        own = server._tool_manager.get_tool(tool.name).description or ""
+        assert tool.description == inspect.cleandoc(own), tool.name
+        assert tool.description.split() == own.split(), tool.name  # the same words, in the same order
+        later = [line for line in tool.description.splitlines()[1:] if line.strip()]
+        assert not later or min(len(line) - len(line.lstrip(" ")) for line in later) == 0, tool.name
+        indented_before += own != tool.description
+    assert indented_before > 100  # the raw docstrings really were indented
+    launch = next(tool for tool in listed if tool.name == "browser_launch").description
+    assert "\nArgs:\n    url: initial URL to load\n" in launch
