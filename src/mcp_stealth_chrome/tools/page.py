@@ -68,7 +68,8 @@ async def browser_snapshot(
     writes nothing to the page. EVERY snapshot replaces all refs; a superseded ref, or one whose element is
     gone, fails saying so instead of hitting the wrong element. The report states matched / measured /
     eligible / returned / omitted for the walk that made the list, so a filtered result never reads as
-    "this page has nothing on it".
+    "this page has nothing on it". The filters below compose (all given ones apply together), and nothing
+    is left out in silence.
 
     Args:
         mode: "interactive_compact" (default): full fidelity minus non-interactive elements with no accessible

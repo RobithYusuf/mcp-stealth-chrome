@@ -1104,7 +1104,7 @@ async def auth_capture(
     include_response_headers: bool = False,
     reveal_values: Union[bool, Literal["body"]] = False,
 ) -> str:
-    """Intercept the next N requests whose URL contains a pattern and return their headers (Authorization,
+    """Watch for the next N requests whose URL contains a pattern and return their headers (Authorization,
     X-CSRF-*, etc.): for SPAs that hold bearer tokens in JS memory, never in localStorage. Values are hidden
     unless reveal_values=True (tool output lands in the transcript). After network_start,
     http_request_with_session reuses a token seen on the same origin without showing it.
