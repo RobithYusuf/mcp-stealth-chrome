@@ -5,6 +5,7 @@ does, all started here and ended here. A real browser is checked in test_a_launc
 """
 import os
 import pathlib
+import secrets
 import shutil
 import signal
 import subprocess
@@ -18,7 +19,9 @@ import _leftovers
 from _protocol import REPO
 from mcp_stealth_chrome import run_marker, state
 
-TOKEN = "0123456789abcdef"
+# New for every run: with one fixed token, two runs at the same time (two worktrees, two agents)
+# listed and ended each other's stand-ins, and both failed.
+TOKEN = secrets.token_hex(8)
 NAP = "import time; time.sleep(60)"
 
 
