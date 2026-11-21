@@ -26,6 +26,24 @@ Part of the agent guide: [AGENTS.md](../../AGENTS.md) says when to read this. It
   `_RUNS_DESPITE_DIALOG` (tab_list reads titles). Mid-tool, `before_input` raises `PersonHasBrowser`. `wait_for_human`
   ends on Done or on Resume agent pressed after it was asked, and ignores page changes while the person holds the
   browser (their own clicks change it).
+- While the bar shows a request for help (`presence.shows_request`: the overlay runs and `ask` returned the
+  request's time), a page change does not end `wait_for_human`; only Done, Resume agent, `done_selector` or
+  `done_url_contains` do. The bar shows that request with Done even with `overlay_bar` off (`wants_bar`). An
+  overlay whose process exits during the wait is started again first (`presence.keep_running`, `revive`), checked at
+  the top of every pass, so also while the person holds the browser and on a selector or URL wait; only one that
+  cannot come back lets a page change count, and the result says the bar ended. A hold whose overlay cannot come
+  back ends the wait as an error (Resume agent is gone with it). A browser or tab that is gone ends the wait as an
+  error (`_gone`); a tab counts as gone only when a non-empty list of Chrome's pages, read then or `TARGETS_AGAIN`
+  (0.3 s) later, lacks it, since an empty or unread list proves nothing. Shopee
+  moves its login page to `/buyer/login/qr` by itself a moment after loading, and a wait measured from the
+  request called that a finished handoff after 0.0 s. A timeout takes the request off the bar, so the person never
+  reads "Your help is needed" while the agent does something else, but the agent keeps it (`shown_at` None): the
+  next `wait_for_human` shows it again with the same text and counts as the same handoff, and a Done counts from
+  that new showing on. Only a request the bar showed (`was_shown`) is shown again: one handed over while no overlay
+  ran stays without a bar, even if one runs by the next wait.
+- Known limit: a Done is matched to the request by wall-clock stamps (`help_done` at or after `shown_at`), so a
+  wall-clock step back while a request is off the bar can let an earlier Done count; a request id shared with the
+  overlay process (planned for 0.27) closes it.
 - `before_input` runs in one wrapper on nodriver's `Tab.mouse_click` (`patches._patch_mouse_click_reports_pointer`,
   which also feeds the click ring; sixteen places press through it), each drag step (the button is still let go in its
   `finally`), each `humanized_scroll` chunk (outside its retry, which would resend the wheel event, and once more
@@ -33,8 +51,9 @@ Part of the agent guide: [AGENTS.md](../../AGENTS.md) says when to read this. It
   click fallback, and each step of `batch_actions` and `workflow_run` (`presence.refusal`). `fill`'s JS-value fallback
   re-raises `PersonHasBrowser` instead of writing the value anyway.
 - Fails closed: `refusal` and `before_input` act on the overlay's handle whether its process runs or not. A dead one
-  is restarted (`revive`, at most `RESTARTS` 3, only while Chrome's PID still runs with the start time recorded at
-  attach, as PIDs are handed out again) and keeps the holder, since the new process reads `control.json` first. Held
+  is restarted (`revive`, at most `RESTARTS` 3 attempts, a failed start counting too and followed by `REVIVE_BACKOFF`
+  3 s without one, only while Chrome's PID still runs with the start time recorded at attach, as PIDs are handed out
+  again) and keeps the holder, since the new process reads `control.json` first. Held
   with no overlay to show Resume agent, every tool is refused except `browser_launch(agent_overlay=False)`, which
   stops it: the one way out, named in the refusal.
 - The button is the only way to take over, so help (Done) and the person's hold (Resume agent) always show it and are
