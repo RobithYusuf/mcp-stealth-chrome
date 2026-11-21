@@ -23,7 +23,7 @@ import sys
 import tempfile
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal, Optional
 
@@ -6253,6 +6253,22 @@ _TRIPWIRE_PROBE_JS = """
     if (text === null) text = ((document.body && document.body.innerText) || '').toLowerCase();
     out.words = (out.words || []).concat(words[h].filter(w => text.includes(w)));
   }
+  // Child-frame URLs are readable cross-origin; same-origin frame text is bounded and filtered
+  // to the host rules, so a hostile page cannot make this walk unbounded.
+  out.frames = [];
+  for (const frame of Array.from(document.querySelectorAll('iframe')).slice(0, 16)) {
+    const item = {href: frame.src || '', words: []};
+    try {
+      const doc = frame.contentDocument;
+      const fhost = (new URL(item.href || doc.location.href)).hostname.toLowerCase();
+      const body = ((doc.body && doc.body.innerText) || '').slice(0, 20000).toLowerCase();
+      for (const h of Object.keys(words)) {
+        if (fhost !== h && !fhost.endsWith('.' + h)) continue;
+        item.words = item.words.concat(words[h].filter(w => body.includes(w)));
+      }
+    } catch (_) { /* cross-origin: the URL is still useful */ }
+    if (item.href) out.frames.push(item);
+  }
   if (%s) {
     let mark = '';
     if (document.querySelector('script[src*="/cdn-cgi/challenge-platform/"][src*="/orchestrate/"]')) {
@@ -6376,7 +6392,9 @@ async def _tripwire_look(tab: Tab, *, url: Optional[str] = None, want_cf: bool =
     if mode == "off":
         return None
     verdict = antibot.url_verdict(url, rules) if url else None
-    if verdict is None and (want_cf or not url or antibot.wants_text(url, rules)):
+    if verdict is None:
+        # A bounded DOM probe is also needed on ordinary parent pages: a verification URL can
+        # live in an iframe whose URL is otherwise invisible to the active document.
         seen = await _tripwire_probe(tab, rules, want_cf)
         if seen is None:
             return None  # unread: nothing known, and nothing withdrawn either
@@ -6387,6 +6405,19 @@ async def _tripwire_look(tab: Tab, *, url: Optional[str] = None, want_cf: bool =
             verdict = antibot.text_verdict(href, seen["words"], rules)
         if verdict is None and seen.get("cf"):
             verdict = antibot.cloudflare_verdict(href, str(seen["cf"]), header)
+        if verdict is None:
+            for frame in seen.get("frames") or ():
+                if not isinstance(frame, dict):
+                    continue
+                frame_url = str(frame.get("href") or "")
+                frame_verdict = antibot.url_verdict(frame_url, rules)
+                if frame_verdict is None and frame.get("words"):
+                    frame_verdict = antibot.text_verdict(frame_url, frame["words"], rules)
+                if frame_verdict is not None:
+                    verdict = replace(frame_verdict,
+                                      trigger=frame_verdict.trigger + " (in child frame)")
+                    href = frame_url
+                    break
     key = _target_key(tab)
     if verdict is None:
         _tripwire_left(tab, key)
@@ -6450,22 +6481,40 @@ def _tripwire_ask(tab: Tab, trip: _Trip, baseline: Optional[dict]) -> None:
 
 
 def _tripwire_after_action(result: str, after: Optional[dict]) -> str:
-    """click, click_text, click_role, press_key and the other clicks know the URL after the action
-    (the fingerprint read it). A verification page there puts one line first, in both modes: the
-    action did happen, so the result stays no error. In pause mode the request is recorded and
-    shown as after a navigation; a workflow then stops before its next step. The URL rules only:
-    this reads nothing more of the page."""
+    """Check the URL reached by the action and URLs of tabs it opened. The action itself did
+    happen, so a detected verification page remains a non-error action result."""
     from . import antibot
-    url = (after or {}).get("url")
-    if not url or result.startswith("Error:"):
+    if result.startswith("Error:"):
         return result
     mode, rules = _tripwire_settings()
-    verdict = antibot.url_verdict(url, rules) if mode != "off" else None
+    if mode == "off":
+        return result
+    candidates = []
+    url = (after or {}).get("url")
+    if url:
+        candidates.append((None, url))
+    before_pages = (after or {}).get("before_pages") or {}
+    pages = (after or {}).get("pages") or {}
+    if isinstance(before_pages, dict) and isinstance(pages, dict):
+        candidates.extend((target, page_url) for target, page_url in pages.items()
+                          if target not in before_pages)
+    verdict = None
+    target = None
+    for candidate_target, candidate_url in candidates:
+        found = antibot.url_verdict(candidate_url, rules)
+        if found is not None:
+            verdict, target = found, candidate_target
+            if candidate_target is not None:
+                verdict = replace(verdict, trigger=verdict.trigger + " (in opened tab)")
+            break
     if verdict is None:
         return result
     try:
-        tab = BrowserState.active_tab()
-        trip = _tripwire_seen(_target_key(tab), mode, verdict, BrowserState.current_headless)
+        tab = next((candidate for candidate in BrowserState.tabs
+                    if target is not None and _target_key(candidate) == str(target)), None)
+        tab = tab or BrowserState.active_tab()
+        key = str(target) if target is not None else _target_key(tab)
+        trip = _tripwire_seen(key, mode, verdict, BrowserState.current_headless)
         if trip.where == "ask":
             _tripwire_ask(tab, trip, after)
     except Exception:
@@ -7036,7 +7085,9 @@ def _click_outcome(head: str, detail: str, before: dict, after: dict) -> str:
               else _click_change(before, after))
     if change is not None:
         # A click that led to a site's verification page says so first (antibot_tripwire).
-        return _tripwire_after_action(ok(f"{head} — {detail}{change}"), after)
+        checked_after = dict(after)
+        checked_after["before_pages"] = before.get("pages")
+        return _tripwire_after_action(ok(f"{head} — {detail}{change}"), checked_after)
     return ok(
         f"{head} but NO page change detected — {detail}. The event was dispatched; "
         f"the page did not react (handler not bound, click swallowed, or the change "
