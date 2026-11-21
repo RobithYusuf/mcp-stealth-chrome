@@ -58,19 +58,26 @@ async def batch_actions(actions: list[dict]) -> str:
                 tool, args = _batch_action_call(act)
                 warning = ""
                 if tool is not None:
-                    # A click before may have sent the page to a verification page: stop before
-                    # this action, whatever stop_on_error says.
-                    said = await _srv._tripwire_step(previous, tool)
-                    if said and said.startswith(antibot.PAUSE_PREFIX):
-                        paused = (i, atype, said, False)
-                        results.append(f"[{i}] {atype}: not run, paused (antibot) before it")
-                        break
-                    warning = f"\n    {said}" if said else ""
-                if tool is None:
-                    r = err(f"unknown action type: {atype}")
+                    # Take over is checked before any checkpoint DOM read. While the person holds
+                    # the browser, this step must not inspect the page at all.
+                    refused = _srv._inner_arguments_error(tool, args) or presence.refusal(
+                        tool, BrowserState.browser)
+                    if refused:
+                        r = refused
+                    else:
+                        # A click before may have sent the page to a verification page: stop before
+                        # this action, whatever stop_on_error says.
+                        said = await _srv._tripwire_step(previous, tool)
+                        if said and said.startswith(antibot.PAUSE_PREFIX):
+                            paused = (i, atype, said, False)
+                            results.append(f"[{i}] {atype}: not run, paused (antibot) before it")
+                            break
+                        warning = f"\n    {said}" if said else ""
+                        r = (presence.refusal(tool, BrowserState.browser)
+                             or await _srv._WORKFLOW_TOOLS[tool](**args))
                 else:
-                    r = (_srv._inner_arguments_error(tool, args) or presence.refusal(tool, BrowserState.browser)
-                         or await _srv._WORKFLOW_TOOLS[tool](**args))
+                    r = err(f"unknown action type: {atype}")
+                if tool is not None:
                     previous = tool
                 if isinstance(r, str) and r.startswith(antibot.PAUSE_PREFIX):
                     paused = (i, atype, r, True)

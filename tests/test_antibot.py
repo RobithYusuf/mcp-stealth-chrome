@@ -285,6 +285,27 @@ def test_a_batch_stops_at_the_verification_page(monkeypatch):
     assert len(site.opened) == 3 and calls[0] == (None, "navigate")
 
 
+@pytest.mark.parametrize("runner", ["batch", "workflow"])
+def test_checks_takeover_before_tripwire_checkpoint(monkeypatch, runner):
+    checks = []
+
+    async def should_not_probe(*_args):
+        checks.append("tripwire")
+        return None
+
+    monkeypatch.setattr(server, "_register_workflow_tools", lambda: None)
+    monkeypatch.setattr(server, "_WORKFLOW_TOOLS", {"navigate": should_not_probe})
+    monkeypatch.setattr(server, "_inner_arguments_error", lambda tool, args: None)
+    monkeypatch.setattr(server, "_tripwire_step", should_not_probe)
+    monkeypatch.setattr(batch.presence, "refusal", lambda *_args: "Error: the person took over")
+    monkeypatch.setattr(BrowserState, "browser", object())
+    from mcp_stealth_chrome.tools.action_kit import workflow_run
+    out = asyncio.run(batch.batch_actions([{"type": "navigate", "url": "https://example.test"}])
+                      if runner == "batch" else workflow_run([{"tool": "navigate", "args": {"url": "https://example.test"}}]))
+    assert "the person took over" in out
+    assert checks == []
+
+
 def test_a_batch_warning_leaves_a_failed_action_counted(monkeypatch):
     async def step_check(previous, tool):
         return "antibot_warning: verification page (x)" if previous else None

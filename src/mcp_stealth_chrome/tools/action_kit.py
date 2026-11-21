@@ -882,6 +882,13 @@ async def workflow_run(
             return refused
         return await _srv._WORKFLOW_TOOLS[tool](**args)
 
+    async def checkpoint(previous: Optional[str], next_tool: str) -> Optional[str]:
+        # Check Take over before the tripwire checkpoint can read the page.
+        refused = presence.refusal(next_tool, BrowserState.browser)
+        if refused:
+            return None  # dispatch checks ownership again and reports the refusal
+        return await _srv._tripwire_step(previous, next_tool)
+
     # The anti-bot tripwire looks between steps: a click may have sent the page to a site's
     # verification page, and the run stops there before its next step, whatever stop_on_error says.
     run = _srv._TRIPWIRE_RUN.set({"tool": "workflow_run"})
@@ -889,7 +896,7 @@ async def workflow_run(
         result = await run_workflow(
             steps, dispatch, lambda name: name in _srv._WORKFLOW_TOOLS,
             start_at=start_at, stop_on_error=stop_on_error, variables=vars, output=output,
-            checkpoint=_srv._tripwire_step,
+            checkpoint=checkpoint,
         )
     except WorkflowError as e:
         return err(str(e))
