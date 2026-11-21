@@ -27,7 +27,7 @@ from mcp_stealth_chrome.identity import (
     navigator_platform,
     os_family,
     strip_headless,
-    ua_metadata_fields,
+    reduced_user_agent,
 )
 
 FIXTURES = pathlib.Path(__file__).parent / "fixtures"
@@ -74,6 +74,12 @@ def test_unknown_key_is_an_error_not_a_silent_no_op(bad):
         key_event_params(bad)
 
 
+def test_ua_helpers():
+    assert chrome_version(WIN_UA) == "140.0.7339.80"
+    assert chrome_version("Mozilla/5.0 (X11; rv:128.0) Gecko/20100101 Firefox/128.0") is None
+    assert "HeadlessChrome" not in strip_headless("x HeadlessChrome/156.0.1.2 y")
+    assert os_family(WIN_UA) == "windows" and navigator_platform("windows") == "Win32"
+    assert os_family(WIN_UA, "MacIntel") == "mac"  # an explicit platform wins
 def test_reduced_native_user_agent():
     assert reduced_user_agent("157.0.8103.80", "mac").endswith("Chrome/157.0.0.0 Safari/537.36")
     assert "HeadlessChrome" not in reduced_user_agent("157.0.8103.80", "linux")
