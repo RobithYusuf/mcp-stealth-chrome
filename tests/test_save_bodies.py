@@ -620,3 +620,108 @@ def test_a_failed_start_leaves_other_notices_of_the_session(monkeypatch, tmp_pat
                                      max_body_bytes=100, buffer_bytes=100))
     text = body_saver.result_notice("s-other", "x")
     assert "instance 'b'" in text and "instance 'a'" not in text, text
+
+
+def test_starts_and_stops_at_the_same_time_leave_one_saver_reachable(monkeypatch, tmp_path):
+    """Two network_start(save_bodies=...) in flight at once (FastMCP runs calls concurrently)
+    while a run is live: one saver ends up live and reachable, every other one is stopped and
+    counted as replaced, and save_bodies=[] then leaves none. Before the per-browser lock both
+    calls awaited the old run's stop, then both registered, and the first saver stayed live
+    where save_bodies=[], browser_close and shutdown() could not reach it."""
+    made = []
+    real_init = body_saver.Saver.__init__
+
+    def init(self, *args, **kwargs):
+        real_init(self, *args, **kwargs)
+        made.append(self)
+
+    async def connected(self):  # the stubbed connection: no Chrome, a moment to set up
+        await asyncio.sleep(0.05)
+
+    monkeypatch.setattr(body_saver.Saver, "__init__", init)
+    monkeypatch.setattr(body_saver.Saver, "start", connected)
+    monkeypatch.setattr(body_saver, "_release_every_target",
+                        lambda ws_url, budget: time.sleep(0.05) or "")
+
+    class Browser:
+        websocket_url = "ws://127.0.0.1:9/devtools/browser/race"
+
+    browser = Browser()
+    entries = body_saver.parse_entries([{"url_pattern": "*/api/*", "name": "race"}])
+
+    def begin():
+        return body_saver.start(browser, instance_id="main", session_key="s-race", entries=entries,
+                                mode="none", export_dir=tmp_path, max_body_bytes=100,
+                                buffer_bytes=100)
+
+    def live():
+        return [s for s in made if not s.ended()]
+
+    async def scenario():
+        first = await begin()
+        a, b = await asyncio.gather(begin(), begin())
+        after_two = live()
+        reachable = body_saver.saver_for(browser)
+        # a stop sent while a start is under way ends the run that start leaves behind
+        _c, stopped = await asyncio.gather(begin(), body_saver.stop_for(browser, "save_bodies=[]"))
+        after_stop = live()
+        return first, a, b, after_two, reachable, stopped, after_stop
+
+    first, a, b, after_two, reachable, stopped, after_stop = asyncio.run(scenario())
+    assert len(after_two) == 1 and after_two[0] is reachable, [s.end_reason for s in made]
+    for saver in (first, a, b):
+        if saver is not reachable:
+            assert saver.ended() and saver.end_reason.startswith("replaced by a new network_start"), \
+                saver.end_reason
+    assert reachable.replaced is not None, "the live one does not say which run it replaced"
+    assert stopped is not None and stopped["stop_reason"] == "save_bodies=[]", stopped
+    assert after_stop == [] and body_saver.saver_for(browser) is None, \
+        [(s.ended(), s.end_reason) for s in made]
+    assert not any(s in body_saver._OPEN for s in made), "a stopped saver is still open"
+    assert body_saver.status("s-race", "main")["state"] == "stopped"
+    for saver in made:
+        saver._writer.shutdown()
+
+
+def test_the_server_exit_ends_a_saver_that_is_no_longer_live(monkeypatch, tmp_path):
+    """shutdown() ends every saver registered and not yet forgotten, not only the one _LIVE
+    names: one that was replaced but has not finished stopping, or one a future path left
+    behind, still holds targets until it is ended."""
+    released = []
+    monkeypatch.setattr(body_saver, "_release_every_target",
+                        lambda ws_url, budget: released.append(ws_url) or "")
+    behind, current = _saver(tmp_path), _saver(tmp_path)
+    behind.ws_url = current.ws_url = "ws://127.0.0.1:9/devtools/browser/exit-open"
+    with body_saver._LOCK:
+        body_saver._OPEN.update({behind, current})
+        body_saver._LIVE[current.ws_url] = current
+    body_saver.shutdown()
+    assert behind.ended() and current.ended(), (behind.end_reason, current.end_reason)
+    assert released == [current.ws_url] * 2
+    assert behind not in body_saver._OPEN and current not in body_saver._OPEN
+
+
+def test_a_saver_registered_without_the_lock_is_ended_not_left_behind(monkeypatch, tmp_path):
+    """The second guard: a live saver that start() did not stop (one registered some other way)
+    is ended when a new one takes its place, never left holding the browser unreachable."""
+    async def connected(self):
+        await asyncio.sleep(0.01)
+    monkeypatch.setattr(body_saver.Saver, "start", connected)
+    monkeypatch.setattr(body_saver, "_release_every_target", lambda ws_url, budget: "")
+    monkeypatch.setattr(body_saver, "saver_for", lambda browser: None)  # start() sees no old run
+
+    class Browser:
+        websocket_url = "ws://127.0.0.1:9/devtools/browser/unlocked"
+
+    stray = _saver(tmp_path)
+    stray.ws_url = Browser.websocket_url
+    with body_saver._LOCK:
+        body_saver._LIVE[stray.ws_url] = stray
+        body_saver._OPEN.add(stray)
+    entries = body_saver.parse_entries([{"url_pattern": "*", "name": "x"}])
+    new = asyncio.run(body_saver.start(Browser(), instance_id="main", session_key="s-unlocked",
+                                       entries=entries, mode="none", export_dir=tmp_path,
+                                       max_body_bytes=100, buffer_bytes=100))
+    assert stray.ended() and "raced" in stray.end_reason, stray.end_reason
+    assert not new.ended() and body_saver._LIVE[stray.ws_url] is new
+    asyncio.run(new.stop("test over"))

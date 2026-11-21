@@ -351,6 +351,13 @@ _LIVE: dict[str, "Saver"] = {}
 _RUNS: dict[tuple[str, str], dict] = {}
 _NOTICES: dict[str, list[str]] = {}
 _WATCHDOG: dict[str, Any] = {"thread": None}
+# Every saver from its registration until _forget, whatever _LIVE says: what shutdown() ends.
+_OPEN: set = set()
+# One asyncio.Lock per browser (and event loop): start, replace and stop_for run one at a time
+# for a browser. Two network_start(save_bodies=...) at once (FastMCP runs calls concurrently,
+# --http sessions too) both awaited the old saver's stop and then both registered, and the
+# first saver stayed live where nothing could reach or stop it.
+_BROWSER_LOCKS: dict[str, tuple[Any, asyncio.Lock]] = {}
 
 
 def _ensure_watchdog() -> None:
@@ -418,6 +425,10 @@ class Saver:
         self.started_at = time.time()
         # Until start() returns: an end then is told in network_start's own answer, not later.
         self.starting = True
+        # Set by start(), under the browser's lock: the final report of the run this one
+        # replaced, and where each name's records go.
+        self.replaced: Optional[dict] = None
+        self.plan: list[dict] = []
         # saver thread only
         self.sessions: dict[str, dict] = {}
         self._next_id = 0
@@ -921,10 +932,28 @@ def file_plan(folder: Path, entries: list[Entry]) -> list[dict]:
 # REGISTRY AND HOOKS
 # ══════════════════════════════════════════════════════════════════════════
 
+def _browser_lock(ws_url: str) -> asyncio.Lock:
+    """The lock that serialises start, replace and stop for one browser. Made under _LOCK (a
+    threading lock, never held across an await); a lock belongs to the loop it first waited
+    on, so a new loop gets a new one."""
+    loop = asyncio.get_running_loop()
+    with _LOCK:
+        held = _BROWSER_LOCKS.get(ws_url)
+        if held is None or held[0] is not loop:
+            held = (loop, asyncio.Lock())
+            _BROWSER_LOCKS[ws_url] = held
+        if len(_BROWSER_LOCKS) > 64:  # browsers come and go; keep the ones in use
+            for url, (_loop, lock) in list(_BROWSER_LOCKS.items()):
+                if url != ws_url and url not in _LIVE and not lock.locked():
+                    _BROWSER_LOCKS.pop(url, None)
+        return held[1]
+
+
 def _forget(saver: Saver, notice: bool = False) -> None:
     saver._writer.shutdown(wait=False)
     report = saver.report()
     with _LOCK:
+        _OPEN.discard(saver)
         if _LIVE.get(saver.ws_url) is saver:
             _LIVE.pop(saver.ws_url, None)
         run = _RUNS.get((saver.session_key, saver.instance_id))
@@ -994,20 +1023,35 @@ def day_folder(export_dir: Path, started: Optional[float] = None) -> Path:
 async def start(browser: Any, *, instance_id: str, session_key: str, entries: list[Entry],
                 mode: str, export_dir: Path, max_body_bytes: int, buffer_bytes: int) -> Saver:
     """Start saving in this browser, ending a run already there first. Raises with the reason
-    when it could not start; nothing is left holding the browser then."""
+    when it could not start; nothing is left holding the browser then. The new saver carries
+    the final report of the run it replaced (`replaced`) and its files' plan (`plan`), both
+    read under the browser's lock, so they are this call's and not another's."""
     ws_url = _ws_url(browser)
     if not ws_url:
         raise RuntimeError("the browser's debugging address is unknown")
+    async with _browser_lock(ws_url):
+        return await _start_locked(browser, ws_url, instance_id, session_key, entries, mode,
+                                   export_dir, max_body_bytes, buffer_bytes)
+
+
+async def _start_locked(browser: Any, ws_url: str, instance_id: str, session_key: str,
+                        entries: list[Entry], mode: str, export_dir: Path, max_body_bytes: int,
+                        buffer_bytes: int) -> Saver:
     old = saver_for(browser)
+    replaced = None
     if old is not None:
         await old.stop("replaced by a new network_start(save_bodies=...)")
+        replaced = old.report()
     folder = day_folder(export_dir)
     for entry in entries:
         confined_output_path(folder, _file_name(entry.name, 1))
+    plan = file_plan(folder, entries)
     runner = _runner()
     saver = Saver(ws_url, instance_id, session_key, entries, mode, folder, max_body_bytes,
                   buffer_bytes, runner)
+    saver.replaced, saver.plan = replaced, plan
     with _LOCK:
+        other = _LIVE.get(ws_url)
         run = _RUNS.get((session_key, instance_id))
         previous = None
         if run is not None:
@@ -1016,6 +1060,12 @@ async def start(browser: Any, *, instance_id: str, session_key: str, entries: li
         # Watched from before it starts: a start that hangs the saver thread is ended within
         # the stall time.
         _LIVE[ws_url] = saver
+        _OPEN.add(saver)
+    if other is not None and other is not old and not other.ended():
+        # Under the browser's lock nothing else registers here; one that did anyway is ended
+        # rather than left holding the browser where nothing reaches it.
+        await asyncio.to_thread(other.fail_open,
+                                "replaced by a new network_start(save_bodies=...) it raced with")
     _ensure_watchdog()
     started = asyncio.ensure_future(_on_runner(runner, saver.start(), 20))
     while not started.done() and not saver.ended():
@@ -1035,13 +1085,18 @@ async def start(browser: Any, *, instance_id: str, session_key: str, entries: li
 
 
 async def stop_for(browser: Any, reason: str) -> Optional[dict]:
-    """End this browser's saving, if any; its final report. Never raises."""
-    saver = saver_for(browser)
-    if saver is None:
+    """End this browser's saving, if any; its final report, or None when none was running.
+    Waits for a start or stop of the same browser in progress. Never raises."""
+    ws_url = _ws_url(browser) if browser is not None else None
+    if not ws_url:
         return None
-    with contextlib.suppress(Exception):
-        await saver.stop(reason)
-    return saver.report()
+    async with _browser_lock(ws_url):
+        saver = saver_for(browser)
+        if saver is None:
+            return None
+        with contextlib.suppress(Exception):
+            await saver.stop(reason)
+        return saver.report()
 
 
 def status(session_key: str, instance_id: str) -> dict:
@@ -1069,8 +1124,11 @@ def shutdown(reason: str = "the server is exiting") -> None:
     every target it may hold, once, over a new connection. Side by side, bounded by
     SHUTDOWN_BUDGET in all; for the server's exit path, after its event loop is gone."""
     ends = time.monotonic() + SHUTDOWN_BUDGET
+    # Every saver registered and not yet forgotten, live or being replaced: registration is
+    # under _LOCK too, so none slips between this list and the ends below. (No event loop runs
+    # at exit, so the browsers' asyncio locks cannot be taken here, and no start can resume.)
     with _LOCK:
-        savers = list(_LIVE.values())
+        savers = list(_OPEN | set(_LIVE.values()))
     running = []
     for saver in savers:
         if saver._end(reason):

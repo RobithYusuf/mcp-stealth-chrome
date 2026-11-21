@@ -333,28 +333,27 @@ _MODE_TEXT = {
 
 
 async def _start_or_stop_saving(result: str, entries: list, reveal: str) -> str:
+    # What was stopped or replaced is what body_saver did under the browser's lock, not a
+    # look taken before: another call may have started or stopped saving in between.
     browser = BrowserState.browser
-    old = body_saver.saver_for(browser)
     if not entries:
-        if old is None:
-            return f"{result}; no body saving was running"
         report = await body_saver.stop_for(browser, "network_start(save_bodies=[])")
+        if report is None:
+            return f"{result}; no body saving was running"
         return (f"{result}; body saving stopped: {_saved_summary(report)}. "
                 f"network_save_status() has the final counts")
-    try:
-        plan = body_saver.file_plan(body_saver.day_folder(EXPORT_DIR), entries)
-    except (OSError, ValueError) as exc:
-        return err(f"{result}; body saving did NOT start, its folder is unusable "
-                   f"({type(exc).__name__}: {exc}). Nothing is being saved")
     try:
         saver = await body_saver.start(
             browser, instance_id=BrowserState.current_instance_id,
             session_key=BrowserState.session_key(), entries=entries, mode=reveal,
             export_dir=EXPORT_DIR, max_body_bytes=_srv.CAPTURE_BODY_MAX_BYTES,
             buffer_bytes=_srv.CAPTURE_BODY_BUFFER_BYTES)
+    except (OSError, ValueError) as exc:
+        return err(f"{result}; body saving did NOT start, its folder is unusable "
+                   f"({type(exc).__name__}: {exc}). Nothing is being saved")
     except Exception as exc:
         return err(f"{result}; body saving did NOT start ({exc}). Nothing is being saved")
-    replaced = old.report() if old is not None else None  # final: start() ended it
+    replaced, plan = saver.replaced, saver.plan
     lines = [result, f"saving response bodies to files, {_MODE_TEXT[reveal]}:"]
     for item in plan:
         entry = item["entry"]
