@@ -323,11 +323,11 @@ async def _run_tool(run: _Run, step: dict, path: list[int]) -> None:
         return
     if run.checkpoint is not None and isinstance(tool, str):
         said = await run.checkpoint(run.previous_tool, tool)
-        if said and said.startswith("Error:"):
-            _fail(run, path, step, said)
-            return
         if said and said.startswith(PAUSE_PREFIX):
             _stop_at_pause(run, path, step, said, ran=False)
+            return
+        if said and said.startswith("Error:"):
+            _fail(run, path, step, said)
             return
         if said and len(run.warnings) < MAX_LATE_FAILURES:
             run.warnings.append({"before": path[0] if len(path) == 1 else _dotted(path),
