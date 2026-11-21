@@ -417,6 +417,20 @@ def test_a_tripwire_request_waits_as_an_agents_does_and_done_completes_it(page):
     assert "again after the request for it was answered" in server._tripwire_render(trip, "navigate", "")
 
 
+
+
+def test_popup_tripwire_waits_on_popup_and_done_clears_popup_record(page, monkeypatch):
+    tab = page("https://shopee.co.id/product/1", overlay=True)
+    popup = Tab(FIELD_URL, tab.browser)
+    popup.target = type("Target", (), {"target_id": "POPUP-TAB"})()
+    monkeypatch.setattr(BrowserState, "tabs", [tab, popup])
+    trip = look(popup, url=FIELD_URL)
+    assert trip is not None
+    assert "POPUP-TAB" in server._HUMAN_HELP
+    press_done(presence._handle(tab.browser))
+    result = asyncio.run(nav.wait_for_human(timeout=5))
+    assert result.startswith("human handoff completed")
+    assert "POPUP-TAB" not in server._HUMAN_HELP
 def test_a_second_look_says_it_in_one_line(page):
     tab = page(FIELD_URL, overlay=True)
     look(tab, url=FIELD_URL)
@@ -493,7 +507,7 @@ def test_an_unread_page_withdraws_nothing(page, monkeypatch):
 
 def test_the_words_and_cloudflare_are_read_only_when_needed(page):
     tab = page("https://example.com/a")
-    assert look(tab, url=tab.url) is None and tab.probes == 1  # child frames may have their own rules
+    assert look(tab, url=tab.url) is None and tab.probes == 0  # no host rule, no probe
     tab = page("https://shopee.co.id/product/1", words=["verifikasi untuk melanjutkan"])
     trip = look(tab, url=tab.url)
     assert tab.probes == 1 and "page text 'Verifikasi untuk melanjutkan'" in trip.verdict.trigger

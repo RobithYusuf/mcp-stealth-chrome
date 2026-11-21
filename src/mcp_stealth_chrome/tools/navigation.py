@@ -11,7 +11,7 @@ import contextlib
 import json
 import sys
 import time
-from typing import Optional
+from typing import Any, Optional
 
 from nodriver import Tab
 
@@ -198,6 +198,32 @@ async def request_human_help(objective: str, timeout: float = 300) -> str:
         return err(str(e))
 
 
+def _pending_human_request() -> tuple[Any, str, dict, str]:
+    """Choose one pending request across this instance's tabs, including popup targets."""
+    current = BrowserState.current_instance_id
+    pending = [(key, record) for key, record in _srv._HUMAN_HELP.items()
+               if record.get("instance_id", current) == current]
+    try:
+        active = BrowserState.active_tab()
+        active_key = _srv._target_key(active)
+    except Exception:
+        active, active_key = None, None
+    if not pending:
+        return active, active_key or "", {}, ""
+    by_key = dict(pending)
+    if active_key in by_key:
+        key = active_key
+    else:
+        key, _record = max(pending, key=lambda item: float(
+            item[1].get("requested_clock") or item[1].get("requested_at") or 0))
+    tab = _srv._tab_for_target(key) or active
+    note = ""
+    if len(pending) > 1:
+        keys = ", ".join(item[0] for item in pending)
+        note = f" [multiple pending requests on tabs {keys}; waiting on tab {key}]"
+    return tab, key, by_key[key], note
+
+
 @mcp.tool()
 async def wait_for_human(
     timeout: Optional[float] = None,
@@ -223,13 +249,9 @@ async def wait_for_human(
     change it saw was measured from this call, not from a person's work.
     """
     try:
-        tab = BrowserState.active_tab()
-        key = _srv._target_key(tab)
-        request = _srv._HUMAN_HELP.get(key, {})
-        # Without a handoff any change at all, a timer or an ad, read as "the human finished".
-        unasked = "" if request else (
-            "; no handoff was pending on this tab (request_human_help was not called), so this "
-            "only says the page changed after wait_for_human started")
+        tab, key, request, selection_note = _pending_human_request()
+        unasked = (f"{selection_note}; no handoff was pending on the selected tab, so this only says "
+                   "the page changed after wait_for_human started") if not request else selection_note
         # None means "inherit". Keying off the literal 300 would silently
         # override a caller who genuinely asked for 300 seconds.
         if timeout is None:

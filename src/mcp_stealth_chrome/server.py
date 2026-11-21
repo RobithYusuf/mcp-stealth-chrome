@@ -1439,9 +1439,11 @@ _CF_CHALLENGE_PROBE_INITIAL_JS = """
     '[data-sitekey^="0x"], input[name="cf-turnstile-response"], ' +
     'script[src*="challenges.cloudflare.com"]'
   );
-  // A sign-in form owns its widget. Leave it to the person instead of trying to click it.
-  if (!cfText && Array.from(responseInputs).some(i => i.form?.querySelector(
-      'input[name="user"], input[type="email"], input[type="password"], input[autocomplete="username"]'))) return false;
+  const loginInterstitial = !!document.querySelector(
+    'script[src*="/cdn-cgi/challenge-platform/"][src*="/orchestrate/"], form[action*="__cf_chl"]')
+    || Array.from(document.scripts).some(
+      s => !s.src && s.text.length < 20000 && s.text.indexOf('_cf_chl_opt') >= 0);
+  if (loginForm && !loginInterstitial) return false;
   return cfText || cfDom;
 })()
 """
@@ -6306,6 +6308,7 @@ class _Trip:
     repeat: bool = False        # the page reported before on this tab, its request still pending
     where: str = ""             # pause: "bar", "window", "headless" or "pending" (antibot.next_line)
     again: bool = False         # the earlier request was answered while the tab stayed: asked again
+    target: Optional[str] = None    # popup target when this pause came from a new tab
     auto_verify: str = ""       # what auto_verify said on this page, kept in a Cloudflare pause
 
 
@@ -6372,11 +6375,19 @@ def _record_human_help(tab: Tab, objective: str, timeout: float, *, by: str, clo
     # bar, the only kind a later wait shows again after a timeout.
     record["asked_at"] = record["shown_at"] = presence.ask(browser or BrowserState.browser, objective)
     record["was_shown"] = record["asked_at"] is not None
+    record["instance_id"] = BrowserState.current_instance_id
     return record
 
 
 def _tab_browser(tab: Tab) -> Any:
     return getattr(tab, "browser", None) or BrowserState.browser
+def _tab_for_target(target: Optional[str]) -> Optional[Tab]:
+    if not target:
+        return None
+    candidates = list(BrowserState.tabs)
+    browser = BrowserState.browser
+    candidates.extend(getattr(browser, "tabs", ()) or ())
+    return next((tab for tab in candidates if _target_key(tab) == str(target)), None)
 
 
 async def _tripwire_look(tab: Tab, *, url: Optional[str] = None, want_cf: bool = False,
@@ -6392,9 +6403,14 @@ async def _tripwire_look(tab: Tab, *, url: Optional[str] = None, want_cf: bool =
     if mode == "off":
         return None
     verdict = antibot.url_verdict(url, rules) if url else None
+    parent_rules = antibot.rules_for(antibot._host(url), rules) if url else []
+    relevant = not url or bool(parent_rules) or want_cf
+    if verdict is None and not relevant:
+        _tripwire_left(tab, _target_key(tab))
+        return None
     if verdict is None:
-        # A bounded DOM probe is also needed on ordinary parent pages: a verification URL can
-        # live in an iframe whose URL is otherwise invisible to the active document.
+        # A bounded DOM probe is needed only for hosts with a configured rule or a CF look.
+        # This preserves the zero-extra-CDP-call common path.
         seen = await _tripwire_probe(tab, rules, want_cf)
         if seen is None:
             return None  # unread: nothing known, and nothing withdrawn either
@@ -6520,9 +6536,11 @@ def _tripwire_after_action(result: str, after: Optional[dict]) -> str:
     if verdict is None:
         return result
     try:
-        tab = BrowserState.active_tab()
+        tab = _tab_for_target(target) or BrowserState.active_tab()
         key = str(target) if target is not None else _target_key(tab)
         trip = _tripwire_seen(key, mode, verdict, BrowserState.current_headless)
+        if target is not None:
+            trip.target = key
         if trip.where == "ask":
             _tripwire_ask(tab, trip, None if target else after, target=target)
         run = _TRIPWIRE_RUN.get()
@@ -6554,8 +6572,9 @@ def _tripwire_pause(trip: _Trip, lead: str, *, asked_for: Optional[str] = None,
     verdict = trip.verdict
     running = "; the browser is running and stays open on it" if launched else ""
     if trip.repeat:
+        popup = f" on popup tab {trip.target}" if trip.target else ""
         return err(f"{antibot.PAUSED}: still on the verification page reported before "
-                   f"({verdict.place}){running}; {_TRIPWIRE_PENDING[trip.where]}.")
+                   f"({verdict.place}){popup}{running}; {_TRIPWIRE_PENDING[trip.where]}.")
     if trip.again:
         lead += (", again after the request for it was answered (the tripwire does not judge the "
                  "answer); the person was asked again")
@@ -6563,6 +6582,8 @@ def _tripwire_pause(trip: _Trip, lead: str, *, asked_for: Optional[str] = None,
         lead += running
     elif asked_for:
         lead += ", not the page asked for"
+    if trip.target:
+        lead += f" on popup tab {trip.target}"
     run = _TRIPWIRE_RUN.get()
     again = "run resume_with" if run else "navigate again"
     cloudflare = verdict.kind == "cloudflare"
@@ -6596,9 +6617,9 @@ async def _tripwire_after_navigation(tab: Tab, observed: Optional[dict], *,
         and "challenge gone" not in str(verify_suffix)
     try:
         trip = await _tripwire_look(tab, url=(observed or {}).get("final_url"),
-                                    want_cf=left or header == "challenge" or headless is not None,
-                                    header=header, loader=(doc_state or {}).get("cf_loader"),
-                                    settle_text=True, headless=headless)
+                                    want_cf=left or header == "challenge", header=header,
+                                    loader=(doc_state or {}).get("cf_loader"), settle_text=True,
+                                    headless=headless)
     except Exception:
         return None  # a look that failed leaves the navigation's own result, as before it existed
     if trip is not None and left:
@@ -6620,9 +6641,21 @@ async def _tripwire_step(previous: Optional[str], next_tool: str) -> Optional[st
     if not BrowserState.is_up():
         return None
     try:
-        tab = BrowserState.active_tab()
         run = _TRIPWIRE_RUN.get()
-        trip = (run.pop("popup", None) if run else None) or await _tripwire_look(tab, want_cf=True)
+        trip = run.pop("popup", None) if run else None
+        if trip is None:
+            tab = BrowserState.active_tab()
+            trip = await _tripwire_look(tab, want_cf=True)
+        elif trip.target:
+            popup = _tab_for_target(trip.target)
+            if popup is not None:
+                popup_url = str(getattr(popup.target, "url", "") or "")
+                if popup_url == "about:blank":
+                    await asyncio.sleep(0.3)
+                    popup_url = str(getattr(popup.target, "url", "") or "")
+                fresh = await _tripwire_look(popup, url=popup_url or None, want_cf=False,
+                                             headless=BrowserState.current_headless)
+                trip = fresh or trip
     except Exception:
         return None  # no tab to look at, or a look that failed: the step runs as before
     if trip is None:
