@@ -83,6 +83,17 @@ def test_ua_helpers():
 def test_reduced_native_user_agent():
     assert reduced_user_agent("157.0.8103.80", "mac").endswith("Chrome/157.0.0.0 Safari/537.36")
     assert "HeadlessChrome" not in reduced_user_agent("157.0.8103.80", "linux")
+def test_unreadable_headless_binary_reports_worker_scope_risk(monkeypatch):
+    from mcp_stealth_chrome import server
+
+    class _Config:
+        browser_args = []
+        browser_executable_path = "/missing/chrome"
+
+    monkeypatch.setattr(server.profile_version, "binary_version", lambda _path: None)
+    note = server._apply_headless_native_user_agent(_Config(), True, {})
+    assert "version could not be read" in note
+    assert "SharedWorker" in note and "ServiceWorker" in note
 
 
 
