@@ -55,15 +55,8 @@ def _safe_list(v) -> list:
 
 _BLOCK_STATUS = {401, 403, 405, 406, 409, 421, 429, 503}
 _BLOCK_MARKERS = (
-    "just a moment",              # Cloudflare interstitial
-    "cf-chl", "challenge-platform",
-    "checking your browser",
-    "attention required",         # Cloudflare block page
     "captcha-delivery",           # DataDome
-    "please verify you are a human",
     "access denied", "access to this page has been denied",
-    "enable javascript and cookies to continue",
-    "verifying you are human",
     "px-captcha",                 # PerimeterX
     "incapsula incident",         # Imperva
 )
@@ -107,10 +100,7 @@ async def _serp_throttle() -> None:
 # js_challenge, etc). curl_cffi can't run the JS, but the stealth browser can —
 # we just have to WAIT for the challenge to resolve instead of reading too early.
 _CHALLENGE_MARKERS = (
-    "just a moment", "checking your browser", "challenge-platform",
-    "blocked by network security", "verifying you are human", "verify you are human",
-    "cf-chl", "jschl", "js_challenge", "please wait", "enable javascript and cookies",
-    "ddos protection by", "attention required",
+    "blocked by network security", "js_challenge",
 )
 
 
