@@ -674,3 +674,15 @@ def test_done_is_for_the_displayed_request_not_its_replacement(page, monkeypatch
     assert 'replaced' in stale and bar.agent['help'] and server._HUMAN_HELP['POPUP'] is b
     assert 'pressed Done' in asyncio.run(nav.wait_for_human(timeout=1))
     assert not server._HUMAN_HELP and not bar.agent['help']
+
+
+@pytest.mark.parametrize('tab_result', [
+    'Error: antibot_paused: tab_new reached a verification page',
+    'Error: Opened tab [2], now active: the page did not answer within 30s; the tab may still be loading',
+])
+def test_reuse_preserves_the_new_tabs_outcome(monkeypatch, tab_result):
+    async def opened(**kwargs):
+        return tab_result
+    monkeypatch.setattr(nav, 'tab_new', opened)
+    out = asyncio.run(server._reuse_without_an_agent_tab('not ours', FIELD_URL, None, None, None))
+    assert out.startswith(tab_result) and 'could not be opened' not in out

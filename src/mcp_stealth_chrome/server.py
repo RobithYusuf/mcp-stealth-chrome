@@ -3494,9 +3494,8 @@ async def _reuse_without_an_agent_tab(refusal: str, url: str, expect_url: Option
     if url and url != "about:blank":
         from .tools import navigation as _navigation
         opened = await _navigation.tab_new(url=url, expect_url=expect_url, expect_status=expect_status)
-        if opened.startswith("Error"):
-            return err(f"{head}; {url} could not be opened in a new tab of the agent's: "
-                       f"{opened[len('Error: '):]}")
+        if opened.startswith("Error:"):
+            return opened + keep_note  # tab_new knows whether it opened the tab and what happened next
         return ok(f"{head}; none of its tabs is the agent's to use, so {url} {opened} "
                   f"(a new tab of the agent's){keep_note}")
     return ok(f"{head}: {refusal} Or pass url= to open a page in a new tab of the agent's.{keep_note}")
