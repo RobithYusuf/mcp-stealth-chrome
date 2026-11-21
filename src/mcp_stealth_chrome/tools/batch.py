@@ -95,11 +95,15 @@ async def batch_actions(actions: list[dict]) -> str:
     return ok(header + "\n" + "\n".join(results))
 
 
+def _utf8_prefix(text: str, limit: int) -> str:
+    data = text.encode("utf-8")
+    if len(data) <= limit:
+        return text
+    return data[:max(0, limit)].decode("utf-8", "ignore")
+
+
 def _paused_batch(paused: tuple, results: list, n_failed: int, total: int) -> str:
-    """A batch stopped at a site's verification page: the pause first (status word right after
-    "Error: "), its trigger, page and next, then resume_with and each action's line. Not counted
-    as a failure: the action named as the pause either reached the page (it runs again on resume)
-    or was not run (the action before it, a click, is not repeated)."""
+    """Render a pause with a hard whole-response bound, including every action line."""
     index, atype, text, ran = paused
     lines = text.splitlines()
     detail = "\n".join(lines[1:])
@@ -112,11 +116,22 @@ def _paused_batch(paused: tuple, results: list, n_failed: int, total: int) -> st
                 "verification page")
         resume = (f"resume_with: batch_actions with actions[{index}:], once the person is done "
                   f"(the actions before it are not repeated)")
-    if not detail:  # said in one line: a page reported before, its request still pending
+    if not detail:
         head += f" ({lines[0][len(antibot.PAUSE_PREFIX):].strip()})"
-    out = [f"{antibot.PAUSED}: {head}."] + ([detail] if detail else []) + [
-        resume, f"{index} of {total} actions ran before it, {n_failed} failed"] + results
-    return err("\n".join(out))
+    base = [f"{antibot.PAUSED}: {head}"] + ([detail] if detail else []) + [
+        resume, f"{index} of {total} actions ran before it, {n_failed} failed"]
+    limit = 1015  # leave room for err()'s ``Error: `` prefix and stay below 1 KiB
+    payload = "\n".join(base)
+    if len(("Error: " + payload).encode("utf-8")) < 1024:
+        for line in results:
+            short = line if len(line) <= 160 else line[:160]
+            candidate = payload + "\n" + short
+            if len(("Error: " + candidate).encode("utf-8")) >= 1024:
+                break
+            payload = candidate
+        return err(payload)
+    payload = _utf8_prefix(payload, limit)
+    return err(payload)
 
 
 # The six legacy batch names and the defaults they always had. Every other key of the action
