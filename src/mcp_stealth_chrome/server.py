@@ -6759,13 +6759,14 @@ async def _tripwire_step(previous: Optional[str], next_tool: str) -> Optional[st
             # never inspect a popup's document or keep a verdict after its URL changed.
             pages = await asyncio.wait_for(_page_targets(BrowserState.browser), timeout=2)
             current = dict(pages).get(trip.target)
-            if current is None:
-                # A successful target-list read proves this popup closed; withdraw only its own
-                # request. An unread list takes the exception path and leaves it pending.
-                _tripwire_left(None, trip.target)
-            else:
-                _tripwire_left(_tab_for_target(trip.target), trip.target)
-            trip = None
+            if current != trip.verdict.url:
+                if current is None:
+                    # A successful target-list read proves this popup closed; withdraw only its own
+                    # request. An unread list takes the exception path and leaves it pending.
+                    _tripwire_left(None, trip.target)
+                else:
+                    _tripwire_left(_tab_for_target(trip.target), trip.target)
+                trip = None
         if trip is None:
             trip = await _tripwire_look(BrowserState.active_tab(), want_cf=True)
     except Exception:
