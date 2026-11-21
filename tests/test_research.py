@@ -17,6 +17,8 @@ def test_block_detection():
     assert _looks_blocked(None, "x") is True
     assert _looks_blocked(200, "<html>Just a moment...</html>") is True
     assert _looks_blocked(200, "<html>" + "x" * 3000 + "</html>") is False
+    article = "<article>What does 'Just a moment' or 'checking your browser' mean?</article>" * 20
+    assert not _looks_blocked(200, article)
     print("  block detection: 5 cases OK")
 
 
@@ -112,7 +114,6 @@ def test_challenge_markers():
     import inspect
     from mcp_stealth_chrome.tools.research import _CHALLENGE_MARKERS, _browser_render
     assert "blocked by network security" in _CHALLENGE_MARKERS  # Reddit js_challenge
-    assert "just a moment" in _CHALLENGE_MARKERS                # Cloudflare
     assert inspect.iscoroutinefunction(_browser_render)
     print("  JS-challenge markers + _browser_render present")
 

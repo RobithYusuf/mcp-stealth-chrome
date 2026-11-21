@@ -27,6 +27,7 @@ from .. import instance_notes
 from .. import keep_alive as _keep_alive
 from .. import launch_lock
 from .. import presence
+from .. import antibot
 from .. import profile_version
 from .. import tab_record
 from ..helpers import err, ok
@@ -291,9 +292,16 @@ async def _launch_browser_instance(
         await asyncio.sleep(0.5)
         main_tab = await _srv._first_live_tab(browser)
         await _srv._apply_fingerprint_to_tab(main_tab, effective_fingerprint)
-        initial_observed = await _srv._commit_navigation(main_tab, url, {"armed": False})
-        if initial_observed is None:
-            await _srv._wait_load_complete(main_tab, 3)
+        doc_state, disarm = await _srv._arm_document_watch(main_tab)
+        try:
+            initial_observed = await _srv._commit_navigation(main_tab, url, doc_state)
+            if initial_observed is None:
+                await _srv._wait_load_complete(main_tab, 3)
+                observed = await _srv._observe_navigation(main_tab, url, disarm())
+            else:
+                observed = initial_observed
+        finally:
+            disarm()
     except asyncio.CancelledError:
         await _srv._safe_stop_browser(browser)
         await _srv._remove_privacy_profile(privacy_profile)
@@ -365,12 +373,19 @@ async def _launch_browser_instance(
         return False, _srv._nav_commit_timeout_message(
             f"Browser instance {instance_id!r} is running; switch_instance({instance_id!r}) to use it. First page",
             initial_observed)
-    return True, (
+    # The first page as the tripwire sees it (antibot_tripwire): spawn_browser observes no
+    # auto-verify pass, so retain the document response and inspect the loaded page.
+    trip = None
+    if url and url != "about:blank":
+        with contextlib.suppress(Exception):  # a look that failed leaves the launch's own result
+            trip = await _srv._tripwire_after_navigation(
+                main_tab, observed, doc_state=doc_state, headless=headless)
+    return True, _srv._tripwire_render(trip, "spawn_browser", (
         f"instance {instance_id!r} launched (headless={headless}, "
         f"privacy={privacy}, identity={identity_source}, "
         f"profile={profile_path.name if profile_path else '(ephemeral Chrome temp)'})"
         f"{dock_note}{restore_text}"
-    )
+    ), asked_for=url, launched=True)
 
 
 async def _spawn_by_reattach(instance_id: str, profile: Path, verdict: dict, *, url: str,
@@ -388,6 +403,7 @@ async def _spawn_by_reattach(instance_id: str, profile: Path, verdict: dict, *, 
                        f"ours and free, but connecting to it failed: {_srv._exc_text(e)}. It was left "
                        f"running as it was")
     owned = observed.pop("_owned", None)
+    doc_state = observed.pop("_doc_state", None)
     owned = {BrowserState.COUNTED, *owned} if owned is not None else {_srv._target_key(t) for t in tabs}
     if _srv._persons_browser(browser) and idle_timeout:
         # The person's browser is theirs to Quit: never ended for the agent's idleness.
@@ -425,8 +441,12 @@ async def _spawn_by_reattach(instance_id: str, profile: Path, verdict: dict, *, 
                                  persons_browser=_srv._persons_browser(browser))
     if "commit_timeout_seconds" in observed:
         return False, _srv._nav_commit_timeout_message(f"Instance {instance_id!r} {summary}", observed)
-    return True, (f"instance {instance_id!r} {summary}{keep_text}\n"
-                  f"{json.dumps(observed, indent=2, default=str)}")
+    trip = (await _srv._tripwire_after_navigation(
+                tabs[select], observed, doc_state=doc_state, headless=bool(record.get("headless")))
+            if url and url != "about:blank" else None)
+    return True, _srv._tripwire_render(trip, "spawn_browser", (
+        f"instance {instance_id!r} {summary}{keep_text}\n"
+        f"{json.dumps(observed, indent=2, default=str)}"), asked_for=url, launched=True)
 
 
 @mcp.tool()
@@ -555,7 +575,10 @@ async def spawn_browser(
                     brave_lean=brave_lean,
                     agent_overlay=agent_overlay,
                 )
-                msg += launch_lock.note() if ok_flag else ""
+                if ok_flag and msg.startswith(antibot.PAUSE_PREFIX):
+                    ok_flag, msg = False, msg.removeprefix("Error: ")
+                elif ok_flag:
+                    msg += launch_lock.note()
     finally:
         _srv._SPAWNING.pop(instance_id, None)
     if not ok_flag:

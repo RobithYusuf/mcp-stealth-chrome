@@ -3,11 +3,12 @@
 Part of the agent guide: [AGENTS.md](../../AGENTS.md) says when to read this. Its rules bind like the rest of the guide. Add what you learn about this topic here, not to AGENTS.md.
 
 - The person's preferences are `settings.SETTINGS` (`agent_overlay`, `overlay_bar`, `overlay_light`, `overlay_lock`,
-  `agent_cursor`, `overlay_hide_after`, `dock_icon`), read at call time from the environment, then
-  `~/.mcp-stealth/settings.json` (`MCP_STEALTH_SETTINGS`, else `data_root()`), then the default. An MCP config is the
-  explicit choice of whoever set up that server, so it wins; the file holds what the person picks in the overlay's menu
-  or with `mcp-stealth-chrome settings` (list, set, reset). The developer chose this split over everything in the
-  environment (20 Nov 2026): a look-and-feel choice should not need an MCP config edit and a restart.
+  `agent_cursor`, `overlay_hide_after`, `dock_icon`, `antibot_tripwire`, `antibot_rules`), read at call time from the
+  environment, then `~/.mcp-stealth/settings.json` (`MCP_STEALTH_SETTINGS`, else `data_root()`), then the default. An
+  MCP config is the explicit choice of whoever set up that server, so it wins; the file holds what the person picks in
+  the overlay's menu or with `mcp-stealth-chrome settings` (list, set, reset). The developer chose this split over
+  everything in the environment (20 Nov 2026): a look-and-feel choice should not need an MCP config edit and a
+  restart.
 - Only settings a person would change go there; paths, limits, test switches and API keys stay environment variables
   (the README's collapsed "Advanced and internal variables"). A new personal switch is a `Setting` read through
   `settings.get`, never `os.environ` directly, or the file and the menu silently do nothing for it.
@@ -26,3 +27,13 @@ Part of the agent guide: [AGENTS.md](../../AGENTS.md) says when to read this. It
   package); `tests/test_settings.py` takes those functions out of its source with `ast` and checks they decide as
   `presence.style()` does. `tests/conftest.py` points `MCP_STEALTH_SETTINGS` at the run's own file, keeping the
   developer's preferences out of every test.
+- `antibot_tripwire` is a choice (pause, warn, off; default pause), read once per look together with
+  `antibot_rules` (one read of the file for both). Off reads no page at all.
+- `antibot_rules` is the one setting of kind "rules": a JSON object `{"example.com": {"url": ["^/verify/"], "text":
+  ["Verify to continue"]}}`, in the file as an object and in `MCP_STEALTH_ANTIBOT_RULES` as JSON text. `url` holds
+  regular expressions searched in the path and query, never the host; `text` holds words of the page, any case, read
+  only on that host; a host covers its subdomains. `settings.parse_rules` refuses the whole value when any part is
+  wrong (an unknown key, an empty list, a regex that does not compile, more than 50 hosts, 20 patterns a list or 200
+  characters a pattern): a rule taken in half would stop runs, or miss pages, in ways nobody asked for. `settings
+  list` shows it as "N hosts"; the overlay's menu does not show it.
+- A person's regex is matched only against the first 8192 characters of path+query. Python's `re` has no time limit; this bound limits the input cost, but does not make pathological patterns safe on every shorter input.
