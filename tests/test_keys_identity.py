@@ -28,6 +28,7 @@ from mcp_stealth_chrome.identity import (
     os_family,
     strip_headless,
     reduced_user_agent,
+    ua_metadata_fields,
 )
 
 FIXTURES = pathlib.Path(__file__).parent / "fixtures"
