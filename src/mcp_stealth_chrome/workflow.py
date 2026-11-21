@@ -457,9 +457,9 @@ _NOTES = {
                "save_as, each reader and the last step; vars only as this run set or changed them, "
                "last without the text its value holds unless a step failed or was ignored (after "
                "a stop at a failure: all vars, whole). "
-               "output=\"full\" lists every step.",
+               "output=\"full\" lists the steps (the first 200).",
     "failures": "failures only: counts and every failed or ignored step, no vars unless a resume "
-                "needs them. output=\"summary\" adds results, output=\"full\" lists every step.",
+                "needs them. output=\"summary\" adds results, output=\"full\" lists the steps (the first 200).",
 }
 # What a resume needs, kept whole whatever the output: resume_with says to pass these vars back.
 _RESUME_KEYS = ("vars", "failed_at", "failed_path", "failure_context", "resume_with", "hint")

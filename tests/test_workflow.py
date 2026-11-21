@@ -862,3 +862,22 @@ def test_last_stays_whole_when_a_step_failed_or_was_ignored_without_a_stop(steps
     summary, _ = run(steps, responses, stop_on_error=False, output="summary")
     assert "failed_at" not in summary
     assert summary["vars"]["last"] == full["vars"]["last"] and "text" in summary["vars"]["last"]
+
+
+# ── review of the branch: full keeps the cap, and the words say so ─────────
+
+
+def test_no_text_says_full_lists_every_step():
+    """full keeps the 200-entry cap and counts the rest in completed_omitted; README and the skill
+    said it listed every step."""
+    from mcp_stealth_chrome import skill_install
+    from mcp_stealth_chrome.tools import action_kit
+    readme = (pathlib.Path(__file__).parents[1] / "README.md").read_text(encoding="utf-8")
+    row = next(line for line in readme.splitlines() if line.startswith("| `workflow_run` |"))
+    skill = next(line for line in skill_install.bundled().read_text(encoding="utf-8").splitlines()
+                 if 'output="full"' in line)
+    texts = {"README row": row, "SKILL.md": skill, "docstring": action_kit.workflow_run.__doc__,
+             **{f"note {mode}": note for mode, note in workflow._NOTES.items()}}
+    for name, text in texts.items():
+        assert "every step" not in text and "200" in text, name
+    assert "completed_omitted" in row and "completed_omitted" in skill
