@@ -19,7 +19,7 @@ from .. import presence
 from .. import server as _srv
 from .._app import mcp
 from ..helpers import err, get_url, ok
-from ..state import BrowserState
+from ..state import BrowserState, connection_alive
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -221,8 +221,9 @@ async def wait_for_human(
     Without the overlay and without a signal, a page change is weak evidence: it counts only
     5s after request_human_help (or after this call) and once it held 2s, the result says what
     changed, and the request stays pending for a later wait. A timeout is an error, and the
-    request stays pending. Without a request_human_help on this tab nothing was handed over, so
-    the result says the change it saw was measured from this call, not from a person's work.
+    request stays pending; a browser or tab that closes during the wait ends it as an error too.
+    Without a request_human_help on this tab nothing was handed over, so the result says the
+    change it saw was measured from this call, not from a person's work.
     """
     try:
         tab = BrowserState.active_tab()
@@ -291,7 +292,26 @@ class _ChangeWatch:
         return now - self.pending[1] >= HANDOFF_SETTLE
 
 
-def _weak_change(request: dict, watch: _ChangeWatch, elapsed: float, unasked: str) -> str:
+BAR_ENDED = ("the overlay's bar showed this request but ended during the wait (its process exited "
+             "and could not be started again), so the person had no Done button")
+
+
+async def _gone(tab, browser) -> Optional[str]:
+    """Why the page can no longer answer, or None: the browser quit or lost its connection, or
+    Chrome no longer lists the tab. Asked only once a read of the page failed."""
+    if browser is None:
+        return "no browser is attached any more"
+    up = (connection_alive(browser) if getattr(browser, "_process", None) is None
+          else not getattr(browser, "stopped", True))
+    if not up:
+        return "the browser is gone (its process ended or its connection closed)"
+    if await _target_gone(browser, tab):
+        return "the tab is gone (Chrome no longer lists it)"
+    return None
+
+
+def _weak_change(request: dict, watch: _ChangeWatch, elapsed: float, unasked: str,
+                 bar_ended: bool = False) -> str:
     """A page change, said as what it is: what changed, that the page may have done it, and that
     the request is still open (only the bar's answer, a selector or a URL close it)."""
     before, after = watch.baseline or {}, watch.current
@@ -305,6 +325,8 @@ def _weak_change(request: dict, watch: _ChangeWatch, elapsed: float, unasked: st
             "ad), not the person.")
     if watch.differed_at_first_read:
         text += " It already differed at this wait's first read, so when it changed is not known."
+    if bar_ended:
+        text += f" It counted because {BAR_ENDED}."
     if request:
         # The next wait measures from the page as reported here; the request keeps its asked
         # time, so a Done pressed later is still heard.
@@ -330,11 +352,29 @@ async def _wait_for_human_loop(tab, key, browser, request, unasked, timeout,
         if done_selector else None
     )
 
+    # Whether the request reached the overlay's bar, and whether that overlay then ended for good
+    # during this wait. While it runs (started again if its process exited) the person has Done,
+    # so the page is not even read; only once it cannot come back may a page change count.
+    reached, bar_ended = asked_at is not None, False
+
     def done(text: str) -> str:
         """Strong evidence: the handoff is over, and the bar stops asking."""
         _srv._HUMAN_HELP.pop(key, None)
         presence.end_help(browser)
         return ok(text)
+
+    async def stopped(elapsed: float) -> Optional[str]:
+        """The error ending a wait whose browser or tab is gone, or None while they are there: the
+        person's answer can no longer come, so this is never any kind of success."""
+        why = await _gone(tab, browser)
+        if why is None:
+            return None
+        if presence.shows_request(browser, asked_at):
+            presence.end_help(browser)
+        dropped = " The request for help was dropped with it." if request else ""
+        _srv._HUMAN_HELP.pop(key, None)
+        return err(f"wait_for_human stopped after {elapsed}s: {why}, so no answer from the person "
+                   f"can come and nothing was completed.{dropped}")
 
     while _clock() - started < max(0.0, timeout):
         elapsed = round(_clock() - started, 2)
@@ -347,21 +387,37 @@ async def _wait_for_human_loop(tab, key, browser, request, unasked, timeout,
             await _pause(HANDOFF_POLL)
             continue
         if done_url_contains:
-            current_url = await get_url(tab)
+            try:
+                current_url = await get_url(tab)  # "" when unread; a lost connection raises
+            except Exception:
+                current_url = ""
+            if not current_url and (ended := await stopped(elapsed)):
+                return ended
             if done_url_contains in current_url:
                 return done(f"human handoff completed after {elapsed}s: URL contains "
                             f"{done_url_contains!r}{unasked}")
         if selector_expr:
-            value = await tab.evaluate(selector_expr, return_by_value=True)
+            try:
+                value = await tab.evaluate(selector_expr, return_by_value=True)
+            except Exception:
+                if ended := await stopped(elapsed):
+                    return ended
+                raise
             value = value.value if hasattr(value, "value") and not isinstance(value, str) else value
             if value and bool(json.loads(value).get("hit")):
                 return done(f"human handoff completed after {elapsed}s: selector "
                             f"{done_selector!r} appeared{unasked}")
         # While the bar shows the request the person has its Done button, so a page change is
         # no answer: the page may move by itself, and the person's own steps change it.
-        if watch is not None and not presence.shows_request(browser, asked_at):
-            if watch.changed(await _srv._page_sig(tab), _clock()):
-                return _weak_change(request, watch, elapsed, unasked)
+        if watch is not None:
+            bar = presence.bar_state(browser, asked_at) if reached and not bar_ended else None
+            bar_ended = bar_ended or bar == "gone"
+            if bar != "shown":
+                sig = await _srv._page_sig(tab)
+                if not sig and (ended := await stopped(elapsed)):
+                    return ended
+                if watch.changed(sig, _clock()):
+                    return _weak_change(request, watch, elapsed, unasked, bar_ended)
         await _pause(HANDOFF_POLL)
     # The request stays pending: the person may still be at it, a Done pressed later is still
     # heard, and the next wait counts as the handoff. Dropping it here made that next wait say
@@ -380,6 +436,8 @@ async def _wait_for_human_loop(tab, key, browser, request, unasked, timeout,
     elif presence.shows_request(browser, asked_at):
         watched = ("the person did not press Done in the overlay's bar (a page change does not "
                    "end this wait while the bar shows the request)")
+    elif bar_ended:
+        watched = f"{BAR_ENDED}, and no page change held {HANDOFF_SETTLE:g}s after that"
     else:
         watched = (f"no page change held {HANDOFF_SETTLE:g}s (a change within "
                    f"{HANDOFF_GRACE:g}s of " + ("request_human_help" if request else "this call")

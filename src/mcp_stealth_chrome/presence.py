@@ -829,6 +829,19 @@ def shows_request(browser: Any, asked_at: Optional[float]) -> bool:
             and float(overlay.agent.get("asked_at") or 0) == float(asked_at))
 
 
+def bar_state(browser: Any, shown_at: Optional[float]) -> str:
+    """Where a request for help the bar showed at `shown_at` stands: "shown" (an overlay runs and
+    shows it; one whose process exited is started again first, `revive`, and the new process reads
+    agent.json, request included), "replaced" (the bar shows a later request), or "gone" (no
+    overlay any more: stopped, or its process exited and could not be started again)."""
+    overlay = _handle(browser)
+    if overlay is None or shown_at is None or not (overlay.alive() or overlay.revive()):
+        return "gone"
+    if float(overlay.agent.get("asked_at") or 0) != float(shown_at):
+        return "replaced"
+    return "shown"
+
+
 def answered(browser: Any, since: float) -> Optional[str]:
     """What the person did with the bar since `since`: "done", "resumed", or None."""
     overlay = _handle(browser)

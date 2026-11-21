@@ -60,16 +60,25 @@ class _Target:
 
 class Page:
     """A tab whose page is the last step reached on the clock: (from second, url, elements).
-    `selector_from` is when the done selector appears, None for never."""
+    `selector_from` is when the done selector appears, None for never. Once `closed` is set (the
+    browser quit or the tab was closed) every read fails as it does on a target that is gone."""
 
     def __init__(self, clock: Clock, *steps, browser=None):
         self.clock, self.steps, self.browser = clock, steps, browser
         self.target = _Target()
         self.selector_from = None
         self.reads = 0
+        self.closed = None  # "browser" or "tab"
+
+    def close(self, what: str) -> None:
+        self.closed = what
+        if what == "browser":
+            self.browser.connection.closed = True
 
     def sig(self) -> dict:
         self.reads += 1
+        if self.closed:
+            return {}  # _page_sig's answer for a page it cannot read
         url, nodes = None, None
         for at, u, n in self.steps:
             if self.clock.elapsed() >= at:
@@ -77,12 +86,21 @@ class Page:
         return {"url": url, "nodes": nodes, "len": nodes * 37, "hash": f"{url}#{nodes}"}
 
     async def evaluate(self, _expr, return_by_value=True):
+        if self.closed:
+            raise ConnectionError("no close frame received or sent")
         hit = self.selector_from is not None and self.clock.elapsed() >= self.selector_from
         return json.dumps({"hit": hit})
 
 
+class _Connection:
+    closed = False
+
+
 class _Browser:
-    pass
+    """An attached-looking browser (no _process), whose CDP connection is open until closed."""
+
+    def __init__(self):
+        self.connection = _Connection()
 
 
 SLEEPER = [sys.executable, "-c", "import time; time.sleep(60)"]
@@ -123,12 +141,17 @@ def handoff(monkeypatch, clock, tmp_path):
         return ["tab activated"]
 
     async def url_of(tab, *_a, **_k):
-        return tab.sig()["url"]
+        return tab.sig().get("url") or ""
+
+    async def page_targets(browser):
+        page = BrowserState.active_tab()
+        return [] if page.closed else [(KEY, page.sig().get("url") or "")]
 
     monkeypatch.setattr(server, "_HUMAN_HELP", {})
     monkeypatch.setattr(server, "_page_sig", page_sig)
     monkeypatch.setattr(nav, "_foreground_for_human", in_front)
     monkeypatch.setattr(nav, "get_url", url_of)
+    monkeypatch.setattr(server, "_page_targets", page_targets)
     yield setup
     for handle in made:
         handle.proc.kill()
@@ -141,6 +164,13 @@ def ask(objective="Log in", **kw):
 
 def wait(**kw):
     return asyncio.run(nav.wait_for_human(**kw))
+
+
+def _write_control(overlay: presence.Overlay, data: dict) -> None:
+    """control.json as the overlay writes it: a new file, then replaced."""
+    tmp = overlay.control_file.with_name("control.json.test")
+    tmp.write_text(json.dumps(data))
+    tmp.replace(overlay.control_file)
 
 
 def press_done(overlay: presence.Overlay) -> None:
@@ -196,6 +226,83 @@ def test_with_the_overlay_done_ends_a_wait_the_page_changed_in(handoff, clock):
     result = wait(timeout=30)
     assert result.startswith("human handoff completed after"), result
     assert "pressed Done" in result and clock.elapsed() >= 10.0, result
+
+
+def _kill(overlay: presence.Overlay) -> None:
+    overlay.proc.kill()
+    overlay.proc.wait()
+
+
+def test_the_overlay_dies_mid_wait_and_comes_back_so_the_page_still_does_not_count(
+        handoff, clock, monkeypatch):
+    """Its process exits at 3 s and is started again (the new one reads agent.json, request
+    included): the page that changed at 6 s and held is no answer, the Done at 12 s is."""
+    page = handoff((0, LOGIN, 400), (6, HOME, 900), overlay=True)
+    overlay = presence._handle(page.browser)
+    monkeypatch.setattr(presence, "_same_chrome", lambda pid, start: True)
+    monkeypatch.setattr(presence, "_spawn", lambda *a, **k: subprocess.Popen(SLEEPER))
+    ask()
+    clock.hooks.append((3.0, lambda: _kill(overlay)))
+    clock.hooks.append((12.0, lambda: press_done(overlay)))
+    result = wait(timeout=30)
+    assert result.startswith("human handoff completed after"), result
+    assert "pressed Done" in result and clock.elapsed() >= 12.0, result
+    assert overlay.restarts == 1 and overlay.alive()
+
+
+def test_the_overlay_dies_mid_wait_and_cannot_come_back_so_a_held_change_is_weak(handoff, clock):
+    page = handoff((0, LOGIN, 400), (6, HOME, 900), overlay=True)
+    overlay = presence._handle(page.browser)
+    overlay.restarts = presence.RESTARTS  # no restart left
+    ask()
+    clock.hooks.append((3.0, lambda: _kill(overlay)))
+    result = wait(timeout=30)
+    assert result.startswith("page changed after"), result
+    assert "weak evidence" in result and "completed" not in result, result
+    assert "the overlay's bar showed this request but ended during the wait" in result, result
+    assert "its process exited" in result and "no Done button" in result, result
+    assert KEY in server._HUMAN_HELP
+
+
+@pytest.mark.parametrize("what,overlay,signal", [
+    ("browser", False, {}),
+    ("tab", False, {}),
+    ("browser", True, {}),                       # the overlay ends with its browser
+    ("browser", False, {"done_selector": "#account"}),
+    ("tab", False, {"done_url_contains": "/account"}),
+])
+def test_a_browser_or_tab_gone_mid_wait_ends_it_as_an_error(handoff, clock, monkeypatch,
+                                                            what, overlay, signal):
+    page = handoff((0, LOGIN, 400), (6, HOME, 900), overlay=overlay)
+    if overlay:
+        handle = presence._handle(page.browser)
+        monkeypatch.setattr(presence, "_same_chrome", lambda pid, start: False)  # Chrome is gone
+        clock.hooks.append((7.0, lambda: _kill(handle)))
+    ask()
+    clock.hooks.append((7.0, lambda: page.close(what)))
+    result = wait(timeout=30, **signal)
+    assert result.startswith("Error: wait_for_human stopped after"), result
+    assert f"the {what} is gone" in result and "nothing was completed" in result, result
+    assert "timeout" not in result and clock.elapsed() < 9.0
+    assert KEY not in server._HUMAN_HELP
+
+
+@pytest.mark.parametrize("asked", [True, False])
+def test_take_over_then_resume_through_the_wait(handoff, clock, asked):
+    """The person takes over at 3 s and changes the page at 6 s (it held, past the grace): no
+    answer while they hold it. Resume agent at 10 s is."""
+    page = handoff((0, LOGIN, 400), (6, HOME, 900), overlay=True)
+    overlay = presence._handle(page.browser)
+    if asked:
+        ask()
+    clock.hooks.append((3.0, lambda: _write_control(overlay, {
+        "holder": "person", "reason": "button", "since": time.time()})))
+    clock.hooks.append((10.0, lambda: _write_control(overlay, {
+        "holder": "agent", "reason": "button", "since": time.time() + 1})))
+    result = wait(timeout=30)
+    assert result.startswith("human handoff completed after"), result
+    assert "pressed Resume agent" in result and clock.elapsed() >= 10.0, result
+    assert KEY not in server._HUMAN_HELP
 
 
 def test_without_an_overlay_a_change_that_does_not_hold_does_not_count(handoff, clock):

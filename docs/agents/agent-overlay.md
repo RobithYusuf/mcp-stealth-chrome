@@ -28,7 +28,10 @@ Part of the agent guide: [AGENTS.md](../../AGENTS.md) says when to read this. It
   browser (their own clicks change it).
 - While the bar shows a request for help (`presence.shows_request`: the overlay runs and `ask` returned the
   request's time), a page change does not end `wait_for_human`; only Done, Resume agent, `done_selector` or
-  `done_url_contains` do. The bar shows that request with Done even with `overlay_bar` off (`wants_bar`). Shopee
+  `done_url_contains` do. The bar shows that request with Done even with `overlay_bar` off (`wants_bar`). An
+  overlay whose process exits during the wait is started again first (`presence.bar_state`, `revive`); only one that
+  cannot come back lets a page change count, and the result says the bar ended. A browser or tab that is gone ends
+  the wait as an error (`_gone`). Shopee
   moves its login page to `/buyer/login/qr` by itself a moment after loading, and a wait measured from the
   request called that a finished handoff after 0.0 s. A timeout keeps the request in the bar, so a Done pressed
   later still reaches the next wait or the next result.
