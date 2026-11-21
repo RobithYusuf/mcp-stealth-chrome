@@ -182,8 +182,10 @@ async def request_human_help(objective: str, timeout: float = 300) -> str:
         }
         _srv._HUMAN_HELP[key] = record  # a new request replaces the tab's earlier one
         # asked_at: when the bar first showed it, kept for the record. shown_at: its current
-        # showing, None while the bar does not show it; a Done counts from there on.
+        # showing, None while the bar does not show it; a Done counts from there on. was_shown:
+        # it reached the bar, the only kind a later wait shows again after a timeout.
         record["asked_at"] = record["shown_at"] = presence.ask(BrowserState.browser, objective)
+        record["was_shown"] = record["asked_at"] is not None
         if record["asked_at"] is not None:
             how = ("Call wait_for_human next. The overlay's bar shows the request with a Done "
                    "button: the wait ends when the person presses it, or on done_url_contains or "
@@ -247,14 +249,13 @@ async def wait_for_human(
         # agent_overlay: Done in the bar, or Resume agent after Take over, ends the wait. While
         # the person holds the browser their own clicks change the page, so a change is no answer.
         browser = BrowserState.browser
-        if request and request.get("shown_at") is None:
+        if request and request.get("was_shown") and request.get("shown_at") is None:
             # A timeout took the request off the bar, so the person never saw "Your help is
-            # needed" while the agent did something else: this wait shows it again.
+            # needed" while the agent did something else: this wait shows it again. A request
+            # that never reached a bar stays without one, even if an overlay runs by now.
             shown = presence.show_again(browser, str(request.get("objective") or ""))
             if shown is not None:
                 request["shown_at"] = shown
-                if request.get("asked_at") is None:
-                    request["asked_at"] = shown
         presence.waiting_for_person(browser, True)  # the bar: "The agent is waiting for you"
         try:
             return await _wait_for_human_loop(

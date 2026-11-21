@@ -248,6 +248,27 @@ def test_a_timeout_takes_the_request_off_the_bar_and_the_next_wait_shows_it_agai
     assert overlay.agent["asked_at"] == first + 100
 
 
+def test_a_request_the_bar_never_showed_is_not_shown_later(handoff, clock, tmp_path):
+    """presence.ask found no overlay, so the request was handed over without a bar. An overlay
+    handle that appears (and runs) before the wait must not start showing it: the agent never
+    asked for that."""
+    page = handoff((0, LOGIN, 400))
+    ask()
+    record = server._HUMAN_HELP[KEY]
+    assert record["shown_at"] is None and record["was_shown"] is False
+    folder = tmp_path / "late-overlay"
+    folder.mkdir()
+    late = presence.Overlay(page.browser, 4242, folder, subprocess.Popen(SLEEPER), False)
+    setattr(page.browser, presence.ATTR, late)
+    try:
+        result = wait(timeout=10)
+        assert late.agent["help"] is None and record["shown_at"] is None, late.agent
+        assert result.startswith("Error: timeout after 10") and "no page change held" in result, result
+    finally:
+        late.proc.kill()
+        late.proc.wait()
+
+
 def test_with_the_overlay_done_ends_a_wait_the_page_changed_in(handoff, clock):
     page = handoff((0, LOGIN, 400), (6, HOME, 900), overlay=True)
     overlay = presence._handle(page.browser)

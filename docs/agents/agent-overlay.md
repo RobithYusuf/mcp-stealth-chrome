@@ -38,7 +38,8 @@ Part of the agent guide: [AGENTS.md](../../AGENTS.md) says when to read this. It
   request called that a finished handoff after 0.0 s. A timeout takes the request off the bar, so the person never
   reads "Your help is needed" while the agent does something else, but the agent keeps it (`shown_at` None): the
   next `wait_for_human` shows it again with the same text and counts as the same handoff, and a Done counts from
-  that new showing on.
+  that new showing on. Only a request the bar showed (`was_shown`) is shown again: one handed over while no overlay
+  ran stays without a bar, even if one runs by the next wait.
 - `before_input` runs in one wrapper on nodriver's `Tab.mouse_click` (`patches._patch_mouse_click_reports_pointer`,
   which also feeds the click ring; sixteen places press through it), each drag step (the button is still let go in its
   `finally`), each `humanized_scroll` chunk (outside its retry, which would resend the wheel event, and once more
