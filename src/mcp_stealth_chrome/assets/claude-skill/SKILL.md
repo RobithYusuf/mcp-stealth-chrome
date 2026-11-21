@@ -64,6 +64,8 @@ Read a whole page per call, not one element per call. On a marketplace price che
 | `[agent_overlay: while the agent was idle the person clicked ...]` | They used the page while you were away. Read it again before acting. |
 | `[agent_overlay: the person typed in the browser ...]` | Their keys reached the page too. Re-read the field before going on. |
 | `auto-verify: ... challenge gone` | A Cloudflare widget was handled during the load. |
+| `antibot_paused: ...` (or `status: antibot_paused` in a workflow) | The site answered with a verification page, and the run stopped there. Open no more pages of that site. Tell the user, `wait_for_human()` while the bar shows the request (a headless browser cannot show one: say so), then run `resume_with` or navigate again. `trigger:` says what fired, `get_url` gives the whole URL. Solve it only where the user is entitled to (see Bot checks). |
+| `antibot_warning: ...` | The same, with the `antibot_tripwire` setting on warn, or after a click: nothing was stopped. Do not go on opening pages of that site. |
 
 ## Working with the person
 

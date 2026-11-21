@@ -605,7 +605,8 @@ def quiet_for(agent, now):
 def help_answered(agent, control):
     """The person pressed Done on the request for help shown now (help_done at or after its
     asked_at). With no request asked, nothing is answered."""
-    return float(control.get("help_done") or 0) >= float(agent.get("asked_at") or 0) > 0
+    return (control.get("answered_id") == agent.get("request_id")
+            and float(control.get("help_done") or 0) >= float(agent.get("asked_at") or 0) > 0)
 
 
 def used_now(clicked, scrolled, typed):
@@ -675,7 +676,8 @@ def bar_words(mode, agent, control, over, nudging, why):
         return ("You have the browser", f"  ·  {told(agent, control)}", "Resume agent", "primary",
                 "person", False)
     if mode == "help":
-        return "Your help is needed", f"  ·  {agent.get('help')}", "Done", "primary", "help", True
+        label = f"Your help is needed ({agent['request_id']})" if agent.get("request_id") else "Your help is needed"
+        return label, f"  ·  {agent.get('help')}", "Done", "primary", "help", True
     return None
 
 
@@ -1369,7 +1371,7 @@ class Overlay:
         # Started again after a crash: who held the browser, and the person's choices, stay.
         before = read(CONTROL)
         if before.get("holder") in ("agent", "person"):
-            for key in ("holder", "since", "reason", "person_last_input", "help_done", "show_cursor"):
+            for key in ("holder", "since", "reason", "person_last_input", "help_done", "answered_id", "show_cursor"):
                 if key in before:
                     self.control[key] = before[key]
         scale = NSScreen.mainScreen().backingScaleFactor()
@@ -1882,6 +1884,7 @@ class Overlay:
         if self.mode in WORKING or self.mode in ("resting", "noted"):
             self.control.update(holder="person", since=now, reason="button")
         elif self.mode in ("person", "help"):
+            self.control["answered_id"] = self.agent.get("request_id")
             if self.mode == "person":
                 self.control.update(holder="agent", since=now, reason="button")
             else:

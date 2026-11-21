@@ -850,6 +850,10 @@ async def workflow_run(
             "failures": counts and failed or ignored steps only. "full": the steps up to 200 (the rest counted) and every var.
             After a failure every mode keeps the whole vars and what a resume needs.
 
+    A site's verification page (antibot_tripwire, default pause) stops the run before its next step whatever
+    stop_on_error says: status antibot_paused, paused_at, paused_path, antibot (trigger, page, next), whole vars
+    and resume_with, which re-runs a navigation that reached the page, else starts at the step after it.
+
     Returns JSON. full: completed (capped at 200 entries, the rest counted), total and vars. summary and
     failures: output names the mode, shown holds the steps kept, not_shown counts the rest, vars_unchanged
     names input vars left out; past the 200 cap they still show failed or ignored steps (the first 100, the
@@ -878,15 +882,29 @@ async def workflow_run(
             return refused
         return await _srv._WORKFLOW_TOOLS[tool](**args)
 
+    async def checkpoint(previous: Optional[str], next_tool: str) -> Optional[str]:
+        # Check Take over before the tripwire checkpoint can read the page. The workflow engine
+        # validates its allow-list first; this refusal is then recorded as a failed step.
+        refused = presence.refusal(next_tool, BrowserState.browser)
+        if refused:
+            return refused
+        return await _srv._tripwire_step(previous, next_tool)
+
+    # The anti-bot tripwire looks between steps: a click may have sent the page to a site's
+    # verification page, and the run stops there before its next step, whatever stop_on_error says.
+    run = _srv._TRIPWIRE_RUN.set({"tool": "workflow_run"})
     try:
         result = await run_workflow(
             steps, dispatch, lambda name: name in _srv._WORKFLOW_TOOLS,
             start_at=start_at, stop_on_error=stop_on_error, variables=vars, output=output,
+            checkpoint=checkpoint,
         )
     except WorkflowError as e:
         return err(str(e))
+    finally:
+        _srv._TRIPWIRE_RUN.reset(run)
     text = json.dumps(result, indent=2, ensure_ascii=False, default=str)
-    return err(text) if "failed_at" in result else ok(text)
+    return err(text) if "failed_at" in result or "paused_at" in result else ok(text)
 
 
 # ── detect_and_bypass ──────────────────────────────────────────────────────

@@ -11,7 +11,7 @@ import contextlib
 import json
 import sys
 import time
-from typing import Optional
+from typing import Any, Optional
 
 from nodriver import Tab
 
@@ -161,6 +161,7 @@ async def request_human_help(objective: str, timeout: float = 300) -> str:
     """
     try:
         tab = BrowserState.active_tab()
+        browser = BrowserState.browser
         if BrowserState.current_headless:
             return err(
                 "human help unavailable: this browser is headless, so there is no "
@@ -173,20 +174,11 @@ async def request_human_help(objective: str, timeout: float = 300) -> str:
                 "human help unavailable: no foreground action succeeded, so the "
                 "browser window could not be confirmed visible"
             )
-        key = _srv._target_key(tab)
-        record = {
-            "objective": objective,
-            "baseline": await _srv._page_sig(tab),
-            "requested_at": time.time(),     # a stamp the overlay's answers are compared with
-            "requested_clock": _clock(),     # where the grace starts
-            "timeout": max(0.0, float(timeout)),
-        }
-        _srv._HUMAN_HELP[key] = record  # a new request replaces the tab's earlier one
-        # asked_at: when the bar first showed it, kept for the record. shown_at: its current
-        # showing, None while the bar does not show it; a Done counts from there on. was_shown:
-        # it reached the bar, the only kind a later wait shows again after a timeout.
-        record["asked_at"] = record["shown_at"] = presence.ask(BrowserState.browser, objective)
-        record["was_shown"] = record["asked_at"] is not None
+        # The record (shared with the anti-bot tripwire's own requests) replaces the tab's earlier
+        # one and shows in the overlay's bar when one runs.
+        record = _srv._record_human_help(tab, objective, timeout, by="agent", clock=_clock(),
+                                         baseline=await _srv._page_sig(tab),
+                                         browser=browser)
         if record["asked_at"] is not None:
             how = ("Call wait_for_human next. The overlay's bar shows the request with a Done "
                    "button: the wait ends when the person presses it, or on done_url_contains or "
@@ -205,6 +197,18 @@ async def request_human_help(objective: str, timeout: float = 300) -> str:
         )
     except Exception as e:
         return err(str(e))
+
+
+def _pending_human_request() -> tuple[Any, str, dict, str]:
+    """Choose one pending request across this instance's tabs, including popup targets."""
+    browser = BrowserState.browser
+    for key, request in _srv._HUMAN_HELP.items():
+        if request["browser"] is browser and request["instance_id"] == BrowserState.current_instance_id:
+            tab = _srv._tab_for_target(key)
+            note = "" if tab else f"request {request['request_id']} targets unavailable tab {key}"
+            return tab, key, request, note
+    active = BrowserState.active_tab()
+    return active, _srv._target_key(active), {}, ""
 
 
 @mcp.tool()
@@ -232,13 +236,16 @@ async def wait_for_human(
     change it saw was measured from this call, not from a person's work.
     """
     try:
-        tab = BrowserState.active_tab()
-        key = _srv._target_key(tab)
-        request = _srv._HUMAN_HELP.get(key, {})
-        # Without a handoff any change at all, a timer or an ad, read as "the human finished".
-        unasked = "" if request else (
-            "; no handoff was pending on this tab (request_human_help was not called), so this "
-            "only says the page changed after wait_for_human started")
+        tab, key, request, selection_note = _pending_human_request()
+        if request and tab is None:
+            # nodriver 0.50 learns new targets only after update_targets; refresh once before
+            # concluding that a popup request's target is unavailable.
+            if await _srv._refresh_tabs():
+                tab = _srv._tab_for_target(key)
+            if tab is None:
+                return err(f"wait_for_human: {selection_note}; no active tab was used")
+        unasked = (f"{selection_note}; no handoff was pending on this tab (request_human_help was not "
+                   "called), so this only says the page changed after wait_for_human started") if not request else selection_note
         # None means "inherit". Keying off the literal 300 would silently
         # override a caller who genuinely asked for 300 seconds.
         if timeout is None:
@@ -254,7 +261,8 @@ async def wait_for_human(
             # A timeout took the request off the bar, so the person never saw "Your help is
             # needed" while the agent did something else: this wait shows it again. A request
             # that never reached a bar stays without one, even if an overlay runs by now.
-            shown = presence.show_again(browser, str(request.get("objective") or ""))
+            shown = presence.show_again(browser, str(request.get("objective") or ""),
+                                        request.get("request_id"))
             if shown is not None:
                 request["shown_at"] = shown
         presence.waiting_for_person(browser, True)  # the bar: "The agent is waiting for you"
@@ -395,9 +403,12 @@ async def _wait_for_human_loop(tab, key, browser, request, unasked, timeout,
     reached, overlay_ended, bar_ended = shown_at is not None, False, False
 
     def done(text: str) -> str:
-        """Strong evidence: the handoff is over, and the bar stops asking."""
-        _srv._HUMAN_HELP.pop(key, None)
-        presence.end_help(browser)
+        """Strong evidence: close only this request's bar and record."""
+        if request:
+            if _srv._HUMAN_HELP.get(key) is not request:
+                return err(f"request {request['request_id']} is no longer pending; no answer was taken")
+            del _srv._HUMAN_HELP[key]
+            presence.end_help(browser, request["request_id"])
         return ok(text)
 
     async def stopped(elapsed: float) -> Optional[str]:
@@ -406,10 +417,11 @@ async def _wait_for_human_loop(tab, key, browser, request, unasked, timeout,
         why = await _gone(tab, browser)
         if why is None:
             return None
-        if presence.shows_request(browser, shown_at):
-            presence.end_help(browser)
+        if presence.shows_request(browser, shown_at, request.get("request_id") if request else None):
+            presence.end_help(browser, request.get("request_id") if request else None)
         dropped = " The request for help was dropped with it." if request else ""
-        _srv._HUMAN_HELP.pop(key, None)
+        if request and _srv._HUMAN_HELP.get(key) is request:
+            del _srv._HUMAN_HELP[key]
         return err(f"wait_for_human stopped after {elapsed}s: {why}, so no answer from the person "
                    f"can come and nothing was completed.{dropped}")
 
@@ -423,11 +435,13 @@ async def _wait_for_human_loop(tab, key, browser, request, unasked, timeout,
             state = presence.keep_running(browser)  # None: this browser has no overlay
             overlay_ended = state == "ended" or (reached and state is None)
             if state == "running" and reached:
-                bar = presence.bar_state(browser, shown_at)  # "shown" or "replaced"
+                bar = presence.bar_state(browser, shown_at, request.get("request_id"))  # "shown" or "replaced"
             elif state == "waiting" and reached:
                 bar = "waiting"  # its overlay may come back: no page verdict meanwhile
         bar_ended = reached and overlay_ended
-        answer = presence.answered(browser, asked_since)
+        if request.get("replaced_by") or bar == "replaced":
+            return err(f"wait_for_human: request {request.get('request_id')} was replaced; no answer was taken")
+        answer = presence.answered(browser, asked_since, request.get("request_id") if request else None)
         if answer:
             return done(f"human handoff completed after {elapsed}s: the person pressed "
                         + ("Done in the overlay's bar" if answer == "done"
@@ -478,11 +492,11 @@ async def _wait_for_human_loop(tab, key, browser, request, unasked, timeout,
     # the handoff (dropping it made that wait say request_human_help had not been called). The bar
     # stops asking, though, so the person never reads "Your help is needed" while the agent does
     # something else; the next wait_for_human shows the request again.
-    on_bar = presence.shows_request(browser, shown_at)
+    on_bar = presence.shows_request(browser, shown_at, request.get("request_id") if request else None)
     if request:
         request["shown_at"] = None
         if on_bar:
-            presence.end_help(browser)
+            presence.end_help(browser, request.get("request_id"))
     if not request:
         after = (" Call request_human_help if the person still needs to act: no handoff was "
                  "pending on this tab.")
@@ -522,6 +536,7 @@ async def _history_navigation(
     requested_url: Optional[str],
     expect_url: Optional[str],
     expect_status: Optional[int],
+    tool: str = "go_back",
 ) -> str:
     """Shared body for go_back / go_forward / reload.
 
@@ -544,10 +559,13 @@ async def _history_navigation(
             await _srv._wait_load_complete(tab, 10)
         except Exception:
             pass  # settle is best-effort; the postcondition probe is the truth
-        observed = await _srv._observe_navigation(tab, requested_url, disarm())
-        return _srv._nav_result(
+        doc = disarm()
+        observed = await _srv._observe_navigation(tab, requested_url, doc)
+        result = _srv._nav_result(
             action, observed, expect_url=expect_url, expect_status=expect_status,
         )
+        trip = await _srv._tripwire_after_navigation(tab, observed, doc_state=doc)
+        return _srv._tripwire_render(trip, tool, result, asked_for=requested_url)
     except asyncio.TimeoutError:
         observed = await _srv._observe_navigation(tab, requested_url, disarm())
         return _srv._nav_commit_timeout(action, observed)
@@ -567,7 +585,7 @@ async def go_back(
     Reports final_url / redirect_chain / status / ready_state observed afterwards; requested_url
     is null because history decides the destination. See navigate() for the expect_* rules."""
     return await _history_navigation(
-        "Went back", lambda tab: tab.back(), None, expect_url, expect_status,
+        "Went back", lambda tab: tab.back(), None, expect_url, expect_status, "go_back",
     )
 
 
@@ -580,7 +598,7 @@ async def go_forward(
     tab; a timeout reports the observed URL and ready_state and says it may still be loading.
     Reports the observed postconditions; see navigate() for the expect_* rules."""
     return await _history_navigation(
-        "Went forward", lambda tab: tab.forward(), None, expect_url, expect_status,
+        "Went forward", lambda tab: tab.forward(), None, expect_url, expect_status, "go_forward",
     )
 
 
@@ -599,7 +617,7 @@ async def reload(
     except Exception:
         before = ""
     return await _history_navigation(
-        "Reloaded", lambda tab: tab.reload(), before or None, expect_url, expect_status,
+        "Reloaded", lambda tab: tab.reload(), before or None, expect_url, expect_status, "reload",
     )
 
 
@@ -753,7 +771,8 @@ async def tab_new(
                 if url != "about:blank":
                     with contextlib.suppress(Exception):
                         await _srv._wait_load_complete(new_tab, 10)
-                observed = await _srv._observe_navigation(new_tab, url, disarm())
+                doc = disarm()
+                observed = await _srv._observe_navigation(new_tab, url, doc)
         finally:
             disarm()
         problem = await _srv._tab_list_problem()
@@ -774,10 +793,14 @@ async def tab_new(
                      else "in its own window, behind the app in use")
         else:
             where = "as a tab"
-        return _srv._nav_result(
+        result = _srv._nav_result(
             f"opened tab [{BrowserState.active_tab_index}] {where}", observed,
             expect_url=expect_url, expect_status=expect_status,
         )
+        if url == "about:blank":
+            return result
+        trip = await _srv._tripwire_after_navigation(new_tab, observed, doc_state=doc)
+        return _srv._tripwire_render(trip, "tab_new", result, asked_for=url)
     except Exception as e:
         return err(str(e))
 

@@ -314,7 +314,7 @@ async def click_at_image(
         head = f"clicked image match at ({x},{y}) score={data['score']:.3f}"
         if _srv._dialog_note(tab) or not verify:
             return ok(f"{head}{_srv._dialog_note(tab)}")
-        return _srv._click_outcome(head, "method=cdp_mouse at the image match", before,
+        return _srv._click_outcome(tab, head, "method=cdp_mouse at the image match", before,
                                    await _srv._sig_after_action(tab, before, pages=True))
     except Exception as e:
         return err(str(e))
