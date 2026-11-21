@@ -38,6 +38,16 @@ def _overlay(tmp_path, control=None, pid=None):
     return browser, overlay
 
 
+def _write_control(overlay, data):
+    """control.json as the overlay writes it (_agent_overlay.write): a new file, then os.replace.
+    The server re-reads it only when (inode, mtime) changes. Written in place it keeps its inode,
+    and Windows gives two writes within one clock tick (about 15 ms) the same mtime, so the
+    server kept the first and three tests failed there; the overlay never writes in place."""
+    tmp = overlay.control_file.with_name(overlay.control_file.name + ".test.tmp")
+    tmp.write_text(json.dumps(data))
+    os.replace(tmp, overlay.control_file)
+
+
 @pytest.fixture
 def made(tmp_path):
     made = []
@@ -97,7 +107,7 @@ def test_refused_while_the_person_holds_the_browser(made):
     assert "Resume agent" in text and "wait_for_human" in text
     assert presence.refusal("server_status", browser) is None
     assert presence.refusal("wait_for_human", browser) is None
-    overlay.control_file.write_text(json.dumps({"holder": "agent"}))
+    _write_control(overlay, {"holder": "agent"})
     assert presence.refusal("click", browser) is None
 
 
@@ -137,11 +147,11 @@ def test_wait_for_human_hears_done_and_resume(made):
     asked = presence.ask(browser, "Tick Agree")
     assert json.loads(overlay.agent_file.read_text())["help"] == "Tick Agree"
     assert presence.answered(browser, asked) is None
-    overlay.control_file.write_text(json.dumps({"holder": "agent", "help_done": asked + 1}))
+    _write_control(overlay, {"holder": "agent", "help_done": asked + 1})
     assert presence.answered(browser, asked) == "done"
-    overlay.control_file.write_text(json.dumps({"holder": "agent", "reason": "button", "since": asked + 2}))
+    _write_control(overlay, {"holder": "agent", "reason": "button", "since": asked + 2})
     assert presence.answered(browser, asked) == "resumed"
-    overlay.control_file.write_text(json.dumps({"holder": "agent", "reason": "button", "since": asked - 5}))
+    _write_control(overlay, {"holder": "agent", "reason": "button", "since": asked - 5})
     assert presence.answered(browser, asked) is None  # a resume from before the wait is no answer
 
 
@@ -294,6 +304,8 @@ def test_agent_overlay_false_on_a_browser_with_one_stops_it(made):
     assert overlay.proc.poll() is not None and presence._handle(browser) is None
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="presence.NOFOLLOW is 0 on Windows: os has no O_NOFOLLOW there, "
+                    "and the overlay that writes these files runs on macOS only")
 def test_state_files_are_not_read_through_a_link(made, tmp_path):
     browser, overlay = made()
     target = tmp_path / "elsewhere.json"
@@ -339,7 +351,7 @@ def test_take_over_stops_a_scroll_under_way(made, monkeypatch):
 
         async def send(self, _command):
             self.sent += 1
-            overlay.control_file.write_text(json.dumps({"holder": "person"}))  # Take over now
+            _write_control(overlay, {"holder": "person"})  # Take over now
 
     tab = Tab()
     with pytest.raises(presence.PersonHasBrowser):
@@ -640,7 +652,7 @@ def test_the_bar_says_whether_the_agent_knows_of_a_take_over(made, monkeypatch):
     presence.waiting_for_person(browser, True)
     assert said() == "The agent is waiting for you"
     presence.waiting_for_person(browser, False)
-    overlay.control_file.write_text(json.dumps({"holder": "person", "since": time.time() + 1}))
+    _write_control(overlay, {"holder": "person", "since": time.time() + 1})
     assert said() == "The agent learns it at its next step"  # a new Take over starts over
 
 
@@ -656,8 +668,8 @@ def test_what_the_person_did_while_the_agent_was_idle_reaches_its_next_call(made
     browser, overlay = made({"holder": "agent"})
     overlay.touch(status="reading the page")
     last = overlay.agent["active_at"]
-    overlay.control_file.write_text(json.dumps(
-        {"holder": "agent", "person_used": ["clicked", "typed"], "person_used_at": last + 30}))
+    _write_control(overlay,
+        {"holder": "agent", "person_used": ["clicked", "typed"], "person_used_at": last + 30})
     asyncio.run(presence.before_tool("get_text", browser, None))
     note = presence.result_note("s", "page text")
     assert "while the agent was idle the person clicked and typed in the browser" in note
@@ -666,8 +678,8 @@ def test_what_the_person_did_while_the_agent_was_idle_reaches_its_next_call(made
     assert presence.result_note("s", "again") == "again"  # said once
     # Use from before the agent's own last call is old news.
     overlay.touch()
-    overlay.control_file.write_text(json.dumps(
-        {"holder": "agent", "person_used": ["scrolled"], "person_used_at": overlay.agent["active_at"] - 1}))
+    _write_control(overlay,
+        {"holder": "agent", "person_used": ["scrolled"], "person_used_at": overlay.agent["active_at"] - 1})
     asyncio.run(presence.before_tool("get_text", browser, None))
     assert presence.result_note("s", "x") == "x"
 
@@ -693,14 +705,14 @@ def test_a_done_no_wait_took_reaches_the_next_result_and_closes_the_request(made
     browser, overlay = made({"holder": "agent"})
     asked = presence.ask(browser, "Log in")
     assert presence.result_note("s", "page text", browser) == "page text"  # not answered yet
-    overlay.control_file.write_text(json.dumps({"holder": "agent", "reason": "help done", "help_done": asked + 3}))
+    _write_control(overlay, {"holder": "agent", "reason": "help done", "help_done": asked + 3})
     text = presence.result_note("s", "page text", browser)
     assert "the person pressed Done on the request for help at" in text
     assert json.loads(overlay.agent_file.read_text())["help"] is None
     assert presence.result_note("s", "again", browser) == "again"  # once
     # A Done from an earlier request says nothing about a new one.
     asked = presence.ask(browser, "Tick Agree")
-    overlay.control_file.write_text(json.dumps({"holder": "agent", "reason": "help done", "help_done": asked - 5}))
+    _write_control(overlay, {"holder": "agent", "reason": "help done", "help_done": asked - 5})
     assert presence.result_note("s", "x", browser) == "x"
     assert json.loads(overlay.agent_file.read_text())["help"] == "Tick Agree"
 
