@@ -7,6 +7,7 @@ tools can do. Kept free of browser and MCP imports so it is testable by itself.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import math
 import random
@@ -405,6 +406,9 @@ async def run_workflow(
     output="summary" or "failures" returns the shorter form _shorten makes of that report."""
     if output not in OUTPUT_MODES:
         raise WorkflowError(f"output must be one of {', '.join(OUTPUT_MODES)}, got {output!r}; nothing ran")
+    # Taken before any step runs: a step may change in place an object it was handed (a whole
+    # ${ref} passes the object itself), and the run's vars then compare equal to the caller's.
+    given = _snapshot(variables) if output != "full" else None
     run = _Run(dispatch=dispatch, allowed=allowed, stop_on_error=stop_on_error,
                variables=dict(variables or {}))
     start = parse_start(start_at)
@@ -436,7 +440,16 @@ async def run_workflow(
             "hint": "fix the underlying issue, then re-run with that start_at to retry "
                     "this step. Variables are not kept between calls, so pass vars back.",
         })
-    return result if output == "full" else _shorten(result, run, output, variables or {})
+    return result if output == "full" else _shorten(result, run, output, given)
+
+
+def _snapshot(variables: Optional[dict]) -> Optional[dict]:
+    """A deep copy of the input vars (JSON data), or None when they cannot be copied: then no var
+    is called unchanged, since nothing proves it."""
+    try:
+        return copy.deepcopy(dict(variables or {}))
+    except Exception:
+        return None
 
 
 _NOTES = {
@@ -451,7 +464,7 @@ _NOTES = {
 _RESUME_KEYS = ("vars", "failed_at", "failed_path", "failure_context", "resume_with", "hint")
 
 
-def _shorten(full: dict, run: _Run, output: str, given: dict) -> dict:
+def _shorten(full: dict, run: _Run, output: str, given: Optional[dict]) -> dict:
     """The summary or failures form of a full report. The one place that decides what a shorter
     report keeps; it names its mode and counts what it leaves out."""
     reported = full["completed"]
@@ -487,7 +500,8 @@ def _shorten(full: dict, run: _Run, output: str, given: dict) -> dict:
     if "failed_at" in full:
         out.update((key, full[key]) for key in _RESUME_KEYS if key in full)
     elif output == "summary" and full.get("vars"):
-        changed = {k: v for k, v in full["vars"].items() if k not in given or given[k] != v}
+        changed = {k: v for k, v in full["vars"].items()
+                   if given is None or k not in given or given[k] != v}
         if isinstance(changed.get("last"), dict):
             changed["last"] = _last_once(changed["last"])
         if changed:

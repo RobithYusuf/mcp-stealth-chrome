@@ -806,3 +806,43 @@ def test_a_cut_steps_back_rather_than_split_a_surrogate_pair():
     # The pair just before the limit is whole; only the one across it moves the cut.
     text = "x" * (RESULT_PREVIEW - 2) + _SPLIT_PAIR + "z" * 10
     assert _cut_at(_preview(text), text) == RESULT_PREVIEW
+
+
+# ── review of the branch: what "set or changed" compares against ───────────
+
+
+def test_an_input_var_changed_in_place_by_a_step_is_reported_as_changed():
+    """A whole ${input} hands the step the object itself; comparing the run's vars with the
+    caller's dict compared that object with itself and called it unchanged."""
+    async def dispatch(tool, args):
+        args["obj"]["items"].append(2)
+        return "ok"
+
+    given = {"input": {"items": [1]}, "other": [5]}
+    summary = asyncio.run(run_workflow([{"tool": "grow", "args": {"obj": "${input}"}}], dispatch,
+                                       lambda name: True, variables=given, output="summary"))
+    assert summary["vars"]["input"] == {"items": [1, 2]}
+    assert summary["vars_unchanged"] == ["other"]
+
+
+def test_vars_that_cannot_be_copied_are_never_called_unchanged():
+    class Uncopyable:
+        def __deepcopy__(self, memo):
+            raise TypeError("no")
+
+    summary, _ = run([{"tool": "a"}], variables={"odd": Uncopyable()}, output="summary")
+    assert "odd" in summary["vars"] and "vars_unchanged" not in summary
+
+
+def test_branch_records_stay_internal_in_a_successful_summary_and_whole_after_a_failure():
+    steps = [{"if": {"value": "${go}", "truthy": True}, "then": [{"tool": "a"}], "else": [{"tool": "b"}]},
+             {"tool": "c"}]
+    # A fresh run, and a resume that was handed the record: neither summary names it.
+    for given in ({"go": True}, {"go": True, "__branches__": {"0": "then"}}):
+        summary, _ = run(steps, variables=given, output="summary")
+        assert "__branches__" not in summary.get("vars", {})
+        assert "__branches__" not in summary.get("vars_unchanged", [])
+    full, _ = run(steps, {"c": "Error: no"}, variables={"go": True})
+    for output in ("summary", "failures"):
+        short, _ = run(steps, {"c": "Error: no"}, variables={"go": True}, output=output)
+        assert short["vars"]["__branches__"] == full["vars"]["__branches__"] == {"0": "then"}
