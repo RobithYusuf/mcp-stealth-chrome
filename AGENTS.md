@@ -137,6 +137,10 @@ uvx mcp-stealth-chrome → Python 3.11+ → FastMCP → nodriver → Chrome/Chro
   (`_inner_arguments_error`) and a refused step is a counted failure with the same message. The six legacy batch
   names (`click`, `fill`, `type`, `press`, `wait`, `navigate`) keep their defaults and pass every other key on:
   `wait` dropped `frame_url` and `navigate` dropped `expect_url` and `expect_status`.
+- What a client lists is not the tool's own schema: `StealthMCP.list_tools` leaves out pydantic's made-up titles
+  (`_app.without_titles`; "Js Fallback" for `js_fallback`), which were 30% of the input schemas a client hands to
+  its model (15.9 of 53.4 KB). `tool.parameters` keeps them. Say what a parameter means in the docstring: a title or
+  a `Field(description=...)` is not where this project documents one, and nothing reads it.
 - Do not add a tool that can fail silently. If an action may not have taken effect, the response says
   so: see `docs/agents/honest-reporting.md`.
 - Do not weaken a security property to make a test pass: managed paths never escape their root,

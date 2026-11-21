@@ -155,8 +155,50 @@ def unknown_arguments_error(name: str, tool: Any, arguments: Any) -> str | None:
             + f"Valid arguments: {valid}")
 
 
+# Where a JSON Schema node holds further schema nodes. "default", "enum", "const" and "examples"
+# hold values, and a value may be a dict with a "title" key of its own, so those are not entered.
+_SCHEMA_MAPS = ("properties", "$defs", "definitions", "patternProperties")
+_SCHEMA_LISTS = ("anyOf", "oneOf", "allOf", "prefixItems")
+_SCHEMA_NODES = ("items", "additionalProperties", "not")
+
+
+def without_titles(schema: Any) -> Any:
+    """A JSON Schema without the "title" annotations, as a new object.
+
+    pydantic gives every property a title made from its name ("js_fallback" becomes "Js Fallback")
+    and the model one too ("clickArguments"). They say nothing the names do not, and they were 30%
+    of the input schemas the server advertises (15.9 of 53.4 KB over 169 tools), which a client
+    hands to its model with every session. A property that is itself called "title" stays: it is
+    a key under "properties", and only a schema node's own "title" string goes.
+    """
+    if not isinstance(schema, dict):
+        return schema
+    out = {}
+    for key, value in schema.items():
+        if key == "title" and isinstance(value, str):
+            continue
+        if key in _SCHEMA_MAPS and isinstance(value, dict):
+            out[key] = {name: without_titles(node) for name, node in value.items()}
+        elif key in _SCHEMA_LISTS and isinstance(value, list):
+            out[key] = [without_titles(node) for node in value]
+        elif key in _SCHEMA_NODES:
+            out[key] = without_titles(value)
+        else:
+            out[key] = value
+    return out
+
+
 class StealthMCP(FastMCP):
     """FastMCP boundary preserving native content and rejecting tab races."""
+
+    async def list_tools(self):
+        """The tools as advertised: FastMCP's list with the made-up titles left out of each
+        schema. The tool itself keeps its full schema (`tool.parameters`), which the argument
+        check and FastMCP's own validation read."""
+        return [tool.model_copy(update={
+            "inputSchema": without_titles(tool.inputSchema),
+            "outputSchema": without_titles(tool.outputSchema),
+        }) for tool in await super().list_tools()]
 
     async def call_tool(self, name: str, arguments: dict[str, Any]):
         context = self.get_context()
