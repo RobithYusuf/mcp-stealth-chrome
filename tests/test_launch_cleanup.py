@@ -24,6 +24,7 @@ def env(tmp_path, monkeypatch):
     order = _fake_launch(monkeypatch)
     calls = SimpleNamespace(order=order, preflights=0, preflight={}, commit="", move=None,
                             finish=(True, ""), close_report=dict(_CLOSED), closes=[], started=[],
+                            during_close=None,
                             profile=tmp_path / "profile", privacy_root=tmp_path / "privacy-profiles")
     monkeypatch.setattr(server, "PRIVACY_PROFILE_ROOT", calls.privacy_root)
     monkeypatch.setattr(server, "ensure_dirs", lambda: None)
@@ -61,6 +62,9 @@ def env(tmp_path, monkeypatch):
     async def dead(browser, profile_dir=None, grace=1.5):
         calls.closes.append((browser, profile_dir))
         order.append("ensure_dead")
+        if calls.during_close is not None:
+            await calls.during_close()
+        await asyncio.sleep(0)  # a real close awaits (Browser.close, then a poll)
         return dict(calls.close_report)
 
     monkeypatch.setattr(server, "_start_chrome", start)
@@ -70,11 +74,14 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "_finish_cookie_move", finish)
     monkeypatch.setattr(server, "_ensure_browser_dead", dead)
     saved = {name: getattr(server.BrowserState, name) for name in _KEPT_FIELDS}
+    saved_instance, saved_instances = server.BrowserState.current_instance_id, dict(server.BrowserState.instances)
     server.BrowserState.reset()
     try:
         yield calls
     finally:
         server.BrowserState.reset()
+        server.BrowserState.current_instance_id = saved_instance
+        server.BrowserState.instances = saved_instances
         for name, value in saved.items():
             setattr(server.BrowserState, name, value)
 
@@ -368,3 +375,78 @@ def test_a_user_data_dir_in_extra_args_that_another_chrome_holds_is_refused_with
     out = _launch(extra_args=[f"--user-data-dir={theirs}"])
     assert f"user_data_dir {theirs} is currently in use by Chrome PID 4242" in out, out
     assert "start" not in env.order
+
+
+@pytest.mark.parametrize("report", ["closed", "alive"])
+@pytest.mark.parametrize("where", ["storage_state", "navigation", "cookie_move"])
+def test_a_switch_during_the_close_of_a_failed_launch_leaves_the_other_instance_alone(
+        env, monkeypatch, tmp_path, where, report):
+    """The close of a failed launch awaits; a switch_instance sent meanwhile used to go through,
+    and the close then reset the instance switched in (verified) or gave it this launch's profile
+    (not ended). Registered as closing, the instance makes the switch wait for the close."""
+    from mcp_stealth_chrome.state import InstanceSnapshot
+    from test_focus_restore import _Tab
+    other_browser = SimpleNamespace(tabs=[_Tab()], stopped=False, config=None)
+    other_profile = tmp_path / "other-profile"
+    server.BrowserState.instances["other"] = InstanceSnapshot(
+        instance_id="other", browser=other_browser, tabs=list(other_browser.tabs), profile_dir=other_profile)
+    if where == "cookie_move":
+        env.move = server._CookieMove(plan=None, backup=tmp_path / "backup.json")
+        env.finish = (False, "1 cookie missing")
+    else:
+        _fail_after_the_start(monkeypatch, where)
+    if report == "alive":
+        env.close_report = dict(_ALIVE)
+    switch = {}
+
+    async def switch_meanwhile():
+        switch["task"] = asyncio.ensure_future(
+            server.mcp.call_tool("switch_instance", {"instance_id": "other"}))
+        await asyncio.sleep(0.05)  # long enough for the switch to go through, were it let
+
+    env.during_close = switch_meanwhile
+    launch = server.mcp._tool_manager._tools["browser_launch"].fn
+
+    async def run():
+        out = await launch(auto_verify=False, headless=True, privacy=True,
+                           storage_state_path="/nowhere/state.json" if where == "storage_state" else None)
+        return out, await asyncio.wait_for(switch["task"], 5)
+
+    out, switched = asyncio.run(run())
+    state_now = server.BrowserState
+    assert out.startswith("Error"), out
+    assert "switched to 'other'" in str(switched), switched
+    assert state_now.current_instance_id == "other"
+    assert state_now.browser is other_browser, "the instance switched in lost its browser to the close"
+    assert state_now.current_profile_dir == other_profile, "the close wrote this launch's profile onto it"
+    folders = _privacy_folders(env)
+    if report == "closed":
+        assert "main" not in state_now.instances, "the ended browser was kept as instance main's handle"
+        assert folders == []
+    else:
+        kept = state_now.instances.get("main")
+        assert kept is not None and kept.browser is env.started[0], "the live browser's handle was dropped"
+        assert len(folders) == 1 and kept.profile_dir == folders[0] and kept.privacy, \
+            "the kept handle does not name its own profile"
+
+
+def test_a_close_that_finds_another_instance_current_records_nothing_on_it(env, monkeypatch, tmp_path):
+    """Should the instance change all the same (a switch that does not go through a tool call),
+    the close resets nothing and writes nothing onto the instance that is current by then, and
+    the result says its outcome could not be recorded."""
+    from mcp_stealth_chrome.state import InstanceSnapshot
+    from test_focus_restore import _Tab
+    other_browser = SimpleNamespace(tabs=[_Tab()], stopped=False, config=None)
+    other_profile = tmp_path / "other-profile"
+    server.BrowserState.instances["other"] = InstanceSnapshot(
+        instance_id="other", browser=other_browser, tabs=list(other_browser.tabs), profile_dir=other_profile)
+    _fail_after_the_start(monkeypatch, "storage_state")
+
+    async def switch_directly():
+        server.BrowserState.switch_to("other")
+
+    env.during_close = switch_directly
+    out = _launch(privacy=True, storage_state_path="/nowhere/state.json")
+    assert "storage_state load failed" in out and "could not be recorded on it" in out, out
+    assert server.BrowserState.browser is other_browser
+    assert server.BrowserState.current_profile_dir == other_profile

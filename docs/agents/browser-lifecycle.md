@@ -127,7 +127,10 @@ Part of the agent guide: [AGENTS.md](../../AGENTS.md) says when to read this. It
   `close_instance` of it wait for the close. After each await the sweep checks its candidate is still where it found
   it (`_still_held`): with one switched in mid-close, the close's `reset()` wiped whichever instance was current.
   `close_instance`, `close_all_instances` and `browser_close` register too, before their first await, and both sweeps
-  skip a registered instance, or a stored one could be closed twice at once. A close still running after 60 s is an
+  skip a registered instance, or a stored one could be closed twice at once. So does a `browser_launch` that fails
+  after the start (`_launch_end_started_browser`): its close awaits, and a `switch_instance` let through meanwhile
+  had the close reset the instance switched in, or give it the failed launch's profile. What the close finds is
+  recorded on its own instance only; one no longer current is left alone and the result says so. A close still running after 60 s is an
   error naming it (`wait_while_closing` returns why): going ahead let the caller act on a state the close then
   changed.
 - A tool answering from the tab list goes through `_tab_list_problem`, which names why the browser went
