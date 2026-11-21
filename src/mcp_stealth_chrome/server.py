@@ -6438,11 +6438,10 @@ def _help_owner(browser: Any) -> Optional[str]:
     return next((name for name, slot in BrowserState.instances.items() if slot.browser is browser), None)
 
 def _record_human_help(tab: Tab, objective: str, timeout: float, *, by: str, clock: float,
-                       baseline: Optional[dict], browser: Any = None, target: Optional[str] = None) -> dict:
+                       baseline: Optional[dict], browser: Any, target: Optional[str] = None) -> dict:
     """Record one correlated help request for a browser and its owning instance."""
     global _HELP_REQUEST_SEQ
     key = target or _target_key(tab)
-    browser = browser or _tab_browser(tab)
     _HELP_REQUEST_SEQ += 1
     request_id = f"help-{_HELP_REQUEST_SEQ}"
     owner = _help_owner(browser)
@@ -6472,8 +6471,6 @@ def _record_human_help(tab: Tab, objective: str, timeout: float, *, by: str, clo
     return record
 
 
-def _tab_browser(tab: Tab) -> Any:
-    return getattr(tab, "browser", None) or BrowserState.browser
 def _tab_for_target(target: Optional[str]) -> Optional[Tab]:
     if not target:
         return None
@@ -6496,11 +6493,12 @@ async def _tripwire_look(tab: Tab, *, url: Optional[str] = None, want_cf: bool =
     mode, rules = _tripwire_settings()
     if mode == "off":
         return None
+    browser = getattr(tab, "browser", None)
     verdict = antibot.url_verdict(url, rules) if url else None
     parent_rules = antibot.rules_for(antibot._host(url), rules) if url else []
     relevant = not url or bool(parent_rules) or want_cf
     if verdict is None and not relevant:
-        _tripwire_left(tab, _target_key(tab))
+        _tripwire_left(browser, _target_key(tab))
         return None
     if verdict is None:
         # A bounded DOM probe is needed only for hosts with a configured rule or a CF look.
@@ -6513,7 +6511,7 @@ async def _tripwire_look(tab: Tab, *, url: Optional[str] = None, want_cf: bool =
             await asyncio.sleep(0.3)
             # Text that appears late is still a page read; re-check ownership immediately
             # before evaluating it because Take over may have happened during the delay.
-            if presence.refusal("get_text", _tab_browser(tab)):
+            if presence.refusal("get_text", browser):
                 return None
             seen = await _tripwire_probe(tab, rules, want_cf)
             if seen is None:
@@ -6544,24 +6542,23 @@ async def _tripwire_look(tab: Tab, *, url: Optional[str] = None, want_cf: bool =
                     break
     key = _target_key(tab)
     if verdict is None:
-        _tripwire_left(tab, key)
+        _tripwire_left(browser, key)
         return None
-    trip = _tripwire_seen(key, mode, verdict,
+    trip = _tripwire_seen(browser, key, mode, verdict,
                           BrowserState.current_headless if headless is None else headless)
     if trip.where == "ask":
-        _tripwire_ask(tab, trip, await _page_sig(tab))
+        _tripwire_ask(tab, browser, trip, await _page_sig(tab))
     return trip
 
 
-def _tripwire_left(tab: Tab, key: Optional[str]) -> None:
+def _tripwire_left(browser: Any, key: Optional[str]) -> None:
     """The tab is on no verification page: forget the one reported, and withdraw the request the
     tripwire made for it (never one the agent made with request_human_help)."""
     seen = _TRIPWIRE_SEEN.pop(key, None)
     request = _HUMAN_HELP.get(key)
-    if not request or request.get("by") != "tripwire":
+    if not request or request["browser"] is not browser or request.get("by") != "tripwire":
         return
     _HUMAN_HELP.pop(key, None)
-    browser = _tab_browser(tab)
     answered = presence.answered(browser, float(request.get("asked_at") or request.get("requested_at")
                                                 or 0), request.get("request_id")) if request.get("was_shown") else None
     if presence.shows_request(browser, request.get("shown_at"), request.get("request_id")):
@@ -6575,15 +6572,13 @@ def _tripwire_left(tab: Tab, key: Optional[str]) -> None:
                    "the tripwire made was withdrawn.")
 
 
-def _tripwire_seen(key: Optional[str], mode: str, verdict: Any, headless: bool) -> _Trip:
+def _tripwire_seen(browser: Any, key: Optional[str], mode: str, verdict: Any, headless: bool) -> _Trip:
     """What a verification page found on a tab, preserving explicit agent handoffs."""
     seen = _TRIPWIRE_SEEN.get(key)
     same = bool(seen) and seen["host"] == verdict.host and seen["path"] == verdict.path
     _TRIPWIRE_SEEN[key] = {"host": verdict.host, "path": verdict.path, "place": verdict.place}
     if mode != "pause":
         return _Trip(mode, verdict, repeat=same)
-    tab = _tab_for_target(key)
-    browser = _tab_browser(tab)
     agent_key, agent_request = next(
         ((request_key, request) for request_key, request in _HUMAN_HELP.items()
          if request.get("browser") is browser and request.get("by") == "agent"),
@@ -6595,7 +6590,7 @@ def _tripwire_seen(key: Optional[str], mode: str, verdict: Any, headless: bool) 
             trip.target = key
         return trip
     request = _HUMAN_HELP.get(key)
-    if request is not None:
+    if request is not None and request["browser"] is browser:
         where = ("pending" if request.get("by") != "tripwire"
                  else "bar" if request.get("was_shown") else "window")
         return _Trip(mode, verdict, repeat=same, where=where)
@@ -6604,18 +6599,18 @@ def _tripwire_seen(key: Optional[str], mode: str, verdict: Any, headless: bool) 
     return _Trip(mode, verdict, where="ask", again=same)
 
 
-def _tripwire_ask(tab: Tab, trip: _Trip, baseline: Optional[dict], *, target: Optional[str] = None) -> None:
+def _tripwire_ask(tab: Tab, browser: Any, trip: _Trip, baseline: Optional[dict], *, target: Optional[str] = None) -> None:
     """The tripwire's request for the person, recorded as request_human_help records it and shown
     in the overlay's bar when there is one. The window is not brought forward: the agent calls
     request_human_help itself for that."""
     record = _record_human_help(
         tab, f"This site shows a verification page ({trip.verdict.host}). Please complete it, "
              "then press Done.", TRIPWIRE_HELP_TIMEOUT, by="tripwire", clock=_handoff_clock(),
-        baseline=baseline, browser=_tab_browser(tab), target=target)
+        baseline=baseline, browser=browser, target=target)
     trip.where = "bar" if record["was_shown"] else "window"
 
 
-def _tripwire_after_action(result: str, after: Optional[dict]) -> str:
+def _tripwire_after_action(tab: Tab, result: str, after: Optional[dict]) -> str:
     """Check the URL reached by the action and URLs of tabs it opened. The action itself did
     happen, so a detected verification page remains a non-error action result."""
     from . import antibot
@@ -6645,13 +6640,13 @@ def _tripwire_after_action(result: str, after: Optional[dict]) -> str:
     if verdict is None:
         return result
     try:
-        tab = _tab_for_target(target) if target else BrowserState.active_tab()
+        browser = tab.browser  # the opener owns the popup even before it enters the tab cache
         key = str(target) if target is not None else _target_key(tab)
-        trip = _tripwire_seen(key, mode, verdict, BrowserState.current_headless)
+        trip = _tripwire_seen(browser, key, mode, verdict, BrowserState.current_headless)
         if target is not None:
             trip.target = key
         if trip.where == "ask":
-            _tripwire_ask(tab, trip, None if target else after, target=target)
+            _tripwire_ask(tab, browser, trip, None if target else after, target=target)
         run = _TRIPWIRE_RUN.get()
         if target and mode == "pause" and run:
             run["popup"] = trip
@@ -6757,15 +6752,11 @@ async def _tripwire_step(previous: Optional[str], next_tool: str) -> Optional[st
         if trip is not None:
             # Only revisit a popup whose URL matched at click time. Target metadata suffices:
             # never inspect a popup's document or keep a verdict after its URL changed.
-            pages = await asyncio.wait_for(_page_targets(BrowserState.browser), timeout=2)
+            browser = BrowserState.browser
+            pages = await asyncio.wait_for(_page_targets(browser), timeout=2)
             current = dict(pages).get(trip.target)
             if current != trip.verdict.url:
-                if current is None:
-                    # A successful target-list read proves this popup closed; withdraw only its own
-                    # request. An unread list takes the exception path and leaves it pending.
-                    _tripwire_left(None, trip.target)
-                else:
-                    _tripwire_left(_tab_for_target(trip.target), trip.target)
+                _tripwire_left(browser, trip.target)
                 trip = None
         if trip is None:
             trip = await _tripwire_look(BrowserState.active_tab(), want_cf=True)
@@ -7227,7 +7218,7 @@ _UNREAD_AFTER_CLICK = ("; the clicked element could no longer be read, while the
                        "shows no change (it may be navigating)")
 
 
-def _click_outcome(head: str, detail: str, before: dict, after: dict) -> str:
+def _click_outcome(tab: Tab, head: str, detail: str, before: dict, after: dict) -> str:
     """Compare fingerprints and say what the click did, never a bare 'clicked'.
 
     Only called when the caller asked to verify. An empty fingerprint is a page that could
@@ -7249,7 +7240,7 @@ def _click_outcome(head: str, detail: str, before: dict, after: dict) -> str:
         # A click that led to a site's verification page says so first (antibot_tripwire).
         checked_after = dict(after)
         checked_after["before_pages"] = before.get("pages")
-        return _tripwire_after_action(ok(f"{head} — {detail}{change}"), checked_after)
+        return _tripwire_after_action(tab, ok(f"{head} — {detail}{change}"), checked_after)
     return ok(
         f"{head} but NO page change detected within {_VERIFY_WINDOW_MS}ms — {detail}. "
         f"The event was dispatched, but no page change was observed within this verification "
@@ -7586,7 +7577,7 @@ async def _click_point_of(tab, el, label: str, fx: float, fy: float, approach: b
     note = _dialog_note(tab)
     if note:
         return ok(f"{head} — {detail}{note}")
-    return _click_outcome(head, detail, before, after)
+    return _click_outcome(tab, head, detail, before, after)
 
 
 async def _click_and_report(
@@ -7619,7 +7610,7 @@ async def _click_and_report(
         detail = f"method=js_click {target}"
         if not verify:
             return ok(f"{head} — {detail}")
-        return _click_outcome(head, detail, before, await _sig_after_action(tab, before, el, pages=True))
+        return _click_outcome(tab, head, detail, before, await _sig_after_action(tab, before, el, pages=True))
 
     before = await _page_sig(tab, el, pages=True) if verify else {}
     x, y = pos.left + pos.width / 2, pos.top + pos.height / 2
@@ -7651,7 +7642,7 @@ async def _click_and_report(
     note = _dialog_note(tab)
     if note:
         return ok(f"{head} — {detail}{note}")
-    return _click_outcome(head, detail, before, after)
+    return _click_outcome(tab, head, detail, before, after)
 
 
 @mcp.tool()
@@ -7725,7 +7716,7 @@ async def click_text(text: str, exact: bool = False, verify: bool = True) -> str
             if _dialog_note(tab):
                 return ok(note + _dialog_note(tab))
             head, _, detail = note.partition(" — ")
-            return _click_outcome(head, detail, before, after)
+            return _click_outcome(tab, head, detail, before, after)
 
         if el is None and not cand.get("found"):
             if in_frame:

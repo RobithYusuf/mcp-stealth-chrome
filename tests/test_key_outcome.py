@@ -115,14 +115,14 @@ def test_a_click_does_not_stop_on_a_torn_read(monkeypatch):
     from mcp_stealth_chrome import server
     after, _ = _after_click(monkeypatch, [TORN, TORN, RESULT])
     assert after["url"] == RESULT["url"]
-    assert "navigated to" in server._click_outcome("clicked", "x", BEFORE, after)
+    assert "navigated to" in server._click_outcome(_Tab(), "clicked", "x", BEFORE, after)
 
 
 def test_a_click_whose_reads_stay_torn_says_the_element_could_not_be_read(monkeypatch):
     from mcp_stealth_chrome import server
     after, reads = _after_click(monkeypatch, [TORN])
     assert reads == len(server._VERIFY_PAUSES)  # the schedule is not lengthened
-    out = server._click_outcome("clicked", "x", BEFORE, after)
+    out = server._click_outcome(_Tab(), "clicked", "x", BEFORE, after)
     assert "could no longer be read" in out and "page changed" not in out, out
 
 
