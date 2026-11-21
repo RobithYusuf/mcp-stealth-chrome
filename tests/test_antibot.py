@@ -455,20 +455,29 @@ def test_popup_tripwire_waits_on_popup_and_done_clears_popup_record(page, monkey
     assert "POPUP-TAB" not in server._HUMAN_HELP
 
 
-def test_popup_probe_at_next_step_checks_configured_text_rule(page, monkeypatch):
-    parent = page("https://shopee.co.id/product/1", words=())
-    popup = Tab("https://shopee.co.id/product/1", parent.browser,
-                words=["verifikasi untuk melanjutkan"])
-    popup.target = type("Target", (), {"target_id": "POPUP-TEXT"})()
+@pytest.mark.parametrize("at_click,later,pauses", [
+    (FIELD_URL, FIELD_URL, True), (FIELD_URL, "https://shopee.co.id/product/2", False),
+    ("about:blank", FIELD_URL, False), ("https://shopee.co.id/product/2", FIELD_URL, False),
+])
+def test_click_checks_only_a_popup_url_that_matched_at_click_time(page, monkeypatch, at_click, later, pauses):
+    parent = page("https://example.test/", headless=True)
+    popup = Tab(later, parent.browser, words=["verifikasi untuk melanjutkan"])
+    popup.target = type("Target", (), {"target_id": "popup"})()
     monkeypatch.setattr(BrowserState, "tabs", [parent, popup])
-    verdict = antibot.url_verdict(FIELD_URL, antibot.BUILT_IN)
-    trip = server._Trip("pause", verdict, target="POPUP-TEXT")
-    token = server._TRIPWIRE_RUN.set({"popup": trip})
+    async def targets(browser):
+        return [("popup", later)]
+    monkeypatch.setattr(server, "_page_targets", targets)
+    run = server._TRIPWIRE_RUN.set({"tool": "batch_actions"})
     try:
-        out = asyncio.run(server._tripwire_step("click", "navigate"))
+        before = {**parent.sig(), "pages": {KEY: parent.url}}
+        after = {**before, "pages": {**before["pages"], "popup": at_click}, "opened_here": ["popup"]}
+        clicked = server._click_outcome("clicked", "#open", before, after)
+        assert ("in opened tab" in clicked) == (at_click == FIELD_URL)
+        result = asyncio.run(server._tripwire_step("click", "navigate"))
+        assert bool(result and result.startswith("Error: antibot_paused:")) == pauses
+        assert popup.probes == 0
     finally:
-        server._TRIPWIRE_RUN.reset(token)
-    assert out.startswith("Error: antibot_paused:") and "page text" in out, out
+        server._TRIPWIRE_RUN.reset(run)
 def test_a_second_look_says_it_in_one_line(page):
     tab = page(FIELD_URL, overlay=True)
     look(tab, url=FIELD_URL)

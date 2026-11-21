@@ -6613,7 +6613,7 @@ def _tripwire_after_action(result: str, after: Optional[dict]) -> str:
     if verdict is None:
         return result
     try:
-        tab = _tab_for_target(target) or BrowserState.active_tab()
+        tab = _tab_for_target(target) if target else BrowserState.active_tab()
         key = str(target) if target is not None else _target_key(tab)
         trip = _tripwire_seen(key, mode, verdict, BrowserState.current_headless)
         if target is not None:
@@ -6720,19 +6720,17 @@ async def _tripwire_step(previous: Optional[str], next_tool: str) -> Optional[st
     try:
         run = _TRIPWIRE_RUN.get()
         trip = run.pop("popup", None) if run else None
+        if trip is not None:
+            # Only revisit a popup whose URL matched at click time. Target metadata suffices:
+            # never inspect a popup's document or keep a verdict after its URL changed.
+            pages = await asyncio.wait_for(_page_targets(BrowserState.browser), timeout=2)
+            current = dict(pages).get(trip.target)
+            if current != trip.verdict.url:
+                if current is not None:
+                    _tripwire_left(_tab_for_target(trip.target), trip.target)
+                trip = None
         if trip is None:
-            tab = BrowserState.active_tab()
-            trip = await _tripwire_look(tab, want_cf=True)
-        elif trip.target:
-            popup = _tab_for_target(trip.target)
-            if popup is not None:
-                popup_url = str(getattr(popup.target, "url", "") or "")
-                if popup_url == "about:blank":
-                    await asyncio.sleep(0.3)
-                    popup_url = str(getattr(popup.target, "url", "") or "")
-                fresh = await _tripwire_look(popup, url=popup_url or None, want_cf=False,
-                                             headless=BrowserState.current_headless)
-                trip = fresh or trip
+            trip = await _tripwire_look(BrowserState.active_tab(), want_cf=True)
     except Exception:
         return None  # no tab to look at, or a look that failed: the step runs as before
     if trip is None:
