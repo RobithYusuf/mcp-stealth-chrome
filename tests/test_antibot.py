@@ -810,3 +810,16 @@ def test_closed_popup_keeps_request_when_target_list_is_unreadable(page, monkeyp
     finally:
         server._TRIPWIRE_RUN.reset(token)
     assert "unread-popup" in server._HUMAN_HELP
+def test_tripwire_does_not_replace_explicit_agent_request(page, monkeypatch):
+    parent = page("https://example.test/", overlay=True)
+    popup = Tab(FIELD_URL, parent.browser)
+    popup.target = type("Target", (), {"target_id": "manual-popup"})()
+    monkeypatch.setattr(BrowserState, "tabs", [parent, popup])
+    asyncio.run(nav.request_human_help("Log in"))
+    manual = server._HUMAN_HELP[server._target_key(parent)]
+    trip = look(popup, url=FIELD_URL)
+    assert trip.where == "agent_pending" and trip.target == "manual-popup"
+    assert list(server._HUMAN_HELP.values()) == [manual]
+    out = server._tripwire_render(trip, "navigate", "x", asked_for=FIELD_URL)
+    assert "explicit request made with request_human_help is still pending" in out
+    assert "popup tab manual-popup" in out

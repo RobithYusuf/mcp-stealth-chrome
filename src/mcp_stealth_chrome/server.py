@@ -6442,7 +6442,9 @@ def _record_human_help(tab: Tab, objective: str, timeout: float, *, by: str, clo
     if owner is None:
         raise RuntimeError("cannot identify the browser instance for this help request")
     for old_key, old in tuple(_HUMAN_HELP.items()):
-        if old.get("browser") is browser:
+        # A tripwire may replace an earlier tripwire request, but never an explicit
+        # request_human_help request. A new explicit request may intentionally supersede either.
+        if old.get("browser") is browser and (by == "agent" or old.get("by") == "tripwire"):
             old["replaced_by"] = request_id
             del _HUMAN_HELP[old_key]
             _tripwire_note(f"help request {old['request_id']} was replaced by {request_id}.")
@@ -6567,15 +6569,26 @@ def _tripwire_left(tab: Tab, key: Optional[str]) -> None:
 
 
 def _tripwire_seen(key: Optional[str], mode: str, verdict: Any, headless: bool) -> _Trip:
-    """What a verification page found on a tab means: said before or not, and in pause mode where
-    the request stands ("ask": none yet, and _tripwire_ask makes it)."""
+    """What a verification page found on a tab, preserving explicit agent handoffs."""
     seen = _TRIPWIRE_SEEN.get(key)
     same = bool(seen) and seen["host"] == verdict.host and seen["path"] == verdict.path
     _TRIPWIRE_SEEN[key] = {"host": verdict.host, "path": verdict.path, "place": verdict.place}
     if mode != "pause":
         return _Trip(mode, verdict, repeat=same)
+    tab = _tab_for_target(key)
+    browser = _tab_browser(tab)
+    agent_key, agent_request = next(
+        ((request_key, request) for request_key, request in _HUMAN_HELP.items()
+         if request.get("browser") is browser and request.get("by") == "agent"),
+        (None, None),
+    )
+    if agent_request is not None:
+        trip = _Trip(mode, verdict, repeat=same, where="agent_pending")
+        if agent_key != key:
+            trip.target = key
+        return trip
     request = _HUMAN_HELP.get(key)
-    if request is not None:  # still pending: the tripwire's own, or one the agent made
+    if request is not None:
         where = ("pending" if request.get("by") != "tripwire"
                  else "bar" if request.get("was_shown") else "window")
         return _Trip(mode, verdict, repeat=same, where=where)
@@ -6647,6 +6660,8 @@ _TRIPWIRE_PENDING = {
     "window": ("the request is pending, and no overlay shows it: request_human_help brings the "
                "window forward, then wait_for_human"),
     "pending": "a request made with request_human_help is pending on this tab: wait_for_human",
+    "agent_pending": ("an explicit request made with request_human_help is still pending in the "
+                      "overlay's bar: call wait_for_human"),
     "headless": "this browser is headless, so nobody can see a request: a visible browser is needed",
 }
 

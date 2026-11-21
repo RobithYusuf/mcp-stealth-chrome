@@ -238,6 +238,8 @@ def next_line(where: str, again: str, cloudflare: bool) -> str:
                    "forward and asks them, then wait_for_human; then "),
         "pending": ("a request made with request_human_help is pending on this tab and was left "
                     "as it is. Call wait_for_human; then "),
+        "agent_pending": ("an explicit request made with request_human_help is still pending in "
+                          "the overlay's bar. Call wait_for_human; then "),
     }
     # Headless: on a visible browser the tripwire asks by itself at its next look at this page.
     line = wait.get(where, "this browser is headless, so nobody sees a request: relaunch it "
