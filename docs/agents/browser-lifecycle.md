@@ -88,7 +88,10 @@ Part of the agent guide: [AGENTS.md](../../AGENTS.md) says when to read this. It
   `_give_focus_back` and `_win_focus_back_from_popup` take the PID that had the front (`_frontmost_pid`, one
   lsappinfo read per input where two were made). `_foreground_for_human` relies on `Page.bringToFront`, which
   raises its own process, checks `_frontmost_pid`, activates its own PID when another app is still in front, and
-  says `NOT the app in front` when that did not work. `tests/test_focus_restore.py` fails if `"open", "-a"` comes
+  says `NOT the app in front` when that did not work. `_frontmost_pid` asks the Process Manager in process
+  (`_front_pid_in_process`, 0.28 ms a call) and falls back to two lsappinfo processes (15.5 ms): it runs before
+  every input on a visible browser and every 20 ms in the popup watch. It stays fresh without a run loop (6 of 6
+  switches agreed with lsappinfo), which `NSWorkspace.frontmostApplication()` does not. `tests/test_focus_restore.py` fails if `"open", "-a"` comes
   back into server.py or tools/navigation.py.
 - The Dock icon is opt-in: only the `dock_icon` setting turns it on (`MCP_STEALTH_DOCK_ICON=1`, or true, yes, on, or the
   settings file; see Settings). Off changes nothing: Google

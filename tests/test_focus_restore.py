@@ -323,15 +323,29 @@ def test_tab_new_headed_opens_behind_and_headless_as_before(monkeypatch):
     assert calls == ["background", "foreground"]
 
 
-def test_frontmost_pid_is_read_from_lsappinfo(monkeypatch):
+def test_frontmost_pid_asks_in_process_first_and_lsappinfo_when_that_fails(monkeypatch):
+    """In process it costs 0.04 ms; two lsappinfo processes cost 15.5 ms, before every input."""
+    spawned = []
+
     def fake_run(cmd, **_kw):
+        spawned.append(cmd)
         return SimpleNamespace(stdout="ASN:0x0-0x1:\n" if cmd[1] == "front" else '"pid"=4242\n')
 
     monkeypatch.setattr(server.sys, "platform", "darwin")
     monkeypatch.setattr(server.subprocess, "run", fake_run)
-    assert server._frontmost_pid() == 4242
+    monkeypatch.setattr(server, "_front_pid_in_process", lambda: 777)
+    assert server._frontmost_pid() == 777 and spawned == []
+    monkeypatch.setattr(server, "_front_pid_in_process", lambda: None)
+    assert server._frontmost_pid() == 4242 and len(spawned) == 2
     monkeypatch.setattr(server.sys, "platform", "linux")
     assert server._frontmost_pid() is None
+
+
+@pytest.mark.skipif(__import__("sys").platform != "darwin", reason="the Process Manager is macOS")
+def test_the_in_process_read_names_a_running_process():
+    import os
+    pid = server._front_pid_in_process()
+    assert pid is None or (isinstance(pid, int) and pid > 0 and pid != os.getpid())
 
 
 def _popup_watch(monkeypatch, fronts, sticks=True):

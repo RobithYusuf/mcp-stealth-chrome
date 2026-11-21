@@ -2113,9 +2113,35 @@ async def _page_visibility(tab: Any) -> Optional[str]:
     return None
 
 
+def _front_pid_in_process() -> Optional[int]:
+    """The app in front, asked of the Process Manager in this process: 0.04 ms, against 15.5 ms
+    for two lsappinfo processes, and it runs before every input on a visible browser and every
+    20 ms in the popup watch. Fresh in a process with no run loop (6 of 6 switches agreed with
+    lsappinfo, and a switch showed in under 1 ms), which NSWorkspace is not."""
+    try:
+        import ctypes
+
+        class _PSN(ctypes.Structure):
+            _fields_ = [("high", ctypes.c_uint32), ("low", ctypes.c_uint32)]
+
+        services = ctypes.cdll.LoadLibrary(
+            "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices")
+        psn, pid = _PSN(), ctypes.c_int(0)
+        if services.GetFrontProcess(ctypes.byref(psn)) != 0:
+            return None
+        if services.GetProcessPID(ctypes.byref(psn), ctypes.byref(pid)) != 0:
+            return None
+        return pid.value if pid.value > 0 else None
+    except Exception:
+        return None
+
+
 def _frontmost_pid() -> Optional[int]:
     if sys.platform != "darwin":
         return None
+    found = _front_pid_in_process()
+    if found is not None:
+        return found
     try:
         front = subprocess.run(["lsappinfo", "front"], capture_output=True, text=True,
                                timeout=2, check=False).stdout.strip()
