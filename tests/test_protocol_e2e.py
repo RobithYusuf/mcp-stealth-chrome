@@ -802,7 +802,7 @@ def test_a_handler_that_reacts_late_is_not_reported_dead(page, base):
 def test_a_dead_button_still_gets_the_whole_wait(page, base):
     page.call("navigate", url=f"{base}/late.html")
     reply = page.call("click", selector="#dead")
-    assert "NO page change detected" in reply.text, reply.text
+    assert "NO page change detected within 450ms" in reply.text, reply.text
     assert reply.seconds >= 0.45, reply.seconds
 
 

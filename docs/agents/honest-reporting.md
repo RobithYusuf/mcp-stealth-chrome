@@ -36,7 +36,7 @@ conclusions. Each rule below replaced a real lie.
 ## After a click
 
 - With `verify=True` (default) a fingerprint before and after decides; no change says
-  `clicked but NO page change detected`. It includes the element's own tree and state (else an iframe, shadow tree or
+  `clicked but NO page change detected within 450ms`. It includes the element's own tree and state (else an iframe, shadow tree or
   checkbox change reads as none) and `_page_sig` hashes the body HTML (by length alone, a counter going from 1 to 2 read
   as `NO page change` and an agent clicked again).
 - Focus counts only when it lands on another element: a real click focuses its own target, and clicking anything

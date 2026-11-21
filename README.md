@@ -306,7 +306,7 @@ Measured in November 2026 on one Mac (M4 Pro, Chrome 157, headless, a throwaway 
 | Open a local page in a running browser | 63 ms | 131 ms |
 | Open `en.wikipedia.org/wiki/Cat`, cached | 276 ms | 370 ms |
 | Click a button that changes the page | 160 ms | 253 ms |
-| Click a button that does nothing | 577 ms, says `NO page change detected` | 262 ms, says it clicked |
+| Click a button that does nothing | 577 ms, says `NO page change detected within 450ms` | 262 ms, says it clicked |
 | Click a button under an overlay | 88 ms, refuses and names the overlay | 252 ms, says it clicked; the overlay took the click |
 | Click a disabled button | 89 ms, says it is disabled | 5.0 s, then a timeout |
 | Fill a text field | 12 ms | 248 ms |
@@ -671,7 +671,7 @@ With the `dock_icon` setting on, a visible browser on a new profile runs from Go
 
 Results describe what was observed. A tool that reports success when nothing happened would leave an agent building on a false result, so these rules hold across the server:
 
-- ✅ A click says whether the page changed. One that changed nothing answers `clicked but NO page change detected`
+- ✅ A click says whether the page changed. One that changed nothing answers `clicked but NO page change detected within 450ms`; a later reaction may still arrive.
 - ✅ A click on a covered element is refused, and the result names what covers it
 - ✅ An empty capture says whether anything was being captured
 - ✅ A browser is reported closed only after its process was seen gone
@@ -680,7 +680,7 @@ Results describe what was observed. A tool that reports success when nothing hap
 <details>
 <summary><b>Every rule, in full</b></summary>
 
-- ✅ Clicks are real mouse input. `click`, `click_text`, `click_role`, `click_element_offset`, `click_at_corner` and `hover` test the target first and refuse by name when something covers it. Clicks say `clicked but NO page change detected` when nothing happened, `the outcome could NOT be verified` when the page could not be read before or after, and name any new tab the click opened. A JS click only happens with `js_fallback=True`, and the result says so.
+- ✅ Clicks are real mouse input. `click`, `click_text`, `click_role`, `click_element_offset`, `click_at_corner` and `hover` test the target first and refuse by name when something covers it. Clicks say `clicked but NO page change detected within 450ms` when no change was observed in the verification window, `the outcome could NOT be verified` when the page could not be read before or after, and name any new tab the click opened. A JS click only happens with `js_fallback=True`, and the result says so.
 - ✅ A click is checked as soon as it lands and reported when the page changes, about 160 ms for a button that works. Only a click that changes nothing waits the full 450 ms before saying so, so a handler that reacts after 300 ms is not reported as dead.
 - ✅ The hit test before a click and the before and after comparison run in an isolated world, like the snapshot. A page that replaces `getBoundingClientRect`, `elementFromPoint`, `getComputedStyle` or `querySelector` to watch for automation sees none of them called by a click, a hover or a navigation: 0 calls, where one click used to make 37.
 - ✅ A native dialog cannot hang the server. A click, key or pointer move that opens one returns and names it, any other tool that needs the page says so instead of waiting, and `dialog_handle` answers the one already open.

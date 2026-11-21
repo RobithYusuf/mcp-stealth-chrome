@@ -6640,9 +6640,9 @@ def _click_outcome(head: str, detail: str, before: dict, after: dict) -> str:
     if change is not None:
         return ok(f"{head} — {detail}{change}")
     return ok(
-        f"{head} but NO page change detected — {detail}. The event was dispatched; "
-        f"the page did not react (handler not bound, click swallowed, or the change "
-        f"is purely visual)."
+        f"{head} but NO page change detected within {_VERIFY_WINDOW_MS}ms — {detail}. "
+        f"The event was dispatched, but no page change was observed within this verification "
+        f"window; a later reaction or a purely visual effect is still possible."
     )
 
 
@@ -6652,6 +6652,7 @@ def _click_outcome(head: str, detail: str, before: dict, after: dict) -> str:
 # acknowledged. Only "NO page change" needs the whole wait, and it gets a longer one than
 # before, so a handler that reacts after 300 ms is not reported as dead.
 _VERIFY_PAUSES = (0.0, 0.05, 0.07, 0.10, 0.11, 0.12)
+_VERIFY_WINDOW_MS = round(sum(_VERIFY_PAUSES) * 1000)
 # One more reading after the first change, so a handler that updates the page and then
 # navigates or opens a tab is reported with where it ended up.
 _VERIFY_SETTLE = 0.06
