@@ -34,6 +34,7 @@ SHIPPED = {
     "906e1d76857435acc6bc19d80f1de3920f5cee48207fc3e3ae559079757a0351",  # 0.26.1 to 0.27.0
     "c55975b4b07e471f6d862a0305fcfdd578cbf725ecb32cb5e98f6f43cb314c38",  # 0.27.1
     "bc00ba580c6a17ab4aa3c35fb4d1865c9fb8f4a6ca635a995458562c2ee92258",  # outgoing workflow collection update
+    "3b96f26f5e18be9ede5ceb4eaf9f2df1eeadb2f0ca2ec96479bf33eaadef241d",  # outgoing workflow collection update
 }
 
 
