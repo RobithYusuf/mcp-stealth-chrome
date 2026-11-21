@@ -55,8 +55,15 @@ def _safe_list(v) -> list:
 
 _BLOCK_STATUS = {401, 403, 405, 406, 409, 421, 429, 503}
 _BLOCK_MARKERS = (
+    "just a moment",              # Cloudflare interstitial
+    "cf-chl", "challenge-platform",
+    "checking your browser",
+    "attention required",         # Cloudflare block page
     "captcha-delivery",           # DataDome
+    "please verify you are a human",
     "access denied", "access to this page has been denied",
+    "enable javascript and cookies to continue",
+    "verifying you are human",
     "px-captcha",                 # PerimeterX
     "incapsula incident",         # Imperva
 )
@@ -95,42 +102,17 @@ async def _serp_throttle() -> None:
 # curl_cffi HTTP fetch (the browserless fast path)
 # ---------------------------------------------------------------------------
 
+# JS-challenge / anti-bot interstitials that a REAL browser clears on its own
+# after a few seconds (Cloudflare "Just a moment", Reddit "network security"
+# js_challenge, etc). curl_cffi can't run the JS, but the stealth browser can —
+# we just have to WAIT for the challenge to resolve instead of reading too early.
 _CHALLENGE_MARKERS = (
-    "blocked by network security", "js_challenge",
+    "just a moment", "checking your browser", "challenge-platform",
+    "blocked by network security", "verifying you are human", "verify you are human",
+    "cf-chl", "jschl", "js_challenge", "please wait", "enable javascript and cookies",
+    "ddos protection by", "attention required",
 )
 
-
-def _cloudflare_challenge_reason(html: str) -> Optional[str]:
-    """Return a challenge-page marker, never a phrase quoted by an article."""
-    low = (html or "").lower()
-    if "blocked by network security" in low or "js_challenge" in low:
-        return "browser challenge marker"
-    own = re.search(r"/cdn-cgi/challenge-platform/[^\"']*/orchestrate/", low)
-    if own:
-        return "Cloudflare orchestrate challenge script"
-    if re.search(r"_cf_chl_opt", low) and re.search(r"<script\b", low):
-        return "Cloudflare _cf_chl_opt challenge script"
-    if re.search(r"<form[^>]+(?:action|id|name)=[^>]*__cf_chl", low):
-        return "Cloudflare __cf_chl challenge form"
-    if re.search(r"<title[^>]*>\s*just a moment\b", low) and own:
-        return "Cloudflare Just a moment challenge"
-    return None
-
-
-def _browser_block_reason(html: str, status: Optional[int], headers: dict) -> Optional[str]:
-    """Evidence from the initial HTTP request plus the rendered challenge document."""
-    header_map = {str(k).lower(): str(v).lower() for k, v in (headers or {}).items()}
-    initial = []
-    if status in (403, 503):
-        initial.append(f"initial HTTP status {status}")
-    if header_map.get("cf-mitigated") == "challenge":
-        initial.append("initial cf-mitigated: challenge header")
-    if "cloudflare" in header_map.get("server", ""):
-        initial.append("initial Server: cloudflare header")
-    marker = _cloudflare_challenge_reason(html)
-    if marker:
-        return "; ".join(initial + [marker])
-    return None
 
 async def _browser_render(tab, url: str, max_wait: float = 16.0,
                           settle: float = 1.0, raise_nav_error: bool = False) -> str:
@@ -163,7 +145,7 @@ async def _browser_render(tab, url: str, max_wait: float = 16.0,
         # ~190KB of leading CSS, so a head-only slice would miss it and return
         # the block page as if it were real content.
         low = (html or "").lower()
-        marked = _cloudflare_challenge_reason(html) is not None
+        marked = any(m in low for m in _CHALLENGE_MARKERS)
         # A tiny page may be a challenge still loading, or just a tiny page. Without a marker
         # the grace period below decides, instead of waiting out max_wait every time.
         short_for_now = len(html or "") < 1500 and (time.monotonic() - start) < 6.0
@@ -851,21 +833,16 @@ async def scrape_markdown(
     if use_browser:
         if not BrowserState.is_up():
             return err("use_browser=True but no browser — call browser_launch first")
-        initial_status, _initial_text, initial_headers = await _fetch_http(
-            u, impersonate=impersonate, proxy=proxy)
         try:
             tab = BrowserState.active_tab()
             html = await _browser_render(tab, u, raise_nav_error=True)   # waits out JS challenges
         except Exception as e:
             return err(f"browser fetch failed: {type(e).__name__}: {e}")
         md = _html_to_markdown(html, base_url=u, max_chars=max_chars)
-        block_reason = _browser_block_reason(html, initial_status, initial_headers)
         return ok(json.dumps({
+            # This path never sees the document response, so a 403 page must not read as 200.
             "url": u, "path": "browser", "status": None, "status_measured": False,
-            "active_tab_navigated": True, "blocked": bool(block_reason),
-            "block_reason": block_reason, "initial_http_status": initial_status,
-            "initial_http_evidence": ([f"status {initial_status}"]
-                                      if initial_status in (403, 503) else []),
+            "active_tab_navigated": True,
             "chars": len(md), "elapsed_ms": int((time.monotonic() - t0) * 1000),
             "markdown": md,
         }, ensure_ascii=False))
@@ -904,9 +881,9 @@ async def smart_fetch(
         return err("url must start with http/https")
     t0 = time.monotonic()
 
-    status, text, headers = None, "", {}
+    status, text, _ = None, "", {}
     if not force_browser:
-        status, text, headers = await _fetch_http(u, impersonate=impersonate, proxy=proxy)
+        status, text, _ = await _fetch_http(u, impersonate=impersonate, proxy=proxy)
         if status is not None and not _looks_blocked(status, text):
             md = _html_to_markdown(text, base_url=u, max_chars=max_chars)
             # A 200 with almost no extractable text is usually a JS/SPA shell
@@ -929,18 +906,17 @@ async def smart_fetch(
         except Exception as e:
             return err(f"browser escalation failed: {type(e).__name__}: {e}")
         md = _html_to_markdown(html, base_url=u, max_chars=max_chars)
-        block_reason = _browser_block_reason(html, status, headers)
+        blk = "blocked by network security" in (html or "").lower()
         hint = None
-        if block_reason:
-            hint = (f"still challenge-blocked after wait+reload ({block_reason}) — the page needs a "
-                    "logged-in session (cookie_import/storage_state) or a residential proxy; "
-                    "retry once more (a warmed session often passes).")
+        if blk:
+            hint = ("still challenge-blocked after wait+reload — the page needs a "
+                    "logged-in session (cookie_import/storage_state) or a residential "
+                    "proxy; retry once more (a warmed session often passes).")
         elif len(md) < 60:
-            hint = ("near-empty after render — page may be login-walled or still hydrating; "
-                    "import a session cookie or retry once.")
+            hint = ("near-empty after render — page may be login-walled or still "
+                    "hydrating; import a session cookie or retry once.")
         return ok(json.dumps({
             "url": u, "path": "browser", "status": None, "status_measured": False,
-            "blocked": bool(block_reason), "block_reason": block_reason,
             "chars": len(md), "escalated_from_http_status": status,
             "elapsed_ms": int((time.monotonic() - t0) * 1000),
             "hint": hint,
