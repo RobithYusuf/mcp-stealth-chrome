@@ -31,7 +31,7 @@ from ..helpers import (
 )
 from ..identity import key_event_params
 from ..refs import new_object_group, resolve_ref
-from ..state import EXPORT_DIR, PRIMARY_SESSION, SESSION_GONE_HOOKS, BrowserState, ensure_dirs
+from ..state import EXPORT_DIR, PRIMARY_SESSION, SESSION_GONE_HOOKS, BrowserState
 from ..workflow import WorkflowError, run_workflow
 from .. import server as _srv
 
@@ -806,7 +806,7 @@ def _export_workflow_var(name: str, value: Any) -> dict:
     """Persist a large collected list as a private managed export artifact."""
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._-") or "var"
     filename = f"workflow-{safe}-{int(time.time() * 1000)}.json"
-    ensure_dirs()
+    _srv.ensure_dirs()
     path = confined_output_path(EXPORT_DIR, filename)
     text = json.dumps(value, indent=2, ensure_ascii=False, default=str)
     write_private(path, text)
