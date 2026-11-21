@@ -29,7 +29,7 @@ from ..helpers import (
     ok,
 )
 from ..identity import chrome_version
-from ..state import PROFILE_DIR, BrowserState
+from ..state import BrowserState
 from . import capture as _capture
 from .. import server as _srv
 
@@ -40,7 +40,7 @@ def _status_profile() -> str:
         return str(BrowserState.current_profile_dir)
     browser = BrowserState.browser
     if browser is None:
-        return str(PROFILE_DIR)
+        return str(_srv.PROFILE_DIR)  # through server: tests point that name at a temporary folder
     if getattr(browser, "_process", None) is None and not getattr(browser, "_process_pid", None):
         return "(attached Chrome: profile not known)"
     data_dir = getattr(getattr(browser, "config", None), "user_data_dir", None)

@@ -4430,10 +4430,10 @@ def _launch_server_profile(req: _LaunchRequest, plan: _LaunchPlan, resolved_prof
         holder_pid = chrome_lock_holder_pid(plan.profile_path)
         if holder_pid is not None:
             return err(
-                f"Default MCP profile is locked by PID {holder_pid}. "
-                f"This usually means another mcp-stealth-chrome instance is running. "
-                f"Run `pkill -f mcp-stealth-chrome` then retry, or use persistent=False "
-                f"for an ephemeral throwaway profile."
+                f"Default MCP profile is locked by PID {holder_pid}: a browser is using it, usually "
+                f"the one another mcp-stealth-chrome session started. Close that browser "
+                f"(browser_close in that session, or quit its window) and retry, or use "
+                f"persistent=False for an ephemeral throwaway profile."
             )
         # Before the window-state wipe below writes to it: a refused profile stays as it was.
         plan.launch_choice = _launch_choice(plan.profile_path, req.headless, plan.merged_extra_args,

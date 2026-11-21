@@ -4233,3 +4233,30 @@ def test_process_command_on_windows_reads_the_process_table_not_ps(monkeypatch):
     assert server._process_command(77) == r'"C:\chrome.exe" --user-data-dir=C:\p'
     assert server._process_command(78) is None  # unreadable is not evidence
     assert server._process_command(99) is None
+
+
+def test_server_status_names_the_profile_folder_a_test_pointed_the_server_at(monkeypatch, tmp_path):
+    """With no browser running, server_status names the default profile. That code moved to
+    tools/diagnostics.py and read its own import of PROFILE_DIR, so a test that had pointed
+    server.PROFILE_DIR at a temporary folder still got the person's real one named."""
+    from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import diagnostics
+
+    monkeypatch.setattr(server.BrowserState, "browser", None)
+    monkeypatch.setattr(server.BrowserState, "current_profile_dir", None)
+    monkeypatch.setattr(server, "PROFILE_DIR", tmp_path / "profile")
+    assert diagnostics._status_profile() == str(tmp_path / "profile")
+
+
+def test_no_refusal_tells_the_caller_to_end_processes_by_name():
+    """A refusal is read by an agent, which runs what it says. "pkill -f mcp-stealth-chrome" ends
+    every server of every agent on the machine, and their browsers with them."""
+    import pathlib
+
+    from mcp_stealth_chrome import server
+
+    package = pathlib.Path(server.__file__).parent
+    found = [f"{path.name}:{number}" for path in sorted(package.rglob("*.py"))
+             for number, line in enumerate(path.read_text().splitlines(), 1)
+             if "pkill" in line or "killall" in line]
+    assert found == []
