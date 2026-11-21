@@ -19,6 +19,9 @@ MAX_EXECUTED_STEPS = 2000
 MAX_FOREACH_ITEMS = 1000
 MAX_REPORTED_ENTRIES = 200
 RESULT_PREVIEW = 500
+# How far back from RESULT_PREVIEW a cut looks for a line break or ", " to end on.
+PREVIEW_BREAK_WINDOW = 80
+CUT_MARK = " ... [+{left} chars; the whole result is in vars when the step has save_as]"
 
 # How much of a run the report shows. "full" is the report as it always was; the others are
 # made from it by _shorten and show nothing it does not, except a last step past the entry cap.
@@ -246,6 +249,21 @@ def _note_failure(run: _Run, message: str) -> None:
     run.variables["last"] = {"ok": False, "value": None, "text": message}
 
 
+def _preview(text: str) -> str:
+    """A step's result as the report shows it. A short one is whole. A longer one ends at the last
+    line break or ", " in the final PREVIEW_BREAK_WINDOW characters before RESULT_PREVIEW (else at
+    the limit) and says how much it left out: cut at 500 with no mark, mid-key ("redirect_c"), it
+    read as the whole result."""
+    if len(text) <= RESULT_PREVIEW:
+        return text
+    head = text[:RESULT_PREVIEW]
+    start = RESULT_PREVIEW - PREVIEW_BREAK_WINDOW
+    cut = max(head.rfind("\n", start), head.rfind(", ", start))
+    if cut < 0:
+        cut = RESULT_PREVIEW
+    return text[:cut] + CUT_MARK.format(left=len(text) - cut)
+
+
 async def _run_tool(run: _Run, step: dict, path: list[int]) -> None:
     tool = step["tool"]
     if not run.allowed(tool):
@@ -270,7 +288,7 @@ async def _run_tool(run: _Run, step: dict, path: list[int]) -> None:
     value = step_value(text)
     run.variables["last"] = {"ok": not failed, "value": value, "text": text}
     entry = {"index": path[0] if len(path) == 1 else _dotted(path), "tool": tool,
-             "label": step.get("label", ""), "ok": not failed, "result": text[:RESULT_PREVIEW]}
+             "label": step.get("label", ""), "ok": not failed, "result": _preview(text)}
     if step.get("save_as"):
         run.variables[str(step["save_as"])] = value
         run.saved.add(str(entry["index"]))
@@ -410,8 +428,9 @@ async def run_workflow(
 
 _NOTES = {
     "summary": "a summary: counts, every failed or ignored step, and the result of each step with "
-               "save_as, each reader and the last step; vars only as this run set or changed them "
-               "(all of them after a failure). output=\"full\" lists every step.",
+               "save_as, each reader and the last step; vars only as this run set or changed them, "
+               "last without the text its value holds (all of them, whole, after a failure). "
+               "output=\"full\" lists every step.",
     "failures": "failures only: counts and every failed or ignored step, no vars unless a resume "
                 "needs them. output=\"summary\" adds results, output=\"full\" lists every step.",
 }
@@ -446,12 +465,25 @@ def _shorten(full: dict, run: _Run, output: str, given: dict) -> dict:
         out.update((key, full[key]) for key in _RESUME_KEYS if key in full)
     elif output == "summary" and full.get("vars"):
         changed = {k: v for k, v in full["vars"].items() if k not in given or given[k] != v}
+        if isinstance(changed.get("last"), dict):
+            changed["last"] = _last_once(changed["last"])
         if changed:
             out["vars"] = changed
         unchanged = [k for k in full["vars"] if k not in changed]
         if unchanged:
             out["vars_unchanged"] = unchanged  # named, so a reader knows they were not lost
     return out
+
+
+def _last_once(last: dict) -> dict:
+    """${last} for a successful summary: without its text when the value came from that text
+    (parsed, or the text itself), which said the step's result twice. A value that did not come
+    from it (a step refused before it ran: value None, text the reason) keeps both. A new dict:
+    the run's own ${last} is not touched."""
+    text = last.get("text")
+    if set(last) == {"ok", "value", "text"} and isinstance(text, str) and step_value(text) == last["value"]:
+        return {"ok": last["ok"], "value": last["value"]}
+    return last
 
 
 def _counts(tally: dict[str, dict[str, int]]) -> dict:

@@ -846,12 +846,14 @@ async def workflow_run(
         output: "summary" (default): counts per tool, every failed or ignored step, and the result of each
             step with save_as, each reader (the get_* tools, query_selector_all, extract_*, browser_snapshot,
             describe_page, search_page, evaluate) and the last step; vars only as this run set or changed
-            them. "failures": counts and failed or ignored steps only. "full": every step and every var.
+            them, and last without its text when its value holds it. "failures": counts and failed or
+            ignored steps only. "full": every step and every var.
             After a failure every mode keeps the whole vars and what a resume needs.
 
     Returns JSON. full: completed (capped at 200 entries, the rest counted), total and vars. summary and
     failures: output names the mode, shown holds the steps kept, not_shown counts the rest, vars_unchanged
-    names input vars left out. On failure also failed_at, failed_path, failure_context and resume_with. With
+    names input vars left out. A step's result over 500 characters is cut, at a line break where one is
+    near, and ends with how much was left out. On failure also failed_at, failed_path, failure_context and resume_with. With
     stop_on_error=False, failed_count and failed_paths list every failure even past that cap. Steps the
     failed step depended on are not re-run on resume, so check that any state they left on the page still
     holds.

@@ -338,6 +338,7 @@ def test_last_describes_a_step_that_was_rejected(bad_step):
 # ── output: summary (default of the tool), failures, full ──────────────────
 
 import inspect  # noqa: E402
+import re  # noqa: E402
 import pathlib  # noqa: E402
 
 from mcp_stealth_chrome import workflow  # noqa: E402
@@ -348,7 +349,9 @@ from mcp_stealth_chrome.workflow import (  # noqa: E402
     sleep_step,
 )
 
-_GOLDEN = pathlib.Path(__file__).parent / "fixtures" / "workflow_full_0.26.0.json"
+_GOLDEN = pathlib.Path(__file__).parent / "fixtures" / "workflow_full.json"
+_LONG_TEXT = "Price: 10. " + "Long product description without separators. " * 20
+_CUT = re.compile(r" \.\.\. \[\+\d+ chars; the whole result is in vars when the step has save_as\]")
 _GOLDEN_STEPS = [
     {"tool": "navigate", "args": {"url": "https://shop.test/${start}"}, "label": "open"},
     {"tool": "get_text", "args": {"selector": "#price"}, "save_as": "price"},
@@ -373,7 +376,7 @@ def _install_fakes(monkeypatch, flaky_click):
     server._register_workflow_tools()
     for name, answer in {
         "navigate": lambda kw: json.dumps({"navigated": kw["url"], "status": 200}),
-        "get_text": "Price: 10",
+        "get_text": _LONG_TEXT,  # past RESULT_PREVIEW, no break near it: cut at the limit
         "fill": lambda kw: f"filled {kw['selector']} with {kw['value']}",
         "click": (lambda kw: "Error: boom") if flaky_click else "clicked",
         "scroll": "Error: nothing to scroll",
@@ -381,9 +384,10 @@ def _install_fakes(monkeypatch, flaky_click):
         monkeypatch.setitem(server._WORKFLOW_TOOLS, name, _fake(answer))
 
 
-def test_full_output_is_the_0_26_0_report_byte_for_byte(monkeypatch):
-    """output="full" is the report every earlier version gave, through the tool, for a run that
-    succeeds, one that fails and the resume of that failure (the fixture was made at 5a6521b)."""
+def test_full_output_is_the_old_report_but_for_the_cut_marker(monkeypatch):
+    """output="full" through the tool, for a run that succeeds, the same run failing and the resume
+    of that failure. Each text is pinned, and once the cut marker of a long result is removed it is
+    byte for byte what 0.26.0 (5a6521b) printed: that marker is the only change to "full"."""
     from mcp_stealth_chrome.tools import action_kit
     golden = json.loads(_GOLDEN.read_text(encoding="utf-8"))
     _install_fakes(monkeypatch, flaky_click=False)
@@ -394,9 +398,11 @@ def test_full_output_is_the_0_26_0_report_byte_for_byte(monkeypatch):
     _install_fakes(monkeypatch, flaky_click=False)
     resumed = asyncio.run(action_kit.workflow_run(
         _GOLDEN_STEPS, start_at=report["failed_path"], vars=report["vars"], output="full"))
-    assert succeeded == golden["ok"]
-    assert failed == golden["fail"]
-    assert resumed == golden["resume"]
+    texts = {"ok": succeeded, "fail": failed, "resume": resumed}
+    for name, text in texts.items():
+        assert text == golden["now"][name], name
+        assert _CUT.sub("", text) == golden["at_5a6521b"][name], name
+    assert len(_CUT.findall(succeeded)) == 1 and len(_CUT.findall(failed)) == 1  # not vacuous
 
 
 def test_the_tool_answers_with_a_summary_unless_asked_for_more(monkeypatch):
@@ -642,3 +648,106 @@ def test_mouse_drift_is_a_workflow_and_batch_step(monkeypatch):
     out = asyncio.run(batch.batch_actions([{"type": "mouse_drift"}]))
     assert out.startswith("1 actions OK"), out
     assert seen == [{"duration_seconds": 1.5, "segments": 3}, {}]
+
+
+# ── ${last} in a successful summary: the step's result once ────────────────
+
+
+@pytest.mark.parametrize("answer,value", [
+    ('[{"title": "a", "price": 1}]', [{"title": "a", "price": 1}]),  # parsed from the text
+    ("True", True),
+    ("clicked the button", "clicked the button"),                   # the text itself: kept once
+])
+def test_a_successful_summary_says_the_last_result_once(answer, value):
+    summary, _ = run([{"tool": "navigate"}, {"tool": "extract"}], {"extract": answer}, output="summary")
+    assert summary["vars"]["last"] == {"ok": True, "value": value}
+    full, _ = run([{"tool": "navigate"}, {"tool": "extract"}], {"extract": answer})
+    assert full["vars"]["last"] == {"ok": True, "value": value, "text": answer}  # full unchanged
+
+
+def test_last_keeps_its_text_when_the_value_did_not_come_from_it():
+    """A step refused before it ran leaves value None and the reason in text: dropping the text
+    would lose the only words saying why."""
+    summary, _ = run([{"tool": "a"}, {"tool": "forbidden"}], output="summary", stop_on_error=False)
+    assert "failed_at" not in summary
+    last = summary["vars"]["last"]
+    assert last["value"] is None and "non-allowlisted" in last["text"]
+
+
+@pytest.mark.parametrize("output", ["summary", "failures", "full"])
+def test_a_failed_run_keeps_last_whole(output):
+    steps = [{"tool": "extract"}, {"tool": "click"}]
+    responses = {"extract": '{"rows": 2}', "click": "Error: covered"}
+    full, _ = run(steps, responses)
+    result, _ = run(steps, responses, output=output)
+    assert result["failed_at"] == 1
+    assert result["vars"]["last"] == full["vars"]["last"] == {
+        "ok": False, "value": "Error: covered", "text": "Error: covered"}
+
+
+def test_the_runs_own_last_is_not_trimmed_in_place():
+    """_last_once builds a new dict: a later step or a caller holding ${last} sees it whole."""
+    last = {"ok": True, "value": [1], "text": "[1]"}
+    assert workflow._last_once(last) == {"ok": True, "value": [1]}
+    assert last == {"ok": True, "value": [1], "text": "[1]"}
+
+
+# ── a cut result preview says it was cut ───────────────────────────────────
+
+from mcp_stealth_chrome.workflow import RESULT_PREVIEW, _preview  # noqa: E402
+
+
+@pytest.mark.parametrize("length", [0, 10, RESULT_PREVIEW])
+def test_a_result_that_fits_is_shown_whole(length):
+    text = "x" * length
+    assert _preview(text) == text
+
+
+def _cut_at(preview, text):
+    """Where the preview stopped, read back from it, and the count its marker gives."""
+    found = _CUT.search(preview)
+    assert found and preview.endswith(found.group(0)), preview[-120:]
+    kept = preview[: found.start()]
+    assert text.startswith(kept)
+    left = int(re.search(r"\+(\d+) chars", found.group(0)).group(1))
+    assert left == len(text) - len(kept)  # the marker counts exactly what was left out
+    return len(kept)
+
+
+def test_a_long_result_without_a_break_is_cut_at_the_limit_and_says_so():
+    text = "y" * (RESULT_PREVIEW + 1)
+    assert _cut_at(_preview(text), text) == RESULT_PREVIEW
+
+
+@pytest.mark.parametrize("sep", ["\n", ", "])
+def test_a_long_result_ends_at_the_last_break_near_the_limit(sep):
+    text = "a" * 450 + sep + "b" * 30 + sep + "c" * 300
+    assert _cut_at(_preview(text), text) == 450 + len(sep) + 30
+
+
+def test_the_later_of_a_line_break_and_a_comma_wins():
+    text = "a" * 430 + "\n" + "b" * 20 + ", " + "c" * 300
+    assert _cut_at(_preview(text), text) == 451
+
+
+def test_a_break_far_before_the_limit_is_not_used():
+    text = "a" * 100 + "\n" + "b" * 600
+    assert _cut_at(_preview(text), text) == RESULT_PREVIEW
+
+
+def test_a_cut_navigate_report_ends_on_a_whole_line_not_mid_key():
+    """The Shopee session saw 'redirect_c': cut at 500 in the middle of a JSON key."""
+    report = json.dumps({"requested_url": "https://shop.test/p/" + "q" * 300, "final_url": "https://shop.test/",
+                         "redirect_chain": ["https://a.test/" + "r" * 40], "redirected": True,
+                         "status": 200, "ready_state": "complete"}, indent=2)
+    text = "Navigated: https://shop.test/ [status 200]\n" + report
+    kept = _cut_at(_preview(text), text)
+    assert kept < RESULT_PREVIEW and text[kept] in "\n,"
+
+
+def test_a_cut_step_keeps_its_whole_result_in_vars_with_save_as():
+    long = "z" * 900
+    result, _ = run([{"tool": "read", "save_as": "page"}], {"read": long})
+    entry = result["completed"][0]
+    assert _cut_at(entry["result"], long) == RESULT_PREVIEW
+    assert result["vars"]["page"] == long and result["vars"]["last"]["text"] == long
