@@ -241,3 +241,10 @@ def test_vertical_tabs_that_cannot_be_written_still_start_nothing(env, monkeypat
     assert "cannot be told" in out and "start" not in env.order, out
     assert "commit" in env.order, f"the refusal is expected after the commit: {env.order}"
     assert not (env.profile / "Default" / "Preferences").exists()
+
+
+@pytest.mark.parametrize("asked,testing_mode,expected", [
+    (None, False, True), (None, True, False), (True, True, True), (False, False, False)])
+def test_unset_persistent_is_true_except_under_testing_mode(asked, testing_mode, expected):
+    """Only the value: a description of where it came from was computed, returned and never read."""
+    assert server._launch_default_persistent(asked, testing_mode) is expected

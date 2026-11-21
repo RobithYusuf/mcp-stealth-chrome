@@ -4107,20 +4107,14 @@ def _launch_check_arguments(browser: str, vertical_tabs: Optional[str], user_dat
     return product, brave_executable, user_data_dir, extra_args, _mock_keychain_refusal(extra_args)
 
 
-def _launch_default_persistent(persistent: Optional[bool], testing_mode: bool) -> tuple:
-    """persistent left unset is True, except under testing_mode. Returns (persistent, source)."""
+def _launch_default_persistent(persistent: Optional[bool], testing_mode: bool) -> Optional[bool]:
+    """persistent left unset is True, except under testing_mode; a value passed stays as passed."""
     # Local testing wants a clean room by default: a testing_mode run that
     # silently accumulated state in the real login profile was both a surprise
     # and a slow way to make tests depend on each other.
     if persistent is None:
-        persistent = not testing_mode
-        persistent_source = (
-            "default (testing_mode → ephemeral; pass persistent=true to keep state)"
-            if testing_mode else "default"
-        )
-    else:
-        persistent_source = "explicit"
-    return persistent, persistent_source
+        return not testing_mode
+    return persistent
 
 
 async def _launch_end_stale_browser() -> Optional[str]:
@@ -5093,7 +5087,7 @@ async def browser_launch(
         browser, vertical_tabs, user_data_dir, extra_args)
     if problem:
         return err(problem)
-    persistent, _persistent_source = _launch_default_persistent(persistent, testing_mode)
+    persistent = _launch_default_persistent(persistent, testing_mode)
     req = _LaunchRequest(
         url=url, headless=headless, proxy=proxy, user_agent=user_agent, window_width=window_width,
         window_height=window_height, lang=lang, extra_args=extra_args,
