@@ -211,11 +211,41 @@ def test_with_the_overlay_a_page_change_never_ends_the_wait_and_done_does(handof
     assert result.startswith("Error: timeout after 15"), result
     assert "did not press Done" in result and "stays pending" in result, result
     assert page.reads == reads  # the wait did not even read the page: the bar answers
-    # Done pressed after that wait gave up is heard by the next one, with the same asked time.
-    press_done(overlay)
+    # The next wait shows the request again, and a Done pressed on it ends that wait.
+    clock.hooks.append((clock.elapsed() + 1.0, lambda: press_done(overlay)))
     result = wait(timeout=15)
-    assert result.startswith("human handoff completed after 0.0s: the person pressed Done"), result
+    assert result.startswith("human handoff completed after 1.0s: the person pressed Done"), result
     assert KEY not in server._HUMAN_HELP and overlay.agent["help"] is None
+
+
+def test_a_timeout_takes_the_request_off_the_bar_and_the_next_wait_shows_it_again(
+        handoff, clock, monkeypatch):
+    """After a timeout the person must not read "Your help is needed" while the agent does
+    something else; the request stays a handoff for the agent, and its next wait shows it again.
+    A Done counts from that new showing on (the wall clock is fake here, so stamps are exact)."""
+    wall = [1_800_000_000.0]
+    monkeypatch.setattr(time, "time", lambda: wall[0])
+    page = handoff((0, LOGIN, 400), overlay=True)
+    overlay = presence._handle(page.browser)
+    ask()
+    first = server._HUMAN_HELP[KEY]["asked_at"]
+    assert overlay.agent["help"] == "Log in"
+    result = wait(timeout=10)
+    assert result.startswith("Error: timeout after 10"), result
+    assert "The bar no longer shows the request" in result, result
+    assert "wait_for_human shows it in the bar again" in result, result
+    assert overlay.agent["help"] is None                      # the bar stopped asking
+    assert server._HUMAN_HELP[KEY]["shown_at"] is None        # the agent still has the request
+    wall[0] += 100
+    # A Done stamped before the new showing (the bar did not show the request then) is no answer.
+    _write_control(overlay, {"holder": "agent", "reason": "help done", "help_done": first + 50})
+    clock.hooks.append((clock.elapsed() + 2.0, lambda: press_done(overlay)))
+    record = server._HUMAN_HELP[KEY]
+    result = wait(timeout=10)
+    assert result.startswith("human handoff completed after 2.0s: the person pressed Done"), result
+    assert "no handoff was pending" not in result
+    assert record["asked_at"] == first and record["shown_at"] == first + 100  # first kept, shown anew
+    assert overlay.agent["asked_at"] == first + 100
 
 
 def test_with_the_overlay_done_ends_a_wait_the_page_changed_in(handoff, clock):

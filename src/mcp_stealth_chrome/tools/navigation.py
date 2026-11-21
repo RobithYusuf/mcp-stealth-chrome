@@ -181,7 +181,9 @@ async def request_human_help(objective: str, timeout: float = 300) -> str:
             "timeout": max(0.0, float(timeout)),
         }
         _srv._HUMAN_HELP[key] = record  # a new request replaces the tab's earlier one
-        record["asked_at"] = presence.ask(BrowserState.browser, objective)
+        # asked_at: when the bar first showed it, kept for the record. shown_at: its current
+        # showing, None while the bar does not show it; a Done counts from there on.
+        record["asked_at"] = record["shown_at"] = presence.ask(BrowserState.browser, objective)
         if record["asked_at"] is not None:
             how = ("Call wait_for_human next. The overlay's bar shows the request with a Done "
                    "button: the wait ends when the person presses it, or on done_url_contains or "
@@ -220,8 +222,9 @@ async def wait_for_human(
     agent) or one of these signals ends the wait; the bar shows Done even with overlay_bar off.
     Without the overlay and without a signal, a page change is weak evidence: it counts only
     5s after request_human_help (or after this call) and once it held 2s, the result says what
-    changed, and the request stays pending for a later wait. A timeout is an error, and the
-    request stays pending; a browser or tab that closes during the wait ends it as an error too.
+    changed, and the request stays pending for a later wait. A timeout is an error: the request
+    stays pending, the bar stops showing it, and the next wait_for_human shows it again. A
+    browser or tab that closes during the wait ends it as an error too.
     Without a request_human_help on this tab nothing was handed over, so the result says the
     change it saw was measured from this call, not from a person's work.
     """
@@ -244,6 +247,14 @@ async def wait_for_human(
         # agent_overlay: Done in the bar, or Resume agent after Take over, ends the wait. While
         # the person holds the browser their own clicks change the page, so a change is no answer.
         browser = BrowserState.browser
+        if request and request.get("shown_at") is None:
+            # A timeout took the request off the bar, so the person never saw "Your help is
+            # needed" while the agent did something else: this wait shows it again.
+            shown = presence.show_again(browser, str(request.get("objective") or ""))
+            if shown is not None:
+                request["shown_at"] = shown
+                if request.get("asked_at") is None:
+                    request["asked_at"] = shown
         presence.waiting_for_person(browser, True)  # the bar: "The agent is waiting for you"
         try:
             return await _wait_for_human_loop(
@@ -341,8 +352,8 @@ async def _wait_for_human_loop(tab, key, browser, request, unasked, timeout,
                                done_url_contains, done_selector) -> str:
     """wait_for_human's wait, while the bar says the agent is waiting."""
     started = _clock()
-    asked_at = request.get("asked_at")
-    asked_since = float(asked_at or request.get("requested_at") or time.time())
+    shown_at = request.get("shown_at")  # the bar's current showing of the request, if any
+    asked_since = float(shown_at or request.get("requested_at") or time.time())
     grace_from = request.get("requested_clock")
     watch = None if done_url_contains or done_selector else _ChangeWatch(
         request.get("baseline"), (started if grace_from is None else grace_from) + HANDOFF_GRACE)
@@ -355,7 +366,7 @@ async def _wait_for_human_loop(tab, key, browser, request, unasked, timeout,
     # Whether the request reached the overlay's bar, and whether that overlay then ended for good
     # during this wait. While it runs (started again if its process exited) the person has Done,
     # so the page is not even read; only once it cannot come back may a page change count.
-    reached, bar_ended = asked_at is not None, False
+    reached, bar_ended = shown_at is not None, False
 
     def done(text: str) -> str:
         """Strong evidence: the handoff is over, and the bar stops asking."""
@@ -369,7 +380,7 @@ async def _wait_for_human_loop(tab, key, browser, request, unasked, timeout,
         why = await _gone(tab, browser)
         if why is None:
             return None
-        if presence.shows_request(browser, asked_at):
+        if presence.shows_request(browser, shown_at):
             presence.end_help(browser)
         dropped = " The request for help was dropped with it." if request else ""
         _srv._HUMAN_HELP.pop(key, None)
@@ -410,7 +421,7 @@ async def _wait_for_human_loop(tab, key, browser, request, unasked, timeout,
         # While the bar shows the request the person has its Done button, so a page change is
         # no answer: the page may move by itself, and the person's own steps change it.
         if watch is not None:
-            bar = presence.bar_state(browser, asked_at) if reached and not bar_ended else None
+            bar = presence.bar_state(browser, shown_at) if reached and not bar_ended else None
             bar_ended = bar_ended or bar == "gone"
             if bar != "shown":
                 sig = await _srv._page_sig(tab)
@@ -419,13 +430,25 @@ async def _wait_for_human_loop(tab, key, browser, request, unasked, timeout,
                 if watch.changed(sig, _clock()):
                     return _weak_change(request, watch, elapsed, unasked, bar_ended)
         await _pause(HANDOFF_POLL)
-    # The request stays pending: the person may still be at it, a Done pressed later is still
-    # heard, and the next wait counts as the handoff. Dropping it here made that next wait say
-    # request_human_help had not been called.
-    after = (" The request for help stays pending: call wait_for_human again to keep waiting (a "
-             "Done pressed meanwhile is still heard), or request_human_help to ask anew."
-             if request else " Call request_human_help if the person still needs to act: no "
-             "handoff was pending on this tab.")
+    # The request stays pending here: the person may still be at it, and the next wait counts as
+    # the handoff (dropping it made that wait say request_human_help had not been called). The bar
+    # stops asking, though, so the person never reads "Your help is needed" while the agent does
+    # something else; the next wait_for_human shows the request again.
+    on_bar = presence.shows_request(browser, shown_at)
+    if request:
+        request["shown_at"] = None
+        if on_bar:
+            presence.end_help(browser)
+    if not request:
+        after = (" Call request_human_help if the person still needs to act: no handoff was "
+                 "pending on this tab.")
+    elif on_bar:
+        after = (" The bar no longer shows the request. It stays pending here: wait_for_human "
+                 "shows it in the bar again and counts it as this handoff (a Done counts from "
+                 "then on), or request_human_help asks anew.")
+    else:
+        after = (" The request for help stays pending: call wait_for_human again to keep "
+                 "waiting, or request_human_help to ask anew.")
     if presence.holds(browser):
         return err(f"timeout after {timeout}s: the person still holds the browser (Take over "
                    f"in the overlay's bar) and has not pressed Resume agent.{after if request else ''}")
@@ -433,7 +456,7 @@ async def _wait_for_human_loop(tab, key, browser, request, unasked, timeout,
         watched = " and ".join(
             ([f"the URL never contained {done_url_contains!r}"] if done_url_contains else [])
             + ([f"selector {done_selector!r} never appeared"] if done_selector else []))
-    elif presence.shows_request(browser, asked_at):
+    elif on_bar:
         watched = ("the person did not press Done in the overlay's bar (a page change does not "
                    "end this wait while the bar shows the request)")
     elif bar_ended:

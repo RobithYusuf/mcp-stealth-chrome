@@ -829,6 +829,15 @@ def shows_request(browser: Any, asked_at: Optional[float]) -> bool:
             and float(overlay.agent.get("asked_at") or 0) == float(asked_at))
 
 
+def show_again(browser: Any, objective: str) -> Optional[float]:
+    """Show a request for help the bar no longer shows (a timeout took it off), starting again an
+    overlay whose process exited. The new showing's time, or None with no overlay to show it."""
+    overlay = _handle(browser)
+    if overlay is None or not (overlay.alive() or overlay.revive()):
+        return None
+    return ask(browser, objective)
+
+
 def bar_state(browser: Any, shown_at: Optional[float]) -> str:
     """Where a request for help the bar showed at `shown_at` stands: "shown" (an overlay runs and
     shows it; one whose process exited is started again first, `revive`, and the new process reads
