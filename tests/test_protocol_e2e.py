@@ -816,7 +816,10 @@ def test_first_page_timeout_keeps_the_browser_usable(base, path, tmp_path):
             if path == "reattach":
                 assert "reattached" in reply.text.lower(), reply.text
         assert reply.failed and "running" in reply.text.lower(), reply.text
-        assert "did not answer within 1s" in reply.text and "tab may still be loading" in reply.text
+        assert "did not answer within 1s" in reply.text
+        assert "earlier navigation was stopped" in reply.text
+        assert '"loading_stopped": true' in reply.text
+        assert '"tab_may_still_be_loading": false' in reply.text
         assert "wait_for_url" in reply.text and "ready_state" in reply.text and "observed URL" in reply.text
         assert client.call("server_status").json()["browser_running"]
         again = client.call("navigate", url=f"{base}/page2.html", _timeout=15)
@@ -849,7 +852,7 @@ def test_tab_new_timeout_owns_and_selects_the_new_tab(base):
         again = client.call("navigate", url=f"{base}/page2.html", _timeout=15)
         assert not again.failed, again.text
         tabs = client.call("tab_list").text
-        assert "Active tab: 1" in tabs and f"{base}/protocol.html" in tabs, tabs
+        assert "Active tab: 1" in tabs and "about:blank" in tabs, tabs
         assert client.evaluate("document.title") == "Page Two"
     finally:
         client.call("close_all_instances", _timeout=40)

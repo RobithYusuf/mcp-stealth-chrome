@@ -540,9 +540,10 @@ async def _history_navigation(
 ) -> str:
     """Shared body for go_back / go_forward / reload.
 
-    The commit phase is bounded by 30 seconds without stopping the tab; a timeout reports the
-    observed URL and ready_state and says the tab may still be loading. Load completion remains
-    best-effort afterwards.
+    The commit phase is bounded by 30 seconds. If the page has not committed, the server stops the
+    load and says whether that stop was confirmed; if it cannot confirm the stop, the result says the
+    tab may still be loading. A response that arrives just after the bound and is proved loaded is
+    reported as success with a note. Load completion remains best-effort afterwards.
 
     History moves are navigations like any other and get the same observed
     postconditions. A back/forward served from the back-forward cache emits no
@@ -598,10 +599,12 @@ async def go_back(
     expect_url: Optional[str] = None,
     expect_status: Optional[int] = None,
 ) -> str:
-    """Go back in history. The commit phase is bounded by 30 seconds without stopping the tab;
-    a timeout reports the observed URL and ready_state and says it may still be loading.
-    Reports final_url / redirect_chain / status / ready_state observed afterwards; requested_url
-    is null because history decides the destination. See navigate() for the expect_* rules."""
+    """Go back in history. The commit phase is bounded by 30 seconds. If the page has not committed,
+    the server stops the load and says whether that stop was confirmed; if it cannot confirm the stop,
+    the result says the tab may still be loading. A response that arrives just after the bound and is
+    proved loaded is reported as success with a note. Reports final_url / redirect_chain / status /
+    ready_state observed afterwards; requested_url is null because history decides the destination.
+    See navigate() for the expect_* rules."""
     return await _history_navigation(
         "Went back", lambda tab: tab.back(), None, expect_url, expect_status, "go_back",
     )
@@ -612,9 +615,11 @@ async def go_forward(
     expect_url: Optional[str] = None,
     expect_status: Optional[int] = None,
 ) -> str:
-    """Go forward in history. The commit phase is bounded by 30 seconds without stopping the
-    tab; a timeout reports the observed URL and ready_state and says it may still be loading.
-    Reports the observed postconditions; see navigate() for the expect_* rules."""
+    """Go forward in history. The commit phase is bounded by 30 seconds. If the page has not committed,
+    the server stops the load and says whether that stop was confirmed; if it cannot confirm the stop,
+    the result says the tab may still be loading. A response that arrives just after the bound and is
+    proved loaded is reported as success with a note. Reports the observed postconditions; see
+    navigate() for the expect_* rules."""
     return await _history_navigation(
         "Went forward", lambda tab: tab.forward(), None, expect_url, expect_status, "go_forward",
     )
@@ -625,9 +630,11 @@ async def reload(
     expect_url: Optional[str] = None,
     expect_status: Optional[int] = None,
 ) -> str:
-    """Reload the active tab. The commit phase is bounded by 30 seconds without stopping the
-    tab; a timeout reports the observed URL and ready_state and says it may still be loading.
-    Reports the observed postconditions. See navigate() for the expect_* rules."""
+    """Reload the active tab. The commit phase is bounded by 30 seconds. If the page has not committed,
+    the server stops the load and says whether that stop was confirmed; if it cannot confirm the stop,
+    the result says the tab may still be loading. A response that arrives just after the bound and is
+    proved loaded is reported as success with a note. Reports the observed postconditions. See
+    navigate() for the expect_* rules."""
     if not BrowserState.is_up():
         return err("Browser not running. Call browser_launch first.")
     try:
@@ -744,9 +751,11 @@ async def tab_new(
 ) -> str:
     """Open a new tab and make it the active one for every later tool.
 
-    The navigation commit is bounded by 30 seconds without stopping the tab; a timeout reports
-    the observed URL and ready_state and says it may still be loading. Load completion is then
-    best-effort. Reports the same observed postconditions as navigate().
+    The navigation commit is bounded by 30 seconds. If the page has not committed, the server stops
+    the load and says whether that stop was confirmed; if it cannot confirm the stop, the result says
+    the tab may still be loading. A response that arrives just after the bound and is proved loaded is
+    reported as success with a note. Load completion is then best-effort. Reports the same observed
+    postconditions as navigate().
 
     new_window: where it opens. Left unset: headed, its own window behind the app the
         person is using (in a browser the person opened from the Dock launcher: a tab of

@@ -1746,6 +1746,20 @@ def test_document_watch_network_enable_cache_tracks_cdp_reconnect():
     assert same_session == 1 and total == 2
 
 
+def test_navigation_timeout_reports_stop_failure_as_still_loading():
+    from mcp_stealth_chrome import server
+
+    result = server._nav_commit_timeout_message("navigate", {
+        "final_url": "http://example.test/hang",
+        "ready_state": "interactive",
+        "status": None,
+        "loading_stopped": False,
+    })
+    assert "tab may still be loading" in result
+    assert '"loading_stopped": false' in result
+    assert '"tab_may_still_be_loading": true' in result
+
+
 def _active(monkeypatch, tab):
     from mcp_stealth_chrome import server
 

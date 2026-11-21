@@ -5402,8 +5402,10 @@ async def browser_launch(
 ) -> str:
     """Launch stealth Chrome via nodriver, on a persistent profile by default.
 
-    The initial navigation commit is bounded by 30 seconds by default without stopping the tab;
-    a timeout reports its observed URL and ready_state. Load completion remains best-effort.
+    The initial navigation commit is bounded by 30 seconds by default. If the page has not committed,
+    the server stops the load and says whether that stop was confirmed; if it cannot confirm the stop,
+    the result says the tab may still be loading. A response that arrives just after the bound and is
+    proved loaded is reported as success with a note. Load completion remains best-effort.
 
     The result names the profile actually used (actual_profile, session_state_source) and what the first load
     observed (final_url, redirect_chain, status, ready_state). After a redirect, read final_url.
@@ -6924,9 +6926,10 @@ async def navigate(
 ) -> str:
     """Navigate the active tab to url. wait_until: load|none.
 
-    The navigation commit is bounded by 30 seconds (the page is not stopped); a timeout says
-    the observed URL and ready_state and that the tab may still be loading. wait_until=load then
-    waits for readyState=complete up to 15 seconds after the commit.
+    The navigation commit is bounded by 30 seconds. If the page has not committed, the server stops
+    the load and says whether that stop was confirmed; if it cannot confirm the stop, the result says
+    the tab may still be loading. A response that arrives just after the bound and is proved loaded is
+    reported as success with a note. wait_until=load then waits for readyState=complete up to 15 seconds.
 
     Reports the OBSERVED postconditions: requested_url, final_url, redirect_chain, status, ready_state. After
     a redirect, read final_url.
