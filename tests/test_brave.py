@@ -285,6 +285,7 @@ def test_vertical_tabs_none_writes_nothing_and_a_broken_file_is_not_replaced(tmp
 
 def test_a_brave_clone_lands_in_brave_profiles_and_says_to_launch_brave(tmp_path, monkeypatch):
     from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import chrome_profiles
 
     root = _profile(tmp_path / "BraveSoftware" / "Brave-Browser", {"brave": {}, "profile": {}},
                     {"brave": {}})
@@ -294,7 +295,7 @@ def test_a_brave_clone_lands_in_brave_profiles_and_says_to_launch_brave(tmp_path
     monkeypatch.setattr(server, "ensure_dirs", lambda: None)
     monkeypatch.setattr(server, "chrome_user_data_root", lambda b=None: root)
     monkeypatch.setattr(server, "chrome_user_data_roots", lambda: [("brave", root)])
-    text = asyncio.run(server.clone_chrome_profile(target_instance_id="mine", browser="brave"))
+    text = asyncio.run(chrome_profiles.clone_chrome_profile(target_instance_id="mine", browser="brave"))
     assert not text.startswith("Error"), text
     result = json.loads(text[text.index("{"):])
     assert result["target"] == str(data / "brave-profiles" / "mine")
