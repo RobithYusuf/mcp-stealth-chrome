@@ -11,6 +11,7 @@ import time
 import pytest
 
 from mcp_stealth_chrome import body_saver, helpers
+from mcp_stealth_chrome.tools import capture
 
 posix_only = pytest.mark.skipif(os.name == "nt", reason="append_private_line's O_NOFOLLOW, dir_fd and "
                                 "flock guarantees are POSIX; Windows has its own checks (docstring)")
@@ -440,17 +441,26 @@ def test_a_write_error_is_counted(tmp_path, monkeypatch):
     saver._writer.shutdown()
 
 
-
-def test_an_unusable_wall_time_falls_back_to_write_time(tmp_path):
+@pytest.mark.parametrize("wall", [1e100, "1700000000", {}, True, False])
+def test_an_unusable_wall_time_falls_back_to_write_time(tmp_path, wall):
     saver = _saver(tmp_path)
     _request(saver, "S", "r")
     request = saver.pending[("S", "r")]
-    request.wall = 1e100
+    request.wall = wall
     saver._write(request, '{"a": 1}', False)
     record = json.loads((tmp_path / "pdp.jsonl").read_text().splitlines()[0])
     assert record["meta"]["ts_note"] == "wallTime was unusable; ts is the write time"
     assert record["meta"]["ts"][:4].isdigit()
     saver._writer.shutdown()
+
+
+@pytest.mark.parametrize("wall", [1e100, "1700000000", {}, True, False])
+def test_har_unusable_wall_time_is_exported_with_a_note(wall):
+    entry = capture._har_entry({"url": "https://x.test/api", "wall_time": wall})
+    assert entry["startedDateTime"] and entry["_timestampNote"] == (
+        "wall_time was unusable; startedDateTime is the export time")
+
+
 def test_the_status_never_shows_a_value_of_the_body(tmp_path):
     saver = _saver(tmp_path, mode="all", entries=body_saver.parse_entries(
         [{"url_pattern": "*/api/*", "name": "pdp"}]))

@@ -529,14 +529,16 @@ def _har_entry(entry: dict) -> dict:
     body = entry.get("request_body")
     wall = entry.get("wall_time")
     timestamp_note = None
-    if wall:
+    if isinstance(wall, bool) or not isinstance(wall, (int, float)):
+        started = datetime.now(timezone.utc).isoformat() if wall is not None else ""
+        timestamp_note = ("wall_time was unusable; startedDateTime is the export time"
+                          if wall is not None else None)
+    else:
         try:
-            started = datetime.fromtimestamp(float(wall), timezone.utc).isoformat()
-        except (OSError, OverflowError, ValueError):
+            started = datetime.fromtimestamp(wall, timezone.utc).isoformat()
+        except (OSError, OverflowError, TypeError, ValueError):
             started = datetime.now(timezone.utc).isoformat()
             timestamp_note = "wall_time was unusable; startedDateTime is the export time"
-    else:
-        started = ""
     request: dict[str, Any] = {
         "method": entry.get("method") or "",
         "url": url,

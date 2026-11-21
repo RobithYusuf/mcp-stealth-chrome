@@ -78,12 +78,12 @@ def _now_iso(epoch: Optional[float] = None) -> str:
 
 
 def _timestamp_for_record(epoch: Optional[float]) -> tuple[str, bool]:
-    """Return wallTime when the platform can represent it, else the write time."""
-    if epoch is None:
-        return _now_iso(), False
+    """Return wallTime when it is a real finite number the platform can represent."""
+    if isinstance(epoch, bool) or not isinstance(epoch, (int, float)):
+        return _now_iso(), epoch is not None
     try:
         return _now_iso(epoch), False
-    except (OSError, OverflowError, ValueError):
+    except (OSError, OverflowError, TypeError, ValueError):
         return _now_iso(), True
 
 
