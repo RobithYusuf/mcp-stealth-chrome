@@ -125,7 +125,7 @@ def test_wait_for_human_preserves_zero_second_handoff_timeout(monkeypatch):
     tab = server.BrowserState.active_tab()
     monkeypatch.setattr(server.BrowserState, "tabs", [tab])
     server._record_human_help(tab, "Log in", 0, by="agent", clock=0,
-                              baseline={"url": "before", "nodes": 1, "len": 1})
+                              baseline={"url": "before", "nodes": 1, "len": 1}, browser=server.BrowserState.browser)
     try:
         wait = server.mcp._tool_manager._tools["wait_for_human"].fn
         result = asyncio.run(wait(done_url_contains="would-match-if-polled"))
