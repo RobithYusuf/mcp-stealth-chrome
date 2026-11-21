@@ -157,6 +157,14 @@ Part of the agent guide: [AGENTS.md](../../AGENTS.md) says when to read this. It
   refuses the current instance by itself, and `close_instance` of another instance acts on its stored
   snapshot. `spawn_browser`'s own refusal holds only while `_LAUNCH_LOCK` is held, which left the stale
   browser step open, so the gate refuses it too.
+- A call that was already running when the launch began passed the gate before there was a mark. Two are
+  guarded. The launch notes what the instance's slot holds once its own first steps are done
+  (`launching.slot`: a stale handle ended, a running browser not reused) and publishes its browser only
+  over that; otherwise it ends its own browser and says another call took the instance (an
+  `attach_to_chrome` that published, or a switch), and a reattach gives the kept browser back for the same
+  reason (`_launch_cut_reason`). `switch_instance` looks at the gate again after its own wait for a close.
+  A privacy profile the launch could not remove is not recorded on an instance holding another browser.
+  Known limit, left for 0.27: every other tool already running when a launch begins is not checked again.
 - `tests/test_launch_owner.py` finds every tool that can change the current instance or end its browser (an
   AST walk for writes of `BrowserState.browser` or `current_instance_id` and calls of `reset`, `switch_to`,
   `restore_from`, `release_instance`) and fails on one that is neither in `_REFUSED_DURING_LAUNCH` nor in

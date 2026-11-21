@@ -823,6 +823,10 @@ class _Launching:
     ended_by: str = ""
     cancelled: bool = False
     plan: Any = None  # the launch's _LaunchPlan, once it has one
+    # What the instance's slot held once the launch's own first steps were done (a stale handle
+    # ended, a running browser not reused): the launch publishes its browser only over that.
+    slot: Any = None
+    slot_taken: bool = False  # `slot` has been recorded
 
 
 # session -> the browser_launch under way there; read through _launching().
@@ -872,10 +876,26 @@ def _launch_cut_reason() -> str:
     to stop), or "". A reattach asks before it takes a kept browser over, so a launch that was
     cut short gives that browser back as it was instead of recording it."""
     entry = _THIS_LAUNCH.get()
-    if entry is None or entry.task is not asyncio.current_task() or not entry.ended_by:
+    if entry is None or entry.task is not asyncio.current_task():
         return ""
-    # Who cut it short is said once, by the launch's own result (_launch_settle).
-    return "this browser_launch was cut short before it took the browser over"
+    if entry.ended_by:
+        # Who cut it short is said once, by the launch's own result (_launch_settle).
+        return "this browser_launch was cut short before it took the browser over"
+    taken = _launch_slot_taken(entry)
+    return f"{taken}, before this browser_launch took the browser over" if taken else ""
+
+
+def _launch_slot_taken(launching: _Launching) -> str:
+    """Why the launching instance's slot is no longer the launch's to fill, or "". A call that was
+    already running when the launch began passed the gate before there was a mark, and can switch
+    instances or publish a browser (attach_to_chrome) while the launch awaits: publishing over
+    it lost that call's handle."""
+    iid = launching.instance_id
+    if BrowserState.current_instance_id != iid:
+        return f"instance {iid!r} stopped being the current one while this launch ran (another call switched)"
+    if launching.slot_taken and BrowserState.browser is not launching.slot:
+        return f"another call put a browser on instance {iid!r} while this launch ran"
+    return ""
 
 
 def _being_launched(instance_id: str) -> bool:
@@ -4864,6 +4884,9 @@ async def _launch_remove_privacy(plan: _LaunchPlan) -> str:
     if BrowserState.current_instance_id != iid:
         return note + (f"; instance {iid!r} is no longer the current one, so it could not be kept "
                        f"on it for a later removal.")
+    if BrowserState.browser is not None and BrowserState.browser is not plan.browser:
+        return note + (f"; instance {iid!r} holds another browser now, so it could not be kept on it "
+                       f"for a later removal.")
     BrowserState.current_profile_dir, BrowserState.current_privacy = plan.privacy_profile, True
     return note + "; it is kept on this instance, so the next browser_launch or browser_close removes it."
 
@@ -4940,6 +4963,18 @@ async def _launch_ready_browser(req: _LaunchRequest, plan: _LaunchPlan, browser:
     navigation is put there: the ad blocker, the overlay, the moved cookies, the storage state.
 
     Returns an error result (the browser closed or stopped first), or None to go on."""
+    # Never over a browser or an instance another call put there meanwhile (_launch_slot_taken):
+    # the launch ends its own and leaves that one as it is.
+    taken = _launch_slot_taken(plan.launching) if plan.launching is not None else ""
+    if taken:
+        reap, _recorded, removal = await _launch_end_started_browser(req, plan)
+        text = (f"browser_launch of instance {plan.launching.instance_id!r} did not finish: {taken}. It changed "
+                f"nothing of what that call left, and ")
+        if _close_incomplete(reap):
+            text += f"its own browser could not be ended ({_close_failure(reap)})."
+        else:
+            text += f"its own browser {'was ended' if reap.get('verified') else 'was asked to stop'}{_kill_note(reap)}."
+        return err(text + removal)
     # The handle and its profile in one step, no await between: a browser_recover reading the
     # instance in between paired the new browser with the old profile, and signalled the PIDs
     # of whichever Chrome had that folder.
@@ -5386,6 +5421,7 @@ async def _launch_run(req: _LaunchRequest, launching: _Launching, session: str, 
             stop = await _launch_reuse_running(req)
             if (stop := await _launch_settle(req, None, launching, stop)) is not None:
                 return stop
+            launching.slot, launching.slot_taken = BrowserState.browser, True
 
             ensure_dirs()
 

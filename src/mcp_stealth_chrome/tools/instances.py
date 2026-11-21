@@ -656,6 +656,10 @@ async def switch_instance(instance_id: str) -> str:
     still = await _app_module.wait_while_closing(BrowserState.session_key(), instance_id)
     if still:
         return still
+    # A launch can have begun while this waited: the gate saw none when the call came in.
+    refused = _srv._launch_gate("switch_instance")
+    if refused:
+        return refused
     BrowserState.claim_released(instance_id)
     existed = instance_id in BrowserState.instances
     BrowserState.switch_to(instance_id)

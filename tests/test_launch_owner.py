@@ -845,3 +845,100 @@ def test_the_saved_tabs_are_not_written_once_the_launch_was_cut_short(env, monke
 
     said = asyncio.run(run())
     assert saved == [] and said == "not recorded: the launch was cut short while its pages were read", said
+
+
+# ── A call that was already running when the launch began ───────────────────────────────────
+
+
+def test_a_browser_another_call_published_during_the_launch_is_not_overwritten(owner, monkeypatch):
+    """attach_to_chrome passes the gate on an empty instance before any launch, then publishes its
+    browser while a launch of that instance is starting Chrome. The launch used to publish its
+    own over it and lose the attached handle. Now it ends its own browser and says why."""
+    theirs = SimpleNamespace(tabs=[_Tab()], stopped=False, config=None)
+    real_start = server._start_chrome
+
+    async def start(config):
+        browser = await real_start(config)
+        server.BrowserState.browser = theirs  # what the attach, already running, publishes now
+        server.BrowserState.tabs = list(theirs.tabs)
+        return browser
+
+    monkeypatch.setattr(server, "_start_chrome", start)
+    out = asyncio.run(_launch_with(owner))
+    assert out == ("Error: browser_launch of instance 'main' did not finish: another call put a browser on "
+                   "instance 'main' while this launch ran. It changed nothing of what that call left, and its "
+                   "own browser was ended."), out
+    assert server.BrowserState.browser is theirs and server.BrowserState.tabs == theirs.tabs
+    assert [b for b, _p in owner.closes] == owner.started
+    assert _privacy_folders(owner) == []
+
+
+def test_a_privacy_profile_left_behind_is_not_written_onto_another_call_s_browser(owner, monkeypatch, tmp_path):
+    """Should the launch's privacy profile not come off, it is said, and not recorded on the
+    instance as the attached browser's profile."""
+    theirs = SimpleNamespace(tabs=[_Tab()], stopped=False, config=None)
+    real_start = server._start_chrome
+    their_profile = tmp_path / "theirs"
+
+    async def start(config):
+        browser = await real_start(config)
+        server.BrowserState.browser = theirs
+        server.BrowserState.current_profile_dir, server.BrowserState.current_privacy = their_profile, False
+        return browser
+
+    async def cannot_remove(_folder):
+        return False
+
+    monkeypatch.setattr(server, "_start_chrome", start)
+    monkeypatch.setattr(server, "_remove_privacy_profile", cannot_remove)
+    out = asyncio.run(_launch_with(owner))
+    assert "instance 'main' holds another browser now, so it could not be kept on it for a later removal" in out, out
+    assert server.BrowserState.current_profile_dir == their_profile and not server.BrowserState.current_privacy
+
+
+def test_a_switch_that_waited_through_the_start_of_a_launch_is_refused(owner):
+    """switch_instance passes the gate before any launch, then waits for a close of the instance it
+    switches to; a launch begins meanwhile. Once the close is over the switch looks at the gate
+    again and is refused, and the launch finishes on its own instance."""
+    async def run():
+        hold = asyncio.Event()
+
+        async def closing_other():
+            with server._closing_in_background("other"):
+                await hold.wait()
+
+        closer = asyncio.ensure_future(closing_other())
+        await asyncio.sleep(0)
+        switch = asyncio.ensure_future(_call("switch_instance", {"instance_id": "other"}))
+        await asyncio.sleep(0.05)  # through the gate, waiting for the close of 'other'
+        launch = asyncio.ensure_future(_launch_with(owner))
+        for _ in range(200):
+            if server._LAUNCHING.get(server.BrowserState.session_key()) is not None:
+                break
+            await asyncio.sleep(0)
+        hold.set()
+        await closer
+        return await switch, await asyncio.wait_for(launch, 10)
+
+    switched, out = asyncio.run(run())
+    assert _refusal("switch_instance") in switched, switched
+    assert "Browser launched" in out, out
+    assert server.BrowserState.current_instance_id == "main" and server.BrowserState.browser is owner.started[0]
+
+
+def test_a_reattach_gives_the_kept_browser_back_when_another_call_took_the_instance(owner, kept, monkeypatch):
+    """The same for a reattach: a browser another call published while the kept one was being taken
+    over stays, and the kept browser is given back as it was, not recorded over it."""
+    theirs = SimpleNamespace(tabs=[_Tab()], stopped=False, config=None)
+    real = server._observe_navigation
+
+    async def observe(*a, **kw):
+        server.BrowserState.browser = theirs
+        return await real(*a, **kw)
+
+    monkeypatch.setattr(server, "_observe_navigation", observe)
+    out = asyncio.run(_launch_kept())
+    assert ("could not be taken over safely: another call put a browser on instance 'main' while this launch "
+            "ran, before this browser_launch took the browser over") in out, out
+    assert (keep_alive.read(kept.profile) or {}).get("server_pid") == 424242, "the record was not given back"
+    assert server.BrowserState.browser is theirs and owner.closes == []
