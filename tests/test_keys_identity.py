@@ -716,6 +716,33 @@ def test_spawn_works_on_a_copied_multi_profile_browser(loop, tmp_path):
         run(loop, "switch_instance", "main")
 
 
+
+@E2E
+def test_spawn_headless_identity_reaches_worker_scopes(loop, base_url):
+    iid = f"ua_spawn_{os.getpid()}"
+    try:
+        out = run(loop, "spawn_browser", iid, headless=True, persistent=False,
+                  url=f"{base_url}/ua_scopes.html")
+        assert not out.startswith("Error:"), out
+        run(loop, "switch_instance", iid)
+        deadline = time.monotonic() + 8
+        report = None
+        while time.monotonic() < deadline:
+            raw = run(loop, "evaluate", "window.__uaReport && JSON.stringify(window.__uaReport)")
+            if raw and raw not in ("null", "undefined"):
+                report = json.loads(raw)
+                break
+            loop.run_until_complete(asyncio.sleep(0.1))
+        assert report is not None, run(loop, "evaluate", "window.__uaError || 'scope fixture did not finish'")
+        for scope, seen in report.items():
+            if isinstance(seen, dict) and "ua" in seen:
+                assert "HeadlessChrome" not in seen["ua"], (scope, seen)
+                if "headers" in seen:
+                    assert "HeadlessChrome" not in seen["headers"].get("user-agent", ""), (scope, seen)
+                    assert "HeadlessChrome" not in seen["headers"].get("sec-ch-ua", ""), (scope, seen)
+    finally:
+        run(loop, "close_instance", iid)
+        run(loop, "switch_instance", "main")
 @E2E
 def test_identity_survives_cross_site_navigation(loop, browser, base_url):
     """nodriver 0.50 opened a new CDP session per navigation, which dropped overrides."""

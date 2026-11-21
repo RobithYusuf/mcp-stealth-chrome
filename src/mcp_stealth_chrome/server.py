@@ -4684,6 +4684,20 @@ def _headless_native_user_agent(config: Config) -> Optional[str]:
     return reduced_user_agent(profile_version.text(version), native_family())
 
 
+def _apply_headless_native_user_agent(config: Config, headless: bool,
+                                      fingerprint: Optional[dict]) -> str:
+    """Set the process UA for worker scopes, or say why that protection was unavailable."""
+    if (not headless or (fingerprint or {}).get("user_agent")
+            or any((arg or "").startswith("--user-agent=") for arg in config.browser_args)):
+        return ""
+    native_ua = _headless_native_user_agent(config)
+    if native_ua:
+        config.add_argument(f"--user-agent={native_ua}")
+        return ""
+    return (" [identity: headless default UA was NOT replaced because Chrome's version could not "
+            "be read; SharedWorker and ServiceWorker may expose HeadlessChrome]")
+
+
 async def _launch_prepare_profile(req: _LaunchRequest, plan: _LaunchPlan) -> Optional[str]:
     """Pick the executable (the Dock icon's Beta or not), refuse it when it may not open the
     profile, prepare the cookie move, and check that vertical_tabs can be written (the write
@@ -4695,11 +4709,8 @@ async def _launch_prepare_profile(req: _LaunchRequest, plan: _LaunchPlan) -> Opt
         plan.launch_choice = _launch_choice(plan.profile_path, req.headless, plan.merged_extra_args,
                                             req.brave_executable)
     plan.dock_note = await _use_dock_icon_browser(config, req.headless, plan.launch_choice)
-    if (req.headless and not (plan.effective_fingerprint or {}).get("user_agent")
-            and not any((arg or "").startswith("--user-agent=") for arg in config.browser_args)):
-        native_ua = _headless_native_user_agent(config)
-        if native_ua:
-            config.add_argument(f"--user-agent={native_ua}")
+    plan.dock_note += _apply_headless_native_user_agent(
+        config, req.headless, plan.effective_fingerprint)
     refused = _profile_version_refusal(plan.profile_path, config.browser_executable_path, req.product)
     if refused:
         await _remove_privacy_profile(plan.privacy_profile)

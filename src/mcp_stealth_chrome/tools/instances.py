@@ -198,6 +198,8 @@ async def _launch_browser_instance(
     if launch_choice is None:
         launch_choice = _srv._launch_choice(profile_path, headless, extra_args, brave_executable)
     dock_note = await _srv._use_dock_icon_browser(config, headless, launch_choice)
+    dock_note += _srv._apply_headless_native_user_agent(
+        config, headless, effective_fingerprint)
     refused = _srv._profile_version_refusal(profile_path, config.browser_executable_path, product)
     if refused:
         await _srv._remove_privacy_profile(privacy_profile)
