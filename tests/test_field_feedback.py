@@ -186,22 +186,24 @@ def test_8_full_page_note_takes_the_scroll_off_both_axes(monkeypatch):
 def test_3r_batch_aliases_pass_every_valid_argument_on():
     """Review 3: batch "wait" dropped frame_url and "navigate" dropped expect_url."""
     from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import batch
     server._register_workflow_tools()
-    tool, args = server._batch_action_call({"type": "wait", "frame_url": "/3ds", "timeout": 10})
+    tool, args = batch._batch_action_call({"type": "wait", "frame_url": "/3ds", "timeout": 10})
     assert (tool, args) == ("wait_for", {"selector": None, "text": None, "timeout": 10,
                                          "frame_url": "/3ds"})
-    tool, args = server._batch_action_call({"type": "navigate", "url": "https://a.test/",
+    tool, args = batch._batch_action_call({"type": "navigate", "url": "https://a.test/",
                                             "expect_url": "a.test", "expect_status": 200})
     assert args == {"url": "https://a.test/", "expect_url": "a.test", "expect_status": 200}
-    assert server._batch_action_call({"type": "press"}) == ("press_key", {"key": "Enter"})
-    assert server._batch_action_call({"type": "click", "ref": "e3", "stop_on_error": True}) == (
+    assert batch._batch_action_call({"type": "press"}) == ("press_key", {"key": "Enter"})
+    assert batch._batch_action_call({"type": "click", "ref": "e3", "stop_on_error": True}) == (
         "click", {"ref": "e3", "selector": None, "humanize": False})
 
 
 def test_3r_an_unknown_inner_argument_is_refused_by_name_and_counted():
     import asyncio
     from mcp_stealth_chrome import server
-    out = asyncio.run(server.batch_actions([
+    from mcp_stealth_chrome.tools import batch
+    out = asyncio.run(batch.batch_actions([
         {"type": "screenshot", "path": "x.jpg"},
         {"type": "wait", "frame_url": "/3ds", "bogus": 1},
     ]))

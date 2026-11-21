@@ -37,10 +37,11 @@ def test_cookie_parser():
 
 def test_helpers_module_state():
     from mcp_stealth_chrome.server import (
-        BrowserState, _DIALOG_AUTO_CFG, _STORAGE_SNAPSHOTS,
+        BrowserState, _STORAGE_SNAPSHOTS,
         _LAUNCH_LOCK, BROWSER_LAUNCH_TIMEOUT, BROWSER_NAV_TIMEOUT,
         TOOL_ACTION_TIMEOUT,
     )
+    from mcp_stealth_chrome.tools.dialogs import _DIALOG_AUTO_CFG
     assert isinstance(_DIALOG_AUTO_CFG, dict)
     assert isinstance(_STORAGE_SNAPSHOTS, dict)
     assert BROWSER_LAUNCH_TIMEOUT > 0
