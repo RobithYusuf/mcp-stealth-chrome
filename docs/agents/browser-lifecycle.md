@@ -209,7 +209,9 @@ Part of the agent guide: [AGENTS.md](../../AGENTS.md) says when to read this. It
   window placement. A reattach cut short before it recorded the kept browser gives it back as it was (the
   record names its old server again, nothing ends it): it may be the person's, opened from the launcher.
   Once recorded it is the launch's browser, and the recover ended it as the current one.
-- The idle reaper and the window sweep skip the launching instance; their next tick sees it.
+- The idle reaper and the window sweep skip the launching instance; their next tick sees it. The window
+  sweep looks again after asking Chrome for its page count, before it records a closed note or closes:
+  a launch or a close can begin while it waits for that answer.
 - A call on an instance being closed waits for the close (`INSTANCE_CLOSING`), so a switch sent during the
   close of a failed launch runs after the launch has returned. A recover sent then does not wait: it marks
   the launch and resets the instance, and the close finds the instance no longer holding its browser.

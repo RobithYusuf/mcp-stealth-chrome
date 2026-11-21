@@ -149,6 +149,7 @@ def owner(env, monkeypatch, tmp_path):
     browser_recover's signals and sweep are pointed at tmp_path."""
     from mcp_stealth_chrome.state import InstanceSnapshot
     server.BrowserState.current_instance_id = "main"
+    server.BrowserState.window_closed.pop("main", None)  # a sweep test's control leaves its note
     other_browser = SimpleNamespace(tabs=[_Tab()], stopped=False, config=None)
     server.BrowserState.instances["other"] = InstanceSnapshot(
         instance_id="other", browser=other_browser, tabs=list(other_browser.tabs),
@@ -173,6 +174,7 @@ def owner(env, monkeypatch, tmp_path):
     monkeypatch.setattr(state, "find_chrome_pids_by_profile", lambda _p: [])
     yield env
     server.BrowserState.instances.pop("other", None)
+    server.BrowserState.window_closed.pop("main", None)
 
 
 def _launch_with(owner):
@@ -724,3 +726,42 @@ def test_the_window_sweep_leaves_the_launching_instance_alone(owner, monkeypatch
     during = asyncio.run(run())
     assert during == [], "the window sweep closed the instance a launch was not done with"
     assert ended == ["last window closed"], "the control: once the launch is over, the sweep closes it"
+
+
+def test_the_window_sweep_looks_again_after_counting_the_pages(owner, monkeypatch):
+    """The sweep checks the launch mark before it asks Chrome for its pages, and a launch can begin
+    while it waits for the answer: it looks again before it records anything or closes."""
+    ended = []
+
+    async def end(reason=None):
+        ended.append(reason)
+        return True
+
+    held = {}
+
+    async def a_launch_begins_meanwhile(_browser):
+        held["hold"], held["task"] = _hold_a_launch_of("main")
+        await asyncio.sleep(0)
+        return 0
+
+    browser = SimpleNamespace(tabs=[], stopped=False, config=None)
+    server.BrowserState.browser = browser
+    monkeypatch.setattr(server, "_end_current_instance", end)
+    monkeypatch.setattr(server, "_page_target_count", a_launch_begins_meanwhile)
+    monkeypatch.setattr(server.quit_watch, "quit_time", lambda _b: None)
+    monkeypatch.setattr(server.quit_watch, "running", lambda _b: False)
+    monkeypatch.setattr(server.quit_watch, "reap", lambda _b: None)
+    monkeypatch.setitem(server._WINDOW_WATCH, id(browser),
+                        {"browser": browser, "zero_since": time.monotonic() - 60, "tool_closed": False})
+
+    async def run():
+        try:
+            await server._sweep_windowless()
+        finally:
+            held["hold"].set()
+            await held["task"]
+            server._LAUNCHING.pop(server.BrowserState.session_key(), None)
+
+    asyncio.run(run())
+    assert ended == [], "the sweep closed the instance a launch began on while it counted the pages"
+    assert "main" not in server.BrowserState.window_closed

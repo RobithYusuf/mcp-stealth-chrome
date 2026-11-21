@@ -7986,6 +7986,8 @@ async def _sweep_windowless() -> set[int]:
             continue
         quit_watch.reap(browser)
         pages = await _page_target_count(browser)
+        if _being_closed(iid) or _being_launched(iid):
+            continue  # a close or a launch of it began while the count was asked for
         now = time.monotonic()
         if pages is None:
             entry["zero_since"] = None  # unanswered is not "no windows"
