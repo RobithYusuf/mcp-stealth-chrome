@@ -444,6 +444,7 @@ async def emulate_device(preset: str = "desktop") -> str:
         from nodriver.cdp import browser as cdp_browser
         from nodriver.cdp import emulation as cdp_emu
         from nodriver.cdp import network as cdp_net
+        from .. import presence
         from ..identity import device_navigator_platform, device_ua_metadata_fields, strip_headless
         from ..server import _apply_fingerprint_to_tab, _brand_for, _ua_metadata_param
         p = _DEVICE_PRESETS[preset_lc]
@@ -453,18 +454,23 @@ async def emulate_device(preset: str = "desktop") -> str:
             # answering as an iPhone. Back to the identity this instance launched with,
             # which falls back to the real browser's own UA.
             await tab.send(cdp_emu.clear_device_metrics_override())
+            presence.device_override(tab, None)  # the overlay's lock: the page fills the window again
             await tab.send(cdp_emu.set_touch_emulation_enabled(enabled=False))
             identity = dict(BrowserState.current_fingerprint or {})
             identity["user_agent"] = identity.get("user_agent") or strip_headless(version[3])
             await _apply_fingerprint_to_tab(tab, identity)
             return ok(f"device: reset to desktop (metrics cleared, User-Agent is "
                       f"{identity['user_agent']})")
+        # Where the page sits in its window, read before the override: under it Chrome draws the
+        # emulated page at that corner and the layout metrics no longer say where (the overlay's lock).
+        insets = await presence.before_device_override(tab)
         await tab.send(cdp_emu.set_device_metrics_override(
             width=int(p["width"]),
             height=int(p["height"]),
             device_scale_factor=float(p["dpr"]),
             mobile=bool(p["mobile"]),
         ))
+        presence.device_override(tab, (p["width"], p["height"]), insets)
         # A phone reporting maxTouchPoints 0 contradicts itself.
         await tab.send(cdp_emu.set_touch_emulation_enabled(
             enabled=bool(p["mobile"]), max_touch_points=5 if p["mobile"] else None,

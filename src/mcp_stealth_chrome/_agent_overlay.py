@@ -628,15 +628,21 @@ def light_level(mode, light_on):
 
 
 def cursor_point(cursor, page, zoom):
-    """The agent's cursor on screen (global, top-left origin), or None without a cursor or a page.
-    The cursor is in CSS pixels, which the page's zoom scales."""
+    """The agent's cursor on screen (global, top-left origin), or None without a cursor or a page,
+    or when the point lies outside the page (its edges count as inside). The cursor is in CSS
+    pixels, which the page's zoom scales. The point is the agent's last one: after
+    set_viewport_size(390, 900) a click made at x 1227 on the desktop layout was drawn 724 pt
+    outside the window, over another app (measured)."""
     if not (cursor and page):
         return None
     try:
         zoom = float(zoom or 1.0)
     except (TypeError, ValueError):
         zoom = 1.0
-    return page[0] + cursor[0] * zoom, page[1] + cursor[1] * zoom
+    x, y = page[0] + cursor[0] * zoom, page[1] + cursor[1] * zoom
+    if not (page[0] <= x <= page[0] + page[2] and page[1] <= y <= page[1] + page[3]):
+        return None
+    return x, y
 
 
 def bar_words(mode, agent, control, over, nudging, why):
@@ -1775,14 +1781,16 @@ class Overlay:
 
     def agent_cursor(self, a, page, mode, show_cursor, H):
         """The agent's cursor where the server last put it, shown while the agent works if the
-        person asked for it, and a ring at each new click of the agent's."""
-        point = cursor_point(a.get("cursor"), page, a.get("zoom"))
+        person asked for it, and a ring at each new click of the agent's. A point outside the page
+        hides the cursor until the next one inside, and a click there is taken without a ring."""
+        cursor = a.get("cursor")
+        point = cursor_point(cursor, page, a.get("zoom"))
         if point is not None:
             self.pointer.move(point[0], H - point[1])
         self.pointer.show(point is not None and show_cursor and mode in WORKING)
-        if point is not None and float(a.get("click_at", 0)) > self.clicks_seen:
+        if cursor and page and float(a.get("click_at", 0)) > self.clicks_seen:
             self.clicks_seen = float(a["click_at"])
-            if mode == "agent" and show_cursor:
+            if point is not None and mode == "agent" and show_cursor:
                 self.ring(point[0], H - point[1], "#3B82F6")
 
     def say(self, a, mode, over, show_cursor, now):

@@ -473,26 +473,97 @@ def page_size(metrics: Any, window_width: Any) -> tuple:
     return getattr(view, "client_width", None), getattr(view, "client_height", None)
 
 
-async def refresh_window(overlay: Overlay, tab: Any) -> None:
-    """Which window shows the agent's tab, and where its page sits inside it."""
+def page_place(width: Any, height: Any, inner_w: Any, inner_h: Any,
+               override: Optional[dict] = None) -> Optional[list]:
+    """[left, top, width, height] of the page inside its window, in points, or None.
+
+    With no device metrics override the page fills the window's width under the toolbar, so it
+    is centred and bottom-aligned (right on Chrome 157: 1280x900 and 500x900 windows, page at
+    (0, 87)). Under one (emulate_device) Chrome draws the page at the top-left of the content
+    area, 1 CSS px to 1 pt, clipped to it: iphone-15 (393x852) in a 500x900 window sat at
+    (0, 87, 393, 813), where the centred guess put the lock at (53.5, 48, 393, 852), 39 pt over
+    the toolbar, whose tabs and address bar must stay usable (measured). That corner is the
+    insets measured before the override began (`override["insets"]`)."""
+    if override and override.get("insets") and width and height:
+        left, top = override["insets"]
+        return [left, top, max(0.0, min(float(override["width"]), float(width) - left)),
+                max(0.0, min(float(override["height"]), float(height) - top))]
+    # No override, or one with no insets measured before it (no overlay was attached when
+    # emulate_device set it, so nothing read where the content area starts): the centred
+    # guess, as before, which is right only without an override.
+    if width and height and inner_w and inner_h:
+        return [max(0.0, (width - inner_w) / 2), max(0.0, height - inner_h), inner_w, inner_h]
+    return None
+
+
+# Device metrics overrides emulate_device set, by the tab's CDP target id (helpers.target_key, as
+# every per-tab cache is keyed): {"width", "height": the emulated size in CSS px, "insets": the
+# page's (left, top) in its window measured just before the first override, or None}. Under an
+# override the layout metrics give the emulated size and nothing of where Chrome draws it.
+_OVERRIDES: dict[str, dict] = {}
+
+
+async def _read_window(tab: Any) -> tuple:
+    """The CDP bounds of the window showing the tab, and the page's layout metrics."""
     from nodriver.cdp import browser as cdp_browser
     from nodriver.cdp import page as cdp_page
     target_id = getattr(getattr(tab, "target", None), "target_id", None)
     _wid, bounds = await asyncio.wait_for(
         tab.send(cdp_browser.get_window_for_target(target_id=target_id)), 1.0)
     metrics = await asyncio.wait_for(tab.send(cdp_page.get_layout_metrics()), 1.0)
+    return bounds, metrics
+
+
+async def before_device_override(tab: Any) -> Optional[tuple]:
+    """The page's left and top insets in its window, read now, before emulate_device sets a
+    device metrics override on the tab. With one already set (another preset over the first),
+    the insets read before that one: the page cannot be measured under an override. None when
+    no overlay is attached (no read for nothing) or the read fails."""
+    from .helpers import target_key
+    known = _OVERRIDES.get(target_key(tab))
+    if known is not None:
+        return known["insets"]
+    if _handle(getattr(tab, "browser", None)) is None:
+        return None
+    with contextlib.suppress(Exception):
+        bounds, metrics = await _read_window(tab)
+        width, height = getattr(bounds, "width", None), getattr(bounds, "height", None)
+        place = page_place(width, height, *page_size(metrics, width))
+        if place is not None:
+            return float(place[0]), float(place[1])
+    return None
+
+
+def device_override(tab: Any, size: Optional[tuple], insets: Optional[tuple] = None) -> None:
+    """emulate_device set a device metrics override of `size` (CSS px) on the tab, with the insets
+    before_device_override read; None: it cleared the override (the desktop preset)."""
+    from .helpers import target_key
+    key = target_key(tab)
+    if size is None:
+        _OVERRIDES.pop(key, None)
+    else:
+        _OVERRIDES[key] = {"width": float(size[0]), "height": float(size[1]), "insets": insets}
+
+
+async def refresh_window(overlay: Overlay, tab: Any) -> None:
+    """Which window shows the agent's tab, and where its page sits inside it."""
+    from .helpers import target_key
+    bounds, metrics = await _read_window(tab)
     width, height = getattr(bounds, "width", None), getattr(bounds, "height", None)
     inner_w, inner_h = page_size(metrics, width)
     window = [getattr(bounds, "left", None), getattr(bounds, "top", None), width, height]
-    viewport = None
-    if width and height and inner_w and inner_h:
-        viewport = [max(0.0, (width - inner_w) / 2), max(0.0, height - inner_h), inner_w, inner_h]
+    override = _OVERRIDES.get(target_key(tab))
+    viewport = page_place(width, height, inner_w, inner_h, override)
     # A full-screen Chrome is several windows on macOS (the toolbar strip apart from the content),
     # so the overlay cannot tell full screen from the bounds alone; the browser says it here.
     state = getattr(bounds, "window_state", None)
     state = getattr(state, "value", state)
     css = metrics[3] if len(metrics) > 3 else None
     css_w = getattr(css, "client_width", None)
+    if override and override.get("insets"):
+        # The page's width in points is the emulated one, as placed above: page_size rounds a
+        # display scale from layout metrics that then report the emulated size.
+        inner_w = override["width"]
     # Page coordinates (the agent's pointer) are CSS pixels: on screen they are this many points.
     zoom = round(float(inner_w) / float(css_w), 4) if inner_w and css_w else 1.0
     measured = {"window": window if None not in window else None, "viewport": viewport,

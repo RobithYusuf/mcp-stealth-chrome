@@ -946,3 +946,144 @@ def test_help_and_the_persons_hold_always_show_the_bar():
     assert bar("agent", "full", False, False) and bar("resting", "compact", False, False)
     assert not bar("agent", "off", False, True)
     assert not bar("thinking", "hover", False, False) and bar("thinking", "hover", False, True)
+
+
+# ── The agent's cursor and the lock under a changed viewport (measured, Chrome 157, 2x display) ──
+
+
+def test_the_agents_cursor_is_drawn_only_inside_the_page():
+    """After set_viewport_size(390, 900) the window was 500 pt wide, and the cursor kept its last
+    CSS point, a click at x 1227 on the desktop layout: it was drawn 724 pt outside the window,
+    over another app (measured). Outside the page it hides, and it comes back inside."""
+    point = _overlay_functions("cursor_point")["cursor_point"]
+    page = (100.0, 187.0, 500.0, 813.0)   # the page of a 500x900 window at (100, 100)
+    assert point([250, 400], page, 1.0) == (350.0, 587.0)
+    # Each edge counts as inside.
+    assert point([0, 400], page, 1.0) == (100.0, 587.0)       # left
+    assert point([500, 400], page, 1.0) == (600.0, 587.0)     # right
+    assert point([250, 0], page, 1.0) == (350.0, 187.0)       # top
+    assert point([250, 813], page, 1.0) == (350.0, 1000.0)    # bottom
+    # Outside on each side.
+    assert point([1227, 310], page, 1.0) is None              # right: the measured case
+    assert point([-0.5, 400], page, 1.0) is None              # left
+    assert point([250, -0.5], page, 1.0) is None              # above
+    assert point([250, 813.5], page, 1.0) is None             # below
+    # With the page's zoom the screen point decides: 400 CSS px at 125% is the right edge.
+    assert point([400, 400], page, 1.25) == (600.0, 687.0)
+    assert point([401, 400], page, 1.25) is None
+    assert point([401, 400], page, 1.0) == (501.0, 587.0)
+    assert point([10, 20], None, 1.0) is None and point(None, page, 1.0) is None
+
+
+@pytest.mark.parametrize("window,inner,override,expected", [
+    # desktop, after a click: the page fills the window under the toolbar
+    ((1280, 900), (1280.0, 813.0), None, [0.0, 87.0, 1280.0, 813.0]),
+    # set_viewport_size(390, 900): the window stops at Chrome's minimum width, 500
+    ((500, 900), (500.0, 813.0), None, [0.0, 87.0, 500.0, 813.0]),
+    # emulate_device("iphone-15"), 393x852: drawn at the content area's top-left, clipped to it
+    ((500, 900), (393.0, 852.0), {"width": 393, "height": 852, "insets": (0.0, 87.0)}, [0.0, 87.0, 393.0, 813.0]),
+    # an override wider and taller than the window (ipad, 820x1180) is clipped on both sides
+    ((500, 900), (410.0, 590.0), {"width": 820, "height": 1180, "insets": (0.0, 87.0)}, [0.0, 87.0, 500.0, 813.0]),
+    # nothing measured before the override (no overlay then): the old centred guess, the wrong row
+    ((500, 900), (393.0, 852.0), {"width": 393, "height": 852, "insets": None}, [53.5, 48.0, 393.0, 852.0]),
+])
+def test_the_page_is_placed_where_chrome_draws_it(window, inner, override, expected):
+    """Under emulate_device the centred, bottom-aligned guess put the lock 53.5 pt right of the
+    page and 39 pt up over the toolbar, whose tabs and address bar must stay usable, and 39 pt
+    taller than the content area (measured: page at (0, 87, 393, 813), lock at (53.5, 48, 393,
+    852)). Without an override the guess is right and stays."""
+    assert presence.page_place(*window, *inner, override) == expected
+
+
+class _WindowBounds:
+    left, top, width, height, window_state = 100, 100, 500, 900, "normal"
+
+
+class _EmulatedTab:
+    """A 500x900 window on a 2x display, answering as Chrome 157 does with and without a device
+    metrics override. Under one the layout metrics report the emulated size: in CSS px here,
+    which is what the measured iphone-15 row reads as (page_size gave 393x852 there; 786 device
+    px would round to the same, and the placement does not depend on which)."""
+
+    def __init__(self, browser):
+        import types
+
+        from nodriver.cdp.target import TargetID
+        self.browser = browser
+        self.target = types.SimpleNamespace(target_id=TargetID("T-emulated"))
+        self.override = None
+        self.methods = []
+
+    async def send(self, command):
+        request = next(command)
+        method = request["method"]
+        self.methods.append(method)
+        if method == "Browser.getVersion":
+            return ("1.3", "Chrome/157.0.8103.39", "r", "Mozilla/5.0 Chrome/157.0.0.0", "js")
+        if method == "Browser.getWindowForTarget":
+            return 1, _WindowBounds()
+        if method == "Emulation.setDeviceMetricsOverride":
+            self.override = (request["params"]["width"], request["params"]["height"])
+        if method == "Emulation.clearDeviceMetricsOverride":
+            self.override = None
+        if method == "Page.getLayoutMetrics":
+            if self.override:
+                return (_Viewport(*self.override), None, None, _Viewport(*self.override))
+            return (_Viewport(1000, 1626), None, None, _Viewport(500, 813))
+        return None
+
+
+def _emulating(tmp_path, monkeypatch, with_overlay=True):
+    from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.state import BrowserState
+    monkeypatch.setattr(presence, "_OVERRIDES", {})
+    monkeypatch.setattr(server.BrowserState, "current_fingerprint", {})
+
+    async def no_identity(*_a, **_k):
+        return None
+    monkeypatch.setattr(server, "_apply_fingerprint_to_tab", no_identity)
+    browser, overlay = _overlay(tmp_path) if with_overlay else (_Browser(), None)
+    tab = _EmulatedTab(browser)
+    monkeypatch.setattr(BrowserState, "active_tab", staticmethod(lambda *a, **k: tab))
+    return tab, overlay
+
+
+def test_the_lock_follows_emulate_device_and_its_reset(tmp_path, monkeypatch):
+    """emulate_device records where the page sat before the override, and the desktop preset
+    forgets it: the three measured rows, through the real tool and refresh_window."""
+    from mcp_stealth_chrome.tools import devtools
+    tab, overlay = _emulating(tmp_path, monkeypatch)
+    try:
+        page = lambda: {k: overlay.agent[k] for k in ("viewport", "zoom")}  # noqa: E731
+        asyncio.run(presence.refresh_window(overlay, tab))
+        assert page() == {"viewport": [0.0, 87.0, 500.0, 813.0], "zoom": 1.0}
+        assert not asyncio.run(devtools.emulate_device("iphone-15")).startswith("Error")
+        asyncio.run(presence.refresh_window(overlay, tab))
+        assert page() == {"viewport": [0.0, 87.0, 393.0, 813.0], "zoom": 1.0}
+        # A second preset over the first keeps the insets read before the first: the page cannot
+        # be measured under an override.
+        reads = tab.methods.count("Page.getLayoutMetrics")
+        assert not asyncio.run(devtools.emulate_device("pixel-8")).startswith("Error")
+        assert tab.methods.count("Page.getLayoutMetrics") == reads
+        assert presence._OVERRIDES["T-emulated"] == {"width": 412.0, "height": 915.0, "insets": (0.0, 87.0)}
+        # Wider than the window: clipped to it, and the cursor's scale stays 1 pt per CSS px, where
+        # page_size's display scale, rounded from 820 over 500, would make it 0.5.
+        assert not asyncio.run(devtools.emulate_device("ipad")).startswith("Error")
+        asyncio.run(presence.refresh_window(overlay, tab))
+        assert page() == {"viewport": [0.0, 87.0, 500.0, 813.0], "zoom": 1.0}
+        assert "reset to desktop" in asyncio.run(devtools.emulate_device("desktop"))
+        assert presence._OVERRIDES == {}
+        asyncio.run(presence.refresh_window(overlay, tab))
+        assert page() == {"viewport": [0.0, 87.0, 500.0, 813.0], "zoom": 1.0}
+    finally:
+        overlay.proc.kill()
+
+
+def test_emulate_device_reads_nothing_more_without_an_overlay(tmp_path, monkeypatch):
+    """No overlay, nothing to place: emulate_device sends what it sent before, and an overlay
+    attached later falls back to the old guess (no insets were read before the override)."""
+    from mcp_stealth_chrome.tools import devtools
+    tab, _none = _emulating(tmp_path, monkeypatch, with_overlay=False)
+    assert not asyncio.run(devtools.emulate_device("iphone-15")).startswith("Error")
+    assert "Page.getLayoutMetrics" not in tab.methods and "Browser.getWindowForTarget" not in tab.methods
+    assert presence._OVERRIDES["T-emulated"]["insets"] is None
