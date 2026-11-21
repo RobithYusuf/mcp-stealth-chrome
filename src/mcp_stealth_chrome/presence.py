@@ -838,6 +838,16 @@ def show_again(browser: Any, objective: str) -> Optional[float]:
     return ask(browser, objective)
 
 
+def keep_running(browser: Any) -> Optional[bool]:
+    """Whether the browser's overlay runs, starting it again first if its process exited
+    (`revive`; the new process reads agent.json and control.json, so the request and the holder
+    stay): None when the browser has no overlay, False when it cannot come back."""
+    overlay = _handle(browser)
+    if overlay is None:
+        return None
+    return overlay.alive() or overlay.revive()
+
+
 def bar_state(browser: Any, shown_at: Optional[float]) -> str:
     """Where a request for help the bar showed at `shown_at` stands: "shown" (an overlay runs and
     shows it; one whose process exited is started again first, `revive`, and the new process reads

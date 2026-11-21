@@ -369,10 +369,10 @@ async def _wait_for_human_loop(tab, key, browser, request, unasked, timeout,
         if done_selector else None
     )
 
-    # Whether the request reached the overlay's bar, and whether that overlay then ended for good
+    # Whether the request reached the overlay's bar, and whether the overlay then ended for good
     # during this wait. While it runs (started again if its process exited) the person has Done,
     # so the page is not even read; only once it cannot come back may a page change count.
-    reached, bar_ended = shown_at is not None, False
+    reached, overlay_ended, bar_ended = shown_at is not None, False, False
 
     def done(text: str) -> str:
         """Strong evidence: the handoff is over, and the bar stops asking."""
@@ -395,12 +395,31 @@ async def _wait_for_human_loop(tab, key, browser, request, unasked, timeout,
 
     while _clock() - started < max(0.0, timeout):
         elapsed = round(_clock() - started, 2)
+        # The bar first, once per pass and before anything else: an overlay whose process exited
+        # is started again here, also while the person holds the browser or a selector or URL is
+        # awaited (their Done and Resume agent are on it).
+        bar = None
+        if not overlay_ended:
+            running = presence.keep_running(browser)  # None: this browser has no overlay
+            overlay_ended = running is False or (reached and running is None)
+            if running and reached:
+                bar = presence.bar_state(browser, shown_at)  # "shown" or "replaced"
+        bar_ended = reached and overlay_ended
         answer = presence.answered(browser, asked_since)
         if answer:
             return done(f"human handoff completed after {elapsed}s: the person pressed "
                         + ("Done in the overlay's bar" if answer == "done"
                            else "Resume agent in the overlay's bar, handing the browser back"))
         if presence.holds(browser):
+            if overlay_ended:
+                # The hold is the overlay's last word, and nothing can show Resume agent any more:
+                # waiting on it would wait on a button nobody has.
+                pending = " The request for help stays pending." if request else ""
+                return err(f"wait_for_human stopped after {elapsed}s: the person took over this "
+                           "browser, and its overlay ended (its process exited and could not be "
+                           "started again), so Resume agent is no longer available. Ask the person "
+                           "in the chat whether they are done; browser_launch(agent_overlay=False) "
+                           f"releases the browser.{pending}")
             await _pause(HANDOFF_POLL)
             continue
         if done_url_contains:
@@ -426,15 +445,12 @@ async def _wait_for_human_loop(tab, key, browser, request, unasked, timeout,
                             f"{done_selector!r} appeared{unasked}")
         # While the bar shows the request the person has its Done button, so a page change is
         # no answer: the page may move by itself, and the person's own steps change it.
-        if watch is not None:
-            bar = presence.bar_state(browser, shown_at) if reached and not bar_ended else None
-            bar_ended = bar_ended or bar == "gone"
-            if bar != "shown":
-                sig = await _srv._page_sig(tab)
-                if not sig and (ended := await stopped(elapsed)):
-                    return ended
-                if watch.changed(sig, _clock()):
-                    return _weak_change(request, watch, elapsed, unasked, bar_ended)
+        if watch is not None and bar != "shown":
+            sig = await _srv._page_sig(tab)
+            if not sig and (ended := await stopped(elapsed)):
+                return ended
+            if watch.changed(sig, _clock()):
+                return _weak_change(request, watch, elapsed, unasked, bar_ended)
         await _pause(HANDOFF_POLL)
     # The request stays pending here: the person may still be at it, and the next wait counts as
     # the handoff (dropping it made that wait say request_human_help had not been called). The bar
@@ -462,6 +478,10 @@ async def _wait_for_human_loop(tab, key, browser, request, unasked, timeout,
         watched = " and ".join(
             ([f"the URL never contained {done_url_contains!r}"] if done_url_contains else [])
             + ([f"selector {done_selector!r} never appeared"] if done_selector else []))
+        if bar_ended:
+            watched += f", and {BAR_ENDED}"
+        elif on_bar:
+            watched += ", and the person did not press Done in the overlay's bar"
     elif on_bar:
         watched = ("the person did not press Done in the overlay's bar (a page change does not "
                    "end this wait while the bar shows the request)")

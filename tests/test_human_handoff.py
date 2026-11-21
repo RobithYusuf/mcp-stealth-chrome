@@ -335,6 +335,82 @@ def test_take_over_then_resume_through_the_wait(handoff, clock, asked):
     assert KEY not in server._HUMAN_HELP
 
 
+def _revivable(monkeypatch) -> list:
+    """Overlay processes that can be started again: _spawn gives a stand-in, Chrome is the same."""
+    spawned: list = []
+
+    def spawn(*_a, **_k):
+        spawned.append(subprocess.Popen(SLEEPER))
+        return spawned[-1]
+    monkeypatch.setattr(presence, "_same_chrome", lambda pid, start: True)
+    monkeypatch.setattr(presence, "_spawn", spawn)
+    return spawned
+
+
+def test_the_overlay_is_started_again_while_the_person_holds_the_browser(handoff, clock, monkeypatch):
+    """Take over at 3 s, the overlay's process exits at 4 s: the wait starts it again (Resume agent
+    is on its bar), and Resume agent at 10 s ends the wait."""
+    page = handoff((0, LOGIN, 400), overlay=True)
+    overlay = presence._handle(page.browser)
+    _revivable(monkeypatch)
+    ask()
+    clock.hooks.append((3.0, lambda: _write_control(overlay, {
+        "holder": "person", "reason": "button", "since": time.time()})))
+    clock.hooks.append((4.0, lambda: _kill(overlay)))
+    during_hold: list = []
+    clock.hooks.append((6.0, lambda: during_hold.append((overlay.restarts, overlay.alive()))))
+    clock.hooks.append((10.0, lambda: _write_control(overlay, {
+        "holder": "agent", "reason": "button", "since": time.time() + 1})))
+    result = wait(timeout=30)
+    assert result.startswith("human handoff completed after"), result
+    assert "pressed Resume agent" in result, result
+    assert during_hold == [(1, True)]  # started again while they held it, so they had Resume
+
+
+def test_a_hold_whose_overlay_cannot_come_back_ends_the_wait_as_an_error(handoff, clock):
+    page = handoff((0, LOGIN, 400), overlay=True)
+    overlay = presence._handle(page.browser)
+    overlay.restarts = presence.RESTARTS  # no restart left
+    ask()
+    clock.hooks.append((3.0, lambda: _write_control(overlay, {
+        "holder": "person", "reason": "button", "since": time.time()})))
+    clock.hooks.append((4.0, lambda: _kill(overlay)))
+    result = wait(timeout=30)
+    assert result.startswith("Error: wait_for_human stopped after 4.0"), result
+    assert "Resume agent is no longer available" in result and "overlay ended" in result, result
+    assert "agent_overlay=False" in result and "stays pending" in result, result
+    assert KEY in server._HUMAN_HELP
+
+
+def test_the_overlay_is_started_again_on_a_selector_wait(handoff, clock, monkeypatch):
+    page = handoff((0, LOGIN, 400), overlay=True)
+    overlay = presence._handle(page.browser)
+    _revivable(monkeypatch)
+    ask()
+    page.selector_from = 8.0
+    clock.hooks.append((3.0, lambda: _kill(overlay)))
+    result = wait(done_selector="#account", timeout=30)
+    assert result.startswith("human handoff completed after"), result
+    assert overlay.restarts == 1 and overlay.alive()
+
+
+@pytest.mark.parametrize("ends", [True, False])
+def test_a_selector_wait_that_times_out_says_whether_the_bar_ended(handoff, clock, ends):
+    page = handoff((0, LOGIN, 400), overlay=True)
+    overlay = presence._handle(page.browser)
+    ask()
+    if ends:
+        overlay.restarts = presence.RESTARTS
+        clock.hooks.append((3.0, lambda: _kill(overlay)))
+    result = wait(done_selector="#account", timeout=10)
+    assert result.startswith("Error: timeout after 10"), result
+    assert "selector '#account' never appeared" in result, result
+    if ends:
+        assert "the overlay's bar showed this request but ended during the wait" in result, result
+    else:
+        assert "the person did not press Done in the overlay's bar" in result, result
+
+
 def test_without_an_overlay_a_change_that_does_not_hold_does_not_count(handoff, clock):
     """After the grace the page changes every second, as a carousel or a redirect chain would."""
     steps = [(0, LOGIN, 400)] + [(6 + i, f"{HOME}?step={i}", 500 + i) for i in range(20)]
