@@ -203,11 +203,11 @@ def _fail_after_the_start(monkeypatch, where):
         return _TabThatCannotLoad(exc)
 
     monkeypatch.setattr(server, "_first_live_tab", first_tab)
-    return ("initial nav timed out after" if where == "navigation timeout"
+    return ("the page did not answer within" if where == "navigation timeout"
             else "initial nav failed: net::ERR_NAME_NOT_RESOLVED")
 
 
-@pytest.mark.parametrize("where", ["storage_state", "navigation", "navigation timeout"])
+@pytest.mark.parametrize("where", ["storage_state", "navigation"])
 def test_a_launch_that_fails_after_the_start_ends_its_browser_as_every_close_does(env, monkeypatch, where):
     """_ensure_browser_dead, not stop() alone: stop() can return while Chrome keeps running."""
     said = _fail_after_the_start(monkeypatch, where)
@@ -217,6 +217,16 @@ def test_a_launch_that_fails_after_the_start_ends_its_browser_as_every_close_doe
     assert env.closes[0][1].parent == env.privacy_root, env.closes
     assert server.BrowserState.browser is None
     assert _privacy_folders(env) == []
+
+
+def test_commit_timeout_keeps_the_privacy_profile_until_close(env, monkeypatch):
+    said = _fail_after_the_start(monkeypatch, "navigation timeout")
+    out = _launch(privacy=True)
+    assert out.startswith("Error:") and said in out, out
+    assert not env.closes and server.BrowserState.browser is env.started[0]
+    assert _privacy_folders(env) == [server.BrowserState.current_profile_dir]
+    assert "privacy profile removed" in asyncio.run(_close_through_a_tool_call())
+    assert server.BrowserState.browser is None and not _privacy_folders(env)
 
 
 def test_a_failed_privacy_launch_leaves_no_privacy_profile_to_clean_up(env, monkeypatch):
@@ -529,11 +539,9 @@ def test_a_close_that_finds_another_instance_current_records_nothing_on_it(env, 
     assert _privacy_folders(env) == []
 
 
-@pytest.mark.parametrize("where", ["storage_state", "navigation", "navigation timeout", "cookie_move"])
+@pytest.mark.parametrize("where", ["storage_state", "navigation", "cookie_move"])
 def test_a_stop_that_was_not_seen_to_end_is_said(env, monkeypatch, tmp_path, where):
-    """_ensure_browser_dead can answer stopped with nothing verified (no process to check), which
-    _close_incomplete does not count as a failure: the handle goes, and the result must say the
-    end was not seen, as browser_close does, rather than nothing or "The browser was closed"."""
+    """Failures that stop a started browser say when the end was not verified."""
     if where == "cookie_move":
         env.move = server._CookieMove(plan=None, backup=tmp_path / "backup.json")
         env.finish = (False, "1 cookie missing")

@@ -160,7 +160,7 @@ def test_click_scrolls_offscreen_target_into_view(page):
 
 def test_click_with_no_effect_is_reported(page):
     out = run(page, "click", selector="#dead")
-    assert "NO page change detected" in out
+    assert "NO page change detected within 450ms" in out
 
 
 def test_checkbox_toggle_is_not_reported_as_no_change(page):

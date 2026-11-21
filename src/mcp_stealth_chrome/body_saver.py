@@ -73,8 +73,18 @@ def stall_after() -> float:
 
 
 def _now_iso(epoch: Optional[float] = None) -> str:
-    moment = datetime.datetime.fromtimestamp(epoch if epoch else time.time()).astimezone()
+    moment = datetime.datetime.fromtimestamp(time.time() if epoch is None else epoch).astimezone()
     return moment.isoformat(timespec="seconds")
+
+
+def _timestamp_for_record(epoch: Optional[float]) -> tuple[str, bool]:
+    """Return wallTime when it is a real finite number the platform can represent."""
+    if isinstance(epoch, bool) or not isinstance(epoch, (int, float)):
+        return _now_iso(), epoch is not None
+    try:
+        return _now_iso(epoch), False
+    except (OSError, OverflowError, TypeError, ValueError):
+        return _now_iso(), True
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -726,8 +736,11 @@ class Saver:
     def _write(self, request: _Request, body: Optional[str], b64: bool) -> None:
         """On the writer thread: the record, masked, then one appended line."""
         try:
+            timestamp, timestamp_fallback = _timestamp_for_record(request.wall)
             meta = {"request_url": request.url, "page_url": request.page_url,
-                    "ts": _now_iso(request.wall), "status": request.status, "mime": request.mime}
+                    "ts": timestamp, "status": request.status, "mime": request.mime}
+            if timestamp_fallback:
+                meta["ts_note"] = "wallTime was unusable; ts is the write time"
             line, info = make_record(meta, body, b64, self.mode, request.entry.paths,
                                      self.max_body_bytes)
             if line is None:

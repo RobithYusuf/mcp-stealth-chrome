@@ -291,28 +291,20 @@ async def _launch_browser_instance(
         await asyncio.sleep(0.5)
         main_tab = await _srv._first_live_tab(browser)
         await _srv._apply_fingerprint_to_tab(main_tab, effective_fingerprint)
-        await asyncio.wait_for(main_tab.get(url), timeout=_srv.BROWSER_NAV_TIMEOUT)
-        await _srv._wait_load_complete(main_tab, 3)
-    except asyncio.TimeoutError:
-        await _srv._safe_stop_browser(browser)
-        await _srv._remove_privacy_profile(privacy_profile)
-        return False, (
-            f"initial nav timed out after {_srv.BROWSER_NAV_TIMEOUT}s on instance "
-            f"{instance_id!r}."
-        )
+        initial_observed = await _srv._commit_navigation(main_tab, url, {"armed": False})
+        if initial_observed is None:
+            await _srv._wait_load_complete(main_tab, 3)
     except asyncio.CancelledError:
         await _srv._safe_stop_browser(browser)
         await _srv._remove_privacy_profile(privacy_profile)
         raise
     except Exception as e:
-        # Verified, not assumed: a Chrome still dying keeps the profile lock, and the next
-        # launch would then be refused as "in use" by a browser nobody asked for.
         await _srv._ensure_browser_dead(browser, profile_path)
         await _srv._remove_privacy_profile(privacy_profile)
         return False, f"initial nav failed: {_srv._exc_text(e)}"
 
     slot_tabs, slot_active, restore_text = [main_tab], 0, ""
-    if restore_tabs:
+    if restore_tabs and initial_observed is None:
         try:
             slot_tabs, slot_active, _report, _summary = await _srv._reopen_saved_tabs(
                 instance_id, browser, main_tab, profile_path, privacy, headless,
@@ -365,10 +357,14 @@ async def _launch_browser_instance(
     _keep, _keep_note = _srv._keep_alive_decision(keep_alive, profile_path, privacy, headless)
     if _keep:
         _keep_note = _srv._arm_keep_alive(browser, profile_path, instance_id, headless,
-                                     effective_fingerprint) or _keep_note
+                                           effective_fingerprint) or _keep_note
     dock_note += _keep_note
     dock_note += _srv._allow_origins_note(browser)
     await _srv._give_focus_back(previous_app)
+    if initial_observed is not None:
+        return False, _srv._nav_commit_timeout_message(
+            f"Browser instance {instance_id!r} is running; switch_instance({instance_id!r}) to use it. First page",
+            initial_observed)
     return True, (
         f"instance {instance_id!r} launched (headless={headless}, "
         f"privacy={privacy}, identity={identity_source}, "
@@ -427,6 +423,8 @@ async def _spawn_by_reattach(instance_id: str, profile: Path, verdict: dict, *, 
     keep_text += await presence.attach(browser, _srv._browser_process_pid(browser), ask=agent_overlay,
                                  headless=bool(verdict["record"].get("headless")),
                                  persons_browser=_srv._persons_browser(browser))
+    if "commit_timeout_seconds" in observed:
+        return False, _srv._nav_commit_timeout_message(f"Instance {instance_id!r} {summary}", observed)
     return True, (f"instance {instance_id!r} {summary}{keep_text}\n"
                   f"{json.dumps(observed, indent=2, default=str)}")
 

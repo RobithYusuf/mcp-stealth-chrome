@@ -54,7 +54,7 @@ Read a whole page per call, not one element per call. On a marketplace price che
 
 | Result says | Do this |
 |---|---|
-| `clicked but NO page change detected` | The click landed, nothing reacted yet. Read the page before clicking again; some reactions are asynchronous. |
+| `clicked but NO page change detected within 450ms` | The click landed, but no page change was observed in the verification window. Read the page before clicking again; a later reaction is still possible. |
 | `NOT clicked ... obscured by <x>` | Something covers the target. Close the cookie banner or modal named, then retry. |
 | `NOT clicked ... pointer-events:none` | You hit a label inside a button. Click the button itself (its ref, or its position). |
 | `the first text match was unreachable (...), so a reachable element with the same text was clicked` | Another element than the first match was clicked. Check it was the one you meant. |

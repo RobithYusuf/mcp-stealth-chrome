@@ -114,7 +114,8 @@ from .state import (
 # Hard ceiling on `nodriver.start()` — without this a locked profile or hung
 # Chrome subprocess hangs the entire MCP session. Override via env var.
 BROWSER_LAUNCH_TIMEOUT = int(os.environ.get("BROWSER_LAUNCH_TIMEOUT", "45"))
-BROWSER_NAV_TIMEOUT = int(os.environ.get("BROWSER_NAV_TIMEOUT", "20"))
+NAV_COMMIT_TIMEOUT = float(os.environ.get("BROWSER_NAV_TIMEOUT", "30"))
+BROWSER_NAV_TIMEOUT = NAV_COMMIT_TIMEOUT
 # Per-tool CDP action ceiling. Pages with stuck JS / blocked service workers
 # can keep CDP commands waiting indefinitely otherwise — this ensures each
 # tool call either succeeds or returns a clean timeout error within N seconds.
@@ -3577,9 +3578,10 @@ async def _reattach_claimed(browser: Any, instance_id: str, profile: Path, recor
                     await _wait(_keep_painting_behind(tab), timeout=5, what="focus emulation")
             doc_state, disarm = await _arm_document_watch(tab)
             try:
-                await asyncio.wait_for(tab.get(url), timeout=BROWSER_NAV_TIMEOUT)
-                await _wait_load_complete(tab, 3)
-                observed = await _observe_navigation(tab, url, disarm())
+                observed = await _commit_navigation(tab, url, doc_state)
+                if observed is None:
+                    await _wait_load_complete(tab, 3)
+                    observed = await _observe_navigation(tab, url, disarm())
             finally:
                 disarm()
             tabs.append(tab)
@@ -3739,6 +3741,8 @@ async def _launch_by_reattach(profile: Path, verdict: dict, *, url: str, keep_al
     ads_note += await presence.attach(browser, _browser_process_pid(browser), ask=agent_overlay,
                                 headless=bool(record.get("headless")),
                                 persons_browser=_persons_browser(browser))
+    if "commit_timeout_seconds" in observed:
+        return err(_nav_commit_timeout_message(summary, observed))
     action = "Loaded" if url and url != "about:blank" else "Selected tab shows"
     return _nav_result(f"{summary[0].upper()}{summary[1:]}. {action}", observed,
                        expect_url=expect_url, expect_status=expect_status,
@@ -4385,16 +4389,13 @@ async def _launch_reuse_running(req: _LaunchRequest) -> Optional[str]:
         _doc_state, _disarm = await _arm_document_watch(_tab)
         try:
             if req.url and req.url != "about:blank":
-                # Honour the caller's url. Returning "already running" while
-                # silently ignoring it left them on the wrong page believing
-                # the navigation had happened.
-                await _wait(_tab.get(req.url), what="reuse navigate")
+                timeout = await _commit_navigation(_tab, req.url, _doc_state)
+                if timeout is not None:
+                    return err(_nav_commit_timeout_message(reuse_head, timeout))
                 try:
                     await _wait(_tab.wait(), timeout=10, what="reuse settle")
                 except Exception:
                     pass
-            # The reuse path is a navigation too: its redirects were
-            # exactly as invisible as a fresh launch's.
             _observed = await _observe_navigation(_tab, req.url, _disarm())
         finally:
             _disarm()
@@ -5081,25 +5082,16 @@ async def _launch_first_page(req: _LaunchRequest, plan: _LaunchPlan) -> tuple:
         main = await _first_live_tab(plan.browser)
         await _apply_fingerprint_to_tab(main, plan.effective_fingerprint)
         if req.profile_mode == "light" or req.testing_mode:
-            # The first document after startup still loads images despite the flag;
-            # every later one obeys it.
-            await asyncio.wait_for(main.get("about:blank"), timeout=BROWSER_NAV_TIMEOUT)
+            await asyncio.wait_for(main.get("about:blank"), timeout=NAV_COMMIT_TIMEOUT)
         _doc_state, _disarm = await _arm_document_watch(main)
         try:
-            await asyncio.wait_for(main.get(req.url), timeout=BROWSER_NAV_TIMEOUT)
-            await _wait_load_complete(main, 3)  # best effort; ready_state is reported
-            # Saying "Loaded /admin" after a redirect to /login leaves the caller
-            # reading a page it never asked for, and expect_* went unchecked.
+            timeout = await _commit_navigation(main, req.url, _doc_state)
+            if timeout is not None:
+                return None, main, timeout
+            await _wait_load_complete(main, 3)
             _launch_observed = await _observe_navigation(main, req.url, _disarm())
         finally:
             _disarm()
-    except asyncio.TimeoutError:
-        reap, recorded, removal = await _launch_end_started_browser(req, plan)
-        return err(
-            f"initial nav timed out after {BROWSER_NAV_TIMEOUT}s — Chrome "
-            f"started but couldn't load {req.url}. Check network/proxy."
-            f"{_launch_end_note(reap, recorded)}{removal}"
-        ), None, None
     except asyncio.CancelledError:
         await _launch_cancelled(plan)
         raise
@@ -5314,6 +5306,9 @@ async def browser_launch(
     agent_overlay: Optional[bool] = None,
 ) -> str:
     """Launch stealth Chrome via nodriver, on a persistent profile by default.
+
+    The initial navigation commit is bounded by 30 seconds by default without stopping the tab;
+    a timeout reports its observed URL and ready_state. Load completion remains best-effort.
 
     The result names the profile actually used (actual_profile, session_state_source) and what the first load
     observed (final_url, redirect_chain, status, ready_state). After a redirect, read final_url.
@@ -5535,6 +5530,10 @@ async def _launch_run(req: _LaunchRequest, launching: _Launching, session: str, 
             # recover meanwhile stops the steps that would record more.
             _launch_record_browser(req, plan, started, main)
             suffix = _launch_keep_alive(req, plan, started)
+            if "commit_timeout_seconds" in observed:
+                await _give_focus_back(plan.previous_app)
+                return await _launch_settle(req, plan, launching, err(_nav_commit_timeout_message(
+                    f"Browser is running{suffix}; first page", observed)))
             health_suffix = await _launch_window_health(req, main)
             if (stop := await _launch_settle(req, plan, launching, None)) is not None:
                 return stop
@@ -6073,6 +6072,7 @@ async def _observe_navigation(
     tab: Tab,
     requested_url: Optional[str],
     doc_state: dict,
+    probe_timeout: float = 5,
 ) -> dict:
     """Read back where the tab ACTUALLY ended up, after the navigation."""
     final_url = ""
@@ -6081,7 +6081,7 @@ async def _observe_navigation(
     try:
         probe = await _wait(
             evaluate_isolated(tab, "JSON.stringify([window.location.href, document.readyState])"),
-            timeout=5,
+            timeout=probe_timeout,
             what="navigation postcondition probe",
         )
         final_url, ready_state = json.loads(probe)
@@ -6172,6 +6172,36 @@ def _nav_result(
     )
 
 
+async def _commit_navigation(tab, url: str, doc_state: dict) -> Optional[dict]:
+    """Wait for Chrome to commit, not for load. On timeout read the current document only."""
+    try:
+        await asyncio.wait_for(tab.get(url), timeout=NAV_COMMIT_TIMEOUT)
+    except asyncio.TimeoutError:
+        observed = await _observe_navigation(tab, url, doc_state, probe_timeout=0.5)
+        observed["commit_timeout_seconds"] = NAV_COMMIT_TIMEOUT
+        return observed
+    return None
+
+
+def _nav_commit_timeout_message(action: str, observed: dict) -> str:
+    """Describe a commit timeout with observations and no claim that loading stopped."""
+    observed = dict(observed)
+    observed["commit_timeout_seconds"] = NAV_COMMIT_TIMEOUT
+    observed["tab_may_still_be_loading"] = True
+    body = json.dumps(observed, indent=2, default=str)
+    shown_url = repr(observed.get("final_url") or "(unmeasured)")
+    ready = observed.get("ready_state") or "unmeasured"
+    return (
+        f"{action}: the page did not answer within {NAV_COMMIT_TIMEOUT:g}s; observed URL "
+        f"{shown_url}, ready_state {ready}. The tab may still be loading; use "
+        f"wait_for_url or wait_for, or navigate again.\n{body}"
+    )
+
+
+def _nav_commit_timeout(action: str, observed: dict) -> str:
+    return err(_nav_commit_timeout_message(action, observed))
+
+
 # How long navigate waits for the load event. It reports ready_state either way, because a
 # page with one stuck subresource is still a page the caller can use.
 NAV_LOAD_WAIT = 15.0
@@ -6204,6 +6234,10 @@ async def navigate(
 ) -> str:
     """Navigate the active tab to url. wait_until: load|none.
 
+    The navigation commit is bounded by 30 seconds (the page is not stopped); a timeout says
+    the observed URL and ready_state and that the tab may still be loading. wait_until=load then
+    waits for readyState=complete up to 15 seconds after the commit.
+
     Reports the OBSERVED postconditions: requested_url, final_url, redirect_chain, status, ready_state. After
     a redirect, read final_url.
 
@@ -6228,7 +6262,9 @@ async def navigate(
         await _watch_dialogs(tab)
     doc_state, disarm = await _arm_document_watch(tab)
     try:
-        await tab.get(url)
+        timeout = await _commit_navigation(tab, url, doc_state)
+        if timeout is not None:
+            return _nav_commit_timeout("navigate", timeout)
         if wait_until != "none":
             await _wait_load_complete(tab, NAV_LOAD_WAIT)
         if focus:
@@ -6640,9 +6676,9 @@ def _click_outcome(head: str, detail: str, before: dict, after: dict) -> str:
     if change is not None:
         return ok(f"{head} — {detail}{change}")
     return ok(
-        f"{head} but NO page change detected — {detail}. The event was dispatched; "
-        f"the page did not react (handler not bound, click swallowed, or the change "
-        f"is purely visual)."
+        f"{head} but NO page change detected within {_VERIFY_WINDOW_MS}ms — {detail}. "
+        f"The event was dispatched, but no page change was observed within this verification "
+        f"window; a later reaction or a purely visual effect is still possible."
     )
 
 
@@ -6652,6 +6688,7 @@ def _click_outcome(head: str, detail: str, before: dict, after: dict) -> str:
 # acknowledged. Only "NO page change" needs the whole wait, and it gets a longer one than
 # before, so a handler that reacts after 300 ms is not reported as dead.
 _VERIFY_PAUSES = (0.0, 0.05, 0.07, 0.10, 0.11, 0.12)
+_VERIFY_WINDOW_MS = round(sum(_VERIFY_PAUSES) * 1000)
 # One more reading after the first change, so a handler that updates the page and then
 # navigates or opens a tab is reported with where it ended up.
 _VERIFY_SETTLE = 0.06
@@ -7143,13 +7180,39 @@ async def fill(ref: Optional[str] = None, selector: Optional[str] = None,
     """Clear a field and type into it with real key presses, then read it back.
 
     A value the page only formatted (a card mask adding spaces, a date mask adding "/") is
-    filled and says how it reads; a value the page cut or changed is an error.
+    filled and says how it reads; a value the page cut or changed is an error. Readonly,
+    disabled and contenteditable=false fields are reported as not editable with the value
+    actually read after the attempt.
     """
     try:
         tab = BrowserState.active_tab()
         el = await resolve_ref(ref) if ref else (await tab.query_selector(selector) if selector else None)
         if el is None:
             return err("element not found")
+        restrictions = await el.apply(
+            """function() { return JSON.stringify({
+                readonly: this.readOnly === true,
+                disabled: this.disabled === true,
+                contenteditable_false: this.getAttribute('contenteditable') === 'false'
+            }); }"""
+        )
+        try:
+            restrictions = json.loads(restrictions or "{}")
+        except (TypeError, ValueError):
+            restrictions = {}
+        restriction = next((name for name, present in (
+            ("readonly", restrictions.get("readonly")),
+            ("disabled", restrictions.get("disabled")),
+            ("contenteditable=false", restrictions.get("contenteditable_false")),
+        ) if present), None)
+        if restriction:
+            actual = await el.apply(
+                "function() { return this.isContentEditable ? this.innerText : "
+                "(typeof this.value === 'string' ? this.value : this.innerText); }"
+            )
+            is_secret = (await el.apply("function() { return this.type === 'password'; }")) is True
+            shown = f"{len(actual)} chars" if is_secret and isinstance(actual, str) else repr(actual[:80])
+            return err(f"field is {restriction} (not editable); after the attempted fill it holds {shown}")
         try:
             await el.clear_input()
         except Exception:
@@ -7177,7 +7240,8 @@ async def fill(ref: Optional[str] = None, selector: Optional[str] = None,
         except Exception:
             await el.set_value(value)
         actual = await el.apply(
-            "function() { return this.isContentEditable ? this.innerText : this.value; }"
+            "function() { return this.isContentEditable ? this.innerText : "
+            "(typeof this.value === 'string' ? this.value : this.innerText); }"
         )
         wanted = str(value)
         if multiline:
@@ -7190,8 +7254,8 @@ async def fill(ref: Optional[str] = None, selector: Optional[str] = None,
             is_secret = (await el.apply("function() { return this.type === 'password'; }")) is True
             shown = f"{len(actual)} chars" if is_secret else repr(actual[:80])
             # An input mask that only adds separators kept every character: PXP's card field
-            # reads '4111 1111 1111 1111' and its expiry '12/30', and calling that an error made
-            # a filled checkout look failed. A character dropped or changed is still one.
+            # reads '4111 1111 1111 1111' and its expiry '12/30', and calling that an error made a
+            # filled checkout look failed. A character dropped or changed is still one.
             if _FORMAT_SEPARATORS.sub("", actual) == _FORMAT_SEPARATORS.sub("", wanted) != "":
                 return ok(f"filled; the page formatted it as {shown}")
             return err(
