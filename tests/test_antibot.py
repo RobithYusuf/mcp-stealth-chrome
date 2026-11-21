@@ -700,3 +700,13 @@ def test_fallback_launch_pause_keeps_profile_warning(page):
                                 trip=look(tab, url=FIELD_URL))
     assert out.startswith('Error: antibot_paused:') and 'WARNING: EMPTY FALLBACK PROFILE' in out
     assert 'do not log in again here' in out and '/profiles/desired' in out and 'temp' in out
+
+
+def test_checkpoint_on_an_unruled_host_reads_once_per_step(page):
+    tab = page('https://example.test/', headless=True)
+    assert asyncio.run(server._tripwire_after_navigation(tab, {'final_url': tab.url})) is None
+    assert tab.probes == 0
+    assert asyncio.run(server._tripwire_step('navigate', 'get_text')) is None
+    assert tab.probes == 1
+    assert asyncio.run(server._tripwire_step('get_text', 'get_url')) is None
+    assert tab.probes == 2

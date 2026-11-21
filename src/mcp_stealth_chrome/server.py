@@ -6480,8 +6480,9 @@ async def _tripwire_look(tab: Tab, *, url: Optional[str] = None, want_cf: bool =
     """Whether `tab` shows a verification page, with the request for the person made when it does
     and the tripwire pauses. None when the tripwire is off (nothing read at all) or the page is no
     verification page as far as was looked; then a request the tripwire made for this tab is
-    withdrawn, and the next result says so. After a URL miss a single probe also checks the
-    first 16 direct same-origin frames. It does not follow cross-origin or nested documents."""
+    withdrawn, and the next result says so. A known unruled host with no Cloudflare signal
+    needs no probe. An ordinary step checkpoint has no URL yet: its single evaluation
+    also checks up to 16 direct same-origin frames, never cross-origin or nested documents."""
     from . import antibot
     mode, rules = _tripwire_settings()
     if mode == "off":
