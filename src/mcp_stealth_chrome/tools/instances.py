@@ -27,6 +27,7 @@ from .. import instance_notes
 from .. import keep_alive as _keep_alive
 from .. import launch_lock
 from .. import presence
+from .. import antibot
 from .. import profile_version
 from .. import tab_record
 from ..helpers import err, ok
@@ -567,7 +568,10 @@ async def spawn_browser(
                     brave_lean=brave_lean,
                     agent_overlay=agent_overlay,
                 )
-                msg += launch_lock.note() if ok_flag else ""
+                if ok_flag and msg.startswith(antibot.PAUSE_PREFIX):
+                    ok_flag, msg = False, msg.removeprefix("Error: ")
+                elif ok_flag:
+                    msg += launch_lock.note()
     finally:
         _srv._SPAWNING.pop(instance_id, None)
     if not ok_flag:
