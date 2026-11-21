@@ -11,7 +11,7 @@ from typing import Any, Optional
 
 from .._app import mcp
 from ..helpers import confined_output_path, err, get_url, ok, ts_filename
-from ..server import _eval_checked, _write_private
+from .. import server as _srv
 from ..state import STORAGE_STATE_DIR, BrowserState, ensure_dirs
 
 
@@ -435,7 +435,7 @@ async def cookie_export(filename: Optional[str] = None,
         ensure_dirs()
         fname = filename or ts_filename("cookies", "json")
         path = confined_output_path(STORAGE_STATE_DIR, fname)
-        _write_private(path, json.dumps(data, indent=2, default=str))
+        _srv._write_private(path, json.dumps(data, indent=2, default=str))
         note = "" if reveal_values else " with values masked; this file cannot be imported"
         return ok(f"{path}\nexported {len(data)} cookies{note}")
     except Exception as e:
@@ -453,7 +453,7 @@ async def localstorage_get(key: Optional[str] = None) -> str:
     try:
         tab = BrowserState.active_tab()
         if key:
-            result = await _eval_checked(tab, f"localStorage.getItem({json.dumps(key)})")
+            result = await _srv._eval_checked(tab, f"localStorage.getItem({json.dumps(key)})")
             return ok(str(result) if result is not None else "null")
         all_ls = await tab.get_local_storage()
         return ok(json.dumps(all_ls, indent=2))
@@ -484,8 +484,8 @@ async def localstorage_set(key: Optional[str] = None, value: Optional[str] = Non
         tab = BrowserState.active_tab()
         script = (("%s.clear();" % store) if clear else "") + (
             "%s.setItem(%s, %s);" % (store, json.dumps(key), json.dumps(value)) if key is not None else "")
-        await _eval_checked(tab, "(() => {%s return %s.length; })()" % (script, store))
-        left = await _eval_checked(tab, f"{store}.length")
+        await _srv._eval_checked(tab, "(() => {%s return %s.length; })()" % (script, store))
+        left = await _srv._eval_checked(tab, f"{store}.length")
         done = []
         if clear:
             done.append("cleared")
@@ -502,10 +502,10 @@ async def sessionstorage_get(key: Optional[str] = None) -> str:
     try:
         tab = BrowserState.active_tab()
         if key:
-            result = await _eval_checked(tab, f"sessionStorage.getItem({json.dumps(key)})")
+            result = await _srv._eval_checked(tab, f"sessionStorage.getItem({json.dumps(key)})")
             return ok(str(result) if result is not None else "null")
         # Enumerate all keys
-        result = await _eval_checked(
+        result = await _srv._eval_checked(
             tab,
             "(() => {var o={}; for(var i=0;i<sessionStorage.length;i++){var k=sessionStorage.key(i); o[k]=sessionStorage.getItem(k);} return JSON.stringify(o);})()",
         )
