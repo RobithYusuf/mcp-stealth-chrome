@@ -1,0 +1,37 @@
+<!doctype html><meta charset=utf-8><title>UA scopes</title><script>
+const read = async () => {
+  const own = async () => ({ua:navigator.userAgent, ch:navigator.userAgentData?.brands,
+    headers: await fetch('/headers').then(r=>r.json())});
+  const worker = src => new Promise((resolve, reject) => {
+    const w = new Worker(src); w.onmessage = e => resolve(e.data); w.onerror = e => reject(e.message); w.postMessage('go');
+  });
+  window.__uaStage = 'workers';
+  const out = {main: await own(), dedicated: await worker('/ua_worker.js'), nested: await worker('/ua_nested.js')};
+  window.__uaStage = 'shared';
+  const shared = new SharedWorker('/ua_shared.js'); shared.port.start();
+  out.shared = await new Promise(resolve => { shared.port.onmessage = e => resolve(e.data); shared.port.postMessage('go'); });
+  window.__uaStage = 'service';
+  const registration = await navigator.serviceWorker.register('/ua_service.js');
+  await navigator.serviceWorker.ready;
+  out.service = await new Promise(resolve => { const channel = new MessageChannel(); channel.port1.onmessage = e => resolve(e.data); registration.active.postMessage('go', [channel.port2]); });
+  window.__uaStage = 'srcdoc';
+  const srcdocMessage = new Promise(resolve => { const fn = e => { if (e.data?.name === 'srcdoc') { removeEventListener('message', fn); resolve(e.data); } }; addEventListener('message', fn); });
+  const srcdoc = document.createElement('iframe'); srcdoc.name = 'srcdoc'; srcdoc.srcdoc = '<script>parent.postMessage({name: "srcdoc", ua: navigator.userAgent, ch: navigator.userAgentData?.brands}, "*")<\/scr' + 'ipt>'; document.body.append(srcdoc);
+  window.__uaStage = 'same';
+  const same = document.createElement('iframe'); same.src = '/ua_frame.html'; document.body.append(same); await new Promise(resolve => { same.onload = resolve; });
+  out.iframe_same = await same.contentWindow.__ua();
+  window.__uaStage = 'cross';
+  const crossMessage = new Promise(resolve => { const fn = e => { if (e.data?.name === 'cross') { removeEventListener('message', fn); resolve(e.data); } }; addEventListener('message', fn); });
+  const cross = document.createElement('iframe'); cross.src = 'http://127.0.0.1:' + location.port + '/ua_cross.html'; document.body.append(cross);
+  out.iframe_cross = await crossMessage;
+  window.__uaStage = 'about';
+  const about = document.createElement('iframe'); about.src = 'about:blank'; document.body.append(about); await new Promise(resolve => setTimeout(resolve, 50));
+  out.iframe_about = {ua: about.contentWindow.navigator.userAgent, ch: about.contentWindow.navigator.userAgentData?.brands};
+  window.__uaStage = 'popup';
+  const popupMessage = new Promise(resolve => { const fn = e => { if (e.data?.name === 'popup') { removeEventListener('message', fn); resolve(e.data); } }; addEventListener('message', fn); });
+  window.open('/ua_popup.html', 'ua-popup');
+  out.popup = await popupMessage;
+  out.iframe_srcdoc = await srcdocMessage;
+  window.__uaReport = out;
+}; read().catch(e => { window.__uaError = String(e && e.stack || e); });
+</script>
