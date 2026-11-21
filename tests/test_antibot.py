@@ -370,6 +370,7 @@ def page(monkeypatch, tmp_path, sfile):
             setattr(browser, presence.ATTR, handle)
             made.append(handle)
         tab = Tab(url, browser, **kw)
+        monkeypatch.setattr(BrowserState, "tabs", [tab])
         monkeypatch.setattr(BrowserState, "browser", browser)
         monkeypatch.setattr(BrowserState, "current_headless", headless)
         monkeypatch.setattr(BrowserState, "active_tab", classmethod(lambda cls: tab))
@@ -409,7 +410,7 @@ def look(tab, **kw):
 def press_done(overlay):
     asked = float(overlay.agent.get("asked_at") or 0)
     tmp = overlay.control_file.with_name("control.json.test")
-    tmp.write_text(json.dumps({"holder": "agent", "reason": "help done", "help_done": asked + 1}))
+    tmp.write_text(json.dumps({"holder": "agent", "reason": "help done", "help_done": asked + 1, "answered_id": overlay.agent["request_id"]}))
     tmp.replace(overlay.control_file)
 
 
@@ -625,3 +626,42 @@ def test_batch_budget_keeps_resume_with_long_unicode_details():
     out = batch._paused_batch((100, "navigate", text, True), ["界" * 160] * 101, 2, 105)
     assert len(out.encode()) < 1024 and "actions[100:]" in out
     assert "2 failed" in out and "next:" in out and "previews omitted" in out
+
+
+def test_spawned_browser_handoff_belongs_to_its_instance(page, monkeypatch):
+    from types import SimpleNamespace
+    tab = page(FIELD_URL, overlay=True)
+    other = _Browser()
+    monkeypatch.setattr(BrowserState, 'browser', other)
+    monkeypatch.setattr(BrowserState, 'instances', {'work': SimpleNamespace(browser=tab.browser, tabs=[tab])})
+    look(tab, url=FIELD_URL, headless=False)
+    assert server._HUMAN_HELP[KEY]['instance_id'] == 'work'
+    assert not nav._pending_human_request()[2]
+    monkeypatch.setattr(BrowserState, 'current_instance_id', 'work')
+    monkeypatch.setattr(BrowserState, 'browser', tab.browser)
+    monkeypatch.setattr(BrowserState, 'tabs', [])
+    out = asyncio.run(nav.wait_for_human(timeout=0, done_url_contains='verify'))
+    assert 'unavailable tab' in out and KEY in out and 'no active tab was used' in out
+
+
+def test_done_is_for_the_displayed_request_not_its_replacement(page, monkeypatch):
+    parent = page(FIELD_URL, overlay=True)
+    popup = Tab(FIELD_URL, parent.browser)
+    popup.target = type('Target', (), {'target_id': 'POPUP'})()
+    monkeypatch.setattr(BrowserState, 'tabs', [parent, popup])
+    bar = presence._handle(parent.browser)
+    look(parent, url=FIELD_URL)
+    a = server._HUMAN_HELP[KEY]
+    look(popup, url=FIELD_URL)
+    b = server._HUMAN_HELP['POPUP']
+    assert a['replaced_by'] == b['request_id'] == bar.agent['request_id']
+    assert nav._pending_human_request()[0] is popup
+    # A click on the old button delivered late, even after the second request's timestamp.
+    bar.control_file.write_text(json.dumps({'answered_id': a['request_id'], 'help_done': b['shown_at'] + 2}))
+    assert presence.answered(parent.browser, b['shown_at'], b['request_id']) is None
+    assert presence._done_pressed(bar) is None
+    press_done(bar)
+    stale = asyncio.run(nav._wait_for_human_loop(parent, KEY, parent.browser, a, '', 1, None, None))
+    assert 'replaced' in stale and bar.agent['help'] and server._HUMAN_HELP['POPUP'] is b
+    assert 'pressed Done' in asyncio.run(nav.wait_for_human(timeout=1))
+    assert not server._HUMAN_HELP and not bar.agent['help']

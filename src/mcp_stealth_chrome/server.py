@@ -6415,30 +6415,44 @@ def _handoff_clock() -> float:
     nav = sys.modules.get(f"{__package__}.tools.navigation")
     return (getattr(nav, "_clock", None) or time.monotonic)()
 
+_HELP_REQUEST_SEQ = 0
+
+
+def _help_owner(browser: Any) -> Optional[str]:
+    if browser is BrowserState.browser:
+        return BrowserState.current_instance_id
+    return next((name for name, slot in BrowserState.instances.items() if slot.browser is browser), None)
 
 def _record_human_help(tab: Tab, objective: str, timeout: float, *, by: str, clock: float,
                        baseline: Optional[dict], browser: Any = None, target: Optional[str] = None) -> dict:
-    """A request for help as request_human_help records it, with every field wait_for_human reads,
-    shown in the overlay's bar when one runs (never bringing the window forward: the caller does
-    that or not). A new request replaces the tab's earlier one. by: "agent" (request_human_help)
-    or "tripwire"; only the tripwire's own request is ever withdrawn by the tripwire. baseline: the
-    page's fingerprint (_page_sig) as the request is made."""
+    """Record one correlated help request for a browser and its owning instance."""
+    global _HELP_REQUEST_SEQ
     key = target or _target_key(tab)
+    browser = browser or _tab_browser(tab)
+    _HELP_REQUEST_SEQ += 1
+    request_id = f"help-{_HELP_REQUEST_SEQ}"
+    owner = _help_owner(browser)
+    if owner is None:
+        raise RuntimeError("cannot identify the browser instance for this help request")
+    for old_key, old in tuple(_HUMAN_HELP.items()):
+        if old.get("browser") is browser:
+            old["replaced_by"] = request_id
+            del _HUMAN_HELP[old_key]
+            _tripwire_note(f"help request {old['request_id']} was replaced by {request_id}.")
     record = {
         "objective": objective,
         "baseline": baseline,
-        "requested_at": time.time(),     # a stamp the overlay's answers are compared with
-        "requested_clock": clock,        # where the grace starts
+        "requested_at": time.time(),
+        "requested_clock": clock,
         "timeout": max(0.0, float(timeout)),
         "by": by,
+        "request_id": request_id,
+        "browser": browser,
+        "instance_id": owner,
     }
-    _HUMAN_HELP[key] = record  # a new request replaces the tab's earlier one
-    # asked_at: when the bar first showed it, kept for the record. shown_at: its current showing,
-    # None while the bar does not show it; a Done counts from there on. was_shown: it reached the
-    # bar, the only kind a later wait shows again after a timeout.
-    record["asked_at"] = record["shown_at"] = presence.ask(browser or BrowserState.browser, objective)
+    _HUMAN_HELP[key] = record
+    record["asked_at"] = record["shown_at"] = presence.ask(browser, objective, request_id)
     record["was_shown"] = record["asked_at"] is not None
-    record["instance_id"] = BrowserState.current_instance_id
     return record
 
 
@@ -6528,9 +6542,9 @@ def _tripwire_left(tab: Tab, key: Optional[str]) -> None:
     _HUMAN_HELP.pop(key, None)
     browser = _tab_browser(tab)
     answered = presence.answered(browser, float(request.get("asked_at") or request.get("requested_at")
-                                                or 0)) if request.get("was_shown") else None
-    if presence.shows_request(browser, request.get("shown_at")):
-        presence.end_help(browser)
+                                                or 0), request.get("request_id")) if request.get("was_shown") else None
+    if presence.shows_request(browser, request.get("shown_at"), request.get("request_id")):
+        presence.end_help(browser, request.get("request_id"))
     where = f" ({seen['place']})" if seen else ""
     if answered == "done":  # the person pressed Done and no wait took it: closed, not withdrawn
         _tripwire_note(f"the tab is no longer on the verification page{where}; the person had pressed "

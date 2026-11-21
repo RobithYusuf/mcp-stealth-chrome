@@ -246,7 +246,7 @@ class Overlay:
         self.agent_file = folder / "agent.json"
         self.control_file = folder / "control.json"
         self.agent: dict = {"pid": pid, "active_at": 0.0, "busy": False, "status": "", "help": None,
-                            "waiting": None, "cursor": None, "click_at": 0.0,
+                            "request_id": None, "waiting": None, "cursor": None, "click_at": 0.0,
                             "viewport": None, "window": None}
         self.control: dict = {}
         self.control_stamp: Any = None
@@ -672,7 +672,10 @@ def _done_pressed(overlay: Optional["Overlay"]) -> Optional[str]:
     Without it an agent that read the page instead of waiting never learned of the Done."""
     if overlay is None or not overlay.agent.get("help"):
         return None
-    done_at = float(overlay.read_control().get("help_done") or 0)
+    control = overlay.read_control()
+    if control.get("answered_id") != overlay.agent.get("request_id"):
+        return None
+    done_at = float(control.get("help_done") or 0)
     if done_at < float(overlay.agent.get("asked_at") or 0) or done_at <= 0:
         return None
     overlay.write(help=None)
@@ -834,32 +837,32 @@ def note_pointer(tab: Any, x: float, y: float, pressed: bool = False) -> None:
         overlay.touch(cursor=[x, y])
 
 
-def ask(browser: Any, objective: str) -> Optional[float]:
-    """Show the person a request for help (amber, with Done). The time it was asked, or None."""
+def ask(browser: Any, objective: str, request_id: Optional[str] = None) -> Optional[float]:
+    """Show the person a request for help (amber, with Done), including its correlation id."""
     overlay = of(browser)
     if overlay is None:
         return None
     asked = time.time()
-    overlay.touch(help=objective[:200], asked_at=asked)
+    overlay.touch(help=objective[:200], request_id=request_id, asked_at=asked)
     return asked
 
 
-def shows_request(browser: Any, asked_at: Optional[float]) -> bool:
-    """The bar shows this request for help, so the person has its Done button: an overlay runs
-    for the browser and the request reached it (`ask` returned `asked_at`, no later one replaced
-    it). The bar shows a request even with overlay_bar off (`_agent_overlay.wants_bar`)."""
+def shows_request(browser: Any, shown_at: Optional[float], request_id: Optional[str] = None) -> bool:
+    """Whether the bar still shows the same request, not a newer replacement."""
     overlay = of(browser)
-    return (overlay is not None and asked_at is not None
-            and float(overlay.agent.get("asked_at") or 0) == float(asked_at))
+    return (overlay is not None and shown_at is not None
+            and float(overlay.agent.get("asked_at") or 0) == float(shown_at)
+            and (request_id is None or overlay.agent.get("request_id") == request_id))
 
 
-def show_again(browser: Any, objective: str) -> Optional[float]:
-    """Show a request for help the bar no longer shows (a timeout took it off), starting again an
-    overlay whose process exited. The new showing's time, or None with no overlay to show it."""
+
+
+def show_again(browser: Any, objective: str, request_id: Optional[str] = None) -> Optional[float]:
+    """Show a request again, retaining its correlation id."""
     overlay = _handle(browser)
     if overlay is None or not (overlay.alive() or overlay.revive()):
         return None
-    return ask(browser, objective)
+    return ask(browser, objective, request_id=request_id)
 
 
 def keep_running(browser: Any) -> Optional[str]:
@@ -870,25 +873,25 @@ def keep_running(browser: Any) -> Optional[str]:
     return None if overlay is None else overlay.recover()
 
 
-def bar_state(browser: Any, shown_at: Optional[float]) -> str:
-    """Where a request for help the bar showed at `shown_at` stands: "shown" (an overlay runs and
-    shows it; one whose process exited is started again first, `revive`, and the new process reads
-    agent.json, request included), "replaced" (the bar shows a later request), or "gone" (no
-    overlay any more: stopped, or its process exited and could not be started again)."""
+def bar_state(browser: Any, shown_at: Optional[float], request_id: Optional[str] = None) -> str:
+    """Where a specific request's bar stands: shown, replaced, or gone."""
     overlay = _handle(browser)
     if overlay is None or shown_at is None or not (overlay.alive() or overlay.revive()):
         return "gone"
-    if float(overlay.agent.get("asked_at") or 0) != float(shown_at):
+    if (float(overlay.agent.get("asked_at") or 0) != float(shown_at)
+            or (request_id is not None and overlay.agent.get("request_id") != request_id)):
         return "replaced"
     return "shown"
 
 
-def answered(browser: Any, since: float) -> Optional[str]:
-    """What the person did with the bar since `since`: "done", "resumed", or None."""
+def answered(browser: Any, since: float, request_id: Optional[str] = None) -> Optional[str]:
+    """What the person did with the specific request's bar since `since`."""
     overlay = _handle(browser)
-    if overlay is None:
+    if overlay is None or (request_id is not None and overlay.agent.get("request_id") != request_id):
         return None
     control = overlay.read_control()
+    if control.get("answered_id") != request_id:
+        return None
     if float(control.get("help_done") or 0) >= since:
         return "done"
     if control.get("holder") == "agent" and control.get("reason") == "button" \
@@ -909,10 +912,10 @@ def holds(browser: Any) -> bool:
     return overlay is not None and overlay.held()
 
 
-def end_help(browser: Any) -> None:
+def end_help(browser: Any, request_id: Optional[str] = None) -> None:
     overlay = of(browser)
-    if overlay is not None:
-        overlay.touch(help=None)
+    if overlay is not None and (request_id is None or overlay.agent.get("request_id") == request_id):
+        overlay.touch(help=None, request_id=None)
 
 
 BAR_MODES = ("full", "compact", "hover", "off")

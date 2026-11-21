@@ -200,28 +200,14 @@ async def request_human_help(objective: str, timeout: float = 300) -> str:
 
 def _pending_human_request() -> tuple[Any, str, dict, str]:
     """Choose one pending request across this instance's tabs, including popup targets."""
-    current = BrowserState.current_instance_id
-    pending = [(key, record) for key, record in _srv._HUMAN_HELP.items()
-               if record.get("instance_id", current) == current]
-    try:
-        active = BrowserState.active_tab()
-        active_key = _srv._target_key(active)
-    except Exception:
-        active, active_key = None, None
-    if not pending:
-        return active, active_key or "", {}, ""
-    by_key = dict(pending)
-    if active_key in by_key:
-        key = active_key
-    else:
-        key, _record = max(pending, key=lambda item: float(
-            item[1].get("requested_clock") or item[1].get("requested_at") or 0))
-    tab = _srv._tab_for_target(key) or active
-    note = ""
-    if len(pending) > 1:
-        keys = ", ".join(item[0] for item in pending)
-        note = f" [multiple pending requests on tabs {keys}; waiting on tab {key}]"
-    return tab, key, by_key[key], note
+    browser = BrowserState.browser
+    for key, request in _srv._HUMAN_HELP.items():
+        if request["browser"] is browser and request["instance_id"] == BrowserState.current_instance_id:
+            tab = _srv._tab_for_target(key)
+            note = "" if tab else f"request {request['request_id']} targets unavailable tab {key}"
+            return tab, key, request, note
+    active = BrowserState.active_tab()
+    return active, _srv._target_key(active), {}, ""
 
 
 @mcp.tool()
@@ -250,6 +236,8 @@ async def wait_for_human(
     """
     try:
         tab, key, request, selection_note = _pending_human_request()
+        if request and tab is None:
+            return err(f"wait_for_human: {selection_note}; no active tab was used")
         unasked = (f"{selection_note}; no handoff was pending on this tab (request_human_help was not "
                    "called), so this only says the page changed after wait_for_human started") if not request else selection_note
         # None means "inherit". Keying off the literal 300 would silently
@@ -267,7 +255,8 @@ async def wait_for_human(
             # A timeout took the request off the bar, so the person never saw "Your help is
             # needed" while the agent did something else: this wait shows it again. A request
             # that never reached a bar stays without one, even if an overlay runs by now.
-            shown = presence.show_again(browser, str(request.get("objective") or ""))
+            shown = presence.show_again(browser, str(request.get("objective") or ""),
+                                        request.get("request_id"))
             if shown is not None:
                 request["shown_at"] = shown
         presence.waiting_for_person(browser, True)  # the bar: "The agent is waiting for you"
@@ -408,9 +397,12 @@ async def _wait_for_human_loop(tab, key, browser, request, unasked, timeout,
     reached, overlay_ended, bar_ended = shown_at is not None, False, False
 
     def done(text: str) -> str:
-        """Strong evidence: the handoff is over, and the bar stops asking."""
-        _srv._HUMAN_HELP.pop(key, None)
-        presence.end_help(browser)
+        """Strong evidence: close only this request's bar and record."""
+        if request:
+            if _srv._HUMAN_HELP.get(key) is not request:
+                return err(f"request {request['request_id']} is no longer pending; no answer was taken")
+            del _srv._HUMAN_HELP[key]
+            presence.end_help(browser, request["request_id"])
         return ok(text)
 
     async def stopped(elapsed: float) -> Optional[str]:
@@ -419,10 +411,11 @@ async def _wait_for_human_loop(tab, key, browser, request, unasked, timeout,
         why = await _gone(tab, browser)
         if why is None:
             return None
-        if presence.shows_request(browser, shown_at):
-            presence.end_help(browser)
+        if presence.shows_request(browser, shown_at, request.get("request_id") if request else None):
+            presence.end_help(browser, request.get("request_id") if request else None)
         dropped = " The request for help was dropped with it." if request else ""
-        _srv._HUMAN_HELP.pop(key, None)
+        if request and _srv._HUMAN_HELP.get(key) is request:
+            del _srv._HUMAN_HELP[key]
         return err(f"wait_for_human stopped after {elapsed}s: {why}, so no answer from the person "
                    f"can come and nothing was completed.{dropped}")
 
@@ -436,11 +429,13 @@ async def _wait_for_human_loop(tab, key, browser, request, unasked, timeout,
             state = presence.keep_running(browser)  # None: this browser has no overlay
             overlay_ended = state == "ended" or (reached and state is None)
             if state == "running" and reached:
-                bar = presence.bar_state(browser, shown_at)  # "shown" or "replaced"
+                bar = presence.bar_state(browser, shown_at, request.get("request_id"))  # "shown" or "replaced"
             elif state == "waiting" and reached:
                 bar = "waiting"  # its overlay may come back: no page verdict meanwhile
         bar_ended = reached and overlay_ended
-        answer = presence.answered(browser, asked_since)
+        if request.get("replaced_by") or bar == "replaced":
+            return err(f"wait_for_human: request {request.get('request_id')} was replaced; no answer was taken")
+        answer = presence.answered(browser, asked_since, request.get("request_id") if request else None)
         if answer:
             return done(f"human handoff completed after {elapsed}s: the person pressed "
                         + ("Done in the overlay's bar" if answer == "done"
@@ -491,11 +486,11 @@ async def _wait_for_human_loop(tab, key, browser, request, unasked, timeout,
     # the handoff (dropping it made that wait say request_human_help had not been called). The bar
     # stops asking, though, so the person never reads "Your help is needed" while the agent does
     # something else; the next wait_for_human shows the request again.
-    on_bar = presence.shows_request(browser, shown_at)
+    on_bar = presence.shows_request(browser, shown_at, request.get("request_id") if request else None)
     if request:
         request["shown_at"] = None
         if on_bar:
-            presence.end_help(browser)
+            presence.end_help(browser, request.get("request_id"))
     if not request:
         after = (" Call request_human_help if the person still needs to act: no handoff was "
                  "pending on this tab.")

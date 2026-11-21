@@ -122,10 +122,10 @@ def test_wait_for_human_preserves_zero_second_handoff_timeout(monkeypatch):
         classmethod(lambda cls: _Tab()),
     )
     monkeypatch.setattr(server.asyncio, "get_event_loop", lambda: _Loop())
-    server._HUMAN_HELP["HUMAN-ZERO"] = {
-        "baseline": {"url": "before", "nodes": 1, "len": 1},
-        "timeout": 0.0,
-    }
+    tab = server.BrowserState.active_tab()
+    monkeypatch.setattr(server.BrowserState, "tabs", [tab])
+    server._record_human_help(tab, "Log in", 0, by="agent", clock=0,
+                              baseline={"url": "before", "nodes": 1, "len": 1})
     try:
         wait = server.mcp._tool_manager._tools["wait_for_human"].fn
         result = asyncio.run(wait(done_url_contains="would-match-if-polled"))

@@ -131,6 +131,7 @@ def handoff(monkeypatch, clock, tmp_path):
             setattr(browser, presence.ATTR, handle)
             made.append(handle)
         page = Page(clock, *steps, browser=browser)
+        monkeypatch.setattr(BrowserState, "tabs", [page])
         monkeypatch.setattr(BrowserState, "browser", browser)
         monkeypatch.setattr(BrowserState, "current_headless", False)
         monkeypatch.setattr(BrowserState, "active_tab", classmethod(lambda cls: page))
@@ -179,7 +180,7 @@ def wait(**kw):
 def _write_control(overlay: presence.Overlay, data: dict) -> None:
     """control.json as the overlay writes it: a new file, then replaced."""
     tmp = overlay.control_file.with_name("control.json.test")
-    tmp.write_text(json.dumps(data))
+    tmp.write_text(json.dumps({"answered_id": overlay.agent.get("request_id"), **data}))
     tmp.replace(overlay.control_file)
 
 
@@ -187,7 +188,7 @@ def press_done(overlay: presence.Overlay) -> None:
     """control.json as the overlay writes it when the person presses Done (a new file, replaced)."""
     asked = float(overlay.agent.get("asked_at") or 0)
     tmp = overlay.control_file.with_name("control.json.test")
-    tmp.write_text(json.dumps({"holder": "agent", "reason": "help done", "help_done": asked + 1}))
+    tmp.write_text(json.dumps({"holder": "agent", "reason": "help done", "help_done": asked + 1, "answered_id": overlay.agent["request_id"]}))
     tmp.replace(overlay.control_file)
 
 
