@@ -255,6 +255,7 @@ def test_r2_3_a_network_get_running_across_a_restart_returns_no_old_body(monkeyp
     network_start had cleared the capture."""
     import asyncio
     from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import monitoring
 
     class Tab:
         target = None
@@ -273,9 +274,9 @@ def test_r2_3_a_network_get_running_across_a_restart_returns_no_old_body(monkeyp
         server.BrowserState.network_index = {"1.1": {"request_id": "1.1", "url": "https://a.test/x"}}
         server.BrowserState.capture_network = True
         try:
-            call = asyncio.ensure_future(server.network_get(include_body=True))
+            call = asyncio.ensure_future(monitoring.network_get(include_body=True))
             await asyncio.sleep(0.05)
-            server._network_restarted()  # what network_start does before clearing
+            monitoring._network_restarted()  # what network_start does before clearing
             server.BrowserState.network_index.clear()
             tab.release.set()
             return await call
@@ -290,6 +291,7 @@ def test_r2_3_a_network_get_running_across_a_restart_returns_no_old_body(monkeyp
 def test_r2_3_network_start_marks_a_restart_and_a_plain_start_sends_what_main_sent(monkeypatch):
     import asyncio
     from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import monitoring
 
     class _Target:
         target_id = "TARGET-FF"
@@ -313,17 +315,17 @@ def test_r2_3_network_start_marks_a_restart_and_a_plain_start_sends_what_main_se
     saved = (server.BrowserState.network_logs, server.BrowserState.network_index,
              server.BrowserState.capture_network)
     try:
-        before = server._NETWORK_GENERATION[0]
-        out = asyncio.run(server.network_start())
-        assert server._NETWORK_GENERATION[0] == before + 1
+        before = monitoring._NETWORK_GENERATION[0]
+        out = asyncio.run(monitoring.network_start())
+        assert monitoring._NETWORK_GENERATION[0] == before + 1
         assert tab.sent == [("Network.enable", {})], tab.sent  # exactly origin/main
         assert "not kept past a navigation" in out and "keep_bodies=True" in out
         tab.sent.clear()
-        out = asyncio.run(server.network_start(keep_bodies=True))
+        out = asyncio.run(monitoring.network_start(keep_bodies=True))
         assert [m for m, _ in tab.sent] == ["Network.enable", "Network.configureDurableMessages"]
         assert "until it closes" in out
         tab.sent.clear()
-        asyncio.run(server.network_start())
+        asyncio.run(monitoring.network_start())
         assert tab.sent == [("Network.enable", {}), ("Network.configureDurableMessages", {})]
     finally:
         (server.BrowserState.network_logs, server.BrowserState.network_index,

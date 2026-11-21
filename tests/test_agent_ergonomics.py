@@ -193,7 +193,8 @@ def test_browser_snapshot_rejects_unmeasured_invalid_json(monkeypatch):
 
 def test_target_key_is_shared_and_console_alias_delegates():
     """Per-tab caches must agree on one key, or they desync after navigation."""
-    from mcp_stealth_chrome.server import _console_target_key, _target_key
+    from mcp_stealth_chrome.server import _target_key
+    from mcp_stealth_chrome.tools.monitoring import _console_target_key
 
     class _Target:
         target_id = "TARGET-123"
@@ -3987,6 +3988,7 @@ def test_os_cursor_status_does_not_wait_for_a_slow_first_measurement(monkeypatch
     import time as _time
 
     from mcp_stealth_chrome import os_input, server
+    from mcp_stealth_chrome.tools import diagnostics
 
     def slow():
         _time.sleep(2.5)
@@ -3996,11 +3998,11 @@ def test_os_cursor_status_does_not_wait_for_a_slow_first_measurement(monkeypatch
     monkeypatch.setattr(server, "_OS_CURSOR_PROBE",
                         {"thread": None, "started": None, "result": None, "measured_at": None})
     started = _time.monotonic()
-    first = asyncio.run(server._os_cursor_status())
+    first = asyncio.run(diagnostics._os_cursor_status())
     assert _time.monotonic() - started < 1.5
     assert first["available"] is None and "still being measured" in first["detail"], first
     server._OS_CURSOR_PROBE["thread"].join(5)
-    assert asyncio.run(server._os_cursor_status()) == {"available": True, "detail": "measured"}
+    assert asyncio.run(diagnostics._os_cursor_status()) == {"available": True, "detail": "measured"}
 
 
 def test_the_idle_sweep_leaves_the_current_instance_alone_while_a_call_runs(monkeypatch):
