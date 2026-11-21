@@ -175,9 +175,10 @@ def without_titles(schema: Any) -> Any:
 
     pydantic gives every property a title made from its name ("js_fallback" becomes "Js Fallback")
     and the model one too ("clickArguments"). They say nothing the names do not, and they were 30%
-    of the input schemas the server advertises (15.9 of 53.4 KB over 169 tools), which a client
-    hands to its model with every session. A property that is itself called "title" stays: it is
-    a key under "properties", and only a schema node's own "title" string goes.
+    of the input schemas the server advertised (15.9 of 53.4 KB, measured over the 169 tools of
+    0.26.0), which a client hands to its model with every session. A property that is itself
+    called "title" stays: it is a key under "properties", and only a schema node's own "title"
+    string goes.
     """
     if not isinstance(schema, dict):
         return schema
