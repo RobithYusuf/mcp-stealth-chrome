@@ -318,17 +318,20 @@ def _stop_at_pause(run: _Run, path: list[int], step: dict, text: str, ran: bool)
 
 async def _run_tool(run: _Run, step: dict, path: list[int]) -> None:
     tool = step["tool"]
+    if not run.allowed(tool):
+        _fail(run, path, step, f"unknown or non-allowlisted tool: {tool}")
+        return
     if run.checkpoint is not None and isinstance(tool, str):
         said = await run.checkpoint(run.previous_tool, tool)
+        if said and said.startswith("Error:"):
+            _fail(run, path, step, said)
+            return
         if said and said.startswith(PAUSE_PREFIX):
             _stop_at_pause(run, path, step, said, ran=False)
             return
         if said and len(run.warnings) < MAX_LATE_FAILURES:
             run.warnings.append({"before": path[0] if len(path) == 1 else _dotted(path),
                                  "warning": said})
-    if not run.allowed(tool):
-        _fail(run, path, step, f"unknown or non-allowlisted tool: {tool}")
-        return
     run.executed += 1
     if run.executed > MAX_EXECUTED_STEPS:
         raise WorkflowError(f"workflow exceeded {MAX_EXECUTED_STEPS} executed steps")

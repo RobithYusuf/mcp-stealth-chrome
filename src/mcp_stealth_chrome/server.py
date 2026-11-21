@@ -6502,6 +6502,10 @@ async def _tripwire_look(tab: Tab, *, url: Optional[str] = None, want_cf: bool =
         if (settle_text and url and antibot.wants_text(url, rules) and not seen.get("words")
                 and not seen.get("cf") and not seen.get("frames")):
             await asyncio.sleep(0.3)
+            # Text that appears late is still a page read; re-check ownership immediately
+            # before evaluating it because Take over may have happened during the delay.
+            if presence.refusal("get_text", _tab_browser(tab)):
+                return None
             seen = await _tripwire_probe(tab, rules, want_cf)
             if seen is None:
                 return None

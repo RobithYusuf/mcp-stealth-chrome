@@ -883,10 +883,11 @@ async def workflow_run(
         return await _srv._WORKFLOW_TOOLS[tool](**args)
 
     async def checkpoint(previous: Optional[str], next_tool: str) -> Optional[str]:
-        # Check Take over before the tripwire checkpoint can read the page.
+        # Check Take over before the tripwire checkpoint can read the page. The workflow engine
+        # validates its allow-list first; this refusal is then recorded as a failed step.
         refused = presence.refusal(next_tool, BrowserState.browser)
         if refused:
-            return None  # dispatch checks ownership again and reports the refusal
+            return refused
         return await _srv._tripwire_step(previous, next_tool)
 
     # The anti-bot tripwire looks between steps: a click may have sent the page to a site's

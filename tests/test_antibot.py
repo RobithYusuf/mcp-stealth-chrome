@@ -304,6 +304,46 @@ def test_checks_takeover_before_tripwire_checkpoint(monkeypatch, runner):
                       if runner == "batch" else workflow_run([{"tool": "navigate", "args": {"url": "https://example.test"}}]))
     assert "the person took over" in out
     assert checks == []
+def test_workflow_rejects_disallowed_step_before_checkpoint(monkeypatch):
+    from mcp_stealth_chrome.tools.action_kit import workflow_run
+    checks = []
+
+    async def checkpoint(*_args):
+        checks.append("read")
+        return None
+
+    async def refusal(*_args):
+        return "Error: the person took over"
+
+    monkeypatch.setattr(server, "_WORKFLOW_TOOLS", {"get_url": lambda **_: "ok"})
+    monkeypatch.setattr(server, "_inner_arguments_error", lambda *_args: None)
+    monkeypatch.setattr(batch.presence, "refusal", refusal)
+    monkeypatch.setattr(server, "_tripwire_step", checkpoint)
+    out = asyncio.run(workflow_run([{"tool": "server_status", "args": {}}]))
+    assert "unknown or non-allowlisted tool: server_status" in out
+    assert checks == []
+
+
+def test_late_text_probe_rechecks_takeover(monkeypatch, page):
+    tab = page("https://shopee.co.id/product/1", words=[])
+    probes = []
+    held = [False]
+
+    async def probe(*_args):
+        probes.append(True)
+        return {"href": tab.url, "words": [], "frames": []}
+
+    def refusal(*_args):
+        return "Error: the person took over" if held[0] else None
+
+    monkeypatch.setattr(server, "_tripwire_probe", probe)
+    monkeypatch.setattr(server.presence, "refusal", refusal)
+    async def pause(_seconds):
+        held[0] = True
+    monkeypatch.setattr(server.asyncio, "sleep", pause)
+    assert asyncio.run(server._tripwire_look(
+        tab, url=tab.url, settle_text=True, want_cf=False)) is None
+    assert probes == [True]
 
 
 def test_a_batch_warning_leaves_a_failed_action_counted(monkeypatch):
