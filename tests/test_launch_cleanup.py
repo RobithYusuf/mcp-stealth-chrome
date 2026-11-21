@@ -472,3 +472,41 @@ def test_a_stop_that_was_not_seen_to_end_is_said(env, monkeypatch, tmp_path, whe
     assert said in out and _NOT_SEEN in out, out
     assert out.index(said) < out.index(_NOT_SEEN), "the note comes after the original error"
     assert "The browser was closed" not in out, out
+
+
+@pytest.mark.parametrize("where", ["last look", "storage_state", "navigation", "cookie_move"])
+def test_a_privacy_profile_that_could_not_be_removed_is_said_and_kept_for_later(env, monkeypatch, tmp_path, where):
+    """_remove_privacy_profile returns False when the process list cannot be read or a file stays
+    held, and after a storage_state load the folder may hold session data. The failure is said,
+    after the original error, and the path stays on the instance, so the next close removes it."""
+    if where == "last look":
+        env.preflight = {2: "its cookie database changed after this launch read it"}
+        said = "changed after this launch read it"
+    elif where == "cookie_move":
+        env.move = server._CookieMove(plan=None, backup=tmp_path / "backup.json")
+        env.finish = (False, "1 cookie missing")
+        said = "its cookies were not all moved: 1 cookie missing"
+    else:
+        said = _fail_after_the_start(monkeypatch, where)
+    real_remove = server._remove_privacy_profile
+
+    async def cannot_remove(profile_dir):
+        if profile_dir is None:
+            return True
+        monkeypatch.setitem(server._PRIVACY_REMOVE_FAILURES, str(profile_dir),
+                            "a process still runs with it: PID 77 (crashpad)")
+        return False
+
+    monkeypatch.setattr(server, "_remove_privacy_profile", cannot_remove)
+    out = _launch(privacy=True, storage_state_path="/nowhere/state.json" if where == "storage_state" else None)
+    folders = _privacy_folders(env)
+    assert len(folders) == 1, folders
+    left = f"The privacy profile could not be removed: {folders[0]}; a process still runs with it: PID 77"
+    assert said in out and left in out and out.index(said) < out.index(left), out
+    assert server.BrowserState.browser is None
+    assert server.BrowserState.current_profile_dir == folders[0] and server.BrowserState.current_privacy, \
+        "the folder left behind is not kept on the instance, so nothing would remove it"
+    monkeypatch.setattr(server, "_remove_privacy_profile", real_remove)
+    closed = asyncio.run(server.mcp._tool_manager._tools["browser_close"].fn())
+    assert "stale privacy profile removed" in closed, closed
+    assert _privacy_folders(env) == []

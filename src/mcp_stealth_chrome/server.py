@@ -4572,8 +4572,7 @@ async def _launch_start_chrome(req: _LaunchRequest, plan: _LaunchPlan) -> tuple:
     # held across it).
     refused = await _cookie_preflight(plan.profile_path, plan.cookie_move)
     if refused:
-        await _remove_privacy_profile(plan.privacy_profile)
-        return err(refused), None, None
+        return err(refused + await _launch_remove_privacy(plan)), None, None
     ads_pending = (_adblock_module().begin(req.block_ads, plan.config.browser_executable_path)
                    if req.block_ads else None)
     browser: Optional[Browser] = None
@@ -4634,7 +4633,25 @@ async def _launch_start_chrome(req: _LaunchRequest, plan: _LaunchPlan) -> tuple:
     return None, browser, ads_pending
 
 
-async def _launch_end_started_browser(req: _LaunchRequest, plan: _LaunchPlan) -> tuple[dict, bool]:
+async def _launch_remove_privacy(plan: _LaunchPlan) -> str:
+    """Remove this launch's privacy profile, if it made one; "" once it is gone. One that cannot
+    be removed (a process list that cannot be read, a file still held) stays recorded on the
+    instance, as browser_close keeps it, so the next browser_launch (its stale-privacy step) or
+    browser_close removes it; the returned note says so, with the reason. Recorded only while
+    the instance is still the current one: its removal awaits."""
+    iid = BrowserState.current_instance_id
+    if await _remove_privacy_profile(plan.privacy_profile):
+        return ""
+    note = (f" The privacy profile could not be removed: {plan.privacy_profile}"
+            f"{_removal_failure(plan.privacy_profile)}")
+    if BrowserState.current_instance_id != iid:
+        return note + (f"; instance {iid!r} is no longer the current one, so it could not be kept "
+                       f"on it for a later removal.")
+    BrowserState.current_profile_dir, BrowserState.current_privacy = plan.privacy_profile, True
+    return note + "; it is kept on this instance, so the next browser_launch or browser_close removes it."
+
+
+async def _launch_end_started_browser(req: _LaunchRequest, plan: _LaunchPlan) -> tuple[dict, bool, str]:
     """A launch that failed after the start ends its browser as every close path does
     (`_ensure_browser_dead`: stop() can return while Chrome runs on). Once that browser is
     verified gone the instance is reset and the privacy profile removed. One that could not be
@@ -4644,18 +4661,18 @@ async def _launch_end_started_browser(req: _LaunchRequest, plan: _LaunchPlan) ->
     for that instance (_closing_in_background), so a call on it, switch_instance among them,
     waits for the close. Whatever it found is then recorded on that instance only: should it
     no longer be the current one all the same, nothing is recorded and nothing of the current
-    instance is touched. Returns (the close report, whether it was recorded)."""
+    instance is touched. Returns (the close report, whether it was recorded, a note when the
+    privacy profile could not be removed)."""
     iid, browser = BrowserState.current_instance_id, BrowserState.browser
     with _closing_in_background(iid):
         reap = await _ensure_browser_dead(browser, plan.profile_path)
         if not (BrowserState.current_instance_id == iid and BrowserState.browser is browser):
-            return reap, False
+            return reap, False, ""
         if _close_incomplete(reap):
             BrowserState.current_profile_dir, BrowserState.current_privacy = plan.profile_path, req.privacy
-            return reap, True
+            return reap, True, ""
         BrowserState.reset()
-        await _remove_privacy_profile(plan.privacy_profile)
-        return reap, True
+        return reap, True, await _launch_remove_privacy(plan)
 
 
 def _launch_unrecorded_note(iid: str) -> str:
@@ -4694,7 +4711,7 @@ async def _launch_ready_browser(req: _LaunchRequest, plan: _LaunchPlan, browser:
             # Left running, the next browser_launch reuses it and never tries the move again.
             # Ended or kept is read from the close report, never from which browser is current.
             iid = BrowserState.current_instance_id
-            reap, recorded = await _launch_end_started_browser(req, plan)
+            reap, recorded, removal = await _launch_end_started_browser(req, plan)
             if _close_incomplete(reap):
                 closed = (f"The browser could not be closed ({_close_failure(reap)}): call "
                           f"browser_close to try again, then launch again, which resumes the move")
@@ -4703,7 +4720,7 @@ async def _launch_ready_browser(req: _LaunchRequest, plan: _LaunchPlan, browser:
                 ended = "was closed" if reap.get("verified") else "was asked to stop"
                 closed = f"The browser {ended}; launch again, which resumes the move{_kill_note(reap)}"
             return err(f"its cookies were not all moved: {moved_text}. {closed}"
-                       f"{'' if recorded else _launch_unrecorded_note(iid)}")
+                       f"{'' if recorded else _launch_unrecorded_note(iid)}{removal}")
         plan.dock_note += moved_text
 
     if req.storage_state_path:
@@ -4716,8 +4733,8 @@ async def _launch_ready_browser(req: _LaunchRequest, plan: _LaunchPlan, browser:
             raise
         except Exception as e:
             iid = BrowserState.current_instance_id
-            reap, recorded = await _launch_end_started_browser(req, plan)
-            return err(f"storage_state load failed: {e}{_launch_end_note(reap, recorded, iid)}")
+            reap, recorded, removal = await _launch_end_started_browser(req, plan)
+            return err(f"storage_state load failed: {e}{_launch_end_note(reap, recorded, iid)}{removal}")
     return None
 
 
@@ -4745,11 +4762,11 @@ async def _launch_first_page(req: _LaunchRequest, plan: _LaunchPlan) -> tuple:
             _disarm()
     except asyncio.TimeoutError:
         iid = BrowserState.current_instance_id
-        reap, recorded = await _launch_end_started_browser(req, plan)
+        reap, recorded, removal = await _launch_end_started_browser(req, plan)
         return err(
             f"initial nav timed out after {BROWSER_NAV_TIMEOUT}s — Chrome "
             f"started but couldn't load {req.url}. Check network/proxy."
-            f"{_launch_end_note(reap, recorded, iid)}"
+            f"{_launch_end_note(reap, recorded, iid)}{removal}"
         ), None, None
     except asyncio.CancelledError:
         await _safe_stop_browser(BrowserState.browser)
@@ -4758,8 +4775,8 @@ async def _launch_first_page(req: _LaunchRequest, plan: _LaunchPlan) -> tuple:
         raise
     except Exception as e:
         iid = BrowserState.current_instance_id
-        reap, recorded = await _launch_end_started_browser(req, plan)
-        return err(f"initial nav failed: {e}{_launch_end_note(reap, recorded, iid)}"), None, None
+        reap, recorded, removal = await _launch_end_started_browser(req, plan)
+        return err(f"initial nav failed: {e}{_launch_end_note(reap, recorded, iid)}{removal}"), None, None
     return None, main, _launch_observed
 
 

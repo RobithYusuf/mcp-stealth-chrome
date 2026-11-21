@@ -38,6 +38,8 @@ Part of the agent guide: [AGENTS.md](../../AGENTS.md) says when to read this. It
   browser through `_ensure_browser_dead` (`_launch_end_started_browser`), not `stop()` alone; one that could not
   be ended (there, or after a cookie move left unfinished) keeps the handle, naming the profile, so
   `browser_close` or the next launch ends it first, and the result says so. A cancelled launch still uses `stop()`.
+  A privacy profile those paths could not remove is said after the original error, with the reason, and stays
+  recorded on the instance (`_launch_remove_privacy`), as `browser_close` keeps its own, so the next launch removes it.
 
 ## Closing: never report a close that did not happen
 
