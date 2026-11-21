@@ -18,6 +18,9 @@ BRANCHES_VAR = "__branches__"
 MAX_EXECUTED_STEPS = 2000
 MAX_FOREACH_ITEMS = 1000
 MAX_REPORTED_ENTRIES = 200
+# Failed or ignored steps past MAX_REPORTED_ENTRIES that a shorter report still shows, as many as
+# failed_paths lists: past the cap their entries are otherwise gone.
+MAX_LATE_FAILURES = 100
 RESULT_PREVIEW = 500
 # How far back from RESULT_PREVIEW a cut looks for a line break or ", " to end on.
 PREVIEW_BREAK_WINDOW = 80
@@ -212,6 +215,9 @@ class _Run:
     tally: dict[str, dict[str, int]] = field(default_factory=dict)
     saved: set[str] = field(default_factory=set)
     last: Optional[dict] = None
+    # Failed or ignored entries past the cap (the first MAX_LATE_FAILURES), and how many more.
+    late_failures: list[dict] = field(default_factory=list)
+    late_failures_omitted: int = 0
 
 
 def _dotted(path: list[int]) -> str:
@@ -229,8 +235,13 @@ def _record(run: _Run, entry: dict) -> None:
         run.tally.setdefault(name, {"ok": 0, "failed": 0, "ignored": 0})[kind] += 1
     if len(run.entries) < MAX_REPORTED_ENTRIES:
         run.entries.append(entry)
-    else:
-        run.omitted += 1
+        return
+    run.omitted += 1
+    if not entry.get("ok"):  # failed or ignored: a shorter report must still show it
+        if len(run.late_failures) < MAX_LATE_FAILURES:
+            run.late_failures.append(entry)
+        else:
+            run.late_failures_omitted += 1
 
 
 def _fail(run: _Run, path: list[int], step: Any, error: str) -> None:
@@ -456,8 +467,18 @@ def _shorten(full: dict, run: _Run, output: str, given: dict) -> dict:
                            "counts": _counts(run.tally), "shown": shown}
     if len(shown) < len(reported):
         out["not_shown"] = len(reported) - len(shown)
-    if output == "summary" and run.last is not None and not any(e is run.last for e in reported):
-        shown.append(run.last)  # the last step ran past the report cap; a summary still shows it
+    # Past the cap: the failed or ignored steps (the first MAX_LATE_FAILURES), and the last step
+    # (in failures only when it failed). They ran after every reported entry, so order is kept.
+    late, cut = list(run.late_failures), run.late_failures_omitted
+    last = run.last
+    if (last is not None and not any(e is last for e in reported) and not any(e is last for e in late)
+            and (output == "summary" or not last.get("ok"))):
+        late.append(last)
+        if not last.get("ok"):
+            cut -= 1  # a failed last step the bound had cut is shown after all
+    shown.extend(late)
+    if cut:
+        out["failed_or_ignored_not_shown"] = cut
     for key in ("completed_omitted", "failed_count", "failed_paths"):
         if key in full:
             out[key] = full[key]

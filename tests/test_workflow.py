@@ -751,3 +751,38 @@ def test_a_cut_step_keeps_its_whole_result_in_vars_with_save_as():
     entry = result["completed"][0]
     assert _cut_at(entry["result"], long) == RESULT_PREVIEW
     assert result["vars"]["page"] == long and result["vars"]["last"]["text"] == long
+
+
+# ── review of the branch: failed or ignored steps past the report cap ──────
+
+
+@pytest.mark.parametrize("output", ["summary", "failures"])
+def test_a_failure_past_the_cap_is_shown_not_only_counted(output):
+    """Counted in failed_count, listed in failed_paths, but its entry (and error) was in no list."""
+    steps = [{"tool": "step"}] * 200 + [{"tool": "bad"}, {"tool": "skip", "continue_on_error": True},
+                                        {"tool": "end"}]
+    responses = {"bad": "Error: failed here", "skip": "Error: ignored here", "end": "done"}
+    full, _ = run(steps, responses, stop_on_error=False)
+    short, _ = run(steps, responses, stop_on_error=False, output=output)
+    assert full["completed_omitted"] == 3 and len(full["completed"]) == 200  # full as it was
+    late = [(e["index"], e["result"]) for e in short["shown"] if e["index"] in (200, 201)]
+    assert late == [(200, "Error: failed here"), (201, "Error: ignored here")]
+    assert short["counts"]["failed"] == 1 and short["counts"]["ignored"] == 1
+    assert [e["index"] for e in short["shown"]][-1] == (202 if output == "summary" else 201)
+    assert "failed_or_ignored_not_shown" not in short
+
+
+def test_late_failures_are_bounded_and_the_bound_says_so():
+    steps = [{"tool": "step"}] * 200 + [{"tool": "bad"}] * 130 + [{"tool": "end"}]
+    short, _ = run(steps, {"bad": "Error: no", "end": "done"}, stop_on_error=False, output="failures")
+    late = [e for e in short["shown"] if e["index"] >= 200]
+    assert len(late) == 100 and late[0]["index"] == 200 and late[-1]["index"] == 299
+    assert short["failed_or_ignored_not_shown"] == 30 and short["failed_count"] == 130
+
+
+def test_a_failed_last_step_cut_by_the_bound_is_still_shown():
+    steps = [{"tool": "step"}] * 200 + [{"tool": "bad"}] * 101
+    short, _ = run(steps, {"bad": "Error: no"}, stop_on_error=False, output="summary")
+    assert short["shown"][-1]["index"] == 300
+    assert "failed_or_ignored_not_shown" not in short  # the one the bound cut is the one shown
+    assert sum(1 for e in short["shown"] if not e["ok"]) == 101
