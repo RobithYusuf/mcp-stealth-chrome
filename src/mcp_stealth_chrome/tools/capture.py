@@ -528,6 +528,15 @@ def _har_entry(entry: dict) -> dict:
     url = entry.get("url") or ""
     body = entry.get("request_body")
     wall = entry.get("wall_time")
+    timestamp_note = None
+    if wall:
+        try:
+            started = datetime.fromtimestamp(float(wall), timezone.utc).isoformat()
+        except (OSError, OverflowError, ValueError):
+            started = datetime.now(timezone.utc).isoformat()
+            timestamp_note = "wall_time was unusable; startedDateTime is the export time"
+    else:
+        started = ""
     request: dict[str, Any] = {
         "method": entry.get("method") or "",
         "url": url,
@@ -543,9 +552,8 @@ def _har_entry(entry: dict) -> dict:
         kind = next((v for k, v in (entry.get("request_headers") or {}).items()
                      if k.lower() == "content-type"), "")
         request["postData"] = {"mimeType": kind, "text": body}
-    return {
-        "startedDateTime": (datetime.fromtimestamp(float(wall), timezone.utc).isoformat()
-                            if wall else ""),
+    out = {
+        "startedDateTime": started,
         "time": -1,
         "request": request,
         "response": {
@@ -564,6 +572,9 @@ def _har_entry(entry: dict) -> dict:
         "_resourceType": entry.get("type"),
         "_requestId": entry.get("request_id"),
     }
+    if timestamp_note:
+        out["_timestampNote"] = timestamp_note
+    return out
 
 
 @mcp.tool()

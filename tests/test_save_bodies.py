@@ -335,7 +335,7 @@ def _invariant(saver):
 
 def _request(saver, sid, rid, url="https://x.test/api/1"):
     saver._on_event("Network.requestWillBeSent", {
-        "requestId": rid, "request": {"url": url}, "documentURL": "https://x.test/p", "wallTime": 1.0,
+        "requestId": rid, "request": {"url": url}, "documentURL": "https://x.test/p", "wallTime": 1700000000.0,
         "type": "Fetch"}, sid)
     saver._on_event("Network.responseReceived", {
         "requestId": rid, "response": {"url": url, "status": 200, "mimeType": "application/json"}}, sid)
@@ -440,6 +440,17 @@ def test_a_write_error_is_counted(tmp_path, monkeypatch):
     saver._writer.shutdown()
 
 
+
+def test_an_unusable_wall_time_falls_back_to_write_time(tmp_path):
+    saver = _saver(tmp_path)
+    _request(saver, "S", "r")
+    request = saver.pending[("S", "r")]
+    request.wall = 1e100
+    saver._write(request, '{"a": 1}', False)
+    record = json.loads((tmp_path / "pdp.jsonl").read_text().splitlines()[0])
+    assert record["meta"]["ts_note"] == "wallTime was unusable; ts is the write time"
+    assert record["meta"]["ts"][:4].isdigit()
+    saver._writer.shutdown()
 def test_the_status_never_shows_a_value_of_the_body(tmp_path):
     saver = _saver(tmp_path, mode="all", entries=body_saver.parse_entries(
         [{"url_pattern": "*/api/*", "name": "pdp"}]))
