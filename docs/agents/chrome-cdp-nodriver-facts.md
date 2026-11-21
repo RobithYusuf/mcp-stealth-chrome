@@ -218,7 +218,10 @@ Platform truths, not preferences. Each one cost a release.
 
 - `os.kill(pid, 0)` is no liveness probe on Windows (0 is `CTRL_C_EVENT`, sent via `GenerateConsoleCtrlEvent`;
   `signal.SIGKILL` does not exist): every close reported Chrome still running. Probe through `_process_exists`
-  (`OpenProcess`/`GetExitCodeProcess`, `state._win_pid_alive`), never `os.kill(pid, 0)`.
+  (`OpenProcess`/`GetExitCodeProcess`, `state._win_pid_alive`), never `os.kill(pid, 0)`. Two probes missed
+  it until 0.26.1: `presence._pid_alive`, whose Ctrl+C stopped the Windows fast test job a few seconds into
+  the overlay tests in every run since at least 0.25.12, and `browser_recover`'s. A test now fails on any
+  `os.kill(x, 0)` in the package without a `win32` branch before it (`test_focus_restore.py`).
 - Nothing on the event loop may shell out to `ps` on Windows: a person's machine has none, the runner's is Git Bash's.
   `_process_command` ran it at every close, blocking the loop 1.1 s up to its 3 s timeout. Command lines come from
   `state.process_table()`.

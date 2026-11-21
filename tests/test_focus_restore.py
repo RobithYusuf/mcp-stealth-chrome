@@ -568,3 +568,30 @@ def test_background_tab_is_asked_for_without_a_new_window():
     assert asyncio.run(server._open_background_tab(browser)) is tab
     assert sent[0]["method"] == "Target.createTarget"
     assert sent[0]["params"]["background"] is True and not sent[0]["params"].get("newWindow")
+
+
+def test_no_liveness_probe_sends_signal_zero_on_windows():
+    """os.kill(pid, 0) on Windows is GenerateConsoleCtrlEvent(CTRL_C_EVENT): it interrupts the
+    console group instead of asking whether the process lives. Every function of the package
+    that probes with it first sends Windows elsewhere; browser_recover's probe sent Ctrl+C there.
+    _agent_overlay.py and _quit_watcher.py are standalone scripts that never run on Windows."""
+    import ast
+    import pathlib
+
+    package = pathlib.Path(server.__file__).parent
+    probes = []
+    for path in sorted(package.rglob("*.py")):
+        if path.name in ("_agent_overlay.py", "_quit_watcher.py"):
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for call in ast.walk(fn):
+                if (isinstance(call, ast.Call) and ast.unparse(call.func) == "os.kill" and len(call.args) == 2
+                        and isinstance(call.args[1], ast.Constant) and call.args[1].value == 0):
+                    guarded = any(isinstance(node, ast.Compare) and "win32" in ast.unparse(node)
+                                  and node.lineno < call.lineno for node in ast.walk(fn))
+                    probes.append((f"{path.relative_to(package)}:{fn.name}", guarded))
+    assert probes, "the scan found no probe at all"
+    assert [name for name, guarded in probes if not guarded] == []

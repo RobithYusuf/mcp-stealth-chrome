@@ -120,6 +120,11 @@ def _read(path: Path) -> Optional[dict]:
 
 
 def _pid_alive(pid: int) -> bool:
+    if sys.platform == "win32":
+        # os.kill(pid, 0) is no probe on Windows: 0 is CTRL_C_EVENT, sent through
+        # GenerateConsoleCtrlEvent, and it interrupted the test run that called it.
+        from .state import _pid_alive as alive
+        return alive(pid)
     try:
         os.kill(pid, 0)
         return True

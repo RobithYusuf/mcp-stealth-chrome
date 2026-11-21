@@ -155,7 +155,7 @@ def test_the_overlay_starts_with_the_file_and_what_the_environment_fixed(sfile, 
 def _overlay_rule(settings_file, fixed):
     """The overlay's own settings functions, taken from its source: the script imports AppKit at
     the top, so it cannot be imported here."""
-    source = (Path(presence.__file__).with_name("_agent_overlay.py")).read_text()
+    source = (Path(presence.__file__).with_name("_agent_overlay.py")).read_text(encoding="utf-8")
     tree = ast.parse(source)
     wanted = {"read_settings", "write_settings", "_merge_settings", "_flag", "chosen_style"}
     body = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in wanted]
@@ -246,7 +246,7 @@ def test_two_writers_at_once_lose_no_choice(sfile):
 
 def _overlay_live(fixed, cursor_at_start=False, show_cursor=False):
     """Overlay.apply_timing_and_cursor with the globals it uses, taken from the overlay's source."""
-    source = (Path(presence.__file__).with_name("_agent_overlay.py")).read_text()
+    source = (Path(presence.__file__).with_name("_agent_overlay.py")).read_text(encoding="utf-8")
     tree = ast.parse(source)
     flag = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_flag")
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Overlay")

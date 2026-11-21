@@ -4265,6 +4265,6 @@ def test_no_refusal_tells_the_caller_to_end_processes_by_name():
 
     package = pathlib.Path(server.__file__).parent
     found = [f"{path.name}:{number}" for path in sorted(package.rglob("*.py"))
-             for number, line in enumerate(path.read_text().splitlines(), 1)
+             for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
              if "pkill" in line or "killall" in line]
     assert found == []

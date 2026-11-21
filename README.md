@@ -315,10 +315,10 @@ Measured in November 2026 on one Mac (M4 Pro, Chrome 157, headless, a throwaway 
 | Snapshot of the Wikipedia page | 2,405 tokens for the first 100 elements, 100,127 for all | 225,658 tokens |
 | Start the browser and load the first page | 1.07 s | 0.66 s |
 | Memory with one page open | 941 MB in 10 processes | 585 MB in 6 processes |
-| Tool definitions sent to the client | about 39,500 tokens for 169 tools | 7,300 tokens for 32 tools |
+| Tool definitions sent to the client | about 32,900 tokens for 169 tools | 7,300 tokens for 32 tools |
 
 - ✅ Faster at opening pages, clicking, filling and reading, and smaller snapshots. A snapshot here lists what can be acted on; the other server's lists the whole accessibility tree including text, so the two are not the same content.
-- ❌ Slower to start, heavier in memory, and its tool list costs a client that loads every definition about five times as much. `profile_mode="light"` brought one page to about 630 MB in 7 processes, at the cost described under Speed, memory and disk.
+- ❌ Slower to start, heavier in memory, and its tool list costs a client that loads every definition about four and a half times as much. `profile_mode="light"` brought one page to about 630 MB in 7 processes, at the cost described under Speed, memory and disk.
 - Tokens were counted with the `o200k_base` tokenizer as an estimate.
 </details>
 
