@@ -28,7 +28,8 @@ Platform truths, not preferences. Each one cost a release.
      folder's real path, the sub-profile, the backup's sha256 and count); then `strip` deletes the `v10` rows beside the
      `v11` ones: every database checked first, then each in a `BEGIN IMMEDIATE` transaction rechecking that each row is
      in the backup by key and is the copy's very row (digest of every column but `last_access_utc`).
-  4. Only now `clean_profile_state`, the window-state wipe and mkdir, so a refusal writes nothing in the profile. Chrome
+  4. Only now the vertical tabs and brave_lean settings (in `browser_launch`), `clean_profile_state`, the window-state
+     wipe and mkdir, so a refusal writes nothing in the profile. Chrome
      starts without the flag; `_finish_cookie_move` sets the cookies (`Storage.setCookies`) and compares keys and sha256
      digests of value, flags and partition, and expiry (within a second, or capped by Chrome's 400 days). All equal is
      `done`; else an error naming the keys, never a value, and it stays `pending`.

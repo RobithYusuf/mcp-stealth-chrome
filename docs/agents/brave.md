@@ -19,7 +19,8 @@ Part of the agent guide: [AGENTS.md](../../AGENTS.md) says when to read this. It
 - A `--user-data-dir` in `extra_args` is the profile that really opens (Chromium reads the last copy, nodriver puts its
   own first), so `_profile_from_extra_args` takes it out and makes it the launch's profile folder before any check: the
   binding, the version guard and the cookie plan see the folder the browser gets. Two different ones, or one without a
-  value, are refused. `--profile-directory` must be one folder name, and copies must agree.
+  value, are refused. `--profile-directory` must be one folder name, and copies must agree. No later check looks for
+  one in extra_args: none survives (`_SWITCH` takes every `--user-data-dir=` spelling, proved in `test_launch_cleanup.py`).
 - A held Brave profile falls back to `brave-profile-pid<N>` (or `brave-profiles/<id>-pid<N>`). `profile_gc`,
   `profile_report` and `profile_cleanup` know `brave-profile`, `brave-profiles/*` and `brave-profile-pid<N>` exactly as
   they know Chrome's names, with the same checks; nothing else is matched.
@@ -52,6 +53,14 @@ Part of the agent guide: [AGENTS.md](../../AGENTS.md) says when to read this. It
 
 ## Launch details
 
+- `browser_launch` writes the vertical tabs and brave_lean settings after `_cookie_preflight` and
+  `_commit_cookie_move`, so a refusal there writes neither (they ran before both and left the tab setting).
+  vertical_tabs is checked before the preflight (`check_vertical_tabs`, writing nothing; the write checks again),
+  so a failed check refuses before anything is written. The check only reads, so any failure of the write itself
+  (a profile that changed since, a sub-profile folder that cannot be written, a full disk) refuses after the
+  commit: that refusal says nothing was started and what the cookie step had already committed, which a pending
+  marker makes the next launch resume. Do not add a trial write before the preflight: it would be a write.
+  `spawn_browser` still writes them before the preflight.
 - Vertical tabs are Preferences keys written before launch (`brave.tabs.vertical_tabs_enabled`,
   `brave.tabs.vertical_tabs_on_right`; Chrome `vertical_tabs.enabled`), merged into the sub-profile's file through a
   temporary file and `os.replace`; a Preferences file that does not parse fails the launch rather than being replaced.

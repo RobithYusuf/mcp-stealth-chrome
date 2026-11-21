@@ -97,6 +97,29 @@ conclusions. Each rule below replaced a real lie.
   cookies makes `storage_diff` blame the action under test).
 - Absence of evidence is not evidence: `_ensure_browser_dead()` sets `verified` only when a process was positively
   observed gone; with no PID and no profile to scan it stays false, and no clean close may be claimed.
+  `_close_incomplete` does not count that as a failure, so every result built on such a report adds `_kill_note`
+  ("stop was requested, but no process could be checked to confirm it ended"): `browser_close`, and the failure
+  paths of `browser_launch` after the start, where the cookie path says "asked to stop", not "was closed". A kept
+  handle's note says to call browser_close to try again, never that it will end the browser.
+- A cookie refusal says "the profile was not changed" only where that holds. The last `_cookie_preflight` of
+  `browser_launch` comes after the commit, the vertical tabs and lean writes and the tidy-up, so it is passed what
+  this launch had written (`_launch_written`) and says "Nothing was started; this launch had already written ...".
+  Only what was written is said as written; the tidy-up (`clean_profile_state`, the window-state wipe) can change
+  nothing, so it is said as run ("run its tidy-up of stale locks and window state"). The first look keeps Chrome's
+  text byte for byte. Known gap: a refusal of `_commit_cookie_move` itself still says
+  "not changed" after its marker was written (shared with spawn_browser).
+- A launch cut short by `browser_recover` is an error that says so, never the success of a step it had
+  reached: "browser_launch of instance 'main' did not finish. browser_recover asked this launch to stop
+  while it ran. Its browser was ended." It says the recover asked it to stop, not that the recover reset
+  anything: the recover marks the launch before it waits, and may then find another pair and reset
+  nothing; its own result says whether it reset. An error the step had already reached stays first, with
+  that sentence after it; a cut after the cookie commit says what the launch had written. A launch the
+  recover had to cancel says so ("it was cancelled at the step it was waiting on"), and that its browser
+  was asked to stop without a checked end. A tool refused during a launch says it was not done and to
+  call it again once the launch has returned, nothing about when.
+  A `browser_recover` whose instance stopped being the current one, or came to hold another browser, while
+  it ran resets nothing and is an error saying which ("browser_recover did not reset: instance 'main'
+  stopped being the current one while this recover ran, ..."), then what it did; never "recovered".
 - `fill_form` fails when a field fails, and then does not click submit. `batch_actions` counts failures by the `Error:`
   prefix, so a failure reported through `ok()` counts as success. Non-list or empty input is an error, not
   `0 actions OK`; a non-object item is a counted failure.

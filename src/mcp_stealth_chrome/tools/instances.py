@@ -35,7 +35,6 @@ from ..state import (
     BrowserState,
     InstanceSnapshot,
     chrome_install_hint,
-    clean_profile_state,
     find_external_chrome_pids,
 )
 
@@ -235,7 +234,7 @@ async def _launch_browser_instance(
         # Only now: clean_profile_state and mkdir write, and a refusal writes nothing.
         profile_path.mkdir(parents=True, exist_ok=True)
         if persistent or profile_dir_override:
-            clean_profile_state(profile_path)
+            _srv.clean_profile_state(profile_path)
     refused = await _srv._cookie_preflight(profile_path, cookie_move)  # the last look; see browser_launch
     if refused:
         await _srv._remove_privacy_profile(privacy_profile)
@@ -657,6 +656,10 @@ async def switch_instance(instance_id: str) -> str:
     still = await _app_module.wait_while_closing(BrowserState.session_key(), instance_id)
     if still:
         return still
+    # A launch can have begun while this waited: the gate saw none when the call came in.
+    refused = _srv._launch_gate("switch_instance")
+    if refused:
+        return refused
     BrowserState.claim_released(instance_id)
     existed = instance_id in BrowserState.instances
     BrowserState.switch_to(instance_id)
@@ -763,7 +766,7 @@ async def _close_instance_now(instance_id: str, forget_tabs: bool) -> str:
                     return err(f"closed browser but failed to remove privacy profile {_profile}"
                                f"{_srv._removal_failure(_profile)}")
             elif _profile:
-                clean_profile_state(_profile)
+                _srv.clean_profile_state(_profile)
             _srv._ATTACHED_BROWSERS.discard(_iid)
             return ok(f"closed current instance {instance_id!r}" + _srv._kill_note(_kill) + _forgot)
         if BrowserState.current_privacy:
@@ -810,7 +813,7 @@ async def _close_instance_now(instance_id: str, forget_tabs: bool) -> str:
     if snap.privacy:
         cleanup_ok = await _srv._remove_privacy_profile(snap.profile_dir)
     elif snap.profile_dir:
-        clean_profile_state(snap.profile_dir)
+        _srv.clean_profile_state(snap.profile_dir)
     if not cleanup_ok:
         return err(f"closed browser but failed to remove privacy profile {snap.profile_dir}"
                    f"{_srv._removal_failure(snap.profile_dir)}")
@@ -856,7 +859,7 @@ async def _close_all_instances_now() -> str:
                                 f"{_srv._removal_failure(snap.profile_dir)})")
                 continue
         elif snap.profile_dir:
-            clean_profile_state(snap.profile_dir)
+            _srv.clean_profile_state(snap.profile_dir)
         BrowserState.instances.pop(iid, None)
         closed.append(iid)
     # Close current. The handle, not is_up(): see browser_close.
@@ -880,7 +883,7 @@ async def _close_all_instances_now() -> str:
             if _current_privacy:
                 cleanup_ok = await _srv._remove_privacy_profile(_current_profile)
             elif _current_profile:
-                clean_profile_state(_current_profile)
+                _srv.clean_profile_state(_current_profile)
             if cleanup_ok:
                 closed.append(BrowserState.current_instance_id)
                 BrowserState.reset()

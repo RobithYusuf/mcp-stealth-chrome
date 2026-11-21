@@ -32,6 +32,14 @@ Part of the agent guide: [AGENTS.md](../../AGENTS.md) says when to read this. It
   reads it BACK: Chrome clamps a window onto a connected display, so a mismatched read-back proves the monitor is gone
   (no display API is queried). Implausible sizes and minimised/fullscreen states are refused; `wipe_window_state()`
   still clears Chrome's own copy, the cure for the corrupt-placement invisible-window bug.
+- A `browser_launch` refused after it made its privacy profile removes that profile on every path, the last
+  `_cookie_preflight` before the start included (it returned and left the folder; `test_launch_cleanup.py`).
+  After the start it goes only once the browser is verified gone. A failed storage_state or first page ends the
+  browser through `_ensure_browser_dead` (`_launch_end_started_browser`), not `stop()` alone; one that could not
+  be ended (there, or after a cookie move left unfinished) keeps the handle, naming the profile, so
+  `browser_close` or the next launch ends it first, and the result says so. A cancelled launch still uses `stop()`.
+  A privacy profile those paths could not remove is said after the original error, with the reason, and stays
+  recorded on the instance (`_launch_remove_privacy`), as `browser_close` keeps its own, so the next launch removes it.
 
 ## Closing: never report a close that did not happen
 
@@ -118,15 +126,116 @@ Part of the agent guide: [AGENTS.md](../../AGENTS.md) says when to read this. It
   facts under Chrome, CDP and nodriver), failing 14 of 32 runs (`tab_new` erring or hanging past 60 s, or `tab_select`
   reading the empty list as "tab 0 out of range").
 - A sweep closing an instance registers it in `_app.INSTANCE_CLOSING`; a call on it, `switch_instance` to it and
-  `close_instance` of it wait for the close. After each await the sweep checks its candidate is still where it found
+  `close_instance` of it wait for the close, all but `browser_recover` and `server_status` (see below). After each await the sweep checks its candidate is still where it found
   it (`_still_held`): with one switched in mid-close, the close's `reset()` wiped whichever instance was current.
   `close_instance`, `close_all_instances` and `browser_close` register too, before their first await, and both sweeps
-  skip a registered instance, or a stored one could be closed twice at once. A close still running after 60 s is an
+  skip a registered instance, or a stored one could be closed twice at once. So does a `browser_launch` that fails
+  after the start (`_launch_end_started_browser`): its close awaits, and a `switch_instance` let through meanwhile
+  had the close reset the instance switched in, or give it the failed launch's profile. What the close finds is
+  recorded on its own instance only; one no longer current is left alone and the result says so. A close still running after 60 s is an
   error naming it (`wait_while_closing` returns why): going ahead let the caller act on a state the close then
   changed.
 - A tool answering from the tab list goes through `_tab_list_problem`, which names why the browser went
   (`window_closed` carries the idle note) and refuses a list the browser did not confirm (`_refresh_tabs` returns
   False).
+
+## Who may change the current instance during a launch
+
+- `browser_launch` awaits between its steps (the stale browser, the profile reservation, a reattach, the
+  cookie move, the start, storage_state, the first navigation, the window, the saved tabs) and works on the
+  current instance across them. A `switch_instance` let through meanwhile had the later steps and the failure
+  cleanup act on the instance switched in (its browser closed, or the failed launch's profile written onto
+  it), and the success path recorded the new browser there. So a launch marks its session (`_LAUNCHING`: the
+  instance and the task) before its first await and clears the mark however it ends, a raise or a cancel
+  included; a mark whose task is done counts as absent, so a mark left behind refuses nothing.
+- While the mark stands, `_launch_gate` (one of `_app.CALL_GATES`, so before the tool runs) refuses
+  `switch_instance`, `attach_to_chrome`, `detach`, `browser_close`, `close_all_instances`, `spawn_browser` and
+  `close_instance` of the launching instance: "browser_launch of instance 'main' is in progress in this
+  session; switch_instance was not done. Call it again once the launch has returned." Refused, not made to
+  wait, as `spawn_browser` refuses a second launch, and the text promises nothing about when. Page tools are
+  not refused. A second launch in the session is refused by `browser_launch` itself, `instance_release`
+  refuses the current instance by itself, and `close_instance` of another instance acts on its stored
+  snapshot. `spawn_browser`'s own refusal holds only while `_LAUNCH_LOCK` is held, which left the stale
+  browser step open, so the gate refuses it too.
+- A call that was already running when the launch began passed the gate before there was a mark. Two are
+  guarded. The launch notes what the instance's slot holds once its own first steps are done
+  (`launching.slot`: a stale handle ended, a running browser not reused) and publishes its browser only
+  over that; otherwise it ends its own browser and says another call took the instance (an
+  `attach_to_chrome` that published, or a switch), and a reattach gives the kept browser back for the same
+  reason (`_launch_cut_reason`). `switch_instance` looks at the gate again after its own wait for a close.
+  A privacy profile the launch could not remove is not recorded on an instance holding another browser.
+  Known limit, left for 0.27: every other tool already running when a launch begins is not checked again.
+- `tests/test_launch_owner.py` finds every tool that can change the current instance or end its browser (an
+  AST walk for writes of `BrowserState.browser` or `current_instance_id` and calls of `reset`, `switch_to`,
+  `restore_from`, `release_instance`) and fails on one that is neither in `_REFUSED_DURING_LAUNCH` nor in
+  `_ALLOWED_DURING_LAUNCH` with its reason. A new such tool goes into one of the two. None of them may become
+  a workflow tool: `batch_actions` and `workflow_run` call tools without the gates.
+- `browser_recover` is never refused by the launch gate or the closing wait: it is the way out of a stuck
+  state, and a launch hung on an await nobody bounded would otherwise leave the session no exit but a
+  restart. The overlay's gate still refuses it while the person holds the browser (Take over), on purpose:
+  that browser is theirs, and recover also leaves a browser the person opened from the launcher alone while
+  it answers. It does what it did (stops the current browser, signals its profile's PIDs, resets), and first
+  marks the launch (`ended_by`) before it stops or resets anything. After every await `browser_launch` looks
+  (`_launch_settle`): a launch cut short ends as an error naming `browser_recover`, ends the browser it
+  started or took over through `_ensure_browser_dead`, once, removes its privacy profile, and records
+  nothing more: no handle for a browser that ended, no tabs, no watcher, no keep_alive record. An error the
+  step had already reached stays first; a success it reached does not count. The start does not begin once
+  the launch is cut short. A browser that could not be ended keeps a handle on its instance, naming its
+  profile, as every close path keeps one. Known limit: a recover that began on that same browser then
+  resets it, as it resets any browser it could not end, after signalling that browser's PIDs.
+- Cancelling a task that awaits `asyncio.to_thread` does not stop the thread. A write to the profile that
+  runs in a thread (the cookie move's marker and strip, its backup, the removal of a privacy profile) goes
+  through `_write_in_thread`: the thread is awaited under `asyncio.shield`, and a cancel that comes
+  meanwhile, again and again under an anyio scope, waits for it to return before it goes on up. The write
+  is bounded by itself (SQLite's busy timeout, a file write and rename), so the cancel path never runs
+  beside a half-written profile. Read-only thread calls need none.
+- A launch publishes its browser and that browser's profile and privacy flag in one step with no await
+  between (`_launch_ready_browser`; the other places that publish a handle already did): a recover in
+  between paired the new browser with the old profile path and signalled the PIDs of whichever Chrome had
+  that folder. With a browser in hand, `browser_recover` looks for PIDs only in a profile proved to be that
+  browser's (`_profile_is_browsers`: its `Config.user_data_dir`), else in none, and says so. Known limit,
+  from before: on an empty slot it still scans the profile the instance last recorded, for orphans, though
+  another Chrome may hold that folder by now.
+- A launch hung on an await that never returns never reaches its next look. So the recover gives the
+  launch it marked `_RECOVER_LAUNCH_WAIT` (2 s) to end by itself, then cancels its task and waits as long
+  again; its result says which. The cancel paths stop the launch's browser (`_launch_cancelled`: stop()
+  without a verified end, the instance reset only while it holds that browser, the privacy profile
+  removed), and the launch answers that it was cancelled. The launch runs in a task of its own
+  (`_launch_run`), not the request's: FastMCP runs a session's requests in one anyio task group, and a task
+  cancelled from outside the group cancels its siblings (measured: the recover's own call was cancelled
+  too). A client's cancel of the launch still reaches that task. A mark whose task was cancelled counts as
+  absent even while the task has not ended, so the session is not refused after the recover; a launch lock
+  such a task holds stays held until it ends, and the recover says so.
+- The cleanup after a cancel is bounded too: `_remove_privacy_profile` waits `_HOLDERS_READ_WAIT` (3 s) for
+  each read of the process list (`processes_holding`, `_profile_holders`), and a read that does not answer
+  counts as holders unknown, which keeps the folder (unknown is never gone) and says so. Known limit, as on
+  main: a client's cancel before the browser exists leaves the privacy profile the launch made; profile_gc
+  removes it later.
+- `browser_recover` waits for nothing that can be stuck: it skips the wait for a close of the current
+  instance (`_app.RUNS_DURING_A_CLOSE`, with `server_status`, which only reads; every other tool still
+  waits). A close that never ended answered every call "still being closed ... or browser_recover if it never
+  ends", and the recover met the same wait and gave the same answer. It takes the instance and the browser
+  it acts on before its first await and, after its awaits (a person's browser probe, the 2 s after SIGTERM),
+  resets only that pair: still the current instance, holding the same browser or none. A `switch_instance`
+  meanwhile, or a cut-short launch that kept a handle on a browser it could not end (the recover found the
+  instance empty), used to be reset by what was current: the instance switched in, or the only handle on a
+  live Chrome. Then nothing of the current instance is reset or cleared, and the result is an error saying
+  which and what was done. A recover that found the launch's browser and still finds it resets it, as it
+  resets any browser it could not end.
+- Inside the steps each acts on the launch's own instance and browser (`plan.launching`, `plan.browser`),
+  never on what is current by then: the failure cleanup (`_launch_end_started_browser`), a cancel
+  (`_launch_cancelled`), the saved tabs (recorded only while the launch still holds its instance), the
+  window placement. A step that writes after an await looks again right before the write, not only when
+  it returns: the commit phase after the first look (no cookie commit) and after the commit (no vertical
+  tabs, lean or tidy-up), and the first saved-tab list after it read the pages. A reattach cut short before it recorded the kept browser gives it back as it was (the
+  record names its old server again, nothing ends it): it may be the person's, opened from the launcher.
+  Once recorded it is the launch's browser, and the recover ended it as the current one.
+- The idle reaper and the window sweep skip the launching instance; their next tick sees it. The window
+  sweep looks again after asking Chrome for its page count, before it records a closed note or closes:
+  a launch or a close can begin while it waits for that answer.
+- A call on an instance being closed waits for the close (`INSTANCE_CLOSING`), so a switch sent during the
+  close of a failed launch runs after the launch has returned. A recover sent then does not wait: it marks
+  the launch and resets the instance, and the close finds the instance no longer holding its browser.
 
 ## Headed focus
 

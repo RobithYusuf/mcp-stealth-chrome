@@ -1382,7 +1382,9 @@ def test_ephemeral_launch_claims_no_profile():
 
     path, info = server._resolve_launch_profile("main", persistent=False, profile_conflict="fallback")
     assert path is None and info["actual_profile"] is None
-    assert "resolved_profile or PROFILE_DIR" not in inspect.getsource(server.browser_launch)
+    # browser_launch runs its steps in _launch_run.
+    for fn in (server.browser_launch, server._launch_run):
+        assert "resolved_profile or PROFILE_DIR" not in inspect.getsource(fn)
 
 
 @POSIX_MODE_BITS
