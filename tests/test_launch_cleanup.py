@@ -179,3 +179,65 @@ def test_a_browser_that_could_not_be_ended_after_a_failed_start_is_kept_and_said
     assert len(folders) == 1, "a privacy profile was deleted under a Chrome still running"
     assert server.BrowserState.browser is env.started[0], "the only handle on a live Chrome was dropped"
     assert server.BrowserState.current_profile_dir == folders[0] and server.BrowserState.current_privacy
+
+
+def _spy_profile_writes(env, monkeypatch):
+    """Record when vertical_tabs, brave_lean and the tidy-up run, in env.order."""
+    from mcp_stealth_chrome import brave as brave_mode
+    real_tabs, real_lean, real_clean = (brave_mode.write_vertical_tabs, server._apply_brave_lean,
+                                        server.clean_profile_state)
+
+    def tabs(*a, **kw):
+        env.order.append("vertical_tabs")
+        return real_tabs(*a, **kw)
+
+    def lean(*a, **kw):
+        env.order.append("brave_lean")
+        return real_lean(*a, **kw)
+
+    def clean(*a, **kw):
+        env.order.append("tidy")
+        return real_clean(*a, **kw)
+
+    monkeypatch.setattr(brave_mode, "write_vertical_tabs", tabs)
+    monkeypatch.setattr(server, "_apply_brave_lean", lean)
+    monkeypatch.setattr(server, "clean_profile_state", clean)
+
+
+@pytest.mark.parametrize("refusal", ["preflight", "commit"])
+def test_a_refused_launch_writes_neither_vertical_tabs_nor_lean(env, monkeypatch, refusal):
+    """The guide's rule: a refused launch writes nothing to the profile. Both writes ran before the
+    cookie preflight and the commit, so a refusal there left the tab setting in Preferences."""
+    _spy_profile_writes(env, monkeypatch)
+    if refusal == "preflight":
+        env.preflight = {1: "Chrome PID 99 opened it after this launch checked it"}
+    else:
+        env.commit = "the strip stopped: a row changed since the backup"
+    out = _launch(vertical_tabs="left")
+    assert out.startswith("Error") and "start" not in env.order, out
+    assert "vertical_tabs" not in env.order and "brave_lean" not in env.order, env.order
+    assert not env.profile.exists(), "the refused launch wrote into the profile"
+
+
+def test_vertical_tabs_and_lean_are_written_after_the_commit_and_before_the_start(env, monkeypatch):
+    _spy_profile_writes(env, monkeypatch)
+    out = _launch(vertical_tabs="left")
+    assert "[vertical tabs: on the left]" in out and not out.startswith("Error"), out
+    steps = [s for s in env.order if s in ("prepare", "preflight1", "commit", "vertical_tabs", "brave_lean",
+                                          "tidy", "preflight2", "start")]
+    assert steps == ["prepare", "preflight1", "commit", "vertical_tabs", "brave_lean", "tidy",
+                     "preflight2", "start"], steps
+    from mcp_stealth_chrome import brave as brave_mode
+    assert brave_mode.vertical_tabs_read_back(env.profile, ["--profile-directory=Default"], "chrome") == "left"
+
+
+def test_vertical_tabs_that_cannot_be_written_still_start_nothing(env, monkeypatch):
+    """An unreadable Preferences is refused earlier (the binding check), so the way vertical_tabs
+    still fails is a profile it cannot see free. That refusal now comes after the commit, which a
+    pending marker makes the next launch resume; nothing starts either way."""
+    monkeypatch.setattr(state, "processes_naming", lambda _root: None)
+    out = _launch(vertical_tabs="left")
+    assert "vertical_tabs could not be written into the profile, so nothing was started" in out, out
+    assert "cannot be told" in out and "start" not in env.order, out
+    assert "commit" in env.order, f"the refusal is expected after the commit: {env.order}"
+    assert not (env.profile / "Default" / "Preferences").exists()

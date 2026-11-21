@@ -15,7 +15,8 @@ Part of the agent guide: [AGENTS.md](../../AGENTS.md) says when to read this. It
 - Under the default, anything uncertain (a mark or lean record that does not parse, a write that stopped) applies
   nothing, not even the `--disable-features` flag. Records of folders that are gone are dropped at the next claim. True
   asks for lean anywhere but the person's Brave folder and does not mark; False puts back. `server.py` only calls
-  `_apply_brave_lean` beside the vertical-tabs write. Chrome gets nothing, and the result says so only when `brave_lean`
+  `_apply_brave_lean` beside the vertical-tabs write, in `browser_launch` after the cookie commit and before the
+  tidy-up (see brave.md). Chrome gets nothing, and the result says so only when `brave_lean`
   was passed. A reattach applies nothing and says so whatever brave_lean was (`_lean_on_reattach`).
 
 ## What lean turns off
