@@ -243,7 +243,7 @@ async def _wait_for_human_loop(tab, key, browser, unasked, timeout, baseline, as
             return ok(f"human handoff completed after {elapsed}s: the person pressed "
                       + ("Done in the overlay's bar" if answer == "done"
                          else "Resume agent in the overlay's bar, handing the browser back")
-                      + presence.note_for(browser, asked_since))
+                      + presence.note_for(browser))
         if presence.holds(browser):
             await asyncio.sleep(0.25)
             continue

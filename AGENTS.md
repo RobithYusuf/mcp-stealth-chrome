@@ -1248,9 +1248,16 @@ the person (the same target events as Cmd+T, a followed link, a closed tab).
   the browser in front, 199 to 231 ms (once 1003) from another app, measured with an app window activated over the
   browser. So it floats only when no switch can leave it there (`wants_floating`): nothing covers the browser, another
   app is in front (the browser in front: level 0 just above its window looks the same, and the next app covers both
-  at once), Command is not held (`command_held`, the modifier state, no permission; read on calm ticks too while
-  floating) and no app came to the front in the last `SWITCH_SETTLE` (0.3 s, before the window list shows it).
-  Measured after: 0 ms in 16 of 16 switches.
+  at once) and no app came to the front in the last `SWITCH_SETTLE` (0.3 s, before the window list shows it).
+  Measured after: 0 ms in 16 of 16 switches. A third condition, Command not held, shipped in 0.25.14 and was taken
+  out: it dropped the floating level during a Cmd+Tab TO the browser as well, which then covered the overlay.
+- Coming TO the browser, its windows are raised over an overlay at level 0, and the overlay came back only when a
+  window scan saw it (the list is not yet changed when the activation notice arrives): 241 to 266 ms under the
+  browser's window on 0.25.15, 243 to 256 ms on 0.25.13, measured with another app's window over the browser and a
+  click on its tab strip (the person: "the tab is there, the overlay comes late"). `switched_` now sets `raise_until`
+  when the app that came to the front is the browser, and for `RAISE_FOR` (0.5 s) every tick, at the moving rate,
+  orders the overlay back over the browser's window without asking the window list. Measured after: 0 ms in 8 of 8,
+  and still 0 ms in 8 of 8 switches away.
 - Cost, measured with a benchmark against no overlay at all (macOS 26, 120 Hz display, 15 s runs alternated): WindowServer
   +35 points and the overlay 8 to 9% CPU for the first design, about +10 points and 3% after. What mattered: the light in
   four edge windows under a nine-slice mask drawn once (no live blur, which three blurred rings were), animations asked
@@ -1677,6 +1684,13 @@ uv run mcp-stealth-chrome --http        # one server for many clients (token req
   Chrome started in-process outlives its event loop, because asyncio's subprocess transport raises "Event loop is
   closed" in `close()` before it reaches `kill()`, and at pytest's exit it is reparented to PID 1. One stayed 8
   hours in the person's Dock.
+- A probe that posts synthetic clicks or keys (CGEventPost) acts on the person's screen. Before each click it
+  hit-tests the point (the topmost window there must belong to the process under test, past the Dock's full-screen
+  layer and the overlay's light strips) and refuses otherwise; keys go out only when the focus is known to be in the
+  test's own process, and never Enter. A probe without that check sent 32 clicks at fixed coordinates into the
+  person's own app, because the test browser opens behind it (21 Nov 2026). macOS lets no test process bring an app
+  to the front while the person uses another (cooperative activation: `activateWithOptions`, System Events and a
+  self-activating helper all failed), so a real click on a hit-tested window is the way to activate one.
 - Mutation-check a new guard: reintroduce the bug and confirm the test fails. Two tests in this repo
   passed against a deliberately reintroduced defect and had to be rewritten.
 - After editing `src/`, reinstall (`uv tool install --force .`) and restart the MCP client — a

@@ -593,11 +593,11 @@ def test_the_overlay_floats_only_where_no_app_switch_can_leave_it_above_another_
     f = _overlay_functions("wants_floating", SWITCH_SETTLE=1)
     floats = f["wants_floating"]
     settled = f["SWITCH_SETTLE"] + 1
-    assert floats(False, False, False, settled)            # behind another app, uncovered
-    assert not floats(True, False, False, settled)         # covered: sit just above the browser
-    assert not floats(False, True, False, settled)         # the browser in front: just above it
-    assert not floats(False, False, True, settled)         # Command held: a Cmd+Tab may follow
-    assert not floats(False, False, False, 0.0)            # an app has just come to the front
+    assert floats(False, False, settled)            # behind another app, uncovered: so a Cmd+Tab TO
+    # the browser cannot cover it (a Command rule in 0.25.14 dropped it then, and it showed late)
+    assert not floats(True, False, settled)         # covered: sit just above the browser
+    assert not floats(False, True, settled)         # the browser in front: just above it
+    assert not floats(False, False, 0.0)            # an app has just come to the front
 
 
 def test_an_idle_agent_leaves_the_page_to_the_person():
@@ -674,12 +674,28 @@ def test_a_note_from_the_person_reaches_the_agent_once(made, monkeypatch):
     assert text.startswith(". The person left a note with Resume agent at ")
     assert text.endswith('"I logged in, go on to the checkout"')
     assert presence.note_for(browser, asked) == ""  # once
-    # Not waiting: the next call carries it.
+    # Not waiting: the next result carries it, whatever the tool (wait_for_human and web_search
+    # skip the before-hooks, and a note was lost that way on PROD).
     overlay.control_file.write_text(json.dumps(
         {"holder": "agent", "note_at": asked + 9, "note": "only compare, do not buy", "note_with": "Done"}))
-    asyncio.run(presence.before_tool("get_text", browser, None))
-    note = presence.result_note("s", "page text")
+    note = presence.result_note("s", "page text", browser)
     assert 'the person left a note with Done at' in note and '"only compare, do not buy"' in note
+    assert presence.result_note("s", "again", browser) == "again"
+    # Left before a wait began and passed to no call: the wait still hands it over.
+    overlay.control_file.write_text(json.dumps(
+        {"holder": "agent", "reason": "button", "since": asked + 20, "note_at": asked + 15,
+         "note": "kocak", "note_with": "Resume agent"}))
+    assert '"kocak"' in presence.note_for(browser)
+
+
+def test_a_refusal_carries_the_note_the_person_left(made):
+    """A refused call returns before every hook, so the note goes in the refusal itself."""
+    now = time.time()
+    browser, overlay = made({"holder": "person", "since": now, "note_at": now - 4, "note": "kocak",
+                             "note_with": "Resume agent"})
+    text = presence.refusal("click", browser)
+    assert text.startswith("Error: the person took over") and '"kocak"' in text
+    assert '"kocak"' not in presence.refusal("click", browser)  # once
 
 
 def test_the_idle_time_reaches_the_overlay(tmp_path, monkeypatch):

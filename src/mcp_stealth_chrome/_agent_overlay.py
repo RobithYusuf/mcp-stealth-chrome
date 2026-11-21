@@ -70,12 +70,12 @@ from Quartz import (CAAnimationGroup, CABasicAnimation, CACurrentMediaTime, CAGr
                     CGContextEOFillPath, CGContextSaveGState, CGContextScaleCTM,
                     CGContextSetLineWidth, CGContextSetRGBFillColor,
                     CGContextSetRGBStrokeColor, CGContextSetShadowWithColor, CGContextStrokePath,
-                    CGEventSourceFlagsState, CGEventSourceSecondsSinceLastEventType,
+                    CGEventSourceSecondsSinceLastEventType,
                     CGPathAddLineToPoint,
                     CGPathCloseSubpath, CGPathCreateMutable, CGPathCreateWithEllipseInRect,
                     CGPathMoveToPoint, CGRectMake,
                     CGWindowListCopyWindowInfo, kCAMediaTimingFunctionEaseInEaseOut,
-                    kCATransitionFade, kCGEventFlagMaskCommand, kCGEventKeyDown,
+                    kCATransitionFade, kCGEventKeyDown,
                     kCGEventLeftMouseDown, kCGEventScrollWheel,
                     kCGEventSourceStateHIDSystemState,
                     kCGImageAlphaPremultipliedLast, kCGNullWindowID,
@@ -135,6 +135,7 @@ THIN = 32.0         # and at its thinnest: it breathes between the two (asked fo
 BREATHE = 4.0       # seconds from thick to thin, and as long back
 STRIP = DEPTH + 8   # thickness of the edge windows that carry it: the light is 0 past DEPTH
 SWITCH_SETTLE = 0.3  # after another app comes to the front, stay out of the floating level this long
+RAISE_FOR = 0.5     # after the browser comes to the front, put the overlay back over it on every tick
 TICK = 1 / 20       # the glow's own pace: every update lands on a frame drawn anyway
 TICK_MOVING = 1 / 60  # while the browser window moves: at 20 a second the light trailed a drag
 CALM_EVERY = 2      # with nothing moving, do a tick's work every 2nd tick
@@ -476,25 +477,21 @@ def told(agent, control):
     return "The agent learns it at its next step"
 
 
-def command_held():
-    """Command is down (no permission needed: the modifier state, not the key events)."""
-    return bool(CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState) & kCGEventFlagMaskCommand)
-
-
 def contains(b, x, y):
     return b[0] <= x < b[0] + b[2] and b[1] <= y < b[1] + b[3]
 
 
-def wants_floating(covered_now, browser_front, command_held, since_switch):
+def wants_floating(covered_now, browser_front, since_switch):
     """The floating level keeps the browser, brought to the front by a click, from covering the
     overlay for a frame. It also holds the overlay over whatever app comes to the front next,
     until a scan sees it: 163 and 179 ms of light over the app a Cmd+Tab went to, measured. So
     float only while that cannot happen: nothing covers the browser, another app is in front
     (with the browser in front, sitting just above its window looks the same, and the next app
-    covers both at once), Command is not held (Cmd+Tab, Cmd+H, Cmd+`) and no app has just come
-    to the front, which the window list may not show yet."""
-    return (not covered_now and not browser_front and not command_held
-            and since_switch >= SWITCH_SETTLE)
+    covers both at once), and no app has just come to the front, which the window list may not
+    show yet. A rule that also left the floating level while Command was held (0.25.14) dropped
+    it during a Cmd+Tab TO the browser too, which then covered the overlay until a scan: the
+    person saw the tab first and the overlay late."""
+    return not covered_now and not browser_front and since_switch >= SWITCH_SETTLE
 
 
 def directly_above(wins, ours, target):
@@ -1337,6 +1334,8 @@ class Overlay:
         self.covered = True         # until a scan says otherwise
         self.browser_front = False
         self.switched_at = 0.0      # when another app last came to the front
+        self.raise_until = 0.0      # put the overlay back over the browser on every tick until then
+        self.browser_pid = None
         self.wins = []
         self.scanned_at = 0.0
         self.ticks = 0
@@ -1517,9 +1516,8 @@ class Overlay:
         now = time.time()
         self.ticks += 1
         calm = not (self.pointer.want or self.ripples.visible or now < self.moved_until)
-        if calm and not force and self.ticks % CALM_EVERY and not (self.floating and command_held()):
-            return  # nothing moves: 10 ticks a second are enough (Command held while floating
-            # may be a Cmd+Tab under way: leave the floating level now)
+        if calm and not force and self.ticks % CALM_EVERY:
+            return  # nothing moves: 10 ticks a second are enough
         a = self.read_agent()
         self.check_settings(now)
         if self.closing is not None:
@@ -1547,6 +1545,7 @@ class Overlay:
             leave(True)  # the server is gone
             return
         pid = a.get("pid")
+        self.browser_pid = pid
         scan = force or now - self.scanned_at >= SCAN_EVERY
         need_bounds = scan or now < self.moved_until or self.frame is None
         b = None
@@ -1631,8 +1630,7 @@ class Overlay:
             self.covered = covered(self.wins, wid, b, pid)
             front = NSWorkspace.sharedWorkspace().frontmostApplication()
             self.browser_front = front is not None and front.processIdentifier() == pid
-        self.floating = wants_floating(self.covered, self.browser_front, command_held(),
-                                       now - self.switched_at)
+        self.floating = wants_floating(self.covered, self.browser_front, now - self.switched_at)
 
         loc = NSEvent.mouseLocation()
         key = CGEventSourceSecondsSinceLastEventType(kCGEventSourceStateHIDSystemState, kCGEventKeyDown)
@@ -1819,6 +1817,8 @@ class Overlay:
         if scan and level == NORMAL_LEVEL and not directly_above(
                 self.wins, {p.windowNumber() for p in stack}, wid):
             restack = True
+        if now < self.raise_until:
+            restack = True  # the browser came to the front over the overlay: back over it now
         if restack:
             self.order(stack, wid)
         if fade_in:
@@ -1988,10 +1988,18 @@ class Target(NSObject):
     def switched_(self, note):
         """Another app came to the front, or the Space changed: settle at once."""
         try:
+            now = time.time()
             if note is not None and note.name() == NSWorkspaceActiveSpaceDidChangeNotification:
-                OVERLAY.space_changed_at = time.time()
+                OVERLAY.space_changed_at = now
             else:
-                OVERLAY.switched_at = time.time()
+                OVERLAY.switched_at = now
+                app = note.userInfo().get("NSWorkspaceApplicationKey") if note is not None and note.userInfo() else None
+                if app is not None and OVERLAY.browser_pid and app.processIdentifier() == OVERLAY.browser_pid:
+                    # Activating the browser raises its windows over the overlay's: order it
+                    # back over them now and on every tick for a moment, at the full rate,
+                    # rather than when the next scan of the window list sees it.
+                    OVERLAY.raise_until = now + RAISE_FOR
+                    OVERLAY.moved_until = max(OVERLAY.moved_until, now + RAISE_FOR)
             OVERLAY.tick(force=True)
         except Exception:
             traceback.print_exc()

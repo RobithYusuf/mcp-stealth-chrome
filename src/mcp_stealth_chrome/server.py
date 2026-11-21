@@ -3790,7 +3790,7 @@ def _overlay_after_tool(_name: str) -> None:
 
 
 def _overlay_note(session_key: str, result: str) -> str:
-    return presence.result_note(session_key, result)
+    return presence.result_note(session_key, result, BrowserState.browser)
 
 
 for _hooks, _hook in ((_app_module.CALL_GATES, _overlay_gate),
