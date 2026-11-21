@@ -132,6 +132,22 @@ async def _foreground_for_human(tab: Tab) -> list[str]:
     return actions
 
 
+# ── Handing the browser to a person ───────────────────────────────────────
+# Without the overlay's Done button a page change is the only evidence that a person finished,
+# and a weak one. Shopee moves /buyer/login to /buyer/login/qr a moment after it loads, and a wait
+# measured from the page at request_human_help answered "human handoff completed after 0.0s: page
+# changed" (a research run of about 150 pages, Nov 2026). A page that moves by itself does so within
+# HANDOFF_GRACE of the request, or of a wait_for_human with no request, and no person finishes a
+# login that fast, so until then the baseline follows the page. A changed page counts only once it
+# held HANDOFF_SETTLE: a redirect chain or a page still drawing itself is not a finished state.
+# Neither number was measured: both are estimates of those two times, with room on each side.
+HANDOFF_GRACE = 5.0
+HANDOFF_SETTLE = 2.0
+HANDOFF_POLL = 0.25  # seconds between reads while wait_for_human waits
+_now = time.time      # the handoff's clock: tests replace it and _pause, and nothing sleeps
+_pause = asyncio.sleep
+
+
 @mcp.tool()
 async def request_human_help(objective: str, timeout: float = 300) -> str:
     """Hand a headed local browser to the human without blocking the MCP call.
@@ -154,23 +170,29 @@ async def request_human_help(objective: str, timeout: float = 300) -> str:
                 "browser window could not be confirmed visible"
             )
         key = _srv._target_key(tab)
-        _srv._HUMAN_HELP[key] = {
+        record = {
             "objective": objective,
             "baseline": await _srv._page_sig(tab),
-            "requested_at": time.time(),
+            "requested_at": _now(),
             "timeout": max(0.0, float(timeout)),
         }
-        shown = presence.ask(BrowserState.browser, objective)
-        bar = ("\nThe overlay's bar shows the request with a Done button; wait_for_human ends "
-               "when the person presses it." if shown is not None else "")
+        _srv._HUMAN_HELP[key] = record  # a new request replaces the tab's earlier one
+        record["asked_at"] = presence.ask(BrowserState.browser, objective)
+        if record["asked_at"] is not None:
+            how = ("Call wait_for_human next. The overlay's bar shows the request with a Done "
+                   "button: the wait ends when the person presses it, or on done_url_contains or "
+                   "done_selector. A page change alone does not end it.")
+        else:
+            how = ("Call wait_for_human(done_url_contains=... or done_selector=...). Without "
+                   "either, a page change is weak evidence: it counts only "
+                   f"{HANDOFF_GRACE:g}s after this request and once it held {HANDOFF_SETTLE:g}s, "
+                   "and the request stays pending.")
         lead = ("Browser window raised, but it is not in the foreground" if NOT_IN_FRONT in actions
                 else "Browser is visible and in the foreground")
         return ok(
             f"{lead} ({', '.join(actions) or 'focus requested'}).\n"
             f"Human: {objective}\n"
-            "When finished, leave the page in its completed state. The agent must call "
-            "wait_for_human(done_url_contains=... or done_selector=...); without a "
-            f"specific signal it will wait for a URL/DOM change from this handoff.{bar}"
+            f"When finished, leave the page in its completed state.\n{how}"
         )
     except Exception as e:
         return err(str(e))
@@ -190,10 +212,13 @@ async def wait_for_human(
         done_url_contains: finish as soon as the URL contains this substring
         done_selector: finish as soon as this CSS selector appears
 
-    With neither signal, any URL/DOM change since the handoff counts as done.
-    A timeout is reported as an error — never as a silent success. Without a
-    request_human_help on this tab nothing was handed over, so the result says the change
-    it saw was measured from this call, not from a person's work.
+    While the overlay's bar shows the request, only the person's answer there (Done, Resume
+    agent) or one of these signals ends the wait; the bar shows Done even with overlay_bar off.
+    Without the overlay and without a signal, a page change is weak evidence: it counts only
+    5s after request_human_help (or after this call) and once it held 2s, the result says what
+    changed, and the request stays pending for a later wait. A timeout is an error, and the
+    request stays pending. Without a request_human_help on this tab nothing was handed over, so
+    the result says the change it saw was measured from this call, not from a person's work.
     """
     try:
         tab = BrowserState.active_tab()
@@ -211,87 +236,150 @@ async def wait_for_human(
                 if "timeout" in request
                 else 300.0
             )
-        baseline = request.get("baseline") or await _srv._page_sig(tab)
         # agent_overlay: Done in the bar, or Resume agent after Take over, ends the wait. While
         # the person holds the browser their own clicks change the page, so a change is no answer.
         browser = BrowserState.browser
-        asked_since = float(request.get("requested_at") or time.time())
         presence.waiting_for_person(browser, True)  # the bar: "The agent is waiting for you"
         try:
             return await _wait_for_human_loop(
-                tab, key, browser, unasked, timeout, baseline, asked_since,
-                done_url_contains, done_selector)
+                tab, key, browser, request, unasked, timeout, done_url_contains, done_selector)
         finally:
             presence.waiting_for_person(browser, False)
     except Exception as e:
         return err(str(e))
 
 
-async def _wait_for_human_loop(tab, key, browser, unasked, timeout, baseline, asked_since,
+def _page_key(sig: dict) -> tuple:
+    return (sig.get("url"), sig.get("nodes"), sig.get("len"), sig.get("hash"))
+
+
+class _ChangeWatch:
+    """wait_for_human's page-change rule, used when nothing stronger can answer. Until
+    `grace_until` the baseline follows the page. After it, a page that differs from the baseline
+    counts once it stayed the same for HANDOFF_SETTLE: its URL when that changed (a page that
+    loaded goes on drawing), else its content."""
+
+    def __init__(self, baseline: Optional[dict], grace_until: float):
+        self.baseline = baseline or None
+        self.grace_until = grace_until
+        self.current: dict = {}
+        self.pending: Optional[tuple] = None  # (what has to hold, since when)
+        self.read_once = False
+        self.differed_at_first_read = False
+
+    def changed(self, sig: Optional[dict], now: float) -> bool:
+        first, self.read_once = not self.read_once, True
+        if not sig:  # unreadable, as during a navigation: nothing has held
+            self.pending = None
+            return False
+        if now < self.grace_until or not self.baseline:
+            self.baseline, self.pending = sig, None
+            return False
+        if _page_key(sig) == _page_key(self.baseline):
+            self.pending = None
+            return False
+        self.differed_at_first_read = self.differed_at_first_read or first
+        held = (("url", sig.get("url")) if sig.get("url") != self.baseline.get("url")
+                else ("content",) + _page_key(sig))
+        if self.pending is None or self.pending[0] != held:
+            self.pending = (held, now)
+        self.current = sig
+        return now - self.pending[1] >= HANDOFF_SETTLE
+
+
+def _weak_change(request: dict, watch: _ChangeWatch, elapsed: float, unasked: str) -> str:
+    """A page change, said as what it is: what changed, that the page may have done it, and that
+    the request is still open (only the bar's answer, a selector or a URL close it)."""
+    before, after = watch.baseline or {}, watch.current
+    if before.get("url") != after.get("url"):
+        what = f"the URL went from {before.get('url')!r} to {after.get('url')!r}"
+    else:
+        what = (f"the page's content changed at {after.get('url')!r} (elements {before.get('nodes')} "
+                f"to {after.get('nodes')}, HTML length {before.get('len')} to {after.get('len')})")
+    text = (f"page changed after {elapsed}s, weak evidence only: {what}, and it held "
+            f"{HANDOFF_SETTLE:g}s{unasked}. That can be the page itself (a redirect, a timer, an "
+            "ad), not the person.")
+    if watch.differed_at_first_read:
+        text += " It already differed at this wait's first read, so when it changed is not known."
+    if request:
+        # The next wait measures from the page as reported here; the request keeps its asked
+        # time, so a Done pressed later is still heard.
+        request["baseline"] = after
+        text += (" The request for help stays pending: read the page to judge it. A later "
+                 "wait_for_human still counts as this handoff, and done_selector or "
+                 "done_url_contains confirms it.")
+    return ok(text)
+
+
+async def _wait_for_human_loop(tab, key, browser, request, unasked, timeout,
                                done_url_contains, done_selector) -> str:
     """wait_for_human's wait, while the bar says the agent is waiting."""
-    loop = asyncio.get_event_loop()
-    started = loop.time()
+    started = _now()
+    asked_at = request.get("asked_at")
+    asked_since = float(asked_at or request.get("requested_at") or started)
+    watch = None if done_url_contains or done_selector else _ChangeWatch(
+        request.get("baseline"), float(request.get("requested_at") or started) + HANDOFF_GRACE)
     selector_expr = (
         "(() => JSON.stringify({hit: !!document.querySelector(%s)}))()"
         % json.dumps(done_selector)
         if done_selector else None
     )
-    while loop.time() - started < max(0.0, timeout):
-        elapsed = round(loop.time() - started, 2)
+
+    def done(text: str) -> str:
+        """Strong evidence: the handoff is over, and the bar stops asking."""
+        _srv._HUMAN_HELP.pop(key, None)
+        presence.end_help(browser)
+        return ok(text)
+
+    while _now() - started < max(0.0, timeout):
+        elapsed = round(_now() - started, 2)
         answer = presence.answered(browser, asked_since)
         if answer:
-            _srv._HUMAN_HELP.pop(key, None)
-            presence.end_help(browser)
-            return ok(f"human handoff completed after {elapsed}s: the person pressed "
-                      + ("Done in the overlay's bar" if answer == "done"
-                         else "Resume agent in the overlay's bar, handing the browser back"))
+            return done(f"human handoff completed after {elapsed}s: the person pressed "
+                        + ("Done in the overlay's bar" if answer == "done"
+                           else "Resume agent in the overlay's bar, handing the browser back"))
         if presence.holds(browser):
-            await asyncio.sleep(0.25)
+            await _pause(HANDOFF_POLL)
             continue
         if done_url_contains:
             current_url = await get_url(tab)
             if done_url_contains in current_url:
-                _srv._HUMAN_HELP.pop(key, None)
-                presence.end_help(browser)
-                return ok(
-                    f"human handoff completed after {elapsed}s: URL contains "
-                    f"{done_url_contains!r}{unasked}"
-                )
+                return done(f"human handoff completed after {elapsed}s: URL contains "
+                            f"{done_url_contains!r}{unasked}")
         if selector_expr:
             value = await tab.evaluate(selector_expr, return_by_value=True)
             value = value.value if hasattr(value, "value") and not isinstance(value, str) else value
             if value and bool(json.loads(value).get("hit")):
-                _srv._HUMAN_HELP.pop(key, None)
-                presence.end_help(browser)
-                return ok(
-                    f"human handoff completed after {elapsed}s: selector "
-                    f"{done_selector!r} appeared{unasked}"
-                )
-        if not done_url_contains and not done_selector:
-            current = await _srv._page_sig(tab)
-            if baseline and current and (
-                current.get("url") != baseline.get("url")
-                or current.get("nodes") != baseline.get("nodes")
-                or current.get("len") != baseline.get("len")
-                or current.get("hash") != baseline.get("hash")
-            ):
-                _srv._HUMAN_HELP.pop(key, None)
-                presence.end_help(browser)
-                return ok(f"human handoff completed after {elapsed}s: page changed{unasked}")
-        await asyncio.sleep(0.25)
-    # Drop the pending handoff so a later wait re-baselines against the page
-    # as it is now, instead of measuring against a stale pre-handoff snapshot.
-    _srv._HUMAN_HELP.pop(key, None)
-    presence.end_help(browser)
+                return done(f"human handoff completed after {elapsed}s: selector "
+                            f"{done_selector!r} appeared{unasked}")
+        # While the bar shows the request the person has its Done button, so a page change is
+        # no answer: the page may move by itself, and the person's own steps change it.
+        if watch is not None and not presence.shows_request(browser, asked_at):
+            if watch.changed(await _srv._page_sig(tab), _now()):
+                return _weak_change(request, watch, elapsed, unasked)
+        await _pause(HANDOFF_POLL)
+    # The request stays pending: the person may still be at it, a Done pressed later is still
+    # heard, and the next wait counts as the handoff. Dropping it here made that next wait say
+    # request_human_help had not been called.
+    after = (" The request for help stays pending: call wait_for_human again to keep waiting (a "
+             "Done pressed meanwhile is still heard), or request_human_help to ask anew."
+             if request else " Call request_human_help if the person still needs to act: no "
+             "handoff was pending on this tab.")
     if presence.holds(browser):
         return err(f"timeout after {timeout}s: the person still holds the browser (Take over "
-                   "in the overlay's bar) and has not pressed Resume agent.")
-    return err(
-        f"timeout after {timeout}s waiting for human completion — nothing changed "
-        "and no completion signal was observed. Call request_human_help again "
-        f"if the person still needs to act{unasked}."
-    )
+                   f"in the overlay's bar) and has not pressed Resume agent.{after if request else ''}")
+    if done_url_contains or done_selector:
+        watched = " and ".join(
+            ([f"the URL never contained {done_url_contains!r}"] if done_url_contains else [])
+            + ([f"selector {done_selector!r} never appeared"] if done_selector else []))
+    elif presence.shows_request(browser, asked_at):
+        watched = ("the person did not press Done in the overlay's bar (a page change does not "
+                   "end this wait while the bar shows the request)")
+    else:
+        watched = (f"no page change held {HANDOFF_SETTLE:g}s (a change within "
+                   f"{HANDOFF_GRACE:g}s of " + ("request_human_help" if request else "this call")
+                   + " is taken as the page's own)")
+    return err(f"timeout after {timeout}s waiting for human completion: {watched}.{after}")
 
 
 async def _history_navigation(

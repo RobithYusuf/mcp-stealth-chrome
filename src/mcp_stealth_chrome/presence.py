@@ -820,6 +820,15 @@ def ask(browser: Any, objective: str) -> Optional[float]:
     return asked
 
 
+def shows_request(browser: Any, asked_at: Optional[float]) -> bool:
+    """The bar shows this request for help, so the person has its Done button: an overlay runs
+    for the browser and the request reached it (`ask` returned `asked_at`, no later one replaced
+    it). The bar shows a request even with overlay_bar off (`_agent_overlay.wants_bar`)."""
+    overlay = of(browser)
+    return (overlay is not None and asked_at is not None
+            and float(overlay.agent.get("asked_at") or 0) == float(asked_at))
+
+
 def answered(browser: Any, since: float) -> Optional[str]:
     """What the person did with the bar since `since`: "done", "resumed", or None."""
     overlay = _handle(browser)

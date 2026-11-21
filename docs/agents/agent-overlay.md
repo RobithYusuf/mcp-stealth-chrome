@@ -26,6 +26,12 @@ Part of the agent guide: [AGENTS.md](../../AGENTS.md) says when to read this. It
   `_RUNS_DESPITE_DIALOG` (tab_list reads titles). Mid-tool, `before_input` raises `PersonHasBrowser`. `wait_for_human`
   ends on Done or on Resume agent pressed after it was asked, and ignores page changes while the person holds the
   browser (their own clicks change it).
+- While the bar shows a request for help (`presence.shows_request`: the overlay runs and `ask` returned the
+  request's time), a page change does not end `wait_for_human`; only Done, Resume agent, `done_selector` or
+  `done_url_contains` do. The bar shows that request with Done even with `overlay_bar` off (`wants_bar`). Shopee
+  moves its login page to `/buyer/login/qr` by itself a moment after loading, and a wait measured from the
+  request called that a finished handoff after 0.0 s. A timeout keeps the request in the bar, so a Done pressed
+  later still reaches the next wait or the next result.
 - `before_input` runs in one wrapper on nodriver's `Tab.mouse_click` (`patches._patch_mouse_click_reports_pointer`,
   which also feeds the click ring; sixteen places press through it), each drag step (the button is still let go in its
   `finally`), each `humanized_scroll` chunk (outside its retry, which would resend the wheel event, and once more

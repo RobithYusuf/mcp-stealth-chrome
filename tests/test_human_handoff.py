@@ -1,0 +1,348 @@
+"""wait_for_human ends on evidence, without a browser: a fake tab whose page follows a script on a
+fake clock, so the grace and settle times run at their real values and nothing sleeps.
+
+From real use (a research run on Shopee, about 150 pages): browser_launch on /buyer/login, then
+request_human_help, then wait_for_human() answered "human handoff completed after 0.0s: page
+changed". The site moves /buyer/login to /buyer/login/qr a moment after it loads, and the baseline
+was the page at request_human_help. The request was then dropped, so the next
+wait_for_human(done_selector=...) said request_human_help had not been called."""
+import asyncio
+import json
+import subprocess
+import sys
+import time
+
+import pytest
+
+from mcp_stealth_chrome import presence, server
+from mcp_stealth_chrome.state import BrowserState
+from mcp_stealth_chrome.tools import diagnostics
+from mcp_stealth_chrome.tools import navigation as nav
+
+LOGIN = "https://shopee.co.id/buyer/login"
+QR = "https://shopee.co.id/buyer/login/qr"
+HOME = "https://shopee.co.id/"
+KEY = "HANDOFF-TAB"
+
+
+class Clock:
+    """The handoff's clock (navigation._now) and its pause (navigation._pause): a pause moves the
+    clock on at once, and a hook runs once the clock passes its time (a person pressing Done)."""
+
+    def __init__(self):
+        self.start = self.t = time.time()
+        self.hooks: list = []
+
+    def __call__(self) -> float:
+        return self.t
+
+    def elapsed(self) -> float:
+        return self.t - self.start
+
+    def advance(self, seconds: float) -> None:
+        self.t += seconds
+        for hook in [h for h in self.hooks if self.elapsed() >= h[0]]:
+            self.hooks.remove(hook)
+            hook[1]()
+
+    async def pause(self, seconds: float) -> None:
+        self.advance(seconds)
+
+
+class _Target:
+    target_id = KEY
+
+
+class Page:
+    """A tab whose page is the last step reached on the clock: (from second, url, elements).
+    `selector_from` is when the done selector appears, None for never."""
+
+    def __init__(self, clock: Clock, *steps, browser=None):
+        self.clock, self.steps, self.browser = clock, steps, browser
+        self.target = _Target()
+        self.selector_from = None
+        self.reads = 0
+
+    def sig(self) -> dict:
+        self.reads += 1
+        url, nodes = None, None
+        for at, u, n in self.steps:
+            if self.clock.elapsed() >= at:
+                url, nodes = u, n
+        return {"url": url, "nodes": nodes, "len": nodes * 37, "hash": f"{url}#{nodes}"}
+
+    async def evaluate(self, _expr, return_by_value=True):
+        hit = self.selector_from is not None and self.clock.elapsed() >= self.selector_from
+        return json.dumps({"hit": hit})
+
+
+class _Browser:
+    pass
+
+
+SLEEPER = [sys.executable, "-c", "import time; time.sleep(60)"]
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    clock = Clock()
+    monkeypatch.setattr(nav, "_now", clock)
+    monkeypatch.setattr(nav, "_pause", clock.pause)
+    return clock
+
+
+@pytest.fixture
+def handoff(monkeypatch, clock, tmp_path):
+    """Puts a Page in front of request_human_help and wait_for_human; with overlay=True the
+    browser has an overlay handle on a process standing in for the overlay."""
+    made = []
+
+    def setup(*steps, overlay=False):
+        browser = _Browser()
+        if overlay:
+            folder = tmp_path / f"overlay{len(made)}"
+            folder.mkdir()
+            handle = presence.Overlay(browser, 4242, folder, subprocess.Popen(SLEEPER), False)
+            setattr(browser, presence.ATTR, handle)
+            made.append(handle)
+        page = Page(clock, *steps, browser=browser)
+        monkeypatch.setattr(BrowserState, "browser", browser)
+        monkeypatch.setattr(BrowserState, "current_headless", False)
+        monkeypatch.setattr(BrowserState, "active_tab", classmethod(lambda cls: page))
+        return page
+
+    async def page_sig(tab, *_a, **_k):
+        return tab.sig()
+
+    async def in_front(_tab):
+        return ["tab activated"]
+
+    async def url_of(tab, *_a, **_k):
+        return tab.sig()["url"]
+
+    monkeypatch.setattr(server, "_HUMAN_HELP", {})
+    monkeypatch.setattr(server, "_page_sig", page_sig)
+    monkeypatch.setattr(nav, "_foreground_for_human", in_front)
+    monkeypatch.setattr(nav, "get_url", url_of)
+    yield setup
+    for handle in made:
+        handle.proc.kill()
+        handle.proc.wait()
+
+
+def ask(objective="Log in", **kw):
+    return asyncio.run(nav.request_human_help(objective, **kw))
+
+
+def wait(**kw):
+    return asyncio.run(nav.wait_for_human(**kw))
+
+
+def press_done(overlay: presence.Overlay) -> None:
+    """control.json as the overlay writes it when the person presses Done (a new file, replaced)."""
+    asked = float(overlay.agent.get("asked_at") or 0)
+    tmp = overlay.control_file.with_name("control.json.test")
+    tmp.write_text(json.dumps({"holder": "agent", "reason": "help done", "help_done": asked + 1}))
+    tmp.replace(overlay.control_file)
+
+
+def test_shopee_a_redirect_inside_the_grace_is_no_handoff(handoff, clock):
+    """The page moves to /qr 0.4 s after the request and then nothing happens: no completion, the
+    request is still pending afterwards, and a later wait with a selector counts as the handoff."""
+    page = handoff((0, LOGIN, 400), (0.4, QR, 420))
+    asked = ask()
+    assert "weak evidence" in asked and f"{nav.HANDOFF_GRACE:g}s after this request" in asked, asked
+    requested_at = server._HUMAN_HELP[KEY]["requested_at"]
+    clock.advance(0.1)  # the agent's next call
+    result = wait(timeout=12)
+    assert result.startswith("Error: timeout after 12"), result
+    assert "completed" not in result and "no page change held" in result, result
+    assert "The request for help stays pending" in result, result
+    assert server._HUMAN_HELP[KEY]["requested_at"] == requested_at  # the same request
+    page.selector_from = clock.elapsed() + 1.0
+    result = wait(done_selector="#account", timeout=5)
+    assert result.startswith("human handoff completed after"), result
+    assert "selector '#account' appeared" in result and "no handoff was pending" not in result
+    assert KEY not in server._HUMAN_HELP  # strong evidence closes the request
+
+
+def test_with_the_overlay_a_page_change_never_ends_the_wait_and_done_does(handoff, clock):
+    page = handoff((0, LOGIN, 400), (6, HOME, 900), overlay=True)
+    overlay = presence._handle(page.browser)
+    asked = ask()
+    assert "A page change alone does not end it" in asked, asked
+    reads = page.reads  # request_human_help's baseline
+    result = wait(timeout=15)  # the page changed at 6 s and held, which counts without an overlay
+    assert result.startswith("Error: timeout after 15"), result
+    assert "did not press Done" in result and "stays pending" in result, result
+    assert page.reads == reads  # the wait did not even read the page: the bar answers
+    # Done pressed after that wait gave up is heard by the next one, with the same asked time.
+    press_done(overlay)
+    result = wait(timeout=15)
+    assert result.startswith("human handoff completed after 0.0s: the person pressed Done"), result
+    assert KEY not in server._HUMAN_HELP and overlay.agent["help"] is None
+
+
+def test_with_the_overlay_done_ends_a_wait_the_page_changed_in(handoff, clock):
+    page = handoff((0, LOGIN, 400), (6, HOME, 900), overlay=True)
+    overlay = presence._handle(page.browser)
+    ask()
+    clock.hooks.append((10.0, lambda: press_done(overlay)))
+    result = wait(timeout=30)
+    assert result.startswith("human handoff completed after"), result
+    assert "pressed Done" in result and clock.elapsed() >= 10.0, result
+
+
+def test_without_an_overlay_a_change_that_does_not_hold_does_not_count(handoff, clock):
+    """After the grace the page changes every second, as a carousel or a redirect chain would."""
+    steps = [(0, LOGIN, 400)] + [(6 + i, f"{HOME}?step={i}", 500 + i) for i in range(20)]
+    handoff(*steps)
+    ask()
+    result = wait(timeout=14)
+    assert result.startswith("Error: timeout after 14"), result
+
+
+def test_without_an_overlay_a_change_that_holds_counts_after_the_grace(handoff, clock):
+    """A move inside the grace is the page's own (the baseline follows it); a move after it that
+    holds HANDOFF_SETTLE ends the wait as weak evidence, measured from the page at the grace's end."""
+    handoff((0, LOGIN, 400), (1, QR, 420), (7, HOME, 900))
+    ask()
+    result = wait(timeout=30)
+    assert result.startswith("page changed after"), result
+    assert f"the URL went from {QR!r} to {HOME!r}" in result, result
+    assert f"held {nav.HANDOFF_SETTLE:g}s" in result and "weak evidence" in result
+    assert "can be the page itself" in result and "completed" not in result
+    assert clock.elapsed() >= 7 + nav.HANDOFF_SETTLE
+    # The request stays, and the next wait measures from the page as reported.
+    record = server._HUMAN_HELP[KEY]
+    assert record["baseline"]["url"] == HOME
+    result = wait(timeout=10)
+    assert result.startswith("Error: timeout after 10"), result  # the same change is not news
+    result = wait(done_url_contains="shopee.co.id/", timeout=5)
+    assert result.startswith("human handoff completed after 0.0s: URL contains"), result
+    assert KEY not in server._HUMAN_HELP
+
+
+def test_a_new_url_counts_once_it_held_though_its_content_still_moves(handoff, clock):
+    """A page the person reached keeps drawing (a feed, a clock): its URL holding is what counts."""
+    steps = [(0, LOGIN, 400)] + [(7 + i / 2, HOME, 900 + i) for i in range(40)]
+    handoff(*steps)
+    ask()
+    result = wait(timeout=30)
+    assert result.startswith("page changed after"), result
+    assert f"the URL went from {LOGIN!r} to {HOME!r}" in result, result
+    assert clock.elapsed() < 7 + nav.HANDOFF_SETTLE + 1
+
+
+def test_a_content_change_names_what_was_measured(handoff, clock):
+    handoff((0, LOGIN, 400), (8, LOGIN, 460))
+    ask()
+    result = wait(timeout=30)
+    assert f"the page's content changed at {LOGIN!r} (elements 400 to 460" in result, result
+
+
+def test_a_change_found_at_a_late_waits_first_read_says_when_is_not_known(handoff, clock):
+    """The agent waited 30 s after the request: the page differed already, maybe by itself."""
+    handoff((0, LOGIN, 400), (0.4, QR, 420))
+    ask()
+    clock.advance(30)
+    result = wait(timeout=10)
+    assert result.startswith("page changed after"), result
+    assert "already differed at this wait's first read" in result, result
+
+
+def test_without_a_request_the_grace_runs_from_the_call(handoff, clock):
+    handoff((0, LOGIN, 400), (0.5, QR, 420))
+    result = wait(timeout=10)
+    assert result.startswith("Error: timeout after 10"), result
+    assert "within 5s of this call" in result and "no handoff was pending" in result, result
+    handoff((0, LOGIN, 400), (clock.elapsed() + 6, HOME, 900))
+    result = wait(timeout=10)
+    assert result.startswith("page changed after"), result
+    assert "no handoff was pending on this tab" in result and "stays pending" not in result
+
+
+def test_a_new_request_replaces_the_pending_one(handoff, clock):
+    handoff((0, LOGIN, 400), (7, HOME, 900))
+    ask("Log in")
+    assert wait(timeout=30).startswith("page changed after")
+    first = server._HUMAN_HELP[KEY]
+    clock.advance(1)
+    ask("Confirm the code")
+    second = server._HUMAN_HELP[KEY]
+    assert second is not first and second["objective"] == "Confirm the code"
+    assert second["requested_at"] > first["requested_at"] and second["baseline"]["url"] == HOME
+
+
+def test_the_docstring_gives_the_constants_it_runs_on():
+    doc = nav.wait_for_human.__doc__
+    assert f"{nav.HANDOFF_GRACE:g}s after request_human_help" in doc
+    assert f"held {nav.HANDOFF_SETTLE:g}s" in doc
+    assert "even with overlay_bar off" in doc
+
+
+def test_the_bar_shows_a_request_only_while_its_overlay_runs_and_holds_it(tmp_path):
+    folder = tmp_path / "overlay"
+    folder.mkdir()
+    browser = _Browser()
+    overlay = presence.Overlay(browser, 4242, folder, subprocess.Popen(SLEEPER), False)
+    setattr(browser, presence.ATTR, overlay)
+    try:
+        asked = presence.ask(browser, "Log in")
+        assert presence.shows_request(browser, asked)
+        assert not presence.shows_request(browser, None)          # ask found no overlay
+        assert not presence.shows_request(browser, asked - 1)     # a later request replaced it
+        overlay.proc.kill()
+        overlay.proc.wait()
+        assert not presence.shows_request(browser, asked)         # nobody can press Done
+    finally:
+        if overlay.proc.poll() is None:
+            overlay.proc.kill()
+    assert not presence.shows_request(_Browser(), asked)
+
+
+class _Config:
+    def __init__(self, host, port):
+        self.host, self.port = host, port
+
+
+class _CdpBrowser:
+    def __init__(self, host, port):
+        self.config = _Config(host, port)
+        self.websocket_url = f"ws://{host}:{port}/devtools/browser/0f1e2d3c"
+
+
+def _status() -> dict:
+    return json.loads(asyncio.run(server.mcp._tool_manager._tools["server_status"].fn()))
+
+
+def test_server_status_names_the_cdp_endpoint(monkeypatch):
+    monkeypatch.setattr(BrowserState, "browser", None)
+    assert _status()["cdp"] is None
+    monkeypatch.setattr(BrowserState, "browser", _CdpBrowser("127.0.0.1", 9333))
+    assert _status()["cdp"] == {"host": "127.0.0.1", "port": 9333,
+                                "browser_ws": "ws://127.0.0.1:9333/devtools/browser/0f1e2d3c"}
+
+
+@pytest.mark.parametrize("host,local", [
+    ("127.0.0.1", True), ("localhost", True), ("::1", True), ("[::1]", True), ("127.0.0.2", True),
+    ("10.0.0.5", False), ("chrome.internal", False), ("0.0.0.0", False),
+])
+def test_a_cdp_host_that_is_not_loopback_is_said(host, local):
+    endpoint = diagnostics._cdp_endpoint(_CdpBrowser(host, 9222))
+    assert endpoint["host"] == host and endpoint["port"] == 9222
+    assert ("note" not in endpoint) is local, endpoint
+    if not local:
+        assert "not a loopback address" in endpoint["note"]
+
+
+def test_a_browser_not_connected_yet_has_no_websocket_url():
+    class Unconnected:
+        config = _Config("127.0.0.1", 9333)
+
+        @property
+        def websocket_url(self):
+            raise AttributeError("'NoneType' object has no attribute 'webSocketDebuggerUrl'")
+
+    assert diagnostics._cdp_endpoint(Unconnected()) == {
+        "host": "127.0.0.1", "port": 9333, "browser_ws": None}

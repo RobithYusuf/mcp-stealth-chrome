@@ -383,9 +383,12 @@ def test_7_list_frames_cuts_long_urls_and_says_so(mcp, base):
 
 
 def test_9_wait_for_human_without_a_handoff_says_so(mcp, base):
+    # The change comes after the 5 s grace counted from the call (a change inside it is the
+    # page's own) and must hold 2 s, so the wait answers about 8.5 s in.
     _go(mcp, f"{base}/plain.html")
-    mcp.evaluate("setTimeout(() => document.getElementById('p').textContent = 'moved', 300); 1")
-    reply = mcp.call("wait_for_human", timeout=5)
+    mcp.evaluate("setTimeout(() => document.getElementById('p').textContent = 'moved', 6500); 1")
+    reply = mcp.call("wait_for_human", timeout=20)
     assert not reply.failed and "no handoff was pending" in reply.text, reply.text
+    assert reply.text.startswith("page changed after") and "weak evidence" in reply.text, reply.text
     reply = mcp.call("wait_for_human", timeout=0.5)
     assert reply.failed and "no handoff was pending" in reply.text, reply.text
