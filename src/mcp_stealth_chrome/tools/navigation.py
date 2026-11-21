@@ -250,8 +250,8 @@ async def wait_for_human(
     """
     try:
         tab, key, request, selection_note = _pending_human_request()
-        unasked = (f"{selection_note}; no handoff was pending on the selected tab, so this only says "
-                   "the page changed after wait_for_human started") if not request else selection_note
+        unasked = (f"{selection_note}; no handoff was pending on this tab (request_human_help was not "
+                   "called), so this only says the page changed after wait_for_human started") if not request else selection_note
         # None means "inherit". Keying off the literal 300 would silently
         # override a caller who genuinely asked for 300 seconds.
         if timeout is None:

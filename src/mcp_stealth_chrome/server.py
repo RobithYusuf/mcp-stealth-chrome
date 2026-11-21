@@ -1439,6 +1439,8 @@ _CF_CHALLENGE_PROBE_INITIAL_JS = """
     '[data-sitekey^="0x"], input[name="cf-turnstile-response"], ' +
     'script[src*="challenges.cloudflare.com"]'
   );
+  const loginForm = Array.from(responseInputs).some(i => i.form?.querySelector(
+      'input[name="user"], input[type="email"], input[type="password"], input[autocomplete="username"]'));
   const loginInterstitial = !!document.querySelector(
     'script[src*="/cdn-cgi/challenge-platform/"][src*="/orchestrate/"], form[action*="__cf_chl"]')
     || Array.from(document.scripts).some(
