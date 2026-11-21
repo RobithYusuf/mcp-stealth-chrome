@@ -4592,6 +4592,7 @@ async def _launch_start_chrome(req: _LaunchRequest, plan: _LaunchPlan) -> tuple:
     # held across it).
     refused = await _cookie_preflight(plan.profile_path, plan.cookie_move)
     if refused:
+        await _remove_privacy_profile(plan.privacy_profile)
         return err(refused), None, None
     ads_pending = (_adblock_module().begin(req.block_ads, plan.config.browser_executable_path)
                    if req.block_ads else None)
