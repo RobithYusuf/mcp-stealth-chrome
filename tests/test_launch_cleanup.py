@@ -594,8 +594,23 @@ def test_the_last_look_is_told_what_this_launch_had_written(env):
     out = _launch(vertical_tabs="left")
     assert out.startswith("Error") and "changed after this launch read it" in out, out
     assert env.written_at_look == [
-        None, "this launch had already written the vertical tabs setting, the tidy-up of stale locks "
-              "and window state in it"], env.written_at_look
+        None, "this launch had already written the vertical tabs setting in it and run its tidy-up of "
+              "stale locks and window state"], env.written_at_look
+
+
+def test_on_a_clean_profile_the_last_look_says_the_tidy_up_ran_not_that_it_wrote(env):
+    """clean_profile_state and the window-state wipe change nothing on a clean profile (no stale
+    lock, exit_type Normal), so the last look's refusal must not say this launch wrote there."""
+    import json
+    (env.profile / "Default").mkdir(parents=True)
+    (env.profile / "Default" / "Preferences").write_text(json.dumps({"profile": {"exit_type": "Normal"}}))
+    before = _digest(env.profile)
+    env.preflight = {2: "its cookie database changed after this launch read it"}
+    out = _launch()
+    assert out.startswith("Error") and "changed after this launch read it" in out, out
+    assert _digest(env.profile) == before, "the tidy-up changed a clean profile after all"
+    assert env.written_at_look == [None, "this launch had already run its tidy-up of stale locks and window state"], \
+        env.written_at_look
 
 
 def test_the_last_look_refusal_names_the_writes_and_the_first_keeps_its_text(tmp_path):

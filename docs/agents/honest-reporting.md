@@ -104,7 +104,9 @@ conclusions. Each rule below replaced a real lie.
 - A cookie refusal says "the profile was not changed" only where that holds. The last `_cookie_preflight` of
   `browser_launch` comes after the commit, the vertical tabs and lean writes and the tidy-up, so it is passed what
   this launch had written (`_launch_written`) and says "Nothing was started; this launch had already written ...".
-  The first look keeps Chrome's text byte for byte. Known gap: a refusal of `_commit_cookie_move` itself still says
+  Only what was written is said as written; the tidy-up (`clean_profile_state`, the window-state wipe) can change
+  nothing, so it is said as run ("run its tidy-up of stale locks and window state"). The first look keeps Chrome's
+  text byte for byte. Known gap: a refusal of `_commit_cookie_move` itself still says
   "not changed" after its marker was written (shared with spawn_browser).
 - `fill_form` fails when a field fails, and then does not click submit. `batch_actions` counts failures by the `Error:`
   prefix, so a failure reported through `ok()` counts as success. Non-list or empty input is an error, not

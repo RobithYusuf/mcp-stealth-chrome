@@ -4087,6 +4087,9 @@ class _LaunchPlan:
     previous_app: Optional[int] = None  # _launch_keep_keyboard
     # What this launch has written in the profile, in order, for a refusal after the commit.
     written: tuple = ()  # _launch_commit_profile
+    # The tidy-up ran (clean_profile_state, the window-state wipe). Kept apart from `written`:
+    # either can change nothing, and the wipe's own failure is suppressed.
+    tidied: bool = False  # _launch_commit_profile
 
 
 def _launch_check_arguments(browser: str, vertical_tabs: Optional[str], user_data_dir: Optional[str],
@@ -4524,9 +4527,15 @@ async def _launch_keep_keyboard(req: _LaunchRequest, plan: _LaunchPlan) -> None:
 
 
 def _launch_written(plan: _LaunchPlan) -> Optional[str]:
-    """What this launch had written in the profile, for a refusal that comes after the commit;
-    None when nothing was."""
-    return f"this launch had already written {', '.join(plan.written)} in it" if plan.written else None
+    """What this launch had done to the profile, for a refusal that comes after the commit; None
+    when nothing was. A write is said as written; the tidy-up only as run, since it may change
+    nothing."""
+    done = []
+    if plan.written:
+        done.append(f"written {', '.join(plan.written)} in it")
+    if plan.tidied:
+        done.append("run its tidy-up of stale locks and window state")
+    return f"this launch had already {' and '.join(done)}" if done else None
 
 
 async def _launch_commit_profile(req: _LaunchRequest, plan: _LaunchPlan) -> Optional[str]:
@@ -4568,7 +4577,7 @@ async def _launch_commit_profile(req: _LaunchRequest, plan: _LaunchPlan) -> Opti
     if lean is not None and (getattr(lean, "written", None) or getattr(lean, "restored", None)):
         plan.written += ("brave_lean's settings",)
     if plan.tidy_profile is not None:
-        plan.written += ("the tidy-up of stale locks and window state",)
+        plan.tidied = True
         clean_profile_state(plan.tidy_profile)  # only clears stale locks
         # Selectively wipe corrupt window-placement / session-restore state. Idempotent and
         # cheap (a few file writes), preserves cookies and logins. Saves us from "window
