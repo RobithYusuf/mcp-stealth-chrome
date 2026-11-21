@@ -201,8 +201,7 @@ def test_3r_batch_aliases_pass_every_valid_argument_on():
 
 def test_3r_an_unknown_inner_argument_is_refused_by_name_and_counted():
     import asyncio
-    from mcp_stealth_chrome import server
-    from mcp_stealth_chrome.tools import batch
+    from mcp_stealth_chrome.tools import action_kit, batch
     out = asyncio.run(batch.batch_actions([
         {"type": "screenshot", "path": "x.jpg"},
         {"type": "wait", "frame_url": "/3ds", "bogus": 1},
@@ -210,7 +209,7 @@ def test_3r_an_unknown_inner_argument_is_refused_by_name_and_counted():
     assert out.startswith("2 actions, 2 failed"), out
     assert "screenshot does not take 'path'; nothing was done" in out
     assert "wait_for does not take 'bogus'" in out
-    result = asyncio.run(server.workflow_run([{"tool": "screenshot", "args": {"path": "x.jpg"}}]))
+    result = asyncio.run(action_kit.workflow_run([{"tool": "screenshot", "args": {"path": "x.jpg"}}]))
     assert result.startswith("Error:") and "screenshot does not take 'path'" in result, result
     doc = json.loads(result[len("Error: "):])
     assert doc["failed_at"] == 0

@@ -317,11 +317,11 @@ def test_a_state_folder_that_is_a_link_is_refused(tmp_path, monkeypatch):
 
 def test_each_batch_step_meets_the_take_over_refusal(monkeypatch):
     from mcp_stealth_chrome import server
-    from mcp_stealth_chrome.tools import batch
+    from mcp_stealth_chrome.tools import action_kit, batch
     monkeypatch.setattr(server.presence, "refusal", lambda name, browser: "Error: held by the person")
     result = asyncio.run(batch.batch_actions(actions=[{"type": "get_url"}]))
     assert "held by the person" in result
-    result = asyncio.run(server.workflow_run(steps=[{"tool": "get_url"}]))
+    result = asyncio.run(action_kit.workflow_run(steps=[{"tool": "get_url"}]))
     assert "held by the person" in result
 
 

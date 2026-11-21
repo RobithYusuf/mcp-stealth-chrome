@@ -37,10 +37,11 @@ def test_cookie_parser():
 
 def test_helpers_module_state():
     from mcp_stealth_chrome.server import (
-        BrowserState, _DIALOG_AUTO_CFG, _STORAGE_SNAPSHOTS,
+        BrowserState, _DIALOG_AUTO_CFG,
         _LAUNCH_LOCK, BROWSER_LAUNCH_TIMEOUT, BROWSER_NAV_TIMEOUT,
         TOOL_ACTION_TIMEOUT,
     )
+    from mcp_stealth_chrome.tools.action_kit import _STORAGE_SNAPSHOTS
     assert isinstance(_DIALOG_AUTO_CFG, dict)
     assert isinstance(_STORAGE_SNAPSHOTS, dict)
     assert BROWSER_LAUNCH_TIMEOUT > 0
@@ -79,10 +80,13 @@ def test_snapshot_js_intact():
     """The big JS strings used by browser_snapshot / describe_page / etc.
     Must be non-empty after move."""
     from mcp_stealth_chrome.server import (
-        _DESCRIBE_PAGE_JS, _SMART_FILL_FIND_JS, _TURNSTILE_FIND_JS,
+        _TURNSTILE_FIND_JS,
         _CF_CHALLENGE_PROBE_INITIAL_JS, _CF_CHALLENGE_PROBE_ACTIVE_JS,
-        _WAIT_DOM_STABLE_JS, _FORM_INTROSPECT_JS, _VISION_LOCATE_PROMPT,
+        _VISION_LOCATE_PROMPT,
         _PROMPT_TEMPLATE,
+    )
+    from mcp_stealth_chrome.tools.action_kit import (
+        _DESCRIBE_PAGE_JS, _SMART_FILL_FIND_JS, _WAIT_DOM_STABLE_JS, _FORM_INTROSPECT_JS,
     )
     for name, js in [
         ("_DESCRIBE_PAGE_JS", _DESCRIBE_PAGE_JS),

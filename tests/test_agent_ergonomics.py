@@ -987,7 +987,7 @@ def test_storage_snapshot_marks_unmeasured_areas_instead_of_empty():
     """
     import asyncio
 
-    from mcp_stealth_chrome.server import _take_storage_snapshot
+    from mcp_stealth_chrome.tools.action_kit import _take_storage_snapshot
 
     class _Tab:
         async def send(self, _cmd):
@@ -1010,6 +1010,7 @@ def test_storage_diff_flags_areas_it_could_not_measure():
     import json as _json
 
     import mcp_stealth_chrome.server as srv
+    from mcp_stealth_chrome.tools import action_kit
 
     before = {
         "url": "https://a.test/", "title": "a", "cookies": [],
@@ -1021,22 +1022,22 @@ def test_storage_diff_flags_areas_it_could_not_measure():
     after = dict(before, errors={}, measured={"url": True, "cookies": True,
                                               "localStorage": True,
                                               "sessionStorage": True})
-    srv._STORAGE_SNAPSHOTS["unit_diff"] = before
+    action_kit._STORAGE_SNAPSHOTS["unit_diff"] = before
 
     async def fake_snapshot(_tab):
         return after
 
-    original = srv._take_storage_snapshot
+    original = action_kit._take_storage_snapshot
     original_tab = srv.BrowserState.active_tab
-    srv._take_storage_snapshot = fake_snapshot
+    action_kit._take_storage_snapshot = fake_snapshot
     srv.BrowserState.active_tab = classmethod(lambda cls: object())
     try:
         out = _json.loads(asyncio.run(
             srv.mcp._tool_manager._tools["storage_diff"].fn("unit_diff")))
     finally:
-        srv._take_storage_snapshot = original
+        action_kit._take_storage_snapshot = original
         srv.BrowserState.active_tab = original_tab
-        srv._STORAGE_SNAPSHOTS.pop("unit_diff", None)
+        action_kit._STORAGE_SNAPSHOTS.pop("unit_diff", None)
 
     assert out["unreliable_areas"] == ["cookies"]
     assert "meaningless" in out["warning"]
@@ -1231,13 +1232,13 @@ def test_report_lines_say_when_facts_are_unreadable():
 def test_storage_snapshot_marks_an_unread_url_as_unmeasured():
     import asyncio
 
-    from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import action_kit
 
     class _Tab(_BrokenTab):
         async def send(self, *_a, **_k):
             raise RuntimeError("no")
 
-    snap = asyncio.run(server._take_storage_snapshot(_Tab("context destroyed")))
+    snap = asyncio.run(action_kit._take_storage_snapshot(_Tab("context destroyed")))
     assert snap["measured"]["url"] is False and "url" in snap["errors"]
 
 
@@ -1470,15 +1471,16 @@ def test_same_name_cookie_keeps_the_most_specific_path(monkeypatch):
 
 def test_sniffed_token_only_goes_back_to_its_exact_origin(monkeypatch):
     from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import action_kit
 
     monkeypatch.setattr(server.BrowserState, "network_index", {
         "1": {"url": "https://x.test/api", "request_headers": {"Authorization": "Bearer secret"}},
     })
-    assert server._latest_auth_header_for("https://x.test/other") == "Bearer secret"
-    assert server._latest_auth_header_for("https://x.test:443/other") == "Bearer secret"
-    assert server._latest_auth_header_for("http://x.test:8080/") is None
-    assert server._latest_auth_header_for("http://x.test/") is None
-    assert server._latest_auth_header_for("https://x.test:8443/") is None
+    assert action_kit._latest_auth_header_for("https://x.test/other") == "Bearer secret"
+    assert action_kit._latest_auth_header_for("https://x.test:443/other") == "Bearer secret"
+    assert action_kit._latest_auth_header_for("http://x.test:8080/") is None
+    assert action_kit._latest_auth_header_for("http://x.test/") is None
+    assert action_kit._latest_auth_header_for("https://x.test:8443/") is None
 
 
 def test_redirected_post_failure_is_not_called_safe_to_replay():
@@ -1524,6 +1526,7 @@ def test_storage_diff_masks_new_credentials_unless_asked(monkeypatch):
     import json as _json
 
     from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import action_kit
 
     empty = {"url": "u", "title": "t", "cookies": [], "localStorage": {"k": "old"},
              "sessionStorage": {}, "errors": {},
@@ -1534,9 +1537,9 @@ def test_storage_diff_masks_new_credentials_unless_asked(monkeypatch):
     async def fake_snapshot(_tab):
         return after
 
-    monkeypatch.setattr(server, "_take_storage_snapshot", fake_snapshot)
+    monkeypatch.setattr(action_kit, "_take_storage_snapshot", fake_snapshot)
     monkeypatch.setattr(server.BrowserState, "active_tab", classmethod(lambda cls: object()))
-    monkeypatch.setitem(server._STORAGE_SNAPSHOTS, "login", empty)
+    monkeypatch.setitem(action_kit._STORAGE_SNAPSHOTS, "login", empty)
     diff = server.mcp._tool_manager._tools["storage_diff"].fn
     masked = asyncio.run(diff("login"))
     for secret in ("TOKENVALUE", "NEWSECRET", "JWTSECRET", "old"):
@@ -3075,7 +3078,7 @@ def test_storage_diff_tells_cookies_on_different_paths_apart(monkeypatch):
     import asyncio
     import json as _json
 
-    from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import action_kit
 
     def snapshot(admin_value):
         return {"url": "u", "title": "t", "localStorage": {}, "sessionStorage": {}, "errors": {},
@@ -3086,9 +3089,9 @@ def test_storage_diff_tells_cookies_on_different_paths_apart(monkeypatch):
     async def fake_snapshot(_tab):
         return snapshot("new")
 
-    monkeypatch.setattr(server, "_take_storage_snapshot", fake_snapshot)
+    monkeypatch.setattr(action_kit, "_take_storage_snapshot", fake_snapshot)
     _active(monkeypatch, object())
-    monkeypatch.setitem(server._STORAGE_SNAPSHOTS, "paths", snapshot("old"))
+    monkeypatch.setitem(action_kit._STORAGE_SNAPSHOTS, "paths", snapshot("old"))
     cookies = _json.loads(asyncio.run(_tool("storage_diff")("paths")))["cookies"]
     assert cookies["modified"] == [{"name": "SID", "domain": "x", "path": "/admin"}]
     assert cookies["added"] == [] and cookies["removed"] == []

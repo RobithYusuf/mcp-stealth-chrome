@@ -54,6 +54,7 @@ def _source_profile(root: pathlib.Path) -> pathlib.Path:
 
 def _clone(tmp_path, monkeypatch, **kw) -> tuple[dict, pathlib.Path]:
     from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import chrome_profiles
     root = _source_profile(tmp_path / "Google" / "Chrome")
     data = tmp_path / "data"
     monkeypatch.setattr(server, "PROFILE_DIR", data / "profile")
@@ -61,7 +62,7 @@ def _clone(tmp_path, monkeypatch, **kw) -> tuple[dict, pathlib.Path]:
     monkeypatch.setattr(server, "ensure_dirs", lambda: None)
     monkeypatch.setattr(server, "chrome_user_data_root", lambda b=None: root)
     monkeypatch.setattr(server, "chrome_user_data_roots", lambda: [("chrome", root)])
-    text = asyncio.run(server.clone_chrome_profile(target_instance_id="daily", browser="chrome", **kw))
+    text = asyncio.run(chrome_profiles.clone_chrome_profile(target_instance_id="daily", browser="chrome", **kw))
     assert not text.startswith("Error"), text
     return json.loads(text[text.index("{"):]), data / "profiles" / "daily" / "Default"
 
