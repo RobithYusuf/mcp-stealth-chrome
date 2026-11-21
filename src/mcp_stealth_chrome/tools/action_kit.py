@@ -846,8 +846,8 @@ async def workflow_run(
         output: "summary" (default): counts per tool, every failed or ignored step, and the result of each
             step with save_as, each reader (the get_* tools, query_selector_all, extract_*, browser_snapshot,
             describe_page, search_page, evaluate) and the last step; vars only as this run set or changed
-            them, and last without its text when its value holds it. "failures": counts and failed or
-            ignored steps only. "full": every step and every var.
+            them, and last without its text when its value holds it and no step failed or was ignored.
+            "failures": counts and failed or ignored steps only. "full": every step and every var.
             After a failure every mode keeps the whole vars and what a resume needs.
 
     Returns JSON. full: completed (capped at 200 entries, the rest counted), total and vars. summary and

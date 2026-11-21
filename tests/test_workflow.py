@@ -846,3 +846,19 @@ def test_branch_records_stay_internal_in_a_successful_summary_and_whole_after_a_
     for output in ("summary", "failures"):
         short, _ = run(steps, {"c": "Error: no"}, variables={"go": True}, output=output)
         assert short["vars"]["__branches__"] == full["vars"]["__branches__"] == {"0": "then"}
+
+
+# ── review of the branch: last stays whole after any failure ───────────────
+
+
+@pytest.mark.parametrize("steps,responses", [
+    ([{"tool": "bad"}], {"bad": "Error: failed"}),                                # failed, no stop
+    ([{"tool": "skip", "continue_on_error": True}, {"tool": "read"}],
+     {"skip": "Error: ignored", "read": "[1]"}),                                  # ignored, then fine
+])
+def test_last_stays_whole_when_a_step_failed_or_was_ignored_without_a_stop(steps, responses):
+    """stop_on_error=False leaves no failed_at, and the summary shortened last anyway."""
+    full, _ = run(steps, responses, stop_on_error=False)
+    summary, _ = run(steps, responses, stop_on_error=False, output="summary")
+    assert "failed_at" not in summary
+    assert summary["vars"]["last"] == full["vars"]["last"] and "text" in summary["vars"]["last"]

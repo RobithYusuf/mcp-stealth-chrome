@@ -455,7 +455,8 @@ def _snapshot(variables: Optional[dict]) -> Optional[dict]:
 _NOTES = {
     "summary": "a summary: counts, every failed or ignored step, and the result of each step with "
                "save_as, each reader and the last step; vars only as this run set or changed them, "
-               "last without the text its value holds (all of them, whole, after a failure). "
+               "last without the text its value holds unless a step failed or was ignored (after "
+               "a stop at a failure: all vars, whole). "
                "output=\"full\" lists every step.",
     "failures": "failures only: counts and every failed or ignored step, no vars unless a resume "
                 "needs them. output=\"summary\" adds results, output=\"full\" lists every step.",
@@ -502,7 +503,9 @@ def _shorten(full: dict, run: _Run, output: str, given: Optional[dict]) -> dict:
     elif output == "summary" and full.get("vars"):
         changed = {k: v for k, v in full["vars"].items()
                    if given is None or k not in given or given[k] != v}
-        if isinstance(changed.get("last"), dict):
+        # Any failed or ignored step, with or without a stop (failed_at): last stays whole.
+        troubled = any(c["failed"] or c["ignored"] for c in run.tally.values())
+        if isinstance(changed.get("last"), dict) and not troubled:
             changed["last"] = _last_once(changed["last"])
         if changed:
             out["vars"] = changed
