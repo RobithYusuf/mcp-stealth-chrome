@@ -786,3 +786,23 @@ def test_a_failed_last_step_cut_by_the_bound_is_still_shown():
     assert short["shown"][-1]["index"] == 300
     assert "failed_or_ignored_not_shown" not in short  # the one the bound cut is the one shown
     assert sum(1 for e in short["shown"] if not e["ok"]) == 101
+
+
+# ── review of the branch: a cut never splits a surrogate pair ──────────────
+
+# A string can hold an emoji as its two UTF-16 code units (text read unit by unit from a page).
+_SPLIT_PAIR = chr(0xD83D) + chr(0xDE00)
+
+
+def test_a_cut_steps_back_rather_than_split_a_surrogate_pair():
+    # A real pair: written out with surrogatepass it is exactly the emoji's UTF-16.
+    assert len(_SPLIT_PAIR) == 2
+    assert _SPLIT_PAIR.encode("utf-16-le", "surrogatepass") == chr(0x1F600).encode("utf-16-le")
+    text = "x" * (RESULT_PREVIEW - 1) + _SPLIT_PAIR + "z"
+    preview = _preview(text)
+    kept = _cut_at(preview, text)  # also checks +N counts from the corrected cut
+    assert kept == RESULT_PREVIEW - 1 and chr(0xD83D) not in preview
+    assert "+3 chars" in preview
+    # The pair just before the limit is whole; only the one across it moves the cut.
+    text = "x" * (RESULT_PREVIEW - 2) + _SPLIT_PAIR + "z" * 10
+    assert _cut_at(_preview(text), text) == RESULT_PREVIEW

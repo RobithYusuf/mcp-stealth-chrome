@@ -272,6 +272,8 @@ def _preview(text: str) -> str:
     cut = max(head.rfind("\n", start), head.rfind(", ", start))
     if cut < 0:
         cut = RESULT_PREVIEW
+    if 0xD800 <= ord(text[cut - 1]) <= 0xDBFF and 0xDC00 <= ord(text[cut]) <= 0xDFFF:
+        cut -= 1  # never between the two halves of a surrogate pair: a lone half cannot be encoded
     return text[:cut] + CUT_MARK.format(left=len(text) - cut)
 
 
