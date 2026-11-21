@@ -1,0 +1,1 @@
+onconnect = e => { const p = e.ports[0]; p.onmessage = async () => p.postMessage({ua: navigator.userAgent, ch: navigator.userAgentData?.brands, headers: await fetch('/headers').then(r => r.json())}); };

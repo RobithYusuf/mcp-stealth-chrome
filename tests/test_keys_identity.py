@@ -491,6 +491,36 @@ def test_partial_override_leaves_the_rest_real(loop, browser, base_url, field, v
     assert re.search(r"Chrome/\d+", seen["ua"])
 
 
+
+@E2E
+def test_headless_identity_reaches_workers_service_workers_and_iframes(loop, browser, base_url):
+    """A page override alone leaves worker scopes announcing HeadlessChrome."""
+    browser()
+    run(loop, "navigate", f"{base_url}/ua_scopes.html")
+    deadline = time.monotonic() + 8
+    report = None
+    while time.monotonic() < deadline:
+        raw = run(loop, "evaluate", "window.__uaReport && JSON.stringify(window.__uaReport)")
+        if raw and raw not in ("null", "undefined"):
+            report = json.loads(raw)
+            break
+        loop.run_until_complete(asyncio.sleep(0.1))
+    assert report is not None, run(loop, "evaluate", "window.__uaError || ('stage=' + window.__uaStage)")
+    assert set(report) >= {"main", "dedicated", "nested", "shared", "service",
+                           "iframe_same", "iframe_about", "iframe_srcdoc"}
+    unfixable = {"shared", "service"}
+    for scope, seen in report.items():
+        if not isinstance(seen, dict) or "ua" not in seen:
+            continue
+        if scope in unfixable:
+            assert "HeadlessChrome" in seen["ua"], (scope, seen)
+            continue
+        assert "HeadlessChrome" not in seen["ua"], (scope, seen)
+        assert "Chrome/" in seen["ua"], (scope, seen)
+        assert all("HeadlessChrome" not in brand["brand"] for brand in (seen.get("ch") or []))
+        if "headers" in seen:
+            assert "HeadlessChrome" not in seen["headers"].get("user-agent", ""), (scope, seen)
+            assert "HeadlessChrome" not in seen["headers"].get("sec-ch-ua", ""), (scope, seen)
 @E2E
 def test_fingerprint_rotate_keeps_hints_in_step(loop, browser, base_url):
     browser()

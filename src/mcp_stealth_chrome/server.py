@@ -77,6 +77,7 @@ from . import profile_gc
 from . import profile_version
 from . import presence
 from . import body_saver
+from . import identity_broker
 from . import cookie_migration
 from . import quit_watch
 from . import keep_alive as _keep_alive
@@ -478,6 +479,7 @@ def _socket_dropped(browser: Any) -> bool:
 
 async def _ensure_browser_dead(browser, profile_dir=None, grace: float = 1.5) -> dict:
     presence.stop(browser)  # its overlay goes first: nothing is left over a closing window
+    await _stop_identity_broker(browser)
     # Body saving ends before its browser: bodies whose loading finished are written first.
     await body_saver.stop_for(browser, "its browser was closed")
     """Stop a browser and VERIFY the OS process actually died.
@@ -1295,11 +1297,33 @@ async def _remove_privacy_profile(profile_dir: Optional[Path]) -> bool:
     return False
 
 
+async def _start_identity_broker(browser: Any, fingerprint: dict[str, str], product: str) -> None:
+    """Hold every target of a headless launch long enough to apply its identity."""
+    websocket_url = getattr(browser, "websocket_url", None)
+    if not websocket_url:
+        raise RuntimeError("Chrome did not expose a browser websocket for identity setup")
+    broker = identity_broker.IdentityBroker(websocket_url, fingerprint, product)
+    # Set the attribute before start: a failed websocket handshake still has a socket
+    # to close in the common launch cleanup path.
+    setattr(browser, "_mcp_identity_broker", broker)
+    await broker.start()
+
+
+async def _stop_identity_broker(browser: Any) -> None:
+    broker = getattr(browser, "_mcp_identity_broker", None) if browser is not None else None
+    if broker is not None:
+        with contextlib.suppress(Exception):
+            await broker.stop()
+        with contextlib.suppress(Exception):
+            delattr(browser, "_mcp_identity_broker")
+
+
 async def _safe_stop_browser(browser: Optional[Browser]) -> None:
     """Best-effort shutdown — used in cleanup paths so a half-launched Chrome
     doesn't leak its profile lock."""
     if browser is None:
         return
+    await _stop_identity_broker(browser)
     presence.stop(browser)  # a launch that failed after its overlay started leaves none behind
     try:
         browser.stop()
@@ -4801,6 +4825,8 @@ async def _launch_start_chrome(req: _LaunchRequest, plan: _LaunchPlan) -> tuple:
         browser = await _start_chrome(plan.config)
         _mark_allow_origins(browser, plan.config)
         brave_mode.mark(browser, req.product)
+        if req.headless:
+            await _start_identity_broker(browser, plan.effective_fingerprint or {}, req.product)
         if not req.headless:
             await _open_background_window(browser, req.window_width, req.window_height)
     except asyncio.TimeoutError:
