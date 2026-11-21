@@ -497,7 +497,7 @@ def _overlay_page_rect(full=False, saved=None):
     at the top, so it cannot be imported here)."""
     import ast
     from pathlib import Path
-    tree = ast.parse((Path(presence.__file__).with_name("_agent_overlay.py")).read_text())
+    tree = ast.parse((Path(presence.__file__).with_name("_agent_overlay.py")).read_text(encoding="utf-8"))
     func = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "insets")
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Overlay")
     method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "page_rect")
@@ -557,7 +557,7 @@ def _overlay_functions(*names, **constants):
     import ast
     import math
     from pathlib import Path
-    source = (Path(presence.__file__).with_name("_agent_overlay.py")).read_text()
+    source = (Path(presence.__file__).with_name("_agent_overlay.py")).read_text(encoding="utf-8")
     tree = ast.parse(source)
     found = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names}
     values = {}
@@ -736,7 +736,7 @@ def _overlay_dict_keys(name):
     """The keys of one of the overlay's dict constants (DOT), read from its source."""
     import ast
     from pathlib import Path
-    tree = ast.parse((Path(presence.__file__).with_name("_agent_overlay.py")).read_text())
+    tree = ast.parse((Path(presence.__file__).with_name("_agent_overlay.py")).read_text(encoding="utf-8"))
     node = next(n for n in tree.body if isinstance(n, ast.Assign) and len(n.targets) == 1
                 and isinstance(n.targets[0], ast.Name) and n.targets[0].id == name)
     return {ast.literal_eval(k) for k in node.value.keys}
