@@ -11,6 +11,9 @@ from test_focus_restore import _fake_launch
 
 _CLOSED = {"stopped": True, "verified": True, "pid": 1, "killed": [], "still_alive": [], "detail": ""}
 _ALIVE = {"stopped": True, "verified": False, "pid": 1, "killed": [], "still_alive": [4321], "detail": ""}
+# stop() returned, but there was no process to check: asked to stop, not seen to end.
+_UNVERIFIED = {"stopped": True, "verified": False, "pid": None, "killed": [], "still_alive": [], "detail": ""}
+_NOT_SEEN = "stop was requested, but no process could be checked to confirm it ended"
 _KEPT_FIELDS = ("current_profile_dir", "current_privacy", "current_headless", "current_fingerprint",
                 "current_proxy", "current_idle_timeout")
 
@@ -122,7 +125,7 @@ def test_a_browser_left_running_by_an_unfinished_move_keeps_its_privacy_profile_
     env.finish = (False, "1 cookie missing")
     env.close_report = dict(_ALIVE)
     out = _launch(privacy=True)
-    assert "could not be closed" in out and "4321" in out, out
+    assert "could not be closed" in out and "4321" in out and "call browser_close to try again" in out, out
     folders = _privacy_folders(env)
     assert len(folders) == 1, "a privacy profile was deleted under a Chrome still running"
     assert server.BrowserState.browser is env.started[0], "the only handle on a live Chrome was dropped"
@@ -182,6 +185,7 @@ def test_a_browser_that_could_not_be_ended_after_a_failed_start_is_kept_and_said
     env.close_report = dict(_ALIVE)
     out = _launch(privacy=True, storage_state_path="/nowhere/state.json" if where == "storage_state" else None)
     assert said in out and "could not be ended" in out and "4321" in out, out
+    assert "call browser_close to try again" in out, out
     folders = _privacy_folders(env)
     assert len(folders) == 1, "a privacy profile was deleted under a Chrome still running"
     assert server.BrowserState.browser is env.started[0], "the only handle on a live Chrome was dropped"
@@ -450,3 +454,21 @@ def test_a_close_that_finds_another_instance_current_records_nothing_on_it(env, 
     assert "storage_state load failed" in out and "could not be recorded on it" in out, out
     assert server.BrowserState.browser is other_browser
     assert server.BrowserState.current_profile_dir == other_profile
+
+
+@pytest.mark.parametrize("where", ["storage_state", "navigation", "navigation timeout", "cookie_move"])
+def test_a_stop_that_was_not_seen_to_end_is_said(env, monkeypatch, tmp_path, where):
+    """_ensure_browser_dead can answer stopped with nothing verified (no process to check), which
+    _close_incomplete does not count as a failure: the handle goes, and the result must say the
+    end was not seen, as browser_close does, rather than nothing or "The browser was closed"."""
+    if where == "cookie_move":
+        env.move = server._CookieMove(plan=None, backup=tmp_path / "backup.json")
+        env.finish = (False, "1 cookie missing")
+        said = "its cookies were not all moved: 1 cookie missing. The browser was asked to stop"
+    else:
+        said = _fail_after_the_start(monkeypatch, where)
+    env.close_report = dict(_UNVERIFIED)
+    out = _launch(storage_state_path="/nowhere/state.json" if where == "storage_state" else None)
+    assert said in out and _NOT_SEEN in out, out
+    assert out.index(said) < out.index(_NOT_SEEN), "the note comes after the original error"
+    assert "The browser was closed" not in out, out

@@ -4664,11 +4664,13 @@ def _launch_unrecorded_note(iid: str) -> str:
 
 
 def _launch_end_note(reap: dict, recorded: bool, iid: str) -> str:
-    """What the result adds after a failure past the start, from the close report."""
-    note = ""
+    """What the result adds after a failure past the start, from the close report. A stop that
+    was asked for but not seen to end says so (_kill_note), as browser_close does."""
     if _close_incomplete(reap):
         note = f" The browser could not be ended ({_close_failure(reap)})"
-        note += "; its handle and profile were kept: browser_close ends it." if recorded else "."
+        note += "; its handle and profile were kept: call browser_close to try again." if recorded else "."
+    else:
+        note = _kill_note(reap)
     return note + ("" if recorded else _launch_unrecorded_note(iid))
 
 
@@ -4694,10 +4696,12 @@ async def _launch_ready_browser(req: _LaunchRequest, plan: _LaunchPlan, browser:
             iid = BrowserState.current_instance_id
             reap, recorded = await _launch_end_started_browser(req, plan)
             if _close_incomplete(reap):
-                closed = (f"The browser could not be closed ({_close_failure(reap)}): close it with "
-                          f"browser_close, then launch again, which resumes the move")
+                closed = (f"The browser could not be closed ({_close_failure(reap)}): call "
+                          f"browser_close to try again, then launch again, which resumes the move")
             else:
-                closed = "The browser was closed; launch again, which resumes the move"
+                # Asked to stop is not seen to end: without a process to check, it says so.
+                ended = "was closed" if reap.get("verified") else "was asked to stop"
+                closed = f"The browser {ended}; launch again, which resumes the move{_kill_note(reap)}"
             return err(f"its cookies were not all moved: {moved_text}. {closed}"
                        f"{'' if recorded else _launch_unrecorded_note(iid)}")
         plan.dock_note += moved_text

@@ -97,6 +97,10 @@ conclusions. Each rule below replaced a real lie.
   cookies makes `storage_diff` blame the action under test).
 - Absence of evidence is not evidence: `_ensure_browser_dead()` sets `verified` only when a process was positively
   observed gone; with no PID and no profile to scan it stays false, and no clean close may be claimed.
+  `_close_incomplete` does not count that as a failure, so every result built on such a report adds `_kill_note`
+  ("stop was requested, but no process could be checked to confirm it ended"): `browser_close`, and the failure
+  paths of `browser_launch` after the start, where the cookie path says "asked to stop", not "was closed". A kept
+  handle's note says to call browser_close to try again, never that it will end the browser.
 - `fill_form` fails when a field fails, and then does not click submit. `batch_actions` counts failures by the `Error:`
   prefix, so a failure reported through `ok()` counts as success. Non-list or empty input is an error, not
   `0 actions OK`; a non-object item is a counted failure.
