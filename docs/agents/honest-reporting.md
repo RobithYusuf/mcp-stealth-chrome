@@ -109,10 +109,14 @@ conclusions. Each rule below replaced a real lie.
   text byte for byte. Known gap: a refusal of `_commit_cookie_move` itself still says
   "not changed" after its marker was written (shared with spawn_browser).
 - A launch cut short by `browser_recover` is an error that says so, never the success of a step it had
-  reached: "browser_launch of instance 'main' did not finish. browser_recover reset instance 'main' while
-  this launch ran. Its browser was ended." An error the step had already reached stays first, with that
-  sentence after it; the recover's own result says the launch was still running. A tool refused during a
-  launch says it was not done and to call it again once the launch has returned, nothing about when.
+  reached: "browser_launch of instance 'main' did not finish. browser_recover asked this launch to stop
+  while it ran. Its browser was ended." It says the recover asked it to stop, not that the recover reset
+  anything: the recover marks the launch before it waits, and may then find another pair and reset
+  nothing; its own result says whether it reset. An error the step had already reached stays first, with
+  that sentence after it; a cut after the cookie commit says what the launch had written. A launch the
+  recover had to cancel says so ("it was cancelled at the step it was waiting on"), and that its browser
+  was asked to stop without a checked end. A tool refused during a launch says it was not done and to
+  call it again once the launch has returned, nothing about when.
   A `browser_recover` whose instance stopped being the current one, or came to hold another browser, while
   it ran resets nothing and is an error saying which ("browser_recover did not reset: instance 'main'
   stopped being the current one while this recover ran, ..."), then what it did; never "recovered".

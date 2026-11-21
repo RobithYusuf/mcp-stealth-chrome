@@ -59,7 +59,9 @@ def _refusal(name):
             f"done. Call it again once the launch has returned.")
 
 
-_RECOVERED = "browser_recover reset instance 'main' while this launch ran."
+# What a launch cut short by browser_recover says of it: asked to stop, never that the recover reset
+# anything (the recover's own result says whether it did).
+_RECOVERED = "browser_recover asked this launch to stop while it ran."
 
 
 def _text(result):
@@ -765,3 +767,81 @@ def test_the_window_sweep_looks_again_after_counting_the_pages(owner, monkeypatc
     asyncio.run(run())
     assert ended == [], "the sweep closed the instance a launch began on while it counted the pages"
     assert "main" not in server.BrowserState.window_closed
+
+
+# ── No write once the launch was cut short ──────────────────────────────────────────────────
+
+
+# The real one: the env fixture replaces server._record_tabs_at_launch with a no-op.
+_RECORD_TABS_AT_LAUNCH = server._record_tabs_at_launch
+
+
+def _mark_the_launch_stopped():
+    """What browser_recover does first: it marks the launch (ended_by) before anything else."""
+    server._LAUNCHING[server.BrowserState.session_key()].ended_by = "browser_recover"
+
+
+@pytest.mark.parametrize("during", ["the first look", "the commit"])
+def test_a_launch_cut_short_in_the_commit_phase_writes_nothing_more(env, monkeypatch, during):
+    """The commit phase awaits the first look and the cookie commit before it writes the vertical
+    tabs and lean settings and runs the tidy-up. Cut short during the first look, nothing is
+    committed; during the commit, no setting is written, and the result says what had been."""
+    from test_launch_cleanup import _launch, _spy_profile_writes
+    _spy_profile_writes(env, monkeypatch)
+    env.move = server._CookieMove(plan=None, marker={"state": "pending"}, strip=True)
+    real_preflight, real_commit = server._cookie_preflight, server._commit_cookie_move
+
+    async def preflight(profile, move, written=None):
+        out = await real_preflight(profile, move, written=written)
+        if during == "the first look" and env.preflights == 1:
+            _mark_the_launch_stopped()
+        return out
+
+    async def commit(profile, move):
+        out = await real_commit(profile, move)
+        if during == "the commit":
+            _mark_the_launch_stopped()
+        return out
+
+    monkeypatch.setattr(server, "_cookie_preflight", preflight)
+    monkeypatch.setattr(server, "_commit_cookie_move", commit)
+    out = _launch(vertical_tabs="left")
+    assert out.startswith("Error: browser_launch of instance 'main' did not finish.") and _RECOVERED in out, out
+    assert not {"vertical_tabs", "brave_lean", "tidy", "start"} & set(map(str, env.order)), env.order
+    if during == "the first look":
+        assert "commit" not in env.order, env.order
+        assert "had already" not in out, out
+    else:
+        assert "commit" in env.order, env.order
+        assert ("This launch had already written the cookie move's pending marker and the removal of the "
+                "v10 cookies its backup holds in it.") in out, out
+
+
+def test_the_saved_tabs_are_not_written_once_the_launch_was_cut_short(env, monkeypatch, tmp_path):
+    """_record_tabs_at_launch reads the pages, then writes the list: a launch cut short during that
+    read writes nothing."""
+    saved = []
+
+    async def pages(_browser):
+        _mark_the_launch_stopped()
+        return [{"targetId": "t1", "url": "https://example.com/"}]
+
+    browser = SimpleNamespace(tabs=[_Tab()], stopped=False, config=None)
+    monkeypatch.setattr(server, "_instance_view",
+                        lambda _iid: (browser, ["t1"], "t1", tmp_path / "profile", False))
+    monkeypatch.setattr(server, "_tab_record_scope", lambda *_a: "scope")
+    monkeypatch.setattr(server, "_page_targets", pages)
+    monkeypatch.setattr(server.tab_record, "save", lambda *a, **kw: saved.append(a) or "recorded")
+
+    async def run():
+        hold, task = _hold_a_launch_of("main")
+        launching = server._LAUNCHING[server.BrowserState.session_key()]
+        try:
+            return await _RECORD_TABS_AT_LAUNCH("main", launching)
+        finally:
+            hold.set()
+            await task
+            server._LAUNCHING.pop(server.BrowserState.session_key(), None)
+
+    said = asyncio.run(run())
+    assert saved == [] and said == "not recorded: the launch was cut short while its pages were read", said

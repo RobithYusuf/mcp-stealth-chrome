@@ -206,7 +206,9 @@ Part of the agent guide: [AGENTS.md](../../AGENTS.md) says when to read this. It
 - Inside the steps each acts on the launch's own instance and browser (`plan.launching`, `plan.browser`),
   never on what is current by then: the failure cleanup (`_launch_end_started_browser`), a cancel
   (`_launch_cancelled`), the saved tabs (recorded only while the launch still holds its instance), the
-  window placement. A reattach cut short before it recorded the kept browser gives it back as it was (the
+  window placement. A step that writes after an await looks again right before the write, not only when
+  it returns: the commit phase after the first look (no cookie commit) and after the commit (no vertical
+  tabs, lean or tidy-up), and the first saved-tab list after it read the pages. A reattach cut short before it recorded the kept browser gives it back as it was (the
   record names its old server again, nothing ends it): it may be the person's, opened from the launcher.
   Once recorded it is the launch's browser, and the recover ended it as the current one.
 - The idle reaper and the window sweep skip the launching instance; their next tick sees it. The window

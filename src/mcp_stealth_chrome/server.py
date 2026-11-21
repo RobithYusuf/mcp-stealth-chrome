@@ -3772,11 +3772,13 @@ def _record_tabs_at_exit(instance_id: str, browser: Any, tabs: list, active_inde
                            limit=_tab_limit(browser))
 
 
-async def _record_tabs_at_launch(instance_id: str) -> str:
+async def _record_tabs_at_launch(instance_id: str, launching: Optional["_Launching"] = None) -> str:
     """The first record of a browser, written as its launch returns. The quit watcher ends a
     browser once its last window is gone, when nothing is left to read, so a Quit before the
     background writer's first pass (about 2.3 s after the call) would leave no list at all.
-    One read, capped like a close's; never raises, and an empty list replaces nothing."""
+    One read, capped like a close's; never raises, and an empty list replaces nothing. For
+    browser_launch (`launching`), nothing is written once the launch was cut short while the
+    pages were read."""
     try:
         view = _instance_view(instance_id)
         if view is None:
@@ -3786,6 +3788,8 @@ async def _record_tabs_at_launch(instance_id: str) -> str:
         if scope is None or _closing(browser):
             return "not recorded"
         pages = await asyncio.wait_for(_page_targets(browser), timeout=_TAB_RECORD_READ_TIMEOUT)
+        if launching is not None and not _launch_owned(None, launching):
+            return "not recorded: the launch was cut short while its pages were read"
         return tab_record.save(instance_id, scope, pages, keys, active, "at launch", force=False,
                                limit=_tab_limit(browser))
     except Exception as exc:
@@ -4662,8 +4666,10 @@ async def _launch_commit_profile(req: _LaunchRequest, plan: _LaunchPlan) -> Opti
     there. plan.written records each write, for the last look's refusal."""
     # The preflight, the commit, the settings and the tidy-up stay in this order: a refusal
     # at the preflight or the commit writes nothing.
-    refused = await _cookie_preflight(plan.profile_path, plan.cookie_move) \
-        or await _commit_cookie_move(plan.profile_path, plan.cookie_move)
+    refused = await _cookie_preflight(plan.profile_path, plan.cookie_move)
+    if not refused and _launch_lost(plan):
+        return None  # cut short while it looked: nothing is committed (_launch_settle says so)
+    refused = refused or await _commit_cookie_move(plan.profile_path, plan.cookie_move)
     if refused:
         await _remove_privacy_profile(plan.privacy_profile)
         return err(refused)
@@ -4671,6 +4677,8 @@ async def _launch_commit_profile(req: _LaunchRequest, plan: _LaunchPlan) -> Opti
     if getattr(move, "marker", None) is not None:
         plan.written += ("the cookie move's pending marker"
                          + (" and the removal of the v10 cookies its backup holds" if move.strip else ""),)
+    if _launch_lost(plan):
+        return None  # cut short during the commit: no setting is written (_launch_settle says what was)
     config = plan.config
     try:
         plan.dock_note += _browser_note(config, req.product) + brave_mode.write_vertical_tabs(
@@ -4782,11 +4790,18 @@ def _launch_owned(plan: Optional[_LaunchPlan], launching: _Launching) -> bool:
     return plan is None or not plan.adopted or BrowserState.browser is plan.browser
 
 
+def _launch_lost(plan: _LaunchPlan) -> bool:
+    """The launch no longer holds its instance (_launch_owned), for a step that is about to write."""
+    return plan.launching is not None and not _launch_owned(plan, plan.launching)
+
+
 def _launch_lost_note(launching: _Launching) -> str:
-    """Who took the launch's instance from it, for the result of the launch it cut short."""
+    """Who took the launch's instance from it, for the result of the launch it cut short. What
+    browser_recover did to the instance is said by its own result, not here: it marks the launch
+    before it waits, and may then find another pair and reset nothing."""
     iid = launching.instance_id
     if launching.ended_by:
-        return f" {launching.ended_by} reset instance {iid!r} while this launch ran."
+        return f" {launching.ended_by} asked this launch to stop while it ran."
     return (f" Instance {iid!r} stopped being the current one, or its browser was replaced, while "
             f"this launch ran; the current instance was left as it was.")
 
@@ -4812,6 +4827,9 @@ async def _launch_settle(req: _LaunchRequest, plan: Optional[_LaunchPlan], launc
         text = stop
     else:
         text = err(f"browser_launch of instance {launching.instance_id!r} did not finish.")
+        written = _launch_written(plan) if plan is not None else None
+        if written:
+            text += f" {written[0].upper()}{written[1:]}."
     text = _sentence(text) + _launch_lost_note(launching)
     if plan is None or plan.ended:
         return text
@@ -5437,7 +5455,7 @@ async def _launch_run(req: _LaunchRequest, launching: _Launching, session: str, 
             restore_suffix, observed = await _launch_restore_tabs(req, plan, started, main, observed)
             if (stop := await _launch_settle(req, plan, launching, None)) is not None:
                 return stop
-            await _record_tabs_at_launch(launching.instance_id)
+            await _record_tabs_at_launch(launching.instance_id, launching)
             if (stop := await _launch_settle(req, plan, launching, None)) is not None:
                 return stop
 
