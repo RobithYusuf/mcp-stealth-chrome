@@ -175,5 +175,6 @@ conclusions. Each rule below replaced a real lie.
   but no clickable widget found" (field report, 21 Nov 2026). `_CF_CHALLENGE_PROBE_INITIAL_JS` (auto_verify's first
   look) counts them only with the challenge page's own marks; the widget's own DOM marks count as before. The ACTIVE
   probe still counts the phrases alone (open item).
+- Probe solver aktif masih memakai frasa halaman untuk memutuskan apakah tantangan tetap ada. Hasil solver bukan bukti lolos; caller harus membaca halaman atau meminta bukti manusia sebelum menyimpulkan verifikasi selesai.
 - The page line cuts the query and says how much and that get_url gives it whole: navigation URLs are never masked, and
   the cut is for length only.

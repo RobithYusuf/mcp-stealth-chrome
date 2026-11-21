@@ -68,7 +68,7 @@ PAGES = {
     "/challenge/123": "<h1>Coding challenge 123</h1>",
     "/verify/captchas": "<h1>All the captchas we know</h1>",
     "/cf-login": ("<title>Sign in</title><form><input name=user><div class='cf-turnstile' "
-                  "data-sitekey='0x4AAAAAAAAAAAAAAA'></div><input type=hidden "
+                  "data-sitekey='0x4AAAAAAAAAAAAAAA'>Verify you are human</div><input type=hidden "
                   "name='cf-turnstile-response' value=''><button>Sign in</button></form>"),
     "/start": "<h1>Start</h1><a id=go href='/p3'>to product 3</a>",
     "/frame-path": "<iframe src='/p3'></iframe>",
