@@ -822,6 +822,23 @@ def test_first_page_timeout_keeps_the_browser_usable(base, path, tmp_path):
         client.close()
 
 
+def test_tab_new_timeout_owns_and_selects_the_new_tab(base):
+    client = Client(env={"BROWSER_NAV_TIMEOUT": "1"})
+    try:
+        assert not launch(client, f"{base}/protocol.html").failed
+        opened = client.call("tab_new", url=f"{base}/hang?new", _timeout=15)
+        assert opened.failed and "now active" in opened.text, opened.text
+        assert client.call("server_status").json()["browser_running"]
+        again = client.call("navigate", url=f"{base}/page2.html", _timeout=15)
+        assert not again.failed, again.text
+        tabs = client.call("tab_list").text
+        assert "Active tab: 1" in tabs and f"{base}/protocol.html" in tabs, tabs
+        assert client.evaluate("document.title") == "Page Two"
+    finally:
+        client.call("close_all_instances", _timeout=40)
+        client.close()
+
+
 @pytest.mark.skipif(os.environ.get("GITHUB_ACTIONS") == "true", reason=(
     "a 350 ms timing budget measured on a developer machine; a shared runner took 0.375 s once"))
 def test_a_click_that_changed_the_page_is_reported_at_once(page, base):

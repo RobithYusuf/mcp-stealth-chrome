@@ -747,16 +747,13 @@ async def tab_new(
         emulation_error = await _srv._keep_painting_behind(new_tab) if mode == "behind" else None
         doc_state, disarm = await _srv._arm_document_watch(new_tab)
         try:
-            if url != "about:blank":
-                await asyncio.wait_for(new_tab.get(url), _srv.NAV_COMMIT_TIMEOUT)
-                try:
-                    await _srv._wait_load_complete(new_tab, 10)
-                except Exception:
-                    pass
-            observed = await _srv._observe_navigation(new_tab, url, disarm())
-        except asyncio.TimeoutError:
-            observed = await _srv._observe_navigation(new_tab, url, disarm())
-            return _srv._nav_commit_timeout("opened tab", observed)
+            timeout = (await _srv._commit_navigation(new_tab, url, doc_state)
+                       if url != "about:blank" else None)
+            if timeout is None:
+                if url != "about:blank":
+                    with contextlib.suppress(Exception):
+                        await _srv._wait_load_complete(new_tab, 10)
+                observed = await _srv._observe_navigation(new_tab, url, disarm())
         finally:
             disarm()
         problem = await _srv._tab_list_problem()
@@ -768,6 +765,8 @@ async def tab_new(
         BrowserState.own([new_tab])
         BrowserState.active_tab_index = BrowserState.tabs.index(new_tab)
         BrowserState.active_lost = ""
+        if timeout is not None:
+            return _srv._nav_commit_timeout(f"Opened tab [{BrowserState.active_tab_index}], now active", timeout)
         if mode == "behind":
             where = await _behind_note(browser, new_tab, before_tab, emulation_error)
         elif mode == "window":
