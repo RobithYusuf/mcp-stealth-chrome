@@ -548,11 +548,12 @@ def test_attach_says_when_the_browser_could_not_be_told():
     import inspect
 
     from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import attach
 
     text = server._attached_note("unknown")
     assert "could not be told" in text and "client hints" in text
     assert server._attached_note("brave") == "" and server._attached_note("chrome") == ""
-    assert "_attached_note(" in inspect.getsource(server.attach_to_chrome)
+    assert "_attached_note(" in inspect.getsource(attach.attach_to_chrome)
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="the Keychain key change exists on macOS only")
