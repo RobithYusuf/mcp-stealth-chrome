@@ -389,6 +389,30 @@ def test_tab_cache_cleanup_preserves_other_live_targets(monkeypatch):
     assert set(server._NETWORK_CAPTURES) == {"TARGET-B"}
 
 
+
+def test_tab_cleanup_removes_network_handlers(monkeypatch):
+    from collections import defaultdict
+    from mcp_stealth_chrome import server
+    from nodriver.cdp import network
+
+    class _Target:
+        target_id = "TARGET-CLOSED"
+
+    class _Tab:
+        target = _Target()
+        def __init__(self):
+            self.handlers = defaultdict(list)
+
+    tab = _Tab()
+    handler = lambda event: None
+    tab.handlers[network.RequestWillBeSent].append(handler)
+    monkeypatch.setattr(server, "_NETWORK_CAPTURES", {
+        "TARGET-CLOSED": ({}, tab, ((network.RequestWillBeSent, handler),)),
+    })
+    server._clear_tab_scoped_state([tab])
+    assert not tab.handlers[network.RequestWillBeSent]
+    assert "TARGET-CLOSED" not in server._NETWORK_CAPTURES
+
 def test_trace_stop_removes_handlers_when_cdp_end_fails(monkeypatch):
     import asyncio
     from collections import defaultdict

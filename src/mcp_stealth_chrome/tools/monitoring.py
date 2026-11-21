@@ -247,9 +247,9 @@ async def network_start(capture_bodies: bool = True, keep_bodies: bool = False,
                         save_bodies: Optional[list[dict[str, Any]]] = None,
                         reveal_values: Union[bool, Literal["body"]] = False) -> str:
     """Begin capturing network requests + responses with full headers.
-
     Capture covers only this tab's CDP session, not out-of-process iframes, workers or service
     workers; block_ads and save_bodies use separate connections with their own target coverage.
+    Capture is bound to the tab where it starts; selecting another tab does not move or stop it.
 
     Args:
         capture_bodies: if True (default), also indexes by request_id so

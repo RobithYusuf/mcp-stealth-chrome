@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 
 PAGE_HEADERS_NOTE = "Wire request headers were not observed for this hop; showing page headers."
+PAGE_HEADERS_DROPPED_NOTE = "Network headers were discarded because the capture tracker limit was reached; showing page headers."
 
 
 @dataclass(slots=True)
@@ -14,20 +15,35 @@ class _Chain:
     received: int = 0
     latest: dict | None = None
     finished: bool = False
+    order: int = 0
 
 
 class RequestHeaders:
     def __init__(self, limit: int):
         self._limit = max(0, limit)
+        self._next_order = 0
         self._chains: dict[str, _Chain] = {}
+
+    def _evict_one(self) -> None:
+        if not self._chains:
+            return
+        # Completed chains and wire-only orphans cannot produce more useful information.
+        candidates = [chain for chain in self._chains.values()
+                      if chain.finished or chain.entry is None]
+        chain = min(candidates or list(self._chains.values()), key=lambda c: c.order)
+        rid = next(key for key, value in self._chains.items() if value is chain)
+        self._chains.pop(rid, None)
+        if chain.entry is not None and chain.entry.get("headers_source") != "wire":
+            chain.entry["headers_source"] = "page"
+            chain.entry["headers_note"] = PAGE_HEADERS_DROPPED_NOTE
 
     def _chain(self, rid: str) -> _Chain:
         chain = self._chains.get(rid)
         if chain is None:
-            chain = self._chains[rid] = _Chain()
-            # Includes ExtraInfo that arrives without a page request. Evict oldest first.
-            if len(self._chains) > self._limit:
-                del self._chains[next(iter(self._chains))]
+            if len(self._chains) >= self._limit:
+                self._evict_one()
+            self._next_order += 1
+            chain = self._chains[rid] = _Chain(order=self._next_order)
         return chain
 
     def request(self, rid: str, entry: dict, previous: dict | None, redirected: bool,
@@ -47,6 +63,8 @@ class RequestHeaders:
         chain.received += 1
         # Only the last hop lives in network_index. Never queue all headers of a redirect chain.
         chain.latest = headers
+        if chain.entry is None:
+            return
         self._publish(rid, chain)
 
     def finish(self, rid: str, entry: dict, has_extra: bool) -> None:

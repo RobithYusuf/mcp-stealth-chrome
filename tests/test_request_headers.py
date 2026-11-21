@@ -45,3 +45,26 @@ def test_orphan_wire_headers_are_forgotten_at_the_capture_limit():
     assert entry == {"headers_source": "page"}
     tracker.extra("old", {"X-Wire": "fresh"})
     assert entry["request_headers"] == {"X-Wire": "fresh"}
+
+
+def test_active_chains_survive_when_orphans_fill_the_limit():
+    tracker = RequestHeaders(3)
+    active = {}
+    tracker.request("active-1", active, None, False, False)
+    tracker.request("active-2", {}, None, False, False)
+    tracker.extra("orphan-1", {"X-Wire": "one"})
+    tracker.extra("orphan-2", {"X-Wire": "two"})
+    tracker.extra("orphan-3", {"X-Wire": "three"})
+    tracker.finish("active-1", active, True)
+    tracker.extra("active-1", {"X-Wire": "active"})
+    assert active["headers_source"] == "wire"
+    assert active["request_headers"] == {"X-Wire": "active"}
+
+
+def test_active_eviction_marks_header_loss_instead_of_page_silence():
+    tracker = RequestHeaders(1)
+    active = {"headers_source": "page", "headers_note": "old"}
+    tracker.request("active", active, None, False, False)
+    tracker.request("new", {}, None, False, False)
+    assert active["headers_source"] == "page"
+    assert "discarded because" in active["headers_note"]
