@@ -101,6 +101,11 @@ conclusions. Each rule below replaced a real lie.
   ("stop was requested, but no process could be checked to confirm it ended"): `browser_close`, and the failure
   paths of `browser_launch` after the start, where the cookie path says "asked to stop", not "was closed". A kept
   handle's note says to call browser_close to try again, never that it will end the browser.
+- A cookie refusal says "the profile was not changed" only where that holds. The last `_cookie_preflight` of
+  `browser_launch` comes after the commit, the vertical tabs and lean writes and the tidy-up, so it is passed what
+  this launch had written (`_launch_written`) and says "Nothing was started; this launch had already written ...".
+  The first look keeps Chrome's text byte for byte. Known gap: a refusal of `_commit_cookie_move` itself still says
+  "not changed" after its marker was written (shared with spawn_browser).
 - `fill_form` fails when a field fails, and then does not click submit. `batch_actions` counts failures by the `Error:`
   prefix, so a failure reported through `ok()` counts as success. Non-list or empty input is an error, not
   `0 actions OK`; a non-object item is a counted failure.

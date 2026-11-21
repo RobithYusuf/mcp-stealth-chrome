@@ -2,6 +2,7 @@
 starts, and every folder is under tmp_path (the profile, the privacy profiles). The fixture also
 stubs the kept-browser search, which would otherwise look at the real main profile."""
 import asyncio
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -27,7 +28,7 @@ def env(tmp_path, monkeypatch):
     order = _fake_launch(monkeypatch)
     calls = SimpleNamespace(order=order, preflights=0, preflight={}, commit="", move=None,
                             finish=(True, ""), close_report=dict(_CLOSED), closes=[], started=[],
-                            during_close=None,
+                            during_close=None, written_at_look=[],
                             profile=tmp_path / "profile", privacy_root=tmp_path / "privacy-profiles")
     monkeypatch.setattr(server, "PRIVACY_PROFILE_ROOT", calls.privacy_root)
     monkeypatch.setattr(server, "ensure_dirs", lambda: None)
@@ -49,9 +50,10 @@ def env(tmp_path, monkeypatch):
         order.append("prepare")
         return calls.move or server._CookieMove(plan=None)
 
-    async def preflight(_profile, _move):
+    async def preflight(_profile, _move, written=None):
         calls.preflights += 1
         order.append(f"preflight{calls.preflights}")
+        calls.written_at_look.append(written)
         return calls.preflight.get(calls.preflights, "")
 
     async def commit(_profile, _move):
@@ -280,6 +282,7 @@ def test_a_profile_taken_between_the_check_and_the_write_refuses_after_the_commi
     out = _launch(vertical_tabs="left")
     assert "vertical_tabs could not be written into the profile, so nothing was started" in out, out
     assert "in use by PID 4242" in out, out
+    assert "The cookie step had already been committed (it had nothing to write)." in out, out
     assert env.order == ["prepare", "preflight1", "commit"], env.order
     assert not (env.profile / "Default" / "Preferences").exists()
 
@@ -510,3 +513,52 @@ def test_a_privacy_profile_that_could_not_be_removed_is_said_and_kept_for_later(
     closed = asyncio.run(server.mcp._tool_manager._tools["browser_close"].fn())
     assert "stale privacy profile removed" in closed, closed
     assert _privacy_folders(env) == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
+def test_a_plain_write_error_after_the_commit_says_what_the_cookie_step_had_committed(env, tmp_path):
+    """The check only reads, so a write that fails on its own (a sub-profile folder that cannot be
+    written, a full disk) refuses after the commit, with nothing changed since the check. The
+    refusal says nothing was started and what the cookie step had already committed."""
+    import os
+    sub = env.profile / "Default"
+    sub.mkdir(parents=True)
+    (sub / "Preferences").write_text('{"profile": {}}')
+    os.chmod(sub, 0o500)  # readable, not writable: the temporary file cannot be made
+    env.move = server._CookieMove(plan=None, marker={"state": "pending"}, strip=True)
+    try:
+        out = _launch(vertical_tabs="left")
+    finally:
+        os.chmod(sub, 0o700)
+    assert "vertical_tabs could not be written into the profile, so nothing was started" in out, out
+    assert ("The cookie step had already been committed (the cookie move's pending marker and the removal "
+            "of the v10 cookies its backup holds; the next launch resumes the move).") in out, out
+    assert env.order[:3] == ["prepare", "preflight1", "commit"] and "start" not in env.order, env.order
+    assert (sub / "Preferences").read_text() == '{"profile": {}}'
+
+
+def test_the_last_look_is_told_what_this_launch_had_written(env):
+    """The last look comes after the commit, the settings and the tidy-up, so its refusal must not
+    say the profile was not changed; the first look is told nothing and keeps that text."""
+    env.preflight = {2: "its cookie database changed after this launch read it"}
+    out = _launch(vertical_tabs="left")
+    assert out.startswith("Error") and "changed after this launch read it" in out, out
+    assert env.written_at_look == [
+        None, "this launch had already written the vertical tabs setting, the tidy-up of stale locks "
+              "and window state in it"], env.written_at_look
+
+
+def test_the_last_look_refusal_names_the_writes_and_the_first_keeps_its_text(tmp_path):
+    from mcp_stealth_chrome import cookie_migration
+    profile = tmp_path / "p"
+    (profile / "Default").mkdir(parents=True)
+    plan = SimpleNamespace(fingerprint=("not what is there",), subprofile="Default", marker=None)
+    move = server._CookieMove(plan=plan)
+    assert cookie_migration.fingerprint_of(profile, "Default") != plan.fingerprint
+    first = asyncio.run(server._cookie_preflight(profile, move))
+    assert "Nothing was started and the profile was not changed." in first, first
+    written = "this launch had already written the vertical tabs setting in it"
+    last = asyncio.run(server._cookie_preflight(profile, move, written=written))
+    assert f"Nothing was started; {written}." in last and "the profile was not changed" not in last, last
+    assert last.replace(f"Nothing was started; {written}.",
+                        "Nothing was started and the profile was not changed.") == first

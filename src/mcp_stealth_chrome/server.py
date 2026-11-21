@@ -2580,16 +2580,20 @@ async def _prepare_cookie_move(profile_path: Optional[Path], config: Config) -> 
 
 
 def _cookie_refusal(profile_path: Any, why: str, marker: Optional[dict] = None,
-                    product: str = "chrome") -> str:
-    """The refusal, with what can be done about it. Nothing was started or written. Chrome's
-    text is unchanged; for Brave it names Brave."""
+                    product: str = "chrome", written: Optional[str] = None) -> str:
+    """The refusal, with what can be done about it. Nothing was started. Left unset, `written`
+    keeps the text that says the profile was not changed (Chrome's text is unchanged; for Brave
+    it names Brave); a refusal that comes after this launch wrote in the profile passes what it
+    wrote instead."""
     saved = ""
     if marker and marker.get("backup"):
         saved = (f" A backup of its cookies is at {marker['backup']} (storage_state_load reads it) "
                  f"and a copy of its cookie databases at {marker.get('database_copy') or 'an unrecorded place'}.")
     browser = "Brave" if product == brave_mode.BRAVE else "Chrome"
-    return (f"refused to open {profile_path} with {browser} 158 or newer: {why}. Nothing was started and "
-            f"the profile was not changed.{saved} Close every Chrome that has this profile open and "
+    done = ("Nothing was started and the profile was not changed." if written is None
+            else f"Nothing was started; {written}.")
+    return (f"refused to open {profile_path} with {browser} 158 or newer: {why}. {done}{saved} "
+            "Close every Chrome that has this profile open and "
             "launch again, which decides afresh. To work meanwhile without risking these cookies, "
             "clone_chrome_profile makes a copy to launch instead. If the cookie database itself is "
             "damaged, Chrome cannot use it either: restore it from a backup of the profile first. "
@@ -2621,7 +2625,8 @@ def _cookie_move_failed(plan: Any, profile_path: Any, why: str, product: str = "
         f"the protection turned off, so nothing is lost, and the next launch tries again]"))
 
 
-async def _cookie_preflight(profile_path: Optional[Path], move: _CookieMove) -> str:
+async def _cookie_preflight(profile_path: Optional[Path], move: _CookieMove,
+                            written: Optional[str] = None) -> str:
     """The last look before anything is written: the profile must be as the cookie decision
     found it. A Chrome that took its lock, or a cookie database of the launched sub-profile
     written since (another program, a v10 cookie arriving after the check), means that decision
@@ -2649,7 +2654,8 @@ async def _cookie_preflight(profile_path: Optional[Path], move: _CookieMove) -> 
 
     why = await asyncio.to_thread(look)
     return _cookie_refusal(profile_path, (
-        f"{why}, so what Chrome would delete is no longer known"), getattr(plan, "marker", None)) if why else ""
+        f"{why}, so what Chrome would delete is no longer known"), getattr(plan, "marker", None),
+        written=written) if why else ""
 
 
 async def _commit_cookie_move(profile_path: Optional[Path], move: _CookieMove) -> str:
@@ -4089,6 +4095,8 @@ class _LaunchPlan:
     dock_note: str = ""  # _launch_prepare_profile on: notes for the result
     cookie_move: Any = None  # _launch_prepare_profile
     previous_app: Optional[int] = None  # _launch_keep_keyboard
+    # What this launch has written in the profile, in order, for a refusal after the commit.
+    written: tuple = ()  # _launch_commit_profile
 
 
 def _launch_check_arguments(browser: str, vertical_tabs: Optional[str], user_data_dir: Optional[str],
@@ -4525,15 +4533,22 @@ async def _launch_keep_keyboard(req: _LaunchRequest, plan: _LaunchPlan) -> None:
             plan.config.add_argument(_flag)
 
 
+def _launch_written(plan: _LaunchPlan) -> Optional[str]:
+    """What this launch had written in the profile, for a refusal that comes after the commit;
+    None when nothing was."""
+    return f"this launch had already written {', '.join(plan.written)} in it" if plan.written else None
+
+
 async def _launch_commit_profile(req: _LaunchRequest, plan: _LaunchPlan) -> Optional[str]:
     """The first writes to the profile, only once the cookie checks have passed: the cookie
     move's commit, the vertical tabs and brave_lean settings, then the tidy-up of locks and
     window state. Returns a refusal (the privacy profile removed), or None to go on.
 
-    vertical_tabs was checked before the preflight (_launch_prepare_profile), so a write that
-    fails here means the profile changed since that check (a browser took it in that moment).
-    That refusal comes after the commit; a pending marker from it is what the next launch
-    resumes, as after a crash there."""
+    vertical_tabs was checked before the preflight (_launch_prepare_profile), but that check only
+    reads: any failure of the write itself (a profile that changed since, a folder that cannot
+    be written, a full disk) comes after the commit, and its refusal says what the cookie step
+    had already committed; a pending marker is what the next launch resumes, as after a crash
+    there. plan.written records each write, for the last look's refusal."""
     # The preflight, the commit, the settings and the tidy-up stay in this order: a refusal
     # at the preflight or the commit writes nothing.
     refused = await _cookie_preflight(plan.profile_path, plan.cookie_move) \
@@ -4541,17 +4556,29 @@ async def _launch_commit_profile(req: _LaunchRequest, plan: _LaunchPlan) -> Opti
     if refused:
         await _remove_privacy_profile(plan.privacy_profile)
         return err(refused)
+    move = plan.cookie_move
+    if getattr(move, "marker", None) is not None:
+        plan.written += ("the cookie move's pending marker"
+                         + (" and the removal of the v10 cookies its backup holds" if move.strip else ""),)
     config = plan.config
     try:
         plan.dock_note += _browser_note(config, req.product) + brave_mode.write_vertical_tabs(
             Path(config.user_data_dir), config.browser_args, req.product, req.vertical_tabs)
     except Exception as e:
         await _remove_privacy_profile(plan.privacy_profile)
+        committed = (f" ({', '.join(plan.written)}; the next launch resumes the move)" if plan.written
+                     else " (it had nothing to write)")
         return err(f"vertical_tabs could not be written into the profile, so nothing was "
-                   f"started: {_exc_text(e)}")
+                   f"started: {_exc_text(e)}. The cookie step had already been committed{committed}.")
+    if req.vertical_tabs is not None:
+        plan.written += ("the vertical tabs setting",)
     plan.dock_note += _apply_brave_lean(config, req.product, req.brave_lean,
                                         server_chosen=plan.explicit_udd is None)
+    lean = getattr(config, brave_lean.ATTR, None)
+    if lean is not None and (getattr(lean, "written", None) or getattr(lean, "restored", None)):
+        plan.written += ("brave_lean's settings",)
     if plan.tidy_profile is not None:
+        plan.written += ("the tidy-up of stale locks and window state",)
         clean_profile_state(plan.tidy_profile)  # only clears stale locks
         # Selectively wipe corrupt window-placement / session-restore state. Idempotent and
         # cheap (a few file writes), preserves cookies and logins. Saves us from "window
@@ -4569,8 +4596,8 @@ async def _launch_start_chrome(req: _LaunchRequest, plan: _LaunchPlan) -> tuple:
     failed ends what it started and removes the privacy profile."""
     # The last look, as close to the start as this server can make it; Chrome takes the lock
     # about half a second later, and that gap is a known limit (no lock it honours can be
-    # held across it).
-    refused = await _cookie_preflight(plan.profile_path, plan.cookie_move)
+    # held across it). Its refusal names what this launch had written by then.
+    refused = await _cookie_preflight(plan.profile_path, plan.cookie_move, written=_launch_written(plan))
     if refused:
         return err(refused + await _launch_remove_privacy(plan)), None, None
     ads_pending = (_adblock_module().begin(req.block_ads, plan.config.browser_executable_path)
