@@ -5285,11 +5285,8 @@ async def browser_recover() -> str:
                 # Give SIGTERM up to 2s to take effect, then SIGKILL stragglers.
                 await asyncio.sleep(2.0)
                 for pid in pids:
-                    try:
-                        os.kill(pid, 0)  # liveness probe
-                    except ProcessLookupError:
-                        continue
-                    except Exception:
+                    # _process_exists, not os.kill(pid, 0): on Windows that sends Ctrl+C.
+                    if not _process_exists(pid):
                         continue
                     try:
                         os.kill(pid, _signal.SIGKILL)

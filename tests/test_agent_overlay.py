@@ -1119,3 +1119,19 @@ def test_a_closed_tab_takes_its_device_override_record_with_it():
     finally:
         presence._OVERRIDES.pop("T-closed", None)
         presence._OVERRIDES.pop("T-open", None)
+
+
+def test_the_liveness_probe_sends_no_signal_on_windows(monkeypatch):
+    """os.kill(pid, 0) is no probe on Windows: 0 is CTRL_C_EVENT, and the Ctrl+C it sent through
+    the console group stopped the Windows test job a few seconds into the overlay tests, run after
+    run. presence asks state._pid_alive there, as server._process_exists does."""
+    from mcp_stealth_chrome import state
+
+    def no_signal(pid, sig):
+        raise AssertionError(f"os.kill({pid}, {sig}) on Windows")
+
+    monkeypatch.setattr(presence.sys, "platform", "win32")
+    monkeypatch.setattr(presence.os, "kill", no_signal)
+    monkeypatch.setattr(state, "_pid_alive", lambda pid: pid == 4242)
+    assert presence._pid_alive(4242) is True
+    assert presence._pid_alive(4243) is False
