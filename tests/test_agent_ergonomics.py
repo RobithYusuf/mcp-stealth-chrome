@@ -282,7 +282,6 @@ def test_dialog_handlers_use_stable_target_identity(monkeypatch):
     import asyncio
 
     from mcp_stealth_chrome import server
-    from mcp_stealth_chrome.tools import dialogs
 
     class _Target:
         target_id = "DIALOG-TARGET"
@@ -307,7 +306,7 @@ def test_dialog_handlers_use_stable_target_identity(monkeypatch):
         "active_tab",
         classmethod(lambda cls: next(active)),
     )
-    dialogs._dialog_pre_action["_registered_tab_ids"].clear()
+    server._dialog_pre_action["_registered_tab_ids"].clear()
     try:
         dialog_handle = server.mcp._tool_manager._tools["dialog_handle"].fn
         asyncio.run(dialog_handle(action="accept"))
@@ -315,7 +314,7 @@ def test_dialog_handlers_use_stable_target_identity(monkeypatch):
         assert len(first.handlers) == 1
         assert replacement.handlers == []
     finally:
-        dialogs._dialog_pre_action["_registered_tab_ids"].clear()
+        server._dialog_pre_action["_registered_tab_ids"].clear()
 
 
 def test_devtools_active_state_survives_tab_wrapper_replacement(monkeypatch):
@@ -1605,7 +1604,6 @@ def test_dialog_handle_answers_only_the_next_dialog(monkeypatch):
     import asyncio
 
     from mcp_stealth_chrome import server
-    from mcp_stealth_chrome.tools import dialogs
 
     class _Target:
         target_id = "ONE-SHOT"
@@ -1626,7 +1624,7 @@ def test_dialog_handle_answers_only_the_next_dialog(monkeypatch):
 
     tab = _Tab()
     monkeypatch.setattr(server.BrowserState, "active_tab", classmethod(lambda cls: tab))
-    dialogs._dialog_pre_action["_registered_tab_ids"].discard("ONE-SHOT")
+    server._dialog_pre_action["_registered_tab_ids"].discard("ONE-SHOT")
     dialog = server.mcp._tool_manager._tools["dialog_handle"].fn
     try:
         asyncio.run(dialog(action="accept"))
@@ -1637,7 +1635,7 @@ def test_dialog_handle_answers_only_the_next_dialog(monkeypatch):
         asyncio.run(tab.handlers[0](None))
         assert tab.answers == [True, False]
     finally:
-        dialogs._dialog_pre_action["_registered_tab_ids"].discard("ONE-SHOT")
+        server._dialog_pre_action["_registered_tab_ids"].discard("ONE-SHOT")
 
 
 # ── Medium-severity findings from the seeded benchmark ────────────────────

@@ -1,25 +1,19 @@
 """Dialog and accessibility tools: dialog_handle, dialog_auto_handle and accessibility_snapshot,
-with the per-tab and per-instance dialog settings they keep.
+with the per-instance dialog settings they keep.
 
-Moved out of server.py. _clear_tab_scoped_state there clears the per-tab registrations kept here,
-so server.py re-exports _DIALOG_AUTO_CFG and _dialog_pre_action. The other helpers stay in
-server.py and are reached as _srv.<name> at call time.
+Moved out of server.py. The per-tab dialog registries (_dialog_pre_action, _DIALOG_AUTO_CFG) stay
+there because _clear_tab_scoped_state clears them, and this module reaches them, like the other
+helpers that stay in server.py, as _srv.<name> at call time.
 """
 
 import json
-from typing import Any, Optional
+from typing import Optional
 
 from .. import server as _srv
 from .._app import mcp
 from ..helpers import err, ok
 from ..state import BrowserState
 
-
-# Read-at-fire-time config so re-arming with a new action/text updates the
-# response without stacking another CDP handler. Keyed by CDP target id.
-_dialog_pre_action: dict[str, Any] = {
-    "action": None, "text": None, "_registered_tab_ids": set(),
-}
 
 
 def _instance_dialog_cfg(kind: str) -> dict:
@@ -58,7 +52,7 @@ async def dialog_handle(action: str = "accept", text: Optional[str] = None) -> s
         pre_cfg["pending"] = True
         from nodriver.cdp import page as cdp_page
         tid = _srv._target_key(tab)
-        if tid in _dialog_pre_action["_registered_tab_ids"]:
+        if tid in _srv._dialog_pre_action["_registered_tab_ids"]:
             # Handler already armed on this tab — config updated above; don't
             # stack a second handler (which would accumulate every call).
             return ok(f"dialog handler re-armed ({action})")
@@ -82,21 +76,11 @@ async def dialog_handle(action: str = "accept", text: Optional[str] = None) -> s
         # cannot answer while a dialog this server never saw is open.
         await _srv._wait(tab.send(cdp_page.enable()), timeout=5.0, what="dialog_handle")
         tab.add_handler(cdp_page.JavascriptDialogOpening, handle)
-        _dialog_pre_action["_registered_tab_ids"].add(tid)
+        _srv._dialog_pre_action["_registered_tab_ids"].add(tid)
         return ok(f"dialog handler armed ({action})")
     except Exception as e:
         return err(str(e))
 
-
-# ── dialog_auto_handle (persistent, type-filterable) ──────────────────────
-# Read-at-fire-time config so the LLM can update action/types without
-# re-registering the handler. Keyed by CDP target id to avoid duplicate handlers
-# on the same tab.
-_DIALOG_AUTO_CFG: dict = {
-    "enabled": False, "action": "accept", "text": "",
-    "types": None,  # None=all; or set like {"beforeunload"}
-    "_registered_tab_ids": set(),
-}
 
 
 @mcp.tool()
@@ -152,7 +136,7 @@ async def dialog_auto_handle(
         tab = BrowserState.active_tab()
         tab_id = _srv._target_key(tab)
         await _srv._answer_open_dialog(tab, action, text)
-        if tab_id in _DIALOG_AUTO_CFG["_registered_tab_ids"]:
+        if tab_id in _srv._DIALOG_AUTO_CFG["_registered_tab_ids"]:
             return ok(
                 f"auto-handle config updated (action={action}, "
                 f"types={list(types) if types else 'all'}); already armed on this tab"
@@ -178,7 +162,7 @@ async def dialog_auto_handle(
 
         await _srv._wait(tab.send(cdp_page.enable()), timeout=5.0, what="dialog_auto_handle")
         tab.add_handler(cdp_page.JavascriptDialogOpening, auto_handler)
-        _DIALOG_AUTO_CFG["_registered_tab_ids"].add(tab_id)
+        _srv._DIALOG_AUTO_CFG["_registered_tab_ids"].add(tab_id)
         return ok(
             f"dialog auto-handle armed (action={action}, "
             f"types={list(types) if types else 'all'})"

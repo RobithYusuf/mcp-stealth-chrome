@@ -6694,6 +6694,22 @@ def _inner_arguments_error(tool: str, args: dict) -> Optional[str]:
 # 15. DIALOG + ACCESSIBILITY — moved to tools/dialogs.py
 # ══════════════════════════════════════════════════════════════════════════
 
+# Read-at-fire-time config so re-arming with a new action/text updates the
+# response without stacking another CDP handler. Keyed by CDP target id.
+_dialog_pre_action: dict[str, Any] = {
+    "action": None, "text": None, "_registered_tab_ids": set(),
+}
+
+
+# ── dialog_auto_handle (persistent, type-filterable) ──────────────────────
+# Read-at-fire-time config so the LLM can update action/types without
+# re-registering the handler. Keyed by CDP target id to avoid duplicate handlers
+# on the same tab.
+_DIALOG_AUTO_CFG: dict = {
+    "enabled": False, "action": "accept", "text": "",
+    "types": None,  # None=all; or set like {"beforeunload"}
+    "_registered_tab_ids": set(),
+}
 
 # Track which tabs already have a console / network capture handler armed, so
 # repeated console_start/network_start calls reset the buffers but do NOT stack
@@ -11900,9 +11916,6 @@ from .tools import viewport as _viewport  # noqa: E402,F401  -- registers the vi
 
 
 from .tools import dialogs as _dialogs  # noqa: E402,F401  -- registers dialog_handle, dialog_auto_handle, accessibility_snapshot
-
-
-from .tools.dialogs import _DIALOG_AUTO_CFG, _dialog_pre_action  # noqa: E402  -- _clear_tab_scoped_state clears their entries
 
 
 # ══════════════════════════════════════════════════════════════════════════
