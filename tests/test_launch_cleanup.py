@@ -100,6 +100,28 @@ def _privacy_folders(env):
     return sorted(env.privacy_root.iterdir()) if env.privacy_root.exists() else []
 
 
+def _existing_profile(env):
+    """A profile with something in it, as a launch finds a used one: the fixture's resolver and
+    ensure_dirs make no folder, so "the folder is still missing" would prove nothing about what
+    the launch writes. exit_type Crashed is what the tidy-up would rewrite."""
+    import json
+    (env.profile / "Default").mkdir(parents=True)
+    (env.profile / "Default" / "Preferences").write_text(json.dumps({"profile": {"exit_type": "Crashed"}}))
+    return _digest(env.profile)
+
+
+def _digest(root):
+    return sorted((str(p.relative_to(root)), p.read_bytes() if p.is_file() else b"")
+                  for p in root.rglob("*"))
+
+
+async def _close_through_a_tool_call():
+    """browser_close as a client sends it: through the call wrapper, which waits while the
+    instance is registered as closing."""
+    result = await asyncio.wait_for(server.mcp.call_tool("browser_close", {}), 10)
+    return str(result)
+
+
 def test_a_refusal_at_the_last_look_removes_the_privacy_profile(env):
     """Every refusal after the privacy profile is made removes it; the last look before the
     start did not, and left the folder behind."""
@@ -108,6 +130,21 @@ def test_a_refusal_at_the_last_look_removes_the_privacy_profile(env):
     assert out.startswith("Error") and "changed after this launch read it" in out, out
     assert "start" not in env.order, env.order
     assert _privacy_folders(env) == [], "the refused privacy launch left its profile behind"
+
+
+def _then_browser_close_ends_it(env, folder):
+    """The browser_close a kept handle asks for acts on this launch's browser and profile: still
+    running, it fails and keeps both; once it ends, the privacy profile goes."""
+    browser = env.started[0]
+    again = asyncio.run(_close_through_a_tool_call())
+    assert "close failed" in again and "handle kept" in again, again
+    assert env.closes[-1] == (browser, folder), env.closes[-1]
+    assert server.BrowserState.browser is browser and _privacy_folders(env) == [folder]
+    env.close_report = dict(_CLOSED)
+    closed = asyncio.run(_close_through_a_tool_call())
+    assert "privacy profile removed" in closed, closed
+    assert env.closes[-1] == (browser, folder), env.closes[-1]
+    assert server.BrowserState.browser is None and _privacy_folders(env) == []
 
 
 def test_a_cookie_move_left_unfinished_removes_the_privacy_profile_once_the_browser_is_gone(env, tmp_path):
@@ -133,6 +170,7 @@ def test_a_browser_left_running_by_an_unfinished_move_keeps_its_privacy_profile_
     assert server.BrowserState.browser is env.started[0], "the only handle on a live Chrome was dropped"
     assert server.BrowserState.current_profile_dir == folders[0] and server.BrowserState.current_privacy, \
         "the kept handle does not name its profile, so nothing would remove it"
+    _then_browser_close_ends_it(env, folders[0])
 
 
 class _TabThatCannotLoad:
@@ -192,6 +230,7 @@ def test_a_browser_that_could_not_be_ended_after_a_failed_start_is_kept_and_said
     assert len(folders) == 1, "a privacy profile was deleted under a Chrome still running"
     assert server.BrowserState.browser is env.started[0], "the only handle on a live Chrome was dropped"
     assert server.BrowserState.current_profile_dir == folders[0] and server.BrowserState.current_privacy
+    _then_browser_close_ends_it(env, folders[0])
 
 
 def _spy_profile_writes(env, monkeypatch):
@@ -229,14 +268,21 @@ def test_a_refused_launch_writes_neither_vertical_tabs_nor_lean(env, monkeypatch
     """The guide's rule: a refused launch writes nothing to the profile. Both writes ran before the
     cookie preflight and the commit, so a refusal there left the tab setting in Preferences."""
     _spy_profile_writes(env, monkeypatch)
+    before = _existing_profile(env)
+    reached = ["prepare", "check_vertical_tabs", "preflight1"]
     if refusal == "preflight":
-        env.preflight = {1: "Chrome PID 99 opened it after this launch checked it"}
+        said = "Chrome PID 99 opened it after this launch checked it"
+        env.preflight = {1: said}
     else:
-        env.commit = "the strip stopped: a row changed since the backup"
+        said = "the strip stopped: a row changed since the backup"
+        env.commit = said
+        reached.append("commit")
     out = _launch(vertical_tabs="left")
-    assert out.startswith("Error") and "start" not in env.order, out
-    assert "vertical_tabs" not in env.order and "brave_lean" not in env.order, env.order
-    assert not env.profile.exists(), "the refused launch wrote into the profile"
+    assert out.startswith(f"Error: {said}"), f"not the injected refusal: {out}"
+    steps = [s for s in env.order if s in ("prepare", "check_vertical_tabs", "preflight1", "commit",
+                                          "vertical_tabs", "brave_lean", "tidy", "preflight2", "start")]
+    assert steps == reached, steps
+    assert _digest(env.profile) == before, "the refused launch wrote into the profile"
 
 
 def test_vertical_tabs_and_lean_are_written_after_the_commit_and_before_the_start(env, monkeypatch):
@@ -257,12 +303,13 @@ def test_vertical_tabs_that_cannot_be_written_still_start_nothing(env, monkeypat
     """An unreadable Preferences is refused earlier (the binding check), so the way vertical_tabs
     still fails is a profile it cannot see free. The check runs before the preflight, so that
     refusal comes before anything was written: nothing but the cookie preparation ran."""
+    before = _existing_profile(env)
     monkeypatch.setattr(state, "processes_naming", lambda _root: None)
     out = _launch(vertical_tabs="left")
     assert "vertical_tabs could not be written into the profile, so nothing was started" in out, out
     assert "cannot be told" in out, out
     assert env.order == ["prepare"], f"the refusal is expected before the preflight: {env.order}"
-    assert not env.profile.exists(), "the refused launch wrote into the profile"
+    assert _digest(env.profile) == before, "the refused launch wrote into the profile"
 
 
 def test_a_profile_taken_between_the_check_and_the_write_refuses_after_the_commit(env, monkeypatch):
@@ -362,10 +409,13 @@ def test_no_spelling_of_user_data_dir_in_extra_args_survives_the_first_check():
         arg = f"--user-data-dir={value}"
         for args in ([arg], ["--foo", arg, "--bar=1"], [arg, arg]):
             udd, rest, problem = server._profile_from_extra_args(None, args, "user_data_dir")
+            # Only an empty value is refused; every other one is taken out and becomes the folder.
+            assert bool(problem) == (not value.strip()), (args, problem)
             if problem:
                 continue
             assert not any(str(a).startswith("--user-data-dir=") for a in rest), (args, rest)
             assert udd == value.strip(), (args, udd)
+            assert rest == [a for a in args if a != arg], (args, rest)
 
 
 def test_privacy_with_a_user_data_dir_in_extra_args_is_still_refused(env, tmp_path):
@@ -562,3 +612,28 @@ def test_the_last_look_refusal_names_the_writes_and_the_first_keeps_its_text(tmp
     assert f"Nothing was started; {written}." in last and "the profile was not changed" not in last, last
     assert last.replace(f"Nothing was started; {written}.",
                         "Nothing was started and the profile was not changed.") == first
+
+
+def test_on_brave_lean_and_the_tabs_are_written_after_the_commit_and_read_back(env, monkeypatch, tmp_path):
+    """The Chrome case above only records that the lean helper was called; Chrome gets nothing from
+    it. On Brave lean writes, so read back what it wrote, and the flag it adds to the start."""
+    import json
+    from mcp_stealth_chrome import brave as brave_mode, brave_lean
+    wrapper = tmp_path / "brave-wrapper"
+    wrapper.write_text("")
+    monkeypatch.setenv(brave_mode.ENV_PATH, str(wrapper))
+    _spy_profile_writes(env, monkeypatch)
+    out = _launch(browser="brave", brave_lean=True, vertical_tabs="right")
+    assert not out.startswith("Error") and "[vertical tabs: on the right]" in out, out
+    steps = [s for s in env.order if s in ("prepare", "check_vertical_tabs", "preflight1", "commit",
+                                          "vertical_tabs", "brave_lean", "tidy", "preflight2", "start")]
+    assert steps == ["prepare", "check_vertical_tabs", "preflight1", "commit", "vertical_tabs",
+                     "check_vertical_tabs", "brave_lean", "tidy", "preflight2", "start"], steps
+    args = ["--profile-directory=Default"]
+    assert brave_lean.read_back(env.profile, args) == {**brave_lean.LOCAL_STATE, **brave_lean.PREFERENCES}
+    assert brave_mode.vertical_tabs_read_back(env.profile, args, "brave") == "right"
+    flags = next(entry[1] for entry in env.order if isinstance(entry, tuple) and entry[0] == "flags")
+    features = [f for f in flags if f.startswith("--disable-features=")]
+    assert len(features) == 1 and all(name in features[0] for name in brave_lean.FEATURES), features
+    assert json.loads((env.profile / "Default" / "Preferences").read_text())["brave"]["tabs"] == {
+        "vertical_tabs_enabled": True, "vertical_tabs_on_right": True}
