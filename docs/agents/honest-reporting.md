@@ -108,6 +108,11 @@ conclusions. Each rule below replaced a real lie.
   nothing, so it is said as run ("run its tidy-up of stale locks and window state"). The first look keeps Chrome's
   text byte for byte. Known gap: a refusal of `_commit_cookie_move` itself still says
   "not changed" after its marker was written (shared with spawn_browser).
+- A launch cut short by `browser_recover` is an error that says so, never the success of a step it had
+  reached: "browser_launch of instance 'main' did not finish. browser_recover reset instance 'main' while
+  this launch ran. Its browser was ended." An error the step had already reached stays first, with that
+  sentence after it; the recover's own result says the launch was still running. A tool refused during a
+  launch says it was not done and to call it again once the launch has returned, nothing about when.
 - `fill_form` fails when a field fails, and then does not click submit. `batch_actions` counts failures by the `Error:`
   prefix, so a failure reported through `ok()` counts as success. Non-list or empty input is an error, not
   `0 actions OK`; a non-object item is a counted failure.

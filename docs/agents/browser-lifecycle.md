@@ -139,6 +139,51 @@ Part of the agent guide: [AGENTS.md](../../AGENTS.md) says when to read this. It
   (`window_closed` carries the idle note) and refuses a list the browser did not confirm (`_refresh_tabs` returns
   False).
 
+## Who may change the current instance during a launch
+
+- `browser_launch` awaits between its steps (the stale browser, the profile reservation, a reattach, the
+  cookie move, the start, storage_state, the first navigation, the window, the saved tabs) and works on the
+  current instance across them. A `switch_instance` let through meanwhile had the later steps and the failure
+  cleanup act on the instance switched in (its browser closed, or the failed launch's profile written onto
+  it), and the success path recorded the new browser there. So a launch marks its session (`_LAUNCHING`: the
+  instance and the task) before its first await and clears the mark however it ends, a raise or a cancel
+  included; a mark whose task is done counts as absent, so a mark left behind refuses nothing.
+- While the mark stands, `_launch_gate` (one of `_app.CALL_GATES`, so before the tool runs) refuses
+  `switch_instance`, `attach_to_chrome`, `detach`, `browser_close`, `close_all_instances`, `spawn_browser` and
+  `close_instance` of the launching instance: "browser_launch of instance 'main' is in progress in this
+  session; switch_instance was not done. Call it again once the launch has returned." Refused, not made to
+  wait, as `spawn_browser` refuses a second launch, and the text promises nothing about when. Page tools are
+  not refused. A second launch in the session is refused by `browser_launch` itself, `instance_release`
+  refuses the current instance by itself, and `close_instance` of another instance acts on its stored
+  snapshot. `spawn_browser`'s own refusal holds only while `_LAUNCH_LOCK` is held, which left the stale
+  browser step open, so the gate refuses it too.
+- `tests/test_launch_owner.py` finds every tool that can change the current instance or end its browser (an
+  AST walk for writes of `BrowserState.browser` or `current_instance_id` and calls of `reset`, `switch_to`,
+  `restore_from`, `release_instance`) and fails on one that is neither in `_REFUSED_DURING_LAUNCH` nor in
+  `_ALLOWED_DURING_LAUNCH` with its reason. A new such tool goes into one of the two. None of them may become
+  a workflow tool: `batch_actions` and `workflow_run` call tools without the gates.
+- `browser_recover` is never refused: it is the way out of a stuck state, and a launch hung on an await
+  nobody bounded would otherwise leave the session no exit but a restart. It does what it did (stops the
+  current browser, signals its profile's PIDs, resets), marks the launch (`ended_by`) before its first
+  await, and its result says the launch was still running. After every await `browser_launch` looks
+  (`_launch_settle`): a launch cut short ends as an error naming `browser_recover`, ends the browser it
+  started or took over through `_ensure_browser_dead`, once, removes its privacy profile, and records
+  nothing more: no handle for a browser that ended, no tabs, no watcher, no keep_alive record. An error the
+  step had already reached stays first; a success it reached does not count. The start does not begin once
+  the launch is cut short. A browser that could not be ended keeps a handle on the instance the recover
+  emptied, naming its profile, as every close path keeps one.
+- Inside the steps each acts on the launch's own instance and browser (`plan.launching`, `plan.browser`),
+  never on what is current by then: the failure cleanup (`_launch_end_started_browser`), a cancel
+  (`_launch_cancelled`), the saved tabs (recorded only while the launch still holds its instance), the
+  window placement. A reattach cut short before it recorded the kept browser gives it back as it was (the
+  record names its old server again, nothing ends it): it may be the person's, opened from the launcher.
+  Once recorded it is the launch's browser, and the recover ended it as the current one.
+- The idle reaper and the window sweep skip the launching instance; their next tick sees it.
+- A call on an instance being closed waits for the close (`INSTANCE_CLOSING`), `browser_recover` included.
+  So a switch or a recover sent during the close of a failed launch runs after the launch has returned. A
+  close still running after 60 s answers "still being closed ... or browser_recover if it never ends", and
+  that recover meets the same wait: a gap left open, since a close is bounded by `_ensure_browser_dead`.
+
 ## Headed focus
 
 - A headed Chrome must not take the keyboard: started normally it is frontmost within 300 ms, and focus given back
