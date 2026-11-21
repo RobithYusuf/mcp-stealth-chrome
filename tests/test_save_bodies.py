@@ -441,7 +441,7 @@ def test_a_write_error_is_counted(tmp_path, monkeypatch):
     saver._writer.shutdown()
 
 
-@pytest.mark.parametrize("wall", [1e100, "1700000000", {}, True, False])
+@pytest.mark.parametrize("wall", [1e100, "not-a-number", {}, True, False])
 def test_an_unusable_wall_time_falls_back_to_write_time(tmp_path, wall):
     saver = _saver(tmp_path)
     _request(saver, "S", "r")
@@ -454,7 +454,7 @@ def test_an_unusable_wall_time_falls_back_to_write_time(tmp_path, wall):
     saver._writer.shutdown()
 
 
-@pytest.mark.parametrize("wall", [1e100, "1700000000", {}, True, False])
+@pytest.mark.parametrize("wall", [1e100, "not-a-number", {}, True, False])
 def test_har_unusable_wall_time_is_exported_with_a_note(wall):
     entry = capture._har_entry({"url": "https://x.test/api", "wall_time": wall})
     assert entry["startedDateTime"] and entry["_timestampNote"] == (
