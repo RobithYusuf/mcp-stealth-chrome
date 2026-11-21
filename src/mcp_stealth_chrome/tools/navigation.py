@@ -237,7 +237,12 @@ async def wait_for_human(
     try:
         tab, key, request, selection_note = _pending_human_request()
         if request and tab is None:
-            return err(f"wait_for_human: {selection_note}; no active tab was used")
+            # nodriver 0.50 learns new targets only after update_targets; refresh once before
+            # concluding that a popup request's target is unavailable.
+            if await _srv._refresh_tabs():
+                tab = _srv._tab_for_target(key)
+            if tab is None:
+                return err(f"wait_for_human: {selection_note}; no active tab was used")
         unasked = (f"{selection_note}; no handoff was pending on this tab (request_human_help was not "
                    "called), so this only says the page changed after wait_for_human started") if not request else selection_note
         # None means "inherit". Keying off the literal 300 would silently

@@ -750,3 +750,63 @@ def test_checkpoint_on_an_unruled_host_reads_once_per_step(page):
     assert tab.probes == 1
     assert asyncio.run(server._tripwire_step('get_text', 'get_url')) is None
     assert tab.probes == 2
+def test_wait_refreshes_before_declaring_popup_target_unavailable(page, monkeypatch):
+    parent = page("https://example.test/", overlay=True)
+    popup = Tab(FIELD_URL, parent.browser)
+    popup.target = type("Target", (), {"target_id": "late-popup"})()
+    monkeypatch.setattr(BrowserState, "tabs", [parent])
+    look(popup, url=FIELD_URL)
+    refreshed = []
+
+    async def refresh():
+        refreshed.append(True)
+        monkeypatch.setattr(BrowserState, "tabs", [parent, popup])
+        return True
+
+    monkeypatch.setattr(server, "_refresh_tabs", refresh)
+    out = asyncio.run(nav.wait_for_human(timeout=0))
+    assert refreshed == [True]
+    assert "unavailable tab" not in out
+
+
+def test_closed_popup_withdraws_only_its_tripwire_request(page, monkeypatch):
+    parent = page("https://example.test/", overlay=True)
+    popup = Tab(FIELD_URL, parent.browser)
+    popup.target = type("Target", (), {"target_id": "closed-popup"})()
+    monkeypatch.setattr(BrowserState, "tabs", [parent, popup])
+    look(popup, url=FIELD_URL)
+    assert "closed-popup" in server._HUMAN_HELP
+
+    async def targets(_browser):
+        return [(server._target_key(parent), parent.url)]
+
+    monkeypatch.setattr(server, "_page_targets", targets)
+    token = server._TRIPWIRE_RUN.set({"popup": server._Trip(
+        "pause", antibot.url_verdict(FIELD_URL, antibot.BUILT_IN), target="closed-popup")})
+    try:
+        assert asyncio.run(server._tripwire_step("click", "navigate")) is None
+    finally:
+        server._TRIPWIRE_RUN.reset(token)
+    assert "closed-popup" not in server._HUMAN_HELP
+    note = server._tripwire_result_note(BrowserState.session_key(), "next")
+    assert "no longer on the verification page" in note
+
+
+def test_closed_popup_keeps_request_when_target_list_is_unreadable(page, monkeypatch):
+    parent = page("https://example.test/", overlay=True)
+    popup = Tab(FIELD_URL, parent.browser)
+    popup.target = type("Target", (), {"target_id": "unread-popup"})()
+    monkeypatch.setattr(BrowserState, "tabs", [parent, popup])
+    look(popup, url=FIELD_URL)
+
+    async def unread(_browser):
+        raise ConnectionError("target list unreadable")
+
+    monkeypatch.setattr(server, "_page_targets", unread)
+    token = server._TRIPWIRE_RUN.set({"popup": server._Trip(
+        "pause", antibot.url_verdict(FIELD_URL, antibot.BUILT_IN), target="unread-popup")})
+    try:
+        assert asyncio.run(server._tripwire_step("click", "navigate")) is None
+    finally:
+        server._TRIPWIRE_RUN.reset(token)
+    assert "unread-popup" in server._HUMAN_HELP
