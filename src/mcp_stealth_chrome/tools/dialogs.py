@@ -90,32 +90,24 @@ async def dialog_auto_handle(
     types: Optional[list[str]] = None,
     text: str = "",
 ) -> str:
-    """Install a PERSISTENT auto-handler for native browser dialogs.
-    Unlike dialog_handle (one-shot, action baked in at arm time), this
-    one stays armed across many dialogs and reads its config at fire
-    time — call again with new action/types to update without re-arming.
+    """Install a PERSISTENT auto-handler for native browser dialogs. Unlike dialog_handle (one-shot, action
+    fixed when armed), it stays armed across many dialogs and reads its config when one fires: call again with
+    a new action or types to update it without re-arming.
 
     Args:
         action: "accept" (Leave / OK) or "dismiss" (Cancel / Stay)
         enabled: True to arm, False to disable (config preserved)
-        types: optional list to scope handling — any of:
-               ["alert", "confirm", "prompt", "beforeunload"]
-               None (default) = handle all types.
-        text: prompt response when action="accept" on prompt() dialogs;
-              also basic-auth "user:pass" for HTTP 401.
+        types: list to scope handling, any of ["alert", "confirm", "prompt", "beforeunload"]; None (default)
+            handles all types.
+        text: prompt response when action="accept" on prompt() dialogs; also basic-auth "user:pass" for HTTP 401.
 
-    Common patterns:
-        # Form pages with "unsaved changes" guard — auto-leave forever
-        dialog_auto_handle(action="accept", types=["beforeunload"])
+    Examples:
+        dialog_auto_handle(action="accept", types=["beforeunload"])  # leave "unsaved changes" guards
+        dialog_auto_handle(action="accept", types=["alert"])  # auto-OK pages that spam alert()
+        dialog_auto_handle(enabled=False)  # disable when done
 
-        # Pages that spam alert() — auto-OK
-        dialog_auto_handle(action="accept", types=["alert"])
-
-        # Disable when done
-        dialog_auto_handle(enabled=False)
-
-    Native dialogs only (Chrome's own card UI). HTML/CSS modal overlays
-    are regular DOM — use click_text("Cancel") / click_role for those.
+    Native dialogs only (Chrome's own card UI). HTML/CSS modal overlays are regular DOM: use
+    click_text("Cancel") / click_role.
     """
     if action not in ("accept", "dismiss"):
         return err(f"dialog_auto_handle: action must be 'accept' or 'dismiss', not {action!r}")

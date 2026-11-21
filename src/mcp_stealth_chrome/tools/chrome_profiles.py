@@ -138,44 +138,32 @@ async def clone_chrome_profile(
     allow_running: bool = False,
     keep_site_data: bool = False,
 ) -> str:
-    """Clone a profile from ANY Chrome-family browser into an isolated MCP location.
+    """Clone a profile from any Chrome-family browser into an isolated MCP location.
 
-    SAFE: reads the source profile without modification, copies to
-    ~/.mcp-stealth/profiles/<target_instance_id>/Default/, or for a Brave profile to
-    ~/.mcp-stealth/brave-profiles/<target_instance_id>/Default/, which launches in Brave
-    (spawn_browser(..., browser='brave')) and keeps its logins: Brave's cookies and saved
-    passwords are encrypted with Brave's own key, which Chrome cannot read.
-
-    The source browser MUST be closed (we check SingletonLock).
-    Preserves: cookies, history, bookmarks, saved passwords, extensions state.
-    Skips (if skip_cache=True): Cache, Code Cache, GPUCache, Media Cache (regenerable), and
-    also the site data folders IndexedDB, Service Worker and File System (saves 500MB+). Those
-    are not caches: web apps that keep their login or offline data there (WhatsApp Web,
-    Telegram Web, many PWAs) ask to sign in again. The result lists them under not_copied.
+    The source is only read. The copy goes to ~/.mcp-stealth/profiles/<target_instance_id>/Default/, or for a
+    Brave profile to ~/.mcp-stealth/brave-profiles/<target_instance_id>/Default/, which launches in Brave
+    (spawn_browser(..., browser='brave')) and so keeps its logins: Brave encrypts cookies and saved passwords
+    with its own key. The source browser MUST be closed (SingletonLock) unless allow_running. Copies cookies,
+    history, bookmarks, saved passwords and extensions state.
 
     Args:
-        source_profile: profile dir name ("Default", "Profile 1", ...).
-                        Use list_chrome_profiles() to see options.
-        target_instance_id: Name for the cloned instance (becomes folder name).
-        skip_cache: Exclude cache dirs for fast + smaller copy (default True).
-        overwrite: Delete target if exists before copying (default False).
-        keep_site_data: copy IndexedDB, Service Worker and File System even with
-            skip_cache=True, for a profile that will be used every day. Larger copy. With
-            allow_running these LevelDB folders are copied as they lie, unchecked.
-        allow_running: clone even while the browser is open. Each SQLite
-            database is copied with its -wal/-shm companions and then
-            integrity-checked; any that fail come back under `sqlite_suspect`
-            instead of being trusted silently. Without this flag the call refuses
-            while the profile is locked.
-        browser: which browser to clone FROM — "brave", "chrome", "edge",
-            "chromium", "vivaldi", "opera", "arc". Omit to use the first root
-            found, which is NOT necessarily the one holding your sessions:
-            an empty Chrome often shadows the Brave/Edge profile you actually
-            log in with. Pass this explicitly when in doubt.
+        source_profile: profile dir name ("Default", "Profile 1", ...); list_chrome_profiles() shows them.
+        target_instance_id: name for the cloned instance (its folder name).
+        skip_cache: leave out Cache, Code Cache, GPUCache and Media Cache (regenerable) and the site data folders
+            IndexedDB, Service Worker and File System (500MB+) (default True). Web apps that keep their login or
+            offline data there (WhatsApp Web, Telegram Web, many PWAs) then ask to sign in again; the result
+            lists them under not_copied.
+        overwrite: delete the target if it exists before copying (default False).
+        browser: which browser to clone FROM: "brave", "chrome", "edge", "chromium", "vivaldi", "opera", "arc".
+            Omitted, the first root found is used, which is NOT necessarily the one holding your sessions: an
+            empty Chrome often shadows the Brave/Edge profile you log in with. Pass it when in doubt.
+        allow_running: clone while the browser is open. Each SQLite database is copied with its -wal/-shm
+            companions and integrity-checked; any that fail come back under `sqlite_suspect`.
+        keep_site_data: copy IndexedDB, Service Worker and File System even with skip_cache=True, for a profile
+            used every day (larger copy). With allow_running these LevelDB folders are copied as they lie,
+            unchecked.
 
-    After clone, launch with:
-        spawn_browser(instance_id='<target_instance_id>')
-        spawn_browser(instance_id='<target_instance_id>', browser='brave') for a Brave profile
+    Then launch it with spawn_browser(instance_id='<target_instance_id>'), plus browser='brave' for Brave.
     """
     import shutil
 

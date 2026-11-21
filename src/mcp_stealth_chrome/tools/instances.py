@@ -458,10 +458,10 @@ async def spawn_browser(
     brave_lean: Optional[bool] = None,
     agent_overlay: Optional[bool] = None,
 ) -> str:
-    """Create a new named browser instance running in parallel with main.
-    Each instance has its own profile, cookies, tabs, logs. Use for multi-account
-    scraping or isolated sessions. A headed instance the person quits, or whose windows
-    are all closed, is ended by the server, and later calls on it say so.
+    """Create a named browser instance running in parallel with main, with its own profile, cookies, tabs and
+    logs, for multi-account scraping or isolated sessions; switch_instance(id) routes later tool calls to it.
+    A headed instance the person quits, or whose windows are all closed, is ended by the server, and later
+    calls on it say so.
 
     Args:
         instance_id: unique name (e.g., "scraper_1", "acct_alice")
@@ -469,27 +469,19 @@ async def spawn_browser(
         profile_dir: override profile path (default: ~/.mcp-stealth/profiles/<id>/)
         desc: natural-language purpose used to find the instance by meaning later
         fingerprint: explicit user_agent/accept_language/platform/timezone overrides
-        privacy: empty profile deleted when closed. The identity stays the real browser
-            and machine unless fingerprint overrides it. To use a logged-in account,
-            leave this off
-        restore_tabs: reopen the tabs this instance had when it was last closed, as
-            browser_launch(restore_tabs=True) does
-        keep_alive: leave this browser running when this server exits, as
-            browser_launch(keep_alive=True) does; a later spawn_browser or browser_launch on
-            the same profile reattaches to it. The idle timeout still applies while a server
+        privacy: empty profile deleted when closed; the identity stays the real browser and machine unless
+            fingerprint overrides it. To use a logged-in account, leave this off
+        restore_tabs: as browser_launch(restore_tabs=True): reopen the tabs it had when last closed
+        keep_alive: as browser_launch(keep_alive=True): left running when this server exits, and a later
+            spawn_browser or browser_launch on the profile reattaches. The idle timeout applies while a server
             holds it
-        browser: "chrome" (default) or "brave", as in browser_launch. A Brave instance's
-            profile defaults to ~/.mcp-stealth/brave-profiles/<id>/
-        vertical_tabs: "left", "right" (Brave only) or "off", as in browser_launch
-        block_ads: block ad and tracker requests in this instance, as
-            browser_launch(block_ads=True) does
-        brave_lean: Brave only; as in browser_launch (None: lean on a profile this server
-            made empty, True: lean, False: as it ships)
-        agent_overlay: the light, bar and Take over over this instance's window, as in
-            browser_launch (macOS, headed; None follows the agent_overlay setting)
+        browser: "chrome" (default) or "brave"; a Brave profile defaults to ~/.mcp-stealth/brave-profiles/<id>/
+        vertical_tabs: "left", "right" (Brave only) or "off"
+        block_ads: as browser_launch(block_ads=True)
+        brave_lean: Brave only (None: lean on a profile this server made empty, True: lean, False: as it ships)
+        agent_overlay: the light, bar and Take over on this window (macOS, headed; None follows the
+            agent_overlay setting)
         other args: same as browser_launch
-
-    Use switch_instance(id) to route subsequent tool calls to this instance.
     """
     try:
         _srv._validate_instance_id(instance_id)

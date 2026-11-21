@@ -37,26 +37,24 @@ async def click_turnstile(
 ) -> str:
     """Auto-find and click the Cloudflare Turnstile checkbox.
 
-    Three-tier detection strategy:
-      1. Primary selectors: iframe[src*=challenges.cloudflare.com], [data-sitekey], .cf-turnstile
-      2. Secondary: .turnstile, input[name=cf-turnstile-response] → nearest sized container
-      3. Fallback (if fallback_template=True): OpenCV template match via verify_cf
-         — covers out-of-process iframe cases (e.g. nopecha.com/captcha/turnstile)
+    Detection, in order:
+      1. iframe[src*=challenges.cloudflare.com], [data-sitekey], .cf-turnstile
+      2. .turnstile, input[name=cf-turnstile-response] → nearest sized container
+      3. if fallback_template=True: OpenCV template match via verify_cf, for out-of-process iframes (e.g.
+         nopecha.com/captcha/turnstile)
 
     Args:
         offset_x: pixels from widget left edge (default 30, calibrated for CF checkbox)
         offset_y: vertical offset (default = container center)
         fallback_template: if selectors fail, try OpenCV template click (default True)
 
-    Reports what the page shows afterwards: whether the cf-turnstile-response token filled,
-    the title, and whether the challenge is still there. A click landing is not a challenge
-    passed. Measured: on nopecha.com/demo/cloudflare the click earned a cf_clearance cookie
-    and the page still answered 403, and the 2captcha demo uses Cloudflare's test sitekey,
-    whose token is a dummy. Neither shows that a real protected site lets you in.
-    Does NOT work on a full-page "Just a moment..." challenge: CDP clicks failed 3 of 3
-    there. Use solve_turnstile_oscursor, which clicks with the real OS cursor (needs the
-    [os-cursor] extra and macOS Accessibility + Screen Recording; takes over the mouse),
-    or storage_state_load with a warm session, or solve_captcha.
+    Reports what the page shows afterwards: whether the cf-turnstile-response token filled, the title, and
+    whether the challenge is still there. A click landing is not a challenge passed: a click can earn a
+    cf_clearance cookie while the page still answers 403, and a test sitekey's token is a dummy.
+    Does NOT work on a full-page "Just a moment..." challenge. Use
+    solve_turnstile_oscursor, which clicks with the real OS cursor (needs the [os-cursor] extra and macOS
+    Accessibility + Screen Recording; takes over the mouse), storage_state_load with a warm session, or
+    solve_captcha.
     """
     try:
         tab = BrowserState.active_tab()

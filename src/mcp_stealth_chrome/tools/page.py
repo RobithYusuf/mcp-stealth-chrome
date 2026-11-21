@@ -60,66 +60,37 @@ async def browser_snapshot(
 ) -> str:
     """Ref-indexed list of the interactive elements on the active tab.
 
-    Reaches into iframes (cross-origin included) and open shadow roots; those
-    elements are marked `frame=fN` / `shadow` and their refs work with click,
-    fill and the rest like any other. Closed shadow roots cannot be measured.
+    Reaches into iframes (cross-origin too) and open shadow roots, marked `frame=fN` / `shadow`; their refs
+    work like any other. Closed shadow roots cannot be measured. A field carries its label as label="..."
+    (from <label for>, a label around it, or aria-labelledby); name_contains matches it.
 
-    Refs (e0, e1, ...) live on the server, mapped to CDP node ids; the snapshot
-    runs in an isolated world and writes nothing to the page. EVERY snapshot
-    replaces all refs. A ref is valid until the next snapshot, and one that was
-    superseded, or whose element is gone, fails with an error saying so instead
-    of hitting the wrong element.
+    Refs (e0, e1, ...) live on the server, mapped to CDP node ids; the snapshot runs in an isolated world and
+    writes nothing to the page. EVERY snapshot replaces all refs; a superseded ref, or one whose element is
+    gone, fails saying so instead of hitting the wrong element. The report states matched / measured /
+    eligible / returned / omitted for the walk that made the list, so a filtered result never reads as
+    "this page has nothing on it".
 
-    A field carries its label as label="..." (from <label for>, a label around it, or
-    aria-labelledby), and name_contains matches it.
-
-    Modes:
-      interactive_compact — default. Full fidelity, minus non-interactive
-                  elements that carry no accessible name (the nameless
-                  ``<img alt="">`` that made a real admin page report ~190
-                  elements), and minus the row of a label whose field is listed.
-                  Every drop is counted in the report.
-      full      — same shape as mcp-camoufox; keeps the unnamed decorative
-                  elements and the label rows compact drops.
-      fast      — reduced selector, no getComputedStyle, minimal attrs (2-3×
-                  faster, less info per element)
-      viewport  — full fidelity, only elements inside the current scroll
-                  viewport (pair with scroll for segment-by-segment reading)
-
-    Scoping (all compose, all reported):
-      max_elements      cap on RETURNED elements; 0 = no cap. Elements past the
-                        cap are counted as `omitted`, never dropped in silence.
-      container_selector  measure only inside the elements matching this CSS.
-                        A selector that matches nothing is reported as an empty
-                        scope, not as an empty page. Invalid CSS is an error —
-                        note that `:has-text()` is a Playwright-ism, not CSS.
-      viewport_only     drop elements fully outside the current viewport.
-      role              comma-separated roles to keep, matched against the
-                        explicit role or the implicit one ("button,link").
-      name_contains     case-insensitive substring of the accessible name
-                        (aria-label / alt / title / text / value / placeholder).
-      include_hidden    also return elements that are not rendered, each marked
-                        `hidden`. They are counted either way.
-      include_frames    False measures the main frame only. max_elements covers
-                        the whole page, main frame first. viewport_only judges
-                        frame content against its own frame's viewport.
-
-    The report always states matched / measured / eligible / returned / omitted
-    for the same DOM walk that produced the list, so a filtered result can never
-    be read as "this page has nothing on it".
-
-    diff_from_last=True (default) caches the DOM hash per tab AND per option
-    scope; when the same scope on the same document and URL hashes the same, the
-    element list is not re-serialized. It is scoped per option set because a
-    compact and a full snapshot measure different sets — sharing one cache entry
-    would answer "unchanged" to a call that would have returned a different list.
-    The cache also keys on each frame's loader id, so a reload or a return to the
-    same URL never reports "unchanged": the refs the caller holds died with the
-    old document even when the hash is identical.
-
-    delta=True prefixes elements added or changed since this tab's previous
-    snapshot IN THE SAME SCOPE with ``*``. A scope's first snapshot marks
-    everything.
+    Args:
+        mode: "interactive_compact" (default): full fidelity minus non-interactive elements with no accessible
+            name (a nameless ``<img alt="">``) and the row of a label whose field is listed, each drop counted.
+            "full": same shape as mcp-camoufox, keeps those. "fast": reduced selector, no getComputedStyle,
+            minimal attrs (2-3× faster, less per element). "viewport": full fidelity, only elements inside the
+            current scroll viewport (pair with scroll to read segment by segment).
+        diff_from_last: True (default) caches the DOM hash per tab and per option scope; when the same scope
+            on the same document and URL hashes the same, the list is not re-serialized. A reload or a return
+            to the same URL never reports "unchanged": the refs held died with the old document.
+        delta: True (default) prefixes elements added or changed since this tab's previous snapshot in the same
+            scope with ``*``. A scope's first snapshot marks everything.
+        max_elements: cap on returned elements; 0 = no cap. Elements past it are counted as `omitted`.
+        container_selector: measure only inside the elements matching this CSS. Matching nothing is reported
+            as an empty scope, not an empty page. Invalid CSS is an error (`:has-text()` is Playwright, not CSS).
+        viewport_only: drop elements fully outside the current viewport.
+        role: comma-separated roles to keep, explicit or implicit ("button,link").
+        name_contains: case-insensitive substring of the accessible name (aria-label / alt / title / text /
+            value / placeholder).
+        include_hidden: also return elements that are not rendered, marked `hidden` (counted either way).
+        include_frames: False measures the main frame only. max_elements covers the whole page, main frame
+            first; viewport_only judges frame content against its own frame's viewport.
     """
     try:
         tab = BrowserState.active_tab()
@@ -214,28 +185,22 @@ async def screenshot(
     output_mode: Literal["artifact", "inline_image", "path", "base64"] = "artifact",
     tab: Optional[int] = None,
 ) -> str:
-    """Screenshot active tab. Saves to ~/.mcp-stealth/screenshots/.
+    """Screenshot the active tab, saved to ~/.mcp-stealth/screenshots/.
 
     Args:
         filename: output name (default timestamped)
-        full_page: stitch entire page height (slower, larger file)
-        return_base64: append base64 body to response (useful for vision models).
-            Refused when the encoded body would exceed B64_INLINE_LIMIT — you get
-            the path plus advice instead of a rejected tool result.
+        full_page: stitch the entire page height (slower, larger file)
+        return_base64: append the base64 body (for vision models). Refused, with the path and advice, when the
+            encoded body would exceed B64_INLINE_LIMIT.
         format: "auto" (from extension, default), "png" (lossless), or "jpeg" (smaller)
-        quality: JPEG quality 1-100 (default 80) — ignored for PNG
-        region: clip to {x, y, width, height} in **CSS pixels relative to the
-                viewport** — the same coordinate space as getBoundingClientRect()
-                and mouse_click_xy, NOT device/captured pixels. Uses CDP
-                Page.captureScreenshot clip (2-5× faster for small crops)
-        region_selector: CSS selector to crop to — the element's bounding box is
-                measured for you. Prefer this over `region`: it removes the whole
-                class of manual-coordinate mistakes. Wins over `region` if both given.
-        max_dimension: if either width or height exceeds this (px), the image is
-            resized proportionally via OpenCV INTER_AREA. Default 1920 keeps output
-            under the 2000 px per-side limit that LLM image tools (Claude/GPT) enforce
-            — prevents "image exceeds dimension limit" failures on long full_page
-            captures or hi-DPR device emulation. Pass 0 to disable resizing.
+        quality: JPEG quality 1-100 (default 80), ignored for PNG
+        region: clip to {x, y, width, height} in CSS pixels relative to the viewport (as getBoundingClientRect()
+            and mouse_click_xy), NOT device/captured pixels; 2-5× faster for small crops
+        region_selector: CSS selector to crop to; its bounding box is measured for you. Prefer it to `region`
+            (no manual coordinates); it wins if both are given.
+        max_dimension: if width or height exceeds this (px), the image is resized proportionally (OpenCV
+            INTER_AREA). The default 1920 stays under the 2000 px per-side limit of model image inputs, also
+            for long full_page captures or hi-DPR emulation. 0 turns resizing off.
     """
     try:
         if output_mode not in ("artifact", "inline_image", "path", "base64"):

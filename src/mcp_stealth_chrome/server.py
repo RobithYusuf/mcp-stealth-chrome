@@ -4919,141 +4919,100 @@ async def browser_launch(
     brave_lean: Optional[bool] = None,
     agent_overlay: Optional[bool] = None,
 ) -> str:
-    """Launch stealth Chrome via nodriver. Creates persistent profile by default.
+    """Launch stealth Chrome via nodriver, on a persistent profile by default.
 
-    Reports which profile it actually used (actual_profile, session_state_source)
-    and the observed postconditions of the initial load (final_url,
-    redirect_chain, status, ready_state) — reporting the requested URL after a
-    redirect is what left callers reading a page they never asked for.
+    The result names the profile actually used (actual_profile, session_state_source) and what the first load
+    observed (final_url, redirect_chain, status, ready_state). After a redirect, read final_url.
 
     Args:
         url: initial URL to load
-        headless: run without UI (many sites detect headless — prefer False). A visible
-            window opens behind the app in use and does not take the keyboard. A click that
-            calls window.open still brings Chrome forward for about 130 ms before focus returns.
-            With the dock_icon setting on (macOS; `mcp-stealth-chrome settings` or
-            MCP_STEALTH_DOCK_ICON=1), a visible browser on a new profile runs from Google Chrome
-            Beta with the project icon, or Brave Beta with its own for browser="brave", so it is
-            not mistaken for the person's own browser. Without Beta, or on a profile Beta must
-            not open, it is the usual browser and the result says why. Off by default.
-            When the person quits it (Cmd+Q, Dock > Quit) or closes every window, the server
-            ends that Chrome within a few seconds, and the next call says it was closed and
-            why; call browser_launch again to continue. tab_close on the last tab does not.
+        headless: run without UI (many sites detect headless, so prefer False). A visible window opens behind
+            the app in use and does not take the keyboard; a click that calls window.open brings Chrome forward
+            for about 130 ms. With the dock_icon setting (macOS; `mcp-stealth-chrome settings` or
+            MCP_STEALTH_DOCK_ICON=1; off by default) a visible browser on a new profile runs from Google Chrome
+            Beta with the project icon (Brave Beta, with its own, for browser="brave"); without Beta, or on a
+            profile Beta must not open, the result says why. If the person quits it (Cmd+Q, Dock > Quit) or
+            closes every window, the server ends it within seconds and the next call says so and why: call
+            browser_launch again. tab_close on the last tab does not.
         proxy: "http://user:pass@host:port" or "socks5://host:port"
         user_agent: override UA string
         window_width, window_height: viewport size
-        persistent: reuse the profile at ~/.mcp-stealth/profile (for the "main"
-            instance; other instances get ~/.mcp-stealth/profiles/<id>).
-            Left unset it defaults to True — EXCEPT under testing_mode, which
-            defaults to an ephemeral throwaway profile. Pass persistent=True
-            explicitly to keep state during a testing_mode run.
+        persistent: reuse ~/.mcp-stealth/profile (the "main" instance; others get ~/.mcp-stealth/profiles/<id>).
+            Unset means True, except under testing_mode: a throwaway profile unless persistent=True is passed.
         lang: browser language
         extra_args: additional Chromium flags
         storage_state_path: load cookies/localStorage from JSON before first nav
-        profile_mode: "light" saves memory and network by not loading images and
-            turning off background Chrome services. For reading ordinary pages.
-            Pages can notice images failing to load (img.naturalWidth stays 0), and
-            layout or vision tools see no pictures, so keep "default" on bot-protected
-            sites or when looking at the page matters.
-        testing_mode: 2-5× faster startup+nav for perf/regression testing —
-            disables image loading, background throttling dampers, translate,
-            notifications, media autoplay. WARNING: reduces stealth — not for
-            anti-bot work (sites can detect missing images as automation signal).
-        auto_verify: if True (default), automatically detect Cloudflare /
-            Turnstile challenges after the initial load and dispatch a
-            CDP-level click on the checkbox. Caps at 2 attempts ~6s total —
-            never loops. Set False to opt out.
-        user_data_dir: launch Chrome against an EXISTING user profile root
-            (e.g. "~/Library/Application Support/Google/Chrome"). Overrides
-            persistent + the default MCP profile. The target Chrome instance
-            (if any) MUST be closed first — locked profiles are detected
-            upfront and refused with the lock-holder PID. Supports ~ expansion.
-        profile_directory: when paired with user_data_dir, picks a sub-profile
-            inside it (e.g. "Default", "Profile 21"). Without this, Chrome
-            uses "Default". Helpful to drive a specific persona without
-            cloning the profile. Use list_chrome_profiles to enumerate.
-        fingerprint: explicit CDP overrides (user_agent, accept_language,
-            platform, timezone). Overrides a pinned identity for this launch.
-        privacy: start from an empty profile that is deleted when the browser closes,
-            so nothing from this browser's history, logins or cookies is present or
-            kept. The identity is still the real browser and machine unless fingerprint
-            overrides it. A proxy written as a pool (a|b) picks one member. Incompatible
-            with user_data_dir.
-            To use a logged-in account, leave this off: the default keeps logins between
-            launches, and persistent=False with privacy=False tries something without
-            saving a login.
-        profile_conflict: what to do when the profile is already held by another
-            Chrome. "fallback" (default, legacy behaviour) uses a separate
-            per-process profile and says so; "fail" refuses with the holding
-            PID; "clone" launches from an integrity-checked read-only copy of
-            it. Nothing on disk is ever deleted or overwritten either way.
-        expect_url, expect_status: validate the initial load — see navigate().
-            An unmeasured value fails the check rather than passing it.
-        restore_tabs: reopen the tabs this instance had open on this profile when this server
-            last closed it (browser_close, close_instance, the idle timeout, Quit, or the
-            server's own exit when its client goes away). Pages open behind the app in use, as
-            tab_new opens them, and the tab that was selected is selected again. Without a url
-            the first saved page loads in the first tab; with a url, that page stays first and
-            selected and the saved pages follow. The result lists each page as reopened (final
-            URL, status) or failed (why), with secret URL parameters masked, and says plainly
-            when there is no saved list. It never fails the launch. Persistent profiles only:
-            persistent=False and privacy=True keep no tabs. The list is kept in
-            ~/.mcp-stealth/window-state/<instance>-tabs.json, readable by you only;
+        testing_mode: 2-5× faster start and navigation for perf/regression tests: no image loading, background
+            throttling dampers, translate, notifications or media autoplay. WARNING: less stealth, not for
+            anti-bot work (sites can read missing images as automation).
+        auto_verify: True (default) detects a Cloudflare / Turnstile challenge after the first load and clicks
+            its checkbox through CDP: at most 2 attempts, ~6s, never a loop. False opts out.
+        user_data_dir: an EXISTING profile root, e.g. "~/Library/Application Support/Google/Chrome" (~ expands),
+            instead of persistent and the MCP profile. Its Chrome MUST be closed first: a locked profile is
+            refused with the PID holding it.
+        profile_directory: with user_data_dir, the sub-profile in it (e.g. "Profile 21"; default "Default"), to
+            drive one persona without cloning. list_chrome_profiles lists them.
+        fingerprint: explicit CDP overrides (user_agent, accept_language, platform, timezone), over a pinned
+            identity for this launch.
+        privacy: an empty profile, deleted when the browser closes: no history, logins or cookies are present
+            or kept. The identity stays the real browser and machine unless fingerprint overrides it. A proxy
+            pool (a|b) picks one member. Not with user_data_dir. For a logged-in account leave it off (the
+            default keeps logins); persistent=False with privacy=False tries something without saving a login.
+        profile_conflict: when another Chrome holds the profile: "fallback" (default) uses a separate
+            per-process profile and says so; "fail" refuses with the holding PID; "clone" launches from an
+            integrity-checked read-only copy. Nothing on disk is deleted or overwritten.
+        expect_url, expect_status: validate the first load, as in navigate(); an unmeasured value fails.
+        profile_mode: "light": no images and no background Chrome services, saving memory and network on
+            ordinary pages. Pages can notice the failed images (img.naturalWidth stays 0) and layout or vision
+            tools see none, so keep "default" on bot-protected sites or when the look matters.
+        restore_tabs: reopen the tabs this instance had on this profile when this server last closed it
+            (browser_close, close_instance, idle timeout, Quit, or the server's exit), behind the app in use,
+            with the same tab selected. Without a url the first saved page loads in the first tab; with one,
+            that page stays first and selected and the saved pages follow. The result lists each page as
+            reopened (final URL, status) or failed (why), secret URL parameters masked, or says there was no
+            saved list; it never fails the launch. Persistent profiles only (persistent=False and privacy=True
+            keep no tabs). The list is ~/.mcp-stealth/window-state/<instance>-tabs.json, readable by you only;
             browser_close(forget_tabs=True) removes it.
-        keep_alive: True leaves this browser running when this server exits (the client went
-            to sleep, reconnected or closed), with its tabs and page state, and the next
-            browser_launch on the same profile reattaches to it instead of starting another
-            Chrome: "reattached to the running browser (pid N, K tabs)". It still ends on Quit,
-            on browser_close after a reattach, and once it has had no server for
-            MCP_STEALTH_KEEP_ALIVE_MAX_HOURS (24). Persistent profiles only: persistent=False
-            and privacy=True ignore it and say so. Headless works too, as an invisible Chrome
-            holding memory until one of those ends it. Not on Windows. Left unset it is False
-            for a new browser and stays as it was on a reattach. A reattach happens whenever
-            a profile is held by a browser a previous server of ours kept, whatever this
-            value; it never attaches to the person's own Chrome or one a live server drives.
-        browser: "chrome" (default) or "brave". Brave keeps its own Shields (ads and trackers
-            blocked), farbling (canvas and audio values differ per site and per session) and
-            identity (navigator.brave, userAgentData naming Brave). Its profiles are separate:
-            ~/.mcp-stealth/brave-profile for main, ~/.mcp-stealth/brave-profiles/<id> for
-            others. A profile belongs to the browser that made it, and opening it with the
-            other one is refused, since neither can read the other's cookies. With the dock_icon
-            setting a visible Brave runs from Brave Beta, with Beta's own icon. Needs Brave
-            installed.
-        vertical_tabs: "left", "right" or "off" writes the tab-strip setting into the profile
-            before the browser starts; None (default) leaves the profile's own setting.
-            Brave has both sides; Chrome only "left", and "right" there is refused.
-        block_ads: block ad and tracker requests in every tab, popup, frame and worker of this
-            browser, with EasyList and EasyPrivacy (Brave's adblock-rust engine). Requests
-            only: nothing is hidden or written in the page, so a blocked ad can leave an empty
-            box. The lists are downloaded on first use into ~/.mcp-stealth/adblock, checked
-            again at most once a day, and used offline from the last copy. Without a list the
-            launch says ad blocking is off and why; it never fails over it. The result says
-            whether it is on; server_status shows what was blocked. Blocked requests fail
-            with net::ERR_BLOCKED_BY_CLIENT, as with any ad blocker, which a page can notice.
-            Brave blocks ads itself with Shields, so there it does nothing.
-        brave_lean: Brave only. True turns off what an agent has no use for (None, the default,
-            does so only on a profile this server made empty; a user_data_dir, a clone or an
-            older profile keeps its settings unless True is passed, and the result says which):
-            Leo AI, VPN, Speedreader and Playlist for this process (--disable-features); P3A,
-            the daily usage ping and Tor windows (Local State); toolbar and sidebar buttons,
-            new tab widgets and sponsored images, Brave News, the wallet's page provider, and
-            the Web Discovery, Wayback Machine and default-browser prompts (Preferences, written
-            before launch into a profile seen free, never into the person's own Brave folder).
-            Shields, farbling, navigator.brave and the brands, vertical tabs, Safe Browsing and
-            filter list updates stay. Rewards, Ads and the wallet page stay as Brave ships them
-            (only policy removes them, and policy would change the person's own Brave). False
-            keeps Brave as it ships and puts back what an earlier lean launch changed. The result
-            says what was turned off and what was not; server_status shows it. Ignored for
-            Chrome, and said so when passed.
-        agent_overlay: macOS, headed. Over the browser window: a light around it while the agent
-            acts, a bar saying what it does, and a lock over the page so a stray click or scroll
-            never reaches it. The bar's Take over hands the browser to the person; while they
-            hold it every tool that acts on or reads the page is refused, saying so, until they
-            press Resume agent (wait_for_human waits for that). A key they press while the agent
-            works pauses its input for a moment and the result says so. request_human_help
-            shows the request in the bar with Done. The bar can show the agent's cursor (the
-            agent_cursor setting, off). None (default) follows the agent_overlay setting, off
-            unless set (`mcp-stealth-chrome settings`, or MCP_STEALTH_AGENT_OVERLAY=1). Needs the os-cursor extra (PyObjC); without it, headless, or on a
+        keep_alive: True leaves this browser running, tabs and page state included, when this server exits
+            (client slept, reconnected or closed); the next browser_launch on the profile reattaches instead of
+            starting another Chrome: "reattached to the running browser (pid N, K tabs)". It still ends on
+            Quit, on browser_close after a reattach, and after MCP_STEALTH_KEEP_ALIVE_MAX_HOURS (24) with no
+            server. Persistent profiles only: persistent=False and privacy=True ignore it and say so. Headless
+            works too (an invisible Chrome holding memory). Not on Windows. Unset: False for a new browser,
+            unchanged on a reattach. A reattach happens whenever a browser an earlier server of ours kept holds
+            the profile, whatever this value; it never attaches to the person's own Chrome or one a live server
+            drives.
+        browser: "chrome" (default) or "brave" (must be installed). Brave keeps its Shields (ads and trackers
+            blocked), farbling (canvas and audio values differ per site and session) and identity
+            (navigator.brave, userAgentData naming Brave). Its profiles: ~/.mcp-stealth/brave-profile (main),
+            ~/.mcp-stealth/brave-profiles/<id> (others). A profile opens only in the browser that made it,
+            since neither reads the other's cookies.
+        vertical_tabs: "left", "right" or "off" writes the tab-strip setting into the profile before start;
+            None (default) leaves it. "right" is Brave only, refused on Chrome.
+        block_ads: block ad and tracker requests in every tab, popup, frame and worker (EasyList and
+            EasyPrivacy, Brave's adblock-rust engine). Requests only: nothing in the page is hidden, so an ad
+            can leave an empty box, and a page can notice the net::ERR_BLOCKED_BY_CLIENT failures. The lists
+            download on first use into ~/.mcp-stealth/adblock, are checked at most daily and work offline from
+            the last copy. The result says whether it is on (without a list: off and why, never a failed
+            launch); server_status shows what was blocked. Does nothing on Brave, whose Shields block ads.
+        brave_lean: Brave only (ignored on Chrome, said so when passed). True turns off what an agent does not
+            use: Leo AI, VPN, Speedreader and Playlist for this process (--disable-features); P3A, the daily
+            usage ping and Tor windows (Local State); toolbar and sidebar buttons, new tab widgets and
+            sponsored images, Brave News, the wallet's page provider, and the Web Discovery, Wayback Machine
+            and default-browser prompts (Preferences, written before launch into a profile seen free, never
+            the person's own Brave folder). Shields, farbling, navigator.brave and the brands, vertical tabs,
+            Safe Browsing, filter list updates, Rewards, Ads and the wallet page stay. None (default) does
+            this only on a profile this server made empty; a user_data_dir, a clone or an older profile keeps
+            its settings unless True is passed. False keeps Brave as it ships and undoes an earlier lean
+            launch. The result says what was turned off and what was not; server_status shows it.
+        agent_overlay: macOS, headed. Over the window: a light while the agent acts, a bar saying what it
+            does, and a lock so a stray click or scroll never reaches the page. The bar's Take over hands the
+            browser to the person; while they hold it, every tool that acts on or reads the page is refused,
+            saying so, until they press Resume agent (wait_for_human waits for that). A key they press
+            pauses the agent's input for a moment, and the result says so. request_human_help shows its
+            request in the bar with Done. The bar can show the agent's cursor (agent_cursor setting, off).
+            None (default) follows the agent_overlay setting, off unless set (`mcp-stealth-chrome settings`
+            or MCP_STEALTH_AGENT_OVERLAY=1). Needs the os-cursor extra (PyObjC); without it, headless, or on a
             browser the person opened from the launcher, the result says it is off and why.
     """
     product, brave_executable, user_data_dir, extra_args, problem = _launch_check_arguments(
@@ -5717,25 +5676,20 @@ async def navigate(
 ) -> str:
     """Navigate the active tab to url. wait_until: load|none.
 
-    Reports the OBSERVED postconditions — requested_url, final_url,
-    redirect_chain, status, ready_state — because a redirect otherwise leaves
-    the caller reading a page it never asked for while the tool claims success.
+    Reports the OBSERVED postconditions: requested_url, final_url, redirect_chain, status, ready_state. After
+    a redirect, read final_url.
 
-    auto_verify: if True (default), automatically detect Cloudflare /
-    Turnstile challenges after load and click the checkbox naturally
-    (CDP-level click, max 2 attempts). Set False to opt out.
+    auto_verify: if True (default), detect a Cloudflare / Turnstile challenge after load and click its
+    checkbox (CDP-level click, max 2 attempts). False opts out.
 
-    focus: if True, bring the tab's window to the OS foreground after navigating. Off by
-    default, because raising the window takes focus from whatever the person is doing.
-    tab_focus does the same on request.
+    focus: if True, bring the tab's window to the OS foreground after navigating. Off by default, since it
+    takes focus from whatever the person is doing; tab_focus does the same on request.
 
-    expect_url: fail when final_url does not match. Glob when the pattern
-        contains * ? or [ ; otherwise a prefix match, so "https://x/admin"
-        accepts "https://x/admin?tab=1". A final_url that could not be read
-        FAILS the check rather than passing it.
-    expect_status: fail when the document HTTP status differs. An unmeasured
-        status (about:blank, same-document navigation) also fails — the tool
-        will not claim an expectation it never verified.
+    expect_url: fail when final_url does not match. Glob when the pattern contains * ? or [ ; otherwise a
+        prefix match, so "https://x/admin" accepts "https://x/admin?tab=1". A final_url that could not be
+        read FAILS the check.
+    expect_status: fail when the document HTTP status differs. An unmeasured status (about:blank,
+        same-document navigation) also fails.
     """
     if not BrowserState.is_up():
         return err("Browser not running. Call browser_launch first.")
@@ -5817,20 +5771,18 @@ async def click(
 ) -> str:
     """Click an element by ref (from snapshot) or CSS selector with real mouse input.
 
-    Dispatches a trusted mouse event at the element's centre, scrolling it into
-    view first if needed. Refuses and names the blocker when the point belongs to
-    something else, so an overlay never produces a false "clicked". The result names
-    what was used: method=cdp_mouse, or method=js_click after js_fallback.
+    Dispatches a trusted mouse event at the element's centre, scrolling it into view first if needed. Refuses
+    and names the blocker when the point belongs to something else, so an overlay never produces a false
+    "clicked". The result names what was used: method=cdp_mouse, or method=js_click after js_fallback.
 
     Args:
         ref: element ref from browser_snapshot
         selector: CSS selector
         humanize: approach along a curved path and click a random spot inside
         verify: compare the page before and after, and say so when nothing changed
-        js_fallback: when the real click cannot land, call element.click() from JS
-            instead of refusing. The event has isTrusted=false, which sites can
-            detect, and bypasses whatever was covering the element. The result
-            states when this happened. Off by default.
+        js_fallback: when the real click cannot land, call element.click() from JS instead of refusing. The
+            event has isTrusted=false, which sites can detect, and bypasses whatever was covering the element.
+            The result states when this happened. Off by default.
     """
     try:
         tab = BrowserState.active_tab()

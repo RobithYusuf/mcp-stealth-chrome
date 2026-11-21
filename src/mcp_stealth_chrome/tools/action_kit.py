@@ -187,32 +187,24 @@ async def describe_page(
     max_wait: float = 2.5,
     stable_ms: int = 400,
 ) -> str:
-    """Compact AI-friendly page summary — replaces accessibility_snapshot
-    for LLM workflows. Returns JSON with the page's intent + interactable
-    surface in ~10× fewer tokens than a full a11y dump.
+    """Compact page summary for an agent, in place of accessibility_snapshot: JSON with the page's intent and
+    interactable surface in ~10× fewer tokens than a full a11y dump. Use it BEFORE smart_fill to learn which
+    labels exist.
 
     Args:
-        wait_stable: if True, install a MutationObserver and wait until the
-            DOM has been quiet for `stable_ms` before snapshotting (max
-            `max_wait` seconds). Use on SPA / lazy-rendered pages so the
-            LLM sees the final state, not a half-hydrated render. Cheap
-            (~50-200ms typical, capped at max_wait).
-        max_wait: outer cap for stability wait (default 2.5s)
+        wait_stable: if True, wait (MutationObserver) until the DOM has been quiet for `stable_ms`, at most
+            `max_wait` seconds, before reading: on SPA / lazy-rendered pages, to see the final state rather
+            than a half-hydrated one. Typically ~50-200ms.
+        max_wait: outer cap for the stability wait (default 2.5s)
         stable_ms: required quiet window in ms (default 400)
 
     Output shape:
-      {
-        "title": "...",
-        "url": "...",
-        "headings": [{"level":"h1","text":"..."}],
-        "fields": [{"label":"...","type":"text|email|...","required":bool,"value":"...","name":"...","id":"..."}],
-        "actions": [{"text":"Submit","kind":"button","disabled":false}],
-        "errors": ["..."],
-        "navigation": ["Dashboard","Settings",...],
-        "stability": "stable|timeout|skipped"  (only present if wait_stable=True)
-      }
-
-    Use this BEFORE smart_fill so the LLM knows which labels exist.
+      {"title": "...", "url": "...",
+       "headings": [{"level":"h1","text":"..."}],
+       "fields": [{"label":"...","type":"text|email|...","required":bool,"value":"...","name":"...","id":"..."}],
+       "actions": [{"text":"Submit","kind":"button","disabled":false}],
+       "errors": ["..."], "navigation": ["Dashboard","Settings",...],
+       "stability": "stable|timeout|skipped"}  (stability only if wait_stable=True)
     """
     try:
         tab = BrowserState.active_tab()
@@ -817,27 +809,22 @@ async def workflow_run(
 ) -> str:
     """Run many tool steps in one call, with branching, loops and earlier results.
 
-    A tool step: {"tool": "fill", "args": {...}, "save_as": "x", "label": "...",
-    "continue_on_error": false}
+    A tool step: {"tool": "fill", "args": {...}, "save_as": "x", "label": "...", "continue_on_error": false}
 
-    Using earlier results: save_as stores a step's result, parsed as JSON when it
-    is JSON. Any string in args may then reference it as ${x}, ${x.field} or
-    ${x[0].name}; a string that is exactly one reference keeps its type. ${last.ok},
-    ${last.value} and ${last.text} describe the previous step. A reference to
-    something undefined fails the step and lists what is defined.
+    save_as stores a step's result, parsed as JSON when it is JSON. Any string in args may then reference it
+    as ${x}, ${x.field} or ${x[0].name}; a string that is exactly one reference keeps its type. ${last.ok},
+    ${last.value} and ${last.text} describe the previous step. A reference to something undefined fails the
+    step and lists what is defined.
 
-    Loop: {"foreach": "${rows}", "as": "row", "steps": [...]} sets ${row} and
-    ${row_index} for each item.
+    Loop: {"foreach": "${rows}", "as": "row", "steps": [...]} sets ${row} and ${row_index} for each item.
 
-    Branch: {"if": <condition>, "then": [...], "else": [...]}. Conditions are
-    {"value": "${x}", "<op>": y} with op one of equals, not_equals, contains,
-    not_contains, matches (regex), gt, gte, lt, lte, truthy, falsy; or
-    {"exists": "${x.y}"}, {"all": [...]}, {"any": [...]}, {"not": {...}}. There is no
-    expression language and nothing is evaluated as code on the server.
+    Branch: {"if": <condition>, "then": [...], "else": [...]}. Conditions are {"value": "${x}", "<op>": y}
+    with op one of equals, not_equals, contains, not_contains, matches (regex), gt, gte, lt, lte, truthy,
+    falsy; or {"exists": "${x.y}"}, {"all": [...]}, {"any": [...]}, {"not": {...}}. There is no expression
+    language and nothing is evaluated as code on the server.
 
     Example, submitting a form once per row of data taken from the page:
-      [{"tool": "evaluate", "args": {"expression": "JSON.stringify(window.rows)"},
-        "save_as": "rows"},
+      [{"tool": "evaluate", "args": {"expression": "JSON.stringify(window.rows)"}, "save_as": "rows"},
        {"foreach": "${rows}", "as": "row", "steps": [
          {"tool": "fill", "args": {"selector": "#name", "value": "${row.name}"}},
          {"if": {"value": "${row.active}", "truthy": true}, "then": [
@@ -846,27 +833,22 @@ async def workflow_run(
 
     Args:
         steps: the steps above
-        start_at: where to begin. A top-level index, or a dotted path from a failure
-            report: "3.2.1" is step 3, item 2 of its loop, inner step 1.
-        stop_on_error: stop at the first failure (default). If False, keep going and
-            report every result.
-        vars: starting variables. Pass the `vars` of a failure report when resuming,
-            since nothing is kept between calls.
+        start_at: where to begin: a top-level index, or a dotted path from a failure report ("3.2.1" is step
+            3, item 2 of its loop, inner step 1). One that does not exist is refused.
+        stop_on_error: stop at the first failure (default). If False, keep going and report every result.
+        vars: starting variables. Pass the `vars` of a failure report when resuming: nothing is kept between
+            calls.
 
-    Returns JSON with completed (capped at 200 entries, the rest counted), total and
-    vars. On failure also failed_at, failed_path, failure_context and resume_with.
-    With stop_on_error=False, failed_count and failed_paths list every failure even
-    past that cap. Steps the failed step depended on are not re-run on resume, so check
-    that any state they left on the page still holds. A start_at that does not exist
-    is refused.
+    Returns JSON with completed (capped at 200 entries, the rest counted), total and vars; on failure also
+    failed_at, failed_path, failure_context and resume_with. With stop_on_error=False, failed_count and
+    failed_paths list every failure even past that cap. Steps the failed step depended on are not re-run on
+    resume, so check that any state they left on the page still holds.
 
-    Tools: navigate, reload, go_back/forward, click, click_text, click_role, fill,
-    fill_form, type_text, paste_text, press_key, select_option, check, uncheck,
-    hover, scroll, scroll_to, mouse_click_xy, smart_fill, wait_for*, screenshot,
-    evaluate, get_text, get_attribute, get_url, get_links, get_html, search_page,
-    query_selector_all, extract_table, extract_structured, browser_snapshot,
-    describe_page, vision_locate, assert_*, storage_*, cookie_import,
-    storage_state_load.
+    Tools: navigate, reload, go_back/forward, click, click_text, click_role, fill, fill_form, type_text,
+    paste_text, press_key, select_option, check, uncheck, hover, scroll, scroll_to, mouse_click_xy,
+    smart_fill, wait_for*, screenshot, evaluate, get_text, get_attribute, get_url, get_links, get_html,
+    search_page, query_selector_all, extract_table, extract_structured, browser_snapshot, describe_page,
+    vision_locate, assert_*, storage_*, cookie_import, storage_state_load.
     """
     _srv._register_workflow_tools()
     steps = parse_json(steps, None) if isinstance(steps, str) else steps
@@ -1122,29 +1104,21 @@ async def auth_capture(
     include_response_headers: bool = False,
     reveal_values: Union[bool, Literal["body"]] = False,
 ) -> str:
-    """Intercept the next N requests matching a URL pattern and return
-    their headers (Authorization, X-CSRF-*, etc.) — useful for
-    SPAs that hold bearer tokens in JS memory and never write them to
-    localStorage. Their values are hidden unless reveal_values=True, because
-    tool output lands in the transcript. After network_start,
-    http_request_with_session reuses a token seen on the same origin without
-    showing it.
-
-    Pattern: substring match on URL (case-sensitive). For regex use
-    network_get instead.
+    """Intercept the next N requests whose URL contains a pattern and return their headers (Authorization,
+    X-CSRF-*, etc.): for SPAs that hold bearer tokens in JS memory, never in localStorage. Values are hidden
+    unless reveal_values=True (tool output lands in the transcript). After network_start,
+    http_request_with_session reuses a token seen on the same origin without showing it.
 
     Args:
-        filter_url_pattern: e.g. "/api/" or "graphql"
+        filter_url_pattern: case-sensitive URL substring, e.g. "/api/" or "graphql" (for regex, network_get)
         count: stop capturing after this many matches (default 1)
         timeout: max seconds to wait (default 10)
-        include_response_headers: also wait for + return response headers
-        reveal_values: return credential values as they are. "body" shows request body
-            values under a secret-named parent and keeps headers, URL secrets and body
-            values whose own key is secret-named hidden; the reply is then
-            {reveal_values, note, entries}.
+        include_response_headers: also wait for and return response headers
+        reveal_values: return credential values as they are. "body" shows request body values under a
+            secret-named parent and keeps headers, URL secrets and body values whose own key is secret-named
+            hidden; the reply is then {reveal_values, note, entries}.
 
-    Returns JSON array of {url, method, request_headers, request_body,
-    [response_headers, status]}.
+    Returns JSON array of {url, method, request_headers, request_body, [response_headers, status]}.
     """
     try:
         reveal = reveal_mode(reveal_values)
@@ -1286,21 +1260,16 @@ async def http_request_with_session(
     connect_timeout: Optional[float] = None,
     reveal_values: bool = False,
 ) -> str:
-    """Authenticated HTTP request that piggybacks on the BROWSER's session.
-
-    Combines:
-      - cookies from active tab (use_browser_cookies=True in http_request)
-      - Authorization header — explicit auth_header, OR auto-extracted
-        from network_index (the most recent same-host request captured
-        via network_start). Pages that hold bearer tokens in JS memory
-        only become reachable after navigate / interaction emits a
-        request — call network_start once at session begin.
+    """Authenticated HTTP request on the BROWSER's session: cookies from the active tab
+    (use_browser_cookies=True in http_request) plus an Authorization header, auth_header or the one from
+    network_index (the most recent same-host request captured via network_start). A page that holds its bearer
+    token in JS memory only emits it after navigate or an interaction, so call network_start once at session
+    begin.
 
     Args:
-        url, method, json_body, data, impersonate, return_mode, timeout,
-        wait_timeout, connect_timeout: same as http_request — including the
-            tracked lifecycle, so a slow authenticated call hands back a
-            request_id for http_request_status instead of a dead end
+        url, method, json_body, data, impersonate, return_mode, timeout, wait_timeout, connect_timeout: same as
+            http_request, including the tracked lifecycle: a slow call hands back a request_id for
+            http_request_status
         extra_headers: merged on top of auto-detected ones
         auth_header: explicit bearer / basic value, e.g. "Bearer eyJ..."
 
@@ -1469,22 +1438,19 @@ async def click_and_wait(
     expect_request_pattern: Optional[str] = None,
     timeout: float = 8.0,
 ) -> str:
-    """Click + wait for the side-effect to land. Distinguishes a
-    successful action from a silent failure (e.g. form invalid where
-    click() returns success but submit never happened).
+    """Click, then wait for the side-effect to land, telling a successful action from a silent failure (e.g.
+    an invalid form, where click() returns success but submit never happened).
 
     Args:
-        ref / selector / text: element to click (passed through to existing
-            click tools — text uses click_text fuzzy match)
+        ref / selector / text: element to click (passed to the click tools; text uses click_text fuzzy match)
         expect: what to wait for after the click. One of:
-            "navigation"     — URL changes
-            "url"            — URL matches expect_url_pattern (regex)
-            "text"           — page contains expect_text
-            "selector"       — expect_selector becomes visible
-            "request"        — outgoing request matches expect_request_pattern
-            "network_idle"   — no in-flight requests for 500ms
-            "auto"           — try navigation→network_idle→nothing
-                           Passing one expect_* selects its mode instead.
+            "navigation"    URL changes
+            "url"           URL matches expect_url_pattern (regex)
+            "text"          page contains expect_text
+            "selector"      expect_selector becomes visible
+            "request"       outgoing request matches expect_request_pattern
+            "network_idle"  no in-flight requests for 500ms
+            "auto"          try navigation→network_idle→nothing; passing one expect_* selects its mode instead
         expect_*: target for the matching expect mode
         timeout: per-mode max wait
 

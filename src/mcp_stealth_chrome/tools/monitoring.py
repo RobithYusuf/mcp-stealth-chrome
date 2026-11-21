@@ -368,28 +368,22 @@ async def network_get(
     """Retrieve captured network events.
 
     Args:
-        limit: max entries returned (chronological: oldest first within the last `limit`, newest last)
+        limit: max entries returned (oldest first within the last `limit`)
         filter_url: substring filter on URL
-        include_body: return response bodies, truncated to max_body_bytes. network_start
-            asks Chrome to keep bodies outside the page (CAPTURE_BODY_BUFFER_BYTES, 64 MB in
-            all, the oldest dropped first; one body up to CAPTURE_BODY_MAX_BYTES, 10 MB), so
-            they can still be read after the page navigated away. Requires
-            network_start(capture_bodies=True).
+        include_body: return response bodies, cut to max_body_bytes. Needs network_start(capture_bodies=True),
+            which has Chrome keep bodies outside the page (CAPTURE_BODY_BUFFER_BYTES, 64 MB in all, oldest
+            dropped first; one body up to CAPTURE_BODY_MAX_BYTES, 10 MB), readable after the page navigated.
         max_body_bytes: cap per-body length (default 10000)
-        full: if True, return entries with full headers + body fields
-            from network_index (use this once you've called network_start).
-            Default False = legacy flat event stream (backward compat).
-        reveal_values: True returns credential headers, fields and query parameters as
-            they are. By default their values read "*** (N chars)", because tool output
-            lands in the transcript. "body" shows body values under a secret-named parent
-            (a token vault's {"gatewayTokens": [...]}) and keeps credential headers, URL
-            secrets and every body value whose own key is secret-named hidden; the reply is
-            then {reveal_values, note, entries}. Bodies other than JSON or forms cannot be
-            read field by field and pass through.
-        resource_type: only these CDP resource types, comma separated, any case:
-            "xhr,fetch" leaves out documents, scripts, styles, images and fonts.
-        max_url_len: URLs longer than this are cut, and the entry says by how much
-            (`url_cut`). 0 returns every URL whole.
+        full: True returns entries with full headers and body fields from network_index (after network_start).
+            False (default) = the legacy flat event stream.
+        reveal_values: True returns credential headers, fields and query parameters as they are; by default
+            their values read "*** (N chars)", since tool output lands in the transcript. "body" shows body
+            values under a secret-named parent (a token vault's {"gatewayTokens": [...]}) and keeps credential
+            headers, URL secrets and every body value whose own key is secret-named hidden; the reply is then
+            {reveal_values, note, entries}. Bodies other than JSON or forms pass through as they are.
+        resource_type: only these CDP resource types, comma separated, any case: "xhr,fetch" leaves out
+            documents, scripts, styles, images and fonts.
+        max_url_len: longer URLs are cut, and the entry says by how much (`url_cut`); 0 keeps every URL whole.
     """
     if limit < 0:
         return err("limit must be >= 0")
