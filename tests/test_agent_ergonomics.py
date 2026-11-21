@@ -613,6 +613,7 @@ def test_spawn_refuses_stale_instance_slot_before_launch(monkeypatch):
     import asyncio
 
     from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import instances
     from mcp_stealth_chrome.state import InstanceSnapshot
 
     calls = []
@@ -627,7 +628,7 @@ def test_spawn_refuses_stale_instance_slot_before_launch(monkeypatch):
         "instances",
         {"worker": InstanceSnapshot(instance_id="worker")},
     )
-    monkeypatch.setattr(server, "_launch_browser_instance", _unexpected_launch)
+    monkeypatch.setattr(instances, "_launch_browser_instance", _unexpected_launch)
     spawn = server.mcp._tool_manager._tools["spawn_browser"].fn
     result = asyncio.run(spawn(instance_id="worker"))
     assert result.startswith("Error: instance 'worker' already exists")
@@ -636,14 +637,15 @@ def test_spawn_refuses_stale_instance_slot_before_launch(monkeypatch):
 
 def test_named_ephemeral_launch_does_not_claim_or_create_persistent_profile(monkeypatch, tmp_path):
     from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import instances
 
-    assert server._instance_profile_path(
+    assert instances._instance_profile_path(
         "worker", persistent=False, privacy=False, profile_dir_override=None,
     ) is None
 
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))  # what expanduser reads on Windows
-    override = server._instance_profile_path(
+    override = instances._instance_profile_path(
         "worker", persistent=False, privacy=False,
         profile_dir_override="~/chosen-profile",
     )
@@ -4071,6 +4073,7 @@ def test_switch_instance_waits_while_a_sweep_closes_that_instance(monkeypatch):
     import asyncio
 
     from mcp_stealth_chrome import _app, server
+    from mcp_stealth_chrome.tools import instances
 
     switched = []
     monkeypatch.setattr(server.BrowserState, "switch_to",
@@ -4081,7 +4084,7 @@ def test_switch_instance_waits_while_a_sweep_closes_that_instance(monkeypatch):
     async def run():
         event = asyncio.Event()
         monkeypatch.setitem(_app.INSTANCE_CLOSING, (server.BrowserState.session_key(), "gone"), event)
-        task = asyncio.ensure_future(server.switch_instance("gone"))
+        task = asyncio.ensure_future(instances.switch_instance("gone"))
         await asyncio.sleep(0.2)
         assert switched == [] and not task.done()
         event.set()
@@ -4098,6 +4101,7 @@ def test_the_idle_sweep_leaves_alone_an_instance_close_instance_is_closing(monke
     import asyncio
 
     from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import instances
 
     snap = SimpleNamespace(browser=object(), tabs=[], active_tab_index=0, profile_dir=None,
                            privacy=False, idle_timeout=1, is_running=lambda: True,
@@ -4127,7 +4131,7 @@ def test_the_idle_sweep_leaves_alone_an_instance_close_instance_is_closing(monke
             return {"verified": True}
 
         monkeypatch.setattr(server, "_ensure_browser_dead", slow_dead)
-        closing = asyncio.ensure_future(server.close_instance("a"))
+        closing = asyncio.ensure_future(instances.close_instance("a"))
         await asyncio.sleep(0.05)
         await server._sweep_idle_instances()
         release.set()
@@ -4144,6 +4148,7 @@ def test_a_close_still_running_after_the_wait_is_an_error_not_a_go_ahead(monkeyp
     import asyncio
 
     from mcp_stealth_chrome import _app, server
+    from mcp_stealth_chrome.tools import instances
 
     switched = []
     monkeypatch.setattr(_app, "_CLOSING_WAIT_SECONDS", 0.1)
@@ -4155,7 +4160,7 @@ def test_a_close_still_running_after_the_wait_is_an_error_not_a_go_ahead(monkeyp
         key = server.BrowserState.session_key()
         monkeypatch.setitem(_app.INSTANCE_CLOSING, (key, "stuck"), event)
         monkeypatch.setitem(_app.INSTANCE_CLOSING, (key, server.BrowserState.current_instance_id), event)
-        return (await server.switch_instance("stuck"), await server.close_instance("stuck"),
+        return (await instances.switch_instance("stuck"), await instances.close_instance("stuck"),
                 await server.mcp.call_tool("tab_list", {}))
 
     switch_reply, close_reply, listed = asyncio.run(run())

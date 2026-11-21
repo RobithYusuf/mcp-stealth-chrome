@@ -62,11 +62,13 @@ def launcher(monkeypatch, tmp_path):
 
 
 def _spawn(server, **kw):
+    from mcp_stealth_chrome.tools import instances
+
     args = dict(instance_id="w", url="about:blank", headless=True, proxy=None, user_agent=None,
                 window_width=800, window_height=600, persistent=False, lang="en-US", extra_args=None,
                 storage_state_path=None, idle_timeout=0)
     args.update(kw)
-    return asyncio.run(server._launch_browser_instance(**args))
+    return asyncio.run(instances._launch_browser_instance(**args))
 
 
 # ── F1: --user-data-dir in extra_args ───────────────────────────────────────

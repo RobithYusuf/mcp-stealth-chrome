@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import pytest
 
 from mcp_stealth_chrome import server, tab_record
+from mcp_stealth_chrome.tools import instances
 
 
 @pytest.fixture
@@ -524,7 +525,7 @@ def test_a_launch_records_its_tabs_before_it_returns(tabs_dir, profile, monkeypa
             assert "launched" in out and not out.startswith("Error"), out
             iid = "main"
         else:
-            ok_, out = asyncio.run(server._launch_browser_instance(
+            ok_, out = asyncio.run(instances._launch_browser_instance(
                 instance_id="inst", url="https://a.example/one", headless=True, proxy=None,
                 user_agent=None, window_width=800, window_height=600, persistent=True,
                 lang="en-US", extra_args=None, storage_state_path=None, idle_timeout=0,

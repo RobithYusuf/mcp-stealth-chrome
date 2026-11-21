@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from mcp_stealth_chrome import dock_icon, profile_version, server, state
+from mcp_stealth_chrome.tools import instances
 from test_focus_restore import _fake_launch
 
 pv = profile_version
@@ -174,7 +175,7 @@ def test_spawn_browser_refuses_a_newer_profile(refused_launch):
     order, profile = refused_launch
     before = _digest(profile)
     try:
-        ok, message = asyncio.run(server._launch_browser_instance(
+        ok, message = asyncio.run(instances._launch_browser_instance(
             instance_id="older", url="about:blank", headless=True, proxy=None, user_agent=None,
             window_width=800, window_height=600, persistent=False, lang="en-US", extra_args=None,
             storage_state_path=None, idle_timeout=0, profile_dir_override=str(profile)))
@@ -432,7 +433,7 @@ def test_the_persistent_profile_is_judged_before_anything_writes_to_it(beta_on, 
 def test_spawn_browser_judges_the_profile_before_making_it(beta_on, tmp_path, exists):
     target = _data_profile(tmp_path / "inst") if exists else tmp_path / "inst"
     try:
-        ok, message = asyncio.run(server._launch_browser_instance(
+        ok, message = asyncio.run(instances._launch_browser_instance(
             instance_id="inst", url="about:blank", headless=False, proxy=None, user_agent=None,
             window_width=800, window_height=600, persistent=True, lang="en-US", extra_args=None,
             storage_state_path=None, idle_timeout=0, profile_dir_override=str(target)))

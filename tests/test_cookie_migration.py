@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 from mcp_stealth_chrome import cookie_migration as cm, server
+from mcp_stealth_chrome.tools import instances
 
 _NOW_CHROME = int((time.time() + 11_644_473_600) * 1_000_000)
 
@@ -386,7 +387,7 @@ def _launch_on(profile: Path, **kw) -> str:
 
 def _spawn_on(profile: Path) -> tuple:
     try:
-        return asyncio.run(server._launch_browser_instance(
+        return asyncio.run(instances._launch_browser_instance(
             instance_id="inst", url="about:blank", headless=True, proxy=None, user_agent=None,
             window_width=800, window_height=600, persistent=True, lang="en-US", extra_args=None,
             storage_state_path=None, idle_timeout=0, profile_dir_override=str(profile)))
@@ -857,7 +858,7 @@ def test_a_refused_launch_writes_nothing_in_the_profile(tmp_path, chromes, monke
             fn = server.mcp._tool_manager._tools["browser_launch"].fn
             out = asyncio.run(fn(persistent=True, headless=True, auto_verify=False))
         else:
-            _ok, out = asyncio.run(server._launch_browser_instance(
+            _ok, out = asyncio.run(instances._launch_browser_instance(
                 instance_id="inst", url="about:blank", headless=True, proxy=None, user_agent=None,
                 window_width=800, window_height=600, persistent=True, lang="en-US", extra_args=None,
                 storage_state_path=None, idle_timeout=0, profile_dir_override=str(profile)))

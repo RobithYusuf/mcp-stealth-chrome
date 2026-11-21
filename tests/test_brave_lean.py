@@ -333,8 +333,9 @@ def test_the_parameter_reaches_both_tools():
     import inspect
 
     from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import instances
 
-    for tool in (server.browser_launch, server.spawn_browser, server._launch_browser_instance):
+    for tool in (server.browser_launch, instances.spawn_browser, instances._launch_browser_instance):
         fn = getattr(tool, "fn", tool)
         assert inspect.signature(fn).parameters["brave_lean"].default is None
 
