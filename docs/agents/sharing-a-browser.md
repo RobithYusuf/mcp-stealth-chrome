@@ -26,7 +26,8 @@ the person (the same target events as Cmd+T, a followed link, a closed tab).
   (idle reaper, window sweep, close tools, failed launches) reacts to an `active_tab()` failure; `_tab_list_problem`
   only reports its text.
 - An active tab closed outside the tools leaves none selected (`active_tab_index = -1`, `active_lost`) and the next tool
-  says so; a kept index made it act on whichever tab slid there, a person's included. `_check_active_tab_alive` runs
+  says so; a kept index made it act on whichever tab slid there, a person's included, and a stale Tab answered
+  "server rejected WebSocket connection: HTTP 500". `_check_active_tab_alive` runs
   before every tool outside `_RUNS_DESPITE_DIALOG` (`_app.BEFORE_TOOL_HOOKS`): one `Target.getTargetInfo`, which needs
   no renderer, so 0.50 notices a close before `update_targets`. Code reading `tabs[active_tab_index]` must bound-check
   it: -1 reads the last tab.
