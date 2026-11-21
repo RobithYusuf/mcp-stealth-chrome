@@ -345,21 +345,35 @@ def _merge(into: dict, update: dict) -> None:
             into[key] = value
 
 
-def write_vertical_tabs(user_data_dir: Path, browser_args: list, product: str,
-                        mode: Optional[str]) -> str:
-    """Write the vertical-tab setting into the launched sub-profile's Preferences, before the
-    browser starts. Returns the note for the launch result. Raises when the file exists and
-    cannot be parsed: writing a new one over it would wipe the profile's settings."""
+def check_vertical_tabs(user_data_dir: Path, browser_args: list,
+                        mode: Optional[str]) -> Optional[tuple[Path, dict]]:
+    """Everything write_vertical_tabs checks before it writes, writing nothing: the Preferences
+    file inside the profile and not a link, the profile seen free, and an existing file that
+    parses as a settings object. Raises as write_vertical_tabs does. Returns (that file, its
+    settings now), or None when mode is None. A launch calls it before anything writes to the
+    profile, so a refusal leaves the profile as it was."""
     if mode is None:
-        return ""
+        return None
     prefs = _preferences_target(Path(user_data_dir), browser_args)
-    folder = prefs.parent
     _refuse_unless_free(Path(user_data_dir))
     data: dict = {}
     if prefs.is_file():
         data = json.loads(prefs.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             raise ValueError(f"{prefs} does not hold a settings object")
+    return prefs, data
+
+
+def write_vertical_tabs(user_data_dir: Path, browser_args: list, product: str,
+                        mode: Optional[str]) -> str:
+    """Write the vertical-tab setting into the launched sub-profile's Preferences, before the
+    browser starts. Returns the note for the launch result. Raises when the file exists and
+    cannot be parsed: writing a new one over it would wipe the profile's settings. The checks
+    run again right before the write (check_vertical_tabs)."""
+    if mode is None:
+        return ""
+    prefs, data = check_vertical_tabs(user_data_dir, browser_args, mode)
+    folder = prefs.parent
     _merge(data, vertical_tab_prefs(product, mode))
     folder.mkdir(parents=True, exist_ok=True)
     handle, temp = tempfile.mkstemp(prefix=".Preferences-", dir=str(folder))

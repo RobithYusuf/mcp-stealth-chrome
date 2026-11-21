@@ -4483,8 +4483,8 @@ def _launch_config(req: _LaunchRequest, plan: _LaunchPlan) -> None:
 
 async def _launch_prepare_profile(req: _LaunchRequest, plan: _LaunchPlan) -> Optional[str]:
     """Pick the executable (the Dock icon's Beta or not), refuse it when it may not open the
-    profile, and prepare the cookie move. Nothing here writes in the profile. The notes go to
-    plan.dock_note.
+    profile, prepare the cookie move, and check that vertical_tabs can be written (the write
+    waits for the commit). Nothing here writes in the profile. The notes go to plan.dock_note.
 
     Returns a refusal (the privacy profile removed), or None to go on."""
     config = plan.config
@@ -4506,6 +4506,12 @@ async def _launch_prepare_profile(req: _LaunchRequest, plan: _LaunchPlan) -> Opt
         config.add_argument(_cookie_flag_arg(config))
     if not cookie_move.backup:
         plan.dock_note += cookie_move.note
+    try:
+        brave_mode.check_vertical_tabs(Path(config.user_data_dir), config.browser_args, req.vertical_tabs)
+    except Exception as e:
+        await _remove_privacy_profile(plan.privacy_profile)
+        return err(f"vertical_tabs could not be written into the profile, so nothing was "
+                   f"started: {_exc_text(e)}")
     return None
 
 
@@ -4524,8 +4530,10 @@ async def _launch_commit_profile(req: _LaunchRequest, plan: _LaunchPlan) -> Opti
     move's commit, the vertical tabs and brave_lean settings, then the tidy-up of locks and
     window state. Returns a refusal (the privacy profile removed), or None to go on.
 
-    A vertical_tabs failure now refuses after the commit; a pending marker from that commit is
-    what the next launch resumes, as after a crash there."""
+    vertical_tabs was checked before the preflight (_launch_prepare_profile), so a write that
+    fails here means the profile changed since that check (a browser took it in that moment).
+    That refusal comes after the commit; a pending marker from it is what the next launch
+    resumes, as after a crash there."""
     # The preflight, the commit, the settings and the tidy-up stay in this order: a refusal
     # at the preflight or the commit writes nothing.
     refused = await _cookie_preflight(plan.profile_path, plan.cookie_move) \

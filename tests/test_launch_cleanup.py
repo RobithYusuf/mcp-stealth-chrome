@@ -182,10 +182,16 @@ def test_a_browser_that_could_not_be_ended_after_a_failed_start_is_kept_and_said
 
 
 def _spy_profile_writes(env, monkeypatch):
-    """Record when vertical_tabs, brave_lean and the tidy-up run, in env.order."""
+    """Record when the vertical_tabs check and write, brave_lean and the tidy-up run, in env.order.
+    The write calls the check itself (looked up in brave at call time), so it shows twice."""
     from mcp_stealth_chrome import brave as brave_mode
-    real_tabs, real_lean, real_clean = (brave_mode.write_vertical_tabs, server._apply_brave_lean,
-                                        server.clean_profile_state)
+    real_check, real_tabs, real_lean, real_clean = (
+        brave_mode.check_vertical_tabs, brave_mode.write_vertical_tabs, server._apply_brave_lean,
+        server.clean_profile_state)
+
+    def check(*a, **kw):
+        env.order.append("check_vertical_tabs")
+        return real_check(*a, **kw)
 
     def tabs(*a, **kw):
         env.order.append("vertical_tabs")
@@ -199,6 +205,7 @@ def _spy_profile_writes(env, monkeypatch):
         env.order.append("tidy")
         return real_clean(*a, **kw)
 
+    monkeypatch.setattr(brave_mode, "check_vertical_tabs", check)
     monkeypatch.setattr(brave_mode, "write_vertical_tabs", tabs)
     monkeypatch.setattr(server, "_apply_brave_lean", lean)
     monkeypatch.setattr(server, "clean_profile_state", clean)
@@ -220,27 +227,66 @@ def test_a_refused_launch_writes_neither_vertical_tabs_nor_lean(env, monkeypatch
 
 
 def test_vertical_tabs_and_lean_are_written_after_the_commit_and_before_the_start(env, monkeypatch):
+    """vertical_tabs is checked before the preflight, written after the commit (checking again
+    right before it writes), then lean and the tidy-up, then the last look and the start."""
     _spy_profile_writes(env, monkeypatch)
     out = _launch(vertical_tabs="left")
     assert "[vertical tabs: on the left]" in out and not out.startswith("Error"), out
-    steps = [s for s in env.order if s in ("prepare", "preflight1", "commit", "vertical_tabs", "brave_lean",
-                                          "tidy", "preflight2", "start")]
-    assert steps == ["prepare", "preflight1", "commit", "vertical_tabs", "brave_lean", "tidy",
-                     "preflight2", "start"], steps
+    steps = [s for s in env.order if s in ("prepare", "check_vertical_tabs", "preflight1", "commit",
+                                          "vertical_tabs", "brave_lean", "tidy", "preflight2", "start")]
+    assert steps == ["prepare", "check_vertical_tabs", "preflight1", "commit", "vertical_tabs",
+                     "check_vertical_tabs", "brave_lean", "tidy", "preflight2", "start"], steps
     from mcp_stealth_chrome import brave as brave_mode
     assert brave_mode.vertical_tabs_read_back(env.profile, ["--profile-directory=Default"], "chrome") == "left"
 
 
 def test_vertical_tabs_that_cannot_be_written_still_start_nothing(env, monkeypatch):
     """An unreadable Preferences is refused earlier (the binding check), so the way vertical_tabs
-    still fails is a profile it cannot see free. That refusal now comes after the commit, which a
-    pending marker makes the next launch resume; nothing starts either way."""
+    still fails is a profile it cannot see free. The check runs before the preflight, so that
+    refusal comes before anything was written: nothing but the cookie preparation ran."""
     monkeypatch.setattr(state, "processes_naming", lambda _root: None)
     out = _launch(vertical_tabs="left")
     assert "vertical_tabs could not be written into the profile, so nothing was started" in out, out
-    assert "cannot be told" in out and "start" not in env.order, out
-    assert "commit" in env.order, f"the refusal is expected after the commit: {env.order}"
+    assert "cannot be told" in out, out
+    assert env.order == ["prepare"], f"the refusal is expected before the preflight: {env.order}"
+    assert not env.profile.exists(), "the refused launch wrote into the profile"
+
+
+def test_a_profile_taken_between_the_check_and_the_write_refuses_after_the_commit(env, monkeypatch):
+    """The narrow case left: the check passed, then a browser took the profile before the write.
+    The write checks again right before it writes, so it refuses, after the commit (a pending
+    marker from that commit is what the next launch resumes), and nothing starts."""
+    taken = []
+    monkeypatch.setattr(state, "processes_naming",
+                        lambda _root: [(4242, "Google Chrome --user-data-dir=x")] if taken else [])
+
+    async def commit_then_taken(_profile, _move):
+        env.order.append("commit")
+        taken.append(True)  # a browser takes the profile right after the commit
+        return ""
+
+    monkeypatch.setattr(server, "_commit_cookie_move", commit_then_taken)
+    out = _launch(vertical_tabs="left")
+    assert "vertical_tabs could not be written into the profile, so nothing was started" in out, out
+    assert "in use by PID 4242" in out, out
+    assert env.order == ["prepare", "preflight1", "commit"], env.order
     assert not (env.profile / "Default" / "Preferences").exists()
+
+
+def test_the_vertical_tabs_check_writes_nothing_and_raises_as_the_write_does(tmp_path):
+    from mcp_stealth_chrome import brave as brave_mode
+    args = ["--profile-directory=Default"]
+    assert brave_mode.check_vertical_tabs(tmp_path / "new", args, None) is None
+    prefs, data = brave_mode.check_vertical_tabs(tmp_path / "new", args, "left")
+    assert prefs == tmp_path / "new" / "Default" / "Preferences" and data == {}
+    assert not (tmp_path / "new").exists(), "the check wrote something"
+    (tmp_path / "list" / "Default").mkdir(parents=True)
+    (tmp_path / "list" / "Default" / "Preferences").write_text("[]")
+    for call in (lambda: brave_mode.check_vertical_tabs(tmp_path / "list", args, "left"),
+                 lambda: brave_mode.write_vertical_tabs(tmp_path / "list", args, "chrome", "left")):
+        with pytest.raises(ValueError, match="does not hold a settings object"):
+            call()
+    assert (tmp_path / "list" / "Default" / "Preferences").read_text() == "[]"
 
 
 @pytest.mark.parametrize("asked,testing_mode,expected", [

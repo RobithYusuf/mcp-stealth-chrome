@@ -55,7 +55,10 @@ Part of the agent guide: [AGENTS.md](../../AGENTS.md) says when to read this. It
 
 - `browser_launch` writes the vertical tabs and brave_lean settings after `_cookie_preflight` and
   `_commit_cookie_move`, so a refusal there writes neither (they ran before both and left the tab setting).
-  A vertical_tabs failure now refuses after the commit, which a pending marker makes the next launch resume.
+  vertical_tabs is checked before the preflight (`check_vertical_tabs`, writing nothing; the write checks again),
+  so its refusal still comes before anything is written. Only a profile that changed between that check and the
+  write (a browser taking it in that moment) refuses after the commit, which a pending marker makes the next
+  launch resume.
   `spawn_browser` still writes them before the preflight.
 - Vertical tabs are Preferences keys written before launch (`brave.tabs.vertical_tabs_enabled`,
   `brave.tabs.vertical_tabs_on_right`; Chrome `vertical_tabs.enabled`), merged into the sub-profile's file through a
