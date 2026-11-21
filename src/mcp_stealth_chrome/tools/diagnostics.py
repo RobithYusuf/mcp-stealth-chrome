@@ -7,6 +7,7 @@ where the server starts the probe; this module reads them as _srv.<name> at call
 
 import asyncio
 import contextlib
+import ipaddress
 import json
 import time
 from typing import Any, Literal, Optional, Union
@@ -47,6 +48,33 @@ def _status_profile() -> str:
     return f"(ephemeral) {data_dir}" if data_dir else "(ephemeral)"
 
 
+def _loopback(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host.strip("[]")).is_loopback
+    except ValueError:
+        return False
+
+
+def _cdp_endpoint(browser: Any) -> Optional[dict]:
+    """The current browser's DevTools endpoint: host, port and the browser's own websocket URL, or
+    None with no browser. A launch binds 127.0.0.1; attach_to_chrome(host=...) can name another
+    machine, and then a note says so rather than leave it to be noticed."""
+    if browser is None:
+        return None
+    config = getattr(browser, "config", None)
+    host, port = getattr(config, "host", None), getattr(config, "port", None)
+    ws = None
+    with contextlib.suppress(Exception):
+        ws = browser.websocket_url  # /json/version's webSocketDebuggerUrl, read at connect
+    endpoint: dict[str, Any] = {"host": host, "port": port, "browser_ws": str(ws) if ws else None}
+    if host is not None and not _loopback(str(host)):
+        endpoint["note"] = (f"{host} is not a loopback address: this browser's DevTools port is "
+                            "reached over the network (attach_to_chrome named that host)")
+    return endpoint
+
+
 @mcp.tool()
 async def server_status() -> str:
     """Diagnostic info about the server, browser, and CDP compatibility patches.
@@ -60,6 +88,9 @@ async def server_status() -> str:
 
     `block_ads`: per browser launched with block_ads=True, the requests looked at, blocked and allowed by
     type and host, the targets covered and any that could not be, and the filter lists' age.
+
+    `cdp`: the current browser's DevTools endpoint, {host, port, browser_ws} (its own websocket URL), or
+    null with no browser. A host that is not a loopback address carries a note saying so.
 
     `profile_gc`: the startup pass over leftover privacy-profiles/* and profile-pid<N> folders: what it
     removed, kept because it holds data, found in use, and errors. It never removes a fallback with cookies,
@@ -76,6 +107,7 @@ async def server_status() -> str:
         "browser_running": BrowserState.is_up(),
         "browser": brave_mode.product_of(BrowserState.browser) if BrowserState.browser is not None else None,
         "instance": BrowserState.current_instance_id,
+        "cdp": _cdp_endpoint(BrowserState.browser),
         "tabs": len(BrowserState.tabs),
         "active_tab": BrowserState.active_tab_index,
         "console_capture": BrowserState.capture_console,

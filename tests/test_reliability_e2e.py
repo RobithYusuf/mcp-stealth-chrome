@@ -341,7 +341,7 @@ def test_human_handoff_focuses_headed_and_times_out_honestly(loop):
         timed_out = loop.run_until_complete(tool("wait_for_human")(
             done_selector="#x", timeout=2))
         assert "timeout" in timed_out.lower()
-        assert "nothing changed" in timed_out.lower()
+        assert "selector '#x' never appeared" in timed_out, timed_out
     finally:
         loop.run_until_complete(tool("close_instance")(iid))
         loop.run_until_complete(tool("switch_instance")("main"))

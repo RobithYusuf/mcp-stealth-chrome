@@ -119,8 +119,18 @@ conclusions. Each rule below replaced a real lie.
 - `fill_form` fails when a field fails, and then does not click submit. `batch_actions` counts failures by the `Error:`
   prefix, so a failure reported through `ok()` counts as success. Non-list or empty input is an error, not
   `0 actions OK`; a non-object item is a counted failure.
+- A cut preview says it was cut. A `workflow_run` step's `result` was `text[:500]` with no mark, often mid-key
+  (`redirect_c`), and read as the whole result. `workflow._preview` ends a longer one at the last line break or `, `
+  in the final 80 characters (else at 500) and appends ` ... [+N chars; ...]`; a short result is unchanged.
 - `server_status` measures `os_cursor` on a thread started with the server and says `still being measured`
   (`available: null`) until done: a cold Quartz and AppKit import takes seconds while profile_gc and the Dock check run,
   and a timed wait answered `not measured (TimeoutError)` on the first call.
 - `server_status` exposes `compat_patches`: a patch that fails to apply crashes nothing but kills the CDP listener at
   the first mismatched payload, so captures come back empty and look like a quiet page.
+- A page change is weak evidence that a person finished. Without the overlay's Done and without a selector or URL,
+  `wait_for_human` counts one only `HANDOFF_GRACE` (5 s) after `request_human_help` or the call, the baseline
+  following the page until then, and once it held `HANDOFF_SETTLE` (2 s): a new URL once the URL held, since a page
+  that keeps drawing would never count, and then the result says the content did not. It never says completed: it names
+  what changed (the URL from what to what, or the content's counts), says the page may have done it, and leaves the
+  request pending, as a timeout does. Dropping it made the next wait say request_human_help had not been called.
+  Only the bar's answer, the selector or the URL close a request.

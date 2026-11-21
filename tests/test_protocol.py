@@ -316,3 +316,17 @@ def test_listed_descriptions_carry_no_docstring_indentation(mcp):
     assert indented_before > 100  # the raw docstrings really were indented
     launch = next(tool for tool in listed if tool.name == "browser_launch").description
     assert "\nArgs:\n    url: initial URL to load\n" in launch
+
+
+def test_workflow_run_takes_its_output_mode_and_a_sleep_step(mcp):
+    """output is a Literal: over a real client "failures" reaches the tool and a mode it does not
+    know is refused. A sleep step needs no browser, and is no tool of its own."""
+    steps = [{"tool": "sleep", "args": {"seconds": 0}}]
+    reply = mcp.call("workflow_run", steps=steps, output="failures")
+    assert not reply.failed, reply.text
+    doc = json.loads(reply.text)
+    assert doc["output"] == "failures" and doc["counts"]["by_tool"] == {"sleep": {"ok": 1, "failed": 0}}
+    assert json.loads(mcp.call("workflow_run", steps=steps).text)["output"] == "summary"
+    reply = mcp.call("workflow_run", steps=steps, output="brief")
+    assert reply.failed and "output" in reply.text, reply.text
+    assert mcp.call("sleep", seconds=0).failed
