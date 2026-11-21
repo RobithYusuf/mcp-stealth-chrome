@@ -942,3 +942,67 @@ def test_a_reattach_gives_the_kept_browser_back_when_another_call_took_the_insta
             "ran, before this browser_launch took the browser over") in out, out
     assert (keep_alive.read(kept.profile) or {}).get("server_pid") == 424242, "the record was not given back"
     assert server.BrowserState.browser is theirs and owner.closes == []
+
+
+# ── A write in a thread is never left half way ──────────────────────────────────────────────
+
+_REAL_COMMIT = server._commit_cookie_move  # the env fixture replaces it with a fake
+
+
+def test_a_cancel_during_a_profile_write_in_a_thread_waits_for_the_write(owner, monkeypatch):
+    """Cancelling a task that awaits asyncio.to_thread does not stop the thread. The cookie
+    marker's write takes 0.5 s here and the launch is cancelled at 0.1 s, as browser_recover
+    cancels one: the launch's cancel goes on up only once the write returned, whole."""
+    events = []
+    written = {}
+
+    def slow_write_marker(profile, marker):
+        events.append(("write started", time.monotonic()))
+        time.sleep(0.5)
+        written.update(marker)  # the whole marker, or none of it
+        events.append(("write returned", time.monotonic()))
+
+    monkeypatch.setattr(server, "_commit_cookie_move", _REAL_COMMIT)
+    monkeypatch.setattr(server.cookie_migration, "write_marker", slow_write_marker)
+    owner.move = server._CookieMove(plan=None, marker={"state": "pending", "moved": 3})
+
+    async def run():
+        launch = asyncio.ensure_future(_launch_with(owner))
+        for _ in range(500):
+            if events:
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.1)
+        launch.cancel()  # what browser_recover does to a launch that did not end
+        try:
+            await launch
+        except asyncio.CancelledError:
+            events.append(("cancel went on up", time.monotonic()))
+
+    asyncio.run(run())
+    names = [name for name, _t in events]
+    assert names == ["write started", "write returned", "cancel went on up"], events
+    assert written == {"state": "pending", "moved": 3}
+    assert _no_mark() and "start" not in owner.order
+
+
+def test_a_write_in_a_thread_outlasts_a_cancel_that_comes_again():
+    """An anyio cancel scope cancels again and again until the task ends: every one of them still
+    waits for the write, and the cancel then goes on up once."""
+    done = []
+
+    def write():
+        time.sleep(0.3)
+        done.append("written")
+
+    async def run():
+        task = asyncio.ensure_future(server._write_in_thread(write))
+        for _ in range(3):
+            await asyncio.sleep(0.05)
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            return list(done)
+
+    assert asyncio.run(run()) == ["written"]

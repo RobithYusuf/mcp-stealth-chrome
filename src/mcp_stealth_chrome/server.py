@@ -1176,6 +1176,29 @@ def _left_in(target: Path) -> list[str]:
     return left
 
 
+async def _write_in_thread(fn: Any, *args: Any, **kwargs: Any) -> Any:
+    """Run a write to the profile in a worker thread, never left half way. Cancelling a task that
+    awaits asyncio.to_thread does not stop the thread: browser_recover cancelled a launch while
+    its cookie strip ran, and the strip went on writing the database beside the cancel path and
+    the next launch. So the thread is awaited under asyncio.shield, and a cancel that comes
+    meanwhile waits for the thread to return (the write is bounded by itself: SQLite's busy
+    timeout, a file write and rename) before it goes on up. Read-only thread calls need none."""
+    work = asyncio.ensure_future(asyncio.to_thread(fn, *args, **kwargs))
+    try:
+        return await asyncio.shield(work)
+    except asyncio.CancelledError as cancelled:
+        while not work.done():
+            try:
+                await asyncio.shield(work)
+            except asyncio.CancelledError:
+                continue  # cancelled again (an anyio scope repeats it): the write still comes first
+            except Exception:
+                break
+        if not work.cancelled():
+            work.exception()  # retrieved: the cancel is what this call answers now
+        raise cancelled
+
+
 async def _remove_privacy_profile(profile_dir: Optional[Path]) -> bool:
     """Remove a privacy profile once its browser is gone, with bounded retries.
 
@@ -1221,7 +1244,7 @@ async def _remove_privacy_profile(profile_dir: Optional[Path]) -> bool:
             await asyncio.sleep(delay)
         else:
             try:
-                await asyncio.to_thread(shutil.rmtree, target)
+                await _write_in_thread(shutil.rmtree, target)
             except FileNotFoundError:
                 pass
             except Exception as exc:
@@ -2766,7 +2789,7 @@ async def _commit_cookie_move(profile_path: Optional[Path], move: _CookieMove) -
     profile = Path(profile_path)
     try:
         if move.marker is not None:
-            await asyncio.to_thread(cookie_migration.write_marker, profile, move.marker)
+            await _write_in_thread(cookie_migration.write_marker, profile, move.marker)
         if move.strip:
             cookies = await asyncio.to_thread(
                 cookie_migration.verified_backup, move.backup, cookie_migration.read_marker(profile))
@@ -2778,8 +2801,8 @@ async def _commit_cookie_move(profile_path: Optional[Path], move: _CookieMove) -
             snapshot = await asyncio.to_thread(
                 cookie_migration.snapshot_digests, Path(str(marker.get("database_copy") or "")),
                 move.plan.subprofile, b"v10")
-            await asyncio.to_thread(cookie_migration.strip, profile, move.plan.subprofile, b"v10", allowed,
-                                    snapshot)
+            await _write_in_thread(cookie_migration.strip, profile, move.plan.subprofile, b"v10", allowed,
+                                   snapshot)
             # Its own change, checked row by row: the last look before Chrome starts compares to this.
             move.plan.fingerprint = await asyncio.to_thread(
                 cookie_migration.fingerprint_of, profile, move.plan.subprofile)
@@ -2873,7 +2896,7 @@ async def _move_cookies_out(profile: Path, config: Config, plan: Any, executable
         cookies += [c for c in earlier or [] if cookie_migration.key(c) not in read]
     backup = STORAGE_STATE_DIR / f"{name}.json"
     document = cookie_migration.backup_document(cookies, profile, executable)
-    await asyncio.to_thread(cookie_migration.write_durable, backup, json.dumps(document))
+    await _write_in_thread(cookie_migration.write_durable, backup, json.dumps(document))
     saved = await asyncio.to_thread(cookie_migration.verified_backup, backup)
     if saved is None or [cookie_migration.value_digest(c) for c in saved] != \
             [cookie_migration.value_digest(c) for c in cookies]:

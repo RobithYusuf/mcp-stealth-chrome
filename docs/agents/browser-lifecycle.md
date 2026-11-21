@@ -183,6 +183,12 @@ Part of the agent guide: [AGENTS.md](../../AGENTS.md) says when to read this. It
   the launch is cut short. A browser that could not be ended keeps a handle on its instance, naming its
   profile, as every close path keeps one. Known limit: a recover that began on that same browser then
   resets it, as it resets any browser it could not end, after signalling that browser's PIDs.
+- Cancelling a task that awaits `asyncio.to_thread` does not stop the thread. A write to the profile that
+  runs in a thread (the cookie move's marker and strip, its backup, the removal of a privacy profile) goes
+  through `_write_in_thread`: the thread is awaited under `asyncio.shield`, and a cancel that comes
+  meanwhile, again and again under an anyio scope, waits for it to return before it goes on up. The write
+  is bounded by itself (SQLite's busy timeout, a file write and rename), so the cancel path never runs
+  beside a half-written profile. Read-only thread calls need none.
 - A launch publishes its browser and that browser's profile and privacy flag in one step with no await
   between (`_launch_ready_browser`; the other places that publish a handle already did): a recover in
   between paired the new browser with the old profile path and signalled the PIDs of whichever Chrome had
