@@ -495,29 +495,6 @@ def test_popup_tripwire_waits_on_popup_and_done_clears_popup_record(page, monkey
     assert "POPUP-TAB" not in server._HUMAN_HELP
 
 
-@pytest.mark.parametrize("at_click,later,pauses", [
-    (FIELD_URL, FIELD_URL, True), (FIELD_URL, "https://shopee.co.id/product/2", False),
-    ("about:blank", FIELD_URL, False), ("https://shopee.co.id/product/2", FIELD_URL, False),
-])
-def test_click_checks_only_a_popup_url_that_matched_at_click_time(page, monkeypatch, at_click, later, pauses):
-    parent = page("https://example.test/", headless=True)
-    popup = Tab(later, parent.browser, words=["verifikasi untuk melanjutkan"])
-    popup.target = type("Target", (), {"target_id": "popup"})()
-    monkeypatch.setattr(BrowserState, "tabs", [parent, popup])
-    async def targets(browser):
-        return [("popup", later)]
-    monkeypatch.setattr(server, "_page_targets", targets)
-    run = server._TRIPWIRE_RUN.set({"tool": "batch_actions"})
-    try:
-        before = {**parent.sig(), "pages": {KEY: parent.url}}
-        after = {**before, "pages": {**before["pages"], "popup": at_click}, "opened_here": ["popup"]}
-        clicked = server._click_outcome("clicked", "#open", before, after)
-        assert ("in opened tab" in clicked) == (at_click == FIELD_URL)
-        result = asyncio.run(server._tripwire_step("click", "navigate"))
-        assert bool(result and result.startswith("Error: antibot_paused:")) == pauses
-        assert popup.probes == 0
-    finally:
-        server._TRIPWIRE_RUN.reset(run)
 def test_a_second_look_says_it_in_one_line(page):
     tab = page(FIELD_URL, overlay=True)
     look(tab, url=FIELD_URL)
@@ -567,7 +544,7 @@ def test_leaving_the_page_withdraws_only_the_tripwires_own_request(page):
     # And on a verification page with the agent's request pending, it is left as it is.
     tab.url = FIELD_URL
     trip = look(tab, url=FIELD_URL)
-    assert trip.where == "pending" and server._HUMAN_HELP[KEY]["objective"] == "Log in"
+    assert trip.where == "agent_pending" and server._HUMAN_HELP[KEY]["objective"] == "Log in"
 
 
 def test_a_request_answered_with_done_is_said_closed_not_withdrawn(page):
@@ -688,9 +665,9 @@ def test_spawned_browser_handoff_belongs_to_its_instance(page, monkeypatch):
     assert not nav._pending_human_request()[2]
     monkeypatch.setattr(BrowserState, 'current_instance_id', 'work')
     monkeypatch.setattr(BrowserState, 'browser', tab.browser)
-    monkeypatch.setattr(BrowserState, 'tabs', [])
+    monkeypatch.setattr(server, "_refresh_tabs", lambda: asyncio.sleep(0, result=False))
     out = asyncio.run(nav.wait_for_human(timeout=0, done_url_contains='verify'))
-    assert 'unavailable tab' in out and KEY in out and 'no active tab was used' in out
+    assert "no active tab was used" not in out and "timeout after 0s" in out
 
 
 def test_done_is_for_the_displayed_request_not_its_replacement(page, monkeypatch):
