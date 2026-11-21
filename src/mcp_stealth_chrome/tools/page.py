@@ -24,13 +24,7 @@ from ..helpers import (
 )
 from ..refs import MAX_FRAMES, all_frames, collect_snapshot, frame_world, resolve_ref
 from ..result_types import structured_json
-from ..server import (
-    _eval_checked,
-    _js_exception_text,
-    _page_facts_for_report,
-    _target_key,
-    _wait,
-)
+from .. import server as _srv
 from ..snapshot import (
     element_fingerprint,
     format_snapshot,
@@ -139,17 +133,17 @@ async def browser_snapshot(
             max_elements=max_elements,
             include_frames=include_frames,
         )
-        walk = await _wait(collect_snapshot(tab, options), what="browser_snapshot")
+        walk = await _srv._wait(collect_snapshot(tab, options), what="browser_snapshot")
         elements = walk.elements
         counts = dict(walk.counts)
         counts["frames"] = {
             "walked": walk.frames, "failed": walk.failed,
             "skipped": walk.skipped, "limit": MAX_FRAMES,
         }
-        url, title = await _page_facts_for_report(tab)
+        url, title = await _srv._page_facts_for_report(tab)
         h = snapshot_hash(elements)
         doc_token = walk.doc_token()
-        cache_key = _target_key(tab)
+        cache_key = _srv._target_key(tab)
         scope_sig = snapshot_scope_signature(options)
         scopes = _SNAPSHOT_CACHE.setdefault(cache_key, {})
         last = scopes.get(scope_sig)
@@ -292,7 +286,7 @@ async def screenshot(
             kwargs: dict[str, Any] = {"format_": fmt, "clip": clip, "capture_beyond_viewport": True}
             if fmt == "jpeg" and quality is not None:
                 kwargs["quality"] = int(quality)
-            b64 = await _wait(tab.send(cdp_page.capture_screenshot(**kwargs)),
+            b64 = await _srv._wait(tab.send(cdp_page.capture_screenshot(**kwargs)),
                               what="screenshot (region)")
             data = base64.b64decode(b64)
             write_private(path, data)
@@ -317,7 +311,7 @@ async def screenshot(
                 # nodriver opens the file itself: it writes a private temporary file, which
                 # replaces `path` only once it holds the capture.
                 with private_staging(path) as staged:
-                    await _wait(tab.save_screenshot(**{**save_kwargs, "filename": str(staged)}),
+                    await _srv._wait(tab.save_screenshot(**{**save_kwargs, "filename": str(staged)}),
                                 timeout=15.0, what="screenshot (nodriver)")
                 captured = True
             except Exception as e1:
@@ -331,7 +325,7 @@ async def screenshot(
                                                     "capture_beyond_viewport": bool(full_page)}
                     if fmt == "jpeg" and quality is not None:
                         cdp_kwargs["quality"] = int(quality)
-                    b64 = await _wait(
+                    b64 = await _srv._wait(
                         tab.send(cdp_page.capture_screenshot(**cdp_kwargs)),
                         timeout=10.0, what="screenshot (CDP raw)",
                     )
@@ -344,7 +338,7 @@ async def screenshot(
                 # full-page stitching). Last resort before giving up.
                 try:
                     from nodriver.cdp import page as cdp_page
-                    b64 = await _wait(
+                    b64 = await _srv._wait(
                         tab.send(cdp_page.capture_screenshot(
                             format_="jpeg", quality=60,
                             capture_beyond_viewport=False,
@@ -362,12 +356,12 @@ async def screenshot(
                 hint = "browser_recover() to force-restart, or browser_close() + browser_launch(persistent=False)"
                 current_url = ""
                 try:
-                    current_url = await _wait(tab.evaluate("location.href"),
+                    current_url = await _srv._wait(tab.evaluate("location.href"),
                                               timeout=2.0, what="url probe") or ""
                 except Exception:
                     pass
                 try:
-                    rs = await _wait(tab.evaluate("document.readyState"),
+                    rs = await _srv._wait(tab.evaluate("document.readyState"),
                                       timeout=2.0, what="js probe")
                     if rs:
                         # about:blank has no paintable content — common foot-gun
@@ -536,7 +530,7 @@ async def get_text(
                 return ok(el.text_all or "")
             return ok(await _visible_text_of(page, el))
         expr = "document.body.textContent" if raw else "document.body.innerText"
-        result = await _wait(page.evaluate(expr, return_by_value=True), what="get_text")
+        result = await _srv._wait(page.evaluate(expr, return_by_value=True), what="get_text")
         text = result.value if hasattr(result, "value") and not isinstance(result, str) else result
         text = str(text or "")
         if frames:
@@ -558,7 +552,7 @@ async def _frame_texts(page, raw: bool) -> str:
     """The text of each child frame, under a line naming it; "" when the page has none.
     Read in each frame's isolated world: the DOM is shared, nothing is added to the page."""
     try:
-        found = await _wait(all_frames(page), what="get_text frames")
+        found = await _srv._wait(all_frames(page), what="get_text frames")
     except Exception as e:
         return f"\n\n[frames not read: {str(e)[:160] or type(e).__name__}]"
     parts, hidden, seen = [], [], 0
@@ -577,7 +571,7 @@ async def _frame_texts(page, raw: bool) -> str:
             continue
         try:
             ctx = await frame_world(conn, frame)
-            remote, exc = await _wait(conn.send(cdp_runtime.evaluate(
+            remote, exc = await _srv._wait(conn.send(cdp_runtime.evaluate(
                 _FRAME_TEXT_JS % ("true" if raw else "false", "textContent" if raw else "innerText"),
                 context_id=ctx, return_by_value=True)), what="get_text frame")
             if exc is not None:
@@ -717,7 +711,7 @@ async def query_selector_all(selector: str, limit: int = 50) -> str:
     """Return count + attrs of all elements matching CSS selector."""
     try:
         tab = BrowserState.active_tab()
-        result = await _eval_checked(
+        result = await _srv._eval_checked(
             tab,
             f"(() => {{ var els = document.querySelectorAll({json.dumps(selector)}); "
             f"var out = []; for(var i=0;i<Math.min(els.length,{limit});i++){{"
@@ -767,7 +761,7 @@ async def list_frames(max_url_len: int = 200) -> str:
         return err("max_url_len must be >= 0 (0 = whole URLs)")
     try:
         tab = BrowserState.active_tab()
-        frames = await _wait(all_frames(tab), what="list_frames")
+        frames = await _srv._wait(all_frames(tab), what="list_frames")
         rows = []
         for f in frames:
             if f["frame"] is None:
@@ -808,7 +802,7 @@ async def frame_evaluate(frame_url_pattern: str, expression: str) -> str:
             await_promise=True, return_by_value=True,
         )
         if isinstance(result, cdp_runtime.ExceptionDetails):
-            return err(f"frame_evaluate could not run: {_js_exception_text(result)}")
+            return err(f"frame_evaluate could not run: {_srv._js_exception_text(result)}")
         result = result.value if hasattr(result, "value") and not isinstance(result, str) else result
         text = str(result)
         cross_origin = text.startswith("ERR:") and (
@@ -817,13 +811,13 @@ async def frame_evaluate(frame_url_pattern: str, expression: str) -> str:
             if text.startswith("ERR:"):
                 return err(f"frame script threw: {text[4:]}")
             return ok(text)
-        for found in await _wait(all_frames(tab), what="frame_evaluate"):
+        for found in await _srv._wait(all_frames(tab), what="frame_evaluate"):
             if found["frame"] is None:
                 continue
             if found["depth"] == 0 or not pattern.search(str(found["frame"].url or "")):
                 continue
             ctx = await frame_world(found["conn"], found["frame"])
-            remote, exc = await _wait(found["conn"].send(cdp_runtime.evaluate(
+            remote, exc = await _srv._wait(found["conn"].send(cdp_runtime.evaluate(
                 expression, context_id=ctx, return_by_value=True, await_promise=True,
             )), what="frame_evaluate")
             if exc is not None:
@@ -945,7 +939,7 @@ async def extract_structured(
           return JSON.stringify(rows);
         })()
         """
-        result = await _eval_checked(tab, js)
+        result = await _srv._eval_checked(tab, js)
         return ok(str(result))
     except Exception as e:
         return err(str(e))
@@ -975,7 +969,7 @@ async def extract_table(selector: str = "table", include_headers: bool = True) -
           return JSON.stringify({headers: headers, rows: out});
         })()
         """
-        result = await _eval_checked(tab, js)
+        result = await _srv._eval_checked(tab, js)
         problem = (parse_json(result, {}) or {}).get("error")
         if problem:
             return err(f"extract_table: {problem} ({selector})")
@@ -1000,7 +994,7 @@ async def scrape_page(
         return err("return_mode must be auto, json, text, or markdown")
     try:
         tab = BrowserState.active_tab()
-        raw = await _wait(tab.evaluate(
+        raw = await _srv._wait(tab.evaluate(
             "(() => { const root = " + ("document.querySelector(\'main,article,[role=main]\') || document.body" if only_main_content else "document.body") + "; return JSON.stringify({contentType: document.contentType || \'\', title: document.title, url: location.href, body: root ? root.innerText : \'\'}); })()",
             return_by_value=True,
         ), what="scrape_page")

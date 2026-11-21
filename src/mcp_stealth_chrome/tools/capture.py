@@ -23,7 +23,7 @@ from ..helpers import (
     BODY_REVEAL_NOTE, confined_output_path, err, mask_request_entry, ok, reveal_mode, target_key,
     ts_filename,
 )
-from ..server import _drop_handlers
+from .. import server as _srv
 from ..state import EXPORT_DIR, BrowserState, ensure_dirs
 
 
@@ -131,7 +131,7 @@ def _intercept_drop_handler() -> None:
     handler_tab, handler = _INTERCEPT.get("handler_tab"), _INTERCEPT.get("handler")
     if handler_tab is not None and handler is not None:
         from nodriver.cdp import fetch as cdp_fetch
-        _drop_handlers(handler_tab, [(cdp_fetch.RequestPaused, handler)])
+        _srv._drop_handlers(handler_tab, [(cdp_fetch.RequestPaused, handler)])
     _INTERCEPT["handler_tab"] = None
     _INTERCEPT["handler"] = None
 
