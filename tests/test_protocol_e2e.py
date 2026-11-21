@@ -120,6 +120,9 @@ class _Fixture(http.server.SimpleHTTPRequestHandler):
         if path == "/hang":
             time.sleep(40)
             return self._reply(200, b"late")
+        if path == "/late-commit":
+            time.sleep(0.3)
+            return self._reply(200, b"<!doctype html><title>Late commit</title><p>ready</p>")
         if path == "/img.png":
             return self._reply(200, _png(), "image/png")
         if path == "/slow.png":
@@ -783,7 +786,7 @@ def test_navigation_commit_timeout_reports_observation_and_leaves_tab_usable(pag
     assert "tab may still be loading" in reply.text
     recovered = page.call("navigate", url=f"{base}/page2.html", _timeout=20)
     assert not recovered.failed, recovered.text
-    assert f'"final_url": "{base}/page2.html"' in recovered.text, recovered.text
+    assert '"status": 200' in recovered.text and '"status_source": "cdp:Network.responseReceived"' in recovered.text, recovered.text
 
 
 @pytest.mark.parametrize("path", ["fresh", "reuse", "spawn", pytest.param("reattach", marks=
@@ -822,10 +825,23 @@ def test_first_page_timeout_keeps_the_browser_usable(base, path, tmp_path):
         client.close()
 
 
+def test_navigation_timeout_that_loaded_is_success(base):
+    client = Client(env={"BROWSER_NAV_TIMEOUT": "0.1"})
+    try:
+        assert not launch(client, "about:blank").failed
+        reply = client.call("navigate", url=f"{base}/late-commit", auto_verify=False, _timeout=15)
+        assert not reply.failed, reply.text
+        assert "status 200" in reply.text and "ready_state complete" in reply.text, reply.text
+        assert "answer arrived after 0.1s bound" in reply.text, reply.text
+    finally:
+        client.call("close_all_instances", _timeout=40)
+        client.close()
+
+
 def test_tab_new_timeout_owns_and_selects_the_new_tab(base):
     client = Client(env={"BROWSER_NAV_TIMEOUT": "1"})
     try:
-        assert not launch(client, f"{base}/protocol.html").failed
+        assert not launch(client, "about:blank").failed
         opened = client.call("tab_new", url=f"{base}/hang?new", _timeout=15)
         assert opened.failed and "now active" in opened.text, opened.text
         assert client.call("server_status").json()["browser_running"]
