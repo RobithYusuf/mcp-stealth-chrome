@@ -4255,9 +4255,8 @@ async def _launch_reuse_running(req: _LaunchRequest) -> Optional[str]:
 def _launch_privacy_and_identity(req: _LaunchRequest, plan: _LaunchPlan) -> Optional[str]:
     """Refuse privacy mode over a caller's profile, and settle the proxy and fingerprint this
     browser gets (plan.effective_*). Returns an error result, or None to go on."""
-    if req.privacy and (req.user_data_dir or req.profile_directory or any(
-        (arg or "").startswith("--user-data-dir=") for arg in plan.merged_extra_args
-    )):
+    # A --user-data-dir in extra_args is req.user_data_dir by now (_profile_from_extra_args).
+    if req.privacy and (req.user_data_dir or req.profile_directory):
         return err("privacy mode cannot reuse user_data_dir or profile_directory")
     if req.privacy:
         plan.persistent = False
@@ -4337,42 +4336,15 @@ async def _launch_explicit_profile(req: _LaunchRequest, plan: _LaunchPlan) -> Op
 
 
 async def _launch_kept_browser(req: _LaunchRequest, plan: _LaunchPlan) -> Optional[str]:
-    """No user_data_dir: refuse a --user-data-dir in extra_args that another Chrome holds, and
-    take over a browser a previous server of ours kept on the profile this launch asks for.
+    """No user_data_dir: take over a browser a previous server of ours kept on the profile this
+    launch asks for. A --user-data-dir in extra_args never reaches here: _profile_from_extra_args
+    made it user_data_dir, whose lock _launch_explicit_profile checks.
 
-    Returns the reattach's result or a refusal, or None to go on to the profile resolver;
-    plan.kept_note says why a kept browser was not taken over."""
-    # Validate user-supplied --user-data-dir BEFORE launch (saves a 30s timeout).
-    # Many users pass a Chrome profile path in extra_args that's currently
-    # held by their daily Chrome — fail fast with actionable advice.
-    custom_udd: Optional[Path] = None
-    for arg in plan.merged_extra_args:
-        if arg.startswith("--user-data-dir="):
-            custom_udd = Path(arg.split("=", 1)[1]).expanduser()
-            break
-    if custom_udd is not None:
-        holder_pid = chrome_lock_holder_pid(custom_udd) if custom_udd.exists() else None
-        if holder_pid is not None:
-            kept = _kept_verdict(custom_udd, req.product)
-            if kept and kept.get("ok"):
-                return await _launch_by_reattach(
-                    custom_udd, kept, url=req.url, keep_alive=req.keep_alive,
-                    ignored=_reattach_ignored(vars(req)), expect_url=req.expect_url,
-                    expect_status=req.expect_status,
-                    block_ads=req.block_ads, agent_overlay=req.agent_overlay)
-            return err(
-                f"Profile directory is locked by another Chrome process: "
-                f"{custom_udd} (PID {holder_pid}). Close that Chrome window first, "
-                f"OR use clone_chrome_profile to make a snapshot copy, "
-                f"OR use the user_data_dir parameter (with same fail-fast lock check), "
-                f"OR omit --user-data-dir to use the default MCP profile, "
-                f"OR use attach_to_chrome(port=...) if Chrome was started with debug port."
-                + _not_reattached_note(custom_udd, kept)
-            )
-
+    Returns the reattach's result, or None to go on to the profile resolver; plan.kept_note
+    says why a kept browser was not taken over."""
     # A browser a previous server of ours kept alive on the profile this launch asks
     # for is taken over, not raced: falling back would hide its tabs and logins.
-    if plan.persistent and custom_udd is None:
+    if plan.persistent:
         _own_folder = _server_profile_for(BrowserState.current_instance_id, req.product)
         for _candidate in _kept_candidates(BrowserState.current_instance_id, req.product):
             # Only the folder the server chose itself: a caller's --user-data-dir that

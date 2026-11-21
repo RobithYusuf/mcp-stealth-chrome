@@ -285,3 +285,40 @@ def test_the_health_probe_restores_a_degenerate_window_without_raising_it(second
     source = inspect.getsource(server._launch_window_health)
     assert "bring_to_front" not in source and "activate" not in source, \
         "the health probe names a call that raises the window"
+
+
+def test_no_spelling_of_user_data_dir_in_extra_args_survives_the_first_check():
+    """_profile_from_extra_args turns a --user-data-dir in extra_args into the launch's
+    user_data_dir, or refuses one with no value, before any other check. brave._SWITCH matches
+    every argument starting with "--user-data-dir=" (two dashes, the name, "=", then anything,
+    newlines included), so no later check needs to look for one in extra_args."""
+    import random
+    import string
+    rng = random.Random(20261121)
+    alphabet = string.printable + "\u00e4\u00e9\u6f22\u2028\u00a0\x00"
+    values = ["", " ", "\t", "\n", "/x", "~/p", "=x", "a b", "/a\n/b", "C:\\U\\p", "--user-data-dir=/y"]
+    values += ["".join(rng.choice(alphabet) for _ in range(rng.randint(0, 16))) for _ in range(3000)]
+    for value in values:
+        arg = f"--user-data-dir={value}"
+        for args in ([arg], ["--foo", arg, "--bar=1"], [arg, arg]):
+            udd, rest, problem = server._profile_from_extra_args(None, args, "user_data_dir")
+            if problem:
+                continue
+            assert not any(str(a).startswith("--user-data-dir=") for a in rest), (args, rest)
+            assert udd == value.strip(), (args, udd)
+
+
+def test_privacy_with_a_user_data_dir_in_extra_args_is_still_refused(env, tmp_path):
+    out = _launch(privacy=True, extra_args=[f"--user-data-dir={tmp_path / 'theirs'}"])
+    assert "privacy mode cannot reuse user_data_dir or profile_directory" in out, out
+    assert "start" not in env.order
+
+
+def test_a_user_data_dir_in_extra_args_that_another_chrome_holds_is_refused_with_its_pid(env, tmp_path, monkeypatch):
+    theirs = tmp_path / "theirs"
+    theirs.mkdir()
+    monkeypatch.setattr(server, "chrome_lock_holder_pid", lambda p: 4242 if p == theirs else None)
+    monkeypatch.setattr(server, "_kept_verdict", lambda *_a, **_kw: None)
+    out = _launch(extra_args=[f"--user-data-dir={theirs}"])
+    assert f"user_data_dir {theirs} is currently in use by Chrome PID 4242" in out, out
+    assert "start" not in env.order

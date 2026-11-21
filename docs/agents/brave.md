@@ -19,7 +19,8 @@ Part of the agent guide: [AGENTS.md](../../AGENTS.md) says when to read this. It
 - A `--user-data-dir` in `extra_args` is the profile that really opens (Chromium reads the last copy, nodriver puts its
   own first), so `_profile_from_extra_args` takes it out and makes it the launch's profile folder before any check: the
   binding, the version guard and the cookie plan see the folder the browser gets. Two different ones, or one without a
-  value, are refused. `--profile-directory` must be one folder name, and copies must agree.
+  value, are refused. `--profile-directory` must be one folder name, and copies must agree. No later check looks for
+  one in extra_args: none survives (`_SWITCH` takes every `--user-data-dir=` spelling, proved in `test_launch_cleanup.py`).
 - A held Brave profile falls back to `brave-profile-pid<N>` (or `brave-profiles/<id>-pid<N>`). `profile_gc`,
   `profile_report` and `profile_cleanup` know `brave-profile`, `brave-profiles/*` and `brave-profile-pid<N>` exactly as
   they know Chrome's names, with the same checks; nothing else is matched.
