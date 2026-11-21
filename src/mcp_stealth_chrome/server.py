@@ -55,6 +55,8 @@ from .identity import (
     navigator_platform,
     os_family,
     strip_headless,
+    reduced_user_agent,
+    native_family,
     ua_metadata_fields,
 )
 from .refs import (
@@ -1092,7 +1094,8 @@ async def _apply_fingerprint_to_tab(tab: Tab, fingerprint: dict[str, str]) -> No
     real_version = version[1].rsplit("/", 1)[-1]
     real = version[3]
     native = strip_headless(real)
-    needs_cleanup = not requested_ua and native != real
+    needs_cleanup = (not requested_ua and native != real) or bool(
+        getattr(getattr(getattr(tab, "browser", None), "config", None), "headless", False))
     if requested_ua or language or platform or needs_cleanup:
         # Brave lists itself as Brave, with reduced versions: an override naming Google Chrome
         # there contradicts navigator.brave, which no override can remove.
@@ -1294,6 +1297,8 @@ async def _remove_privacy_profile(profile_dir: Optional[Path]) -> bool:
         holders = f"who holds it is unknown: reading the process list took longer than {_HOLDERS_READ_WAIT:g} s"
     _PRIVACY_REMOVE_FAILURES[str(profile_dir)] = "; ".join(p for p in (reason, holders) if p)
     return False
+
+
 
 
 async def _safe_stop_browser(browser: Optional[Browser]) -> None:
@@ -4672,6 +4677,28 @@ def _launch_config(req: _LaunchRequest, plan: _LaunchPlan) -> None:
             config.add_argument(_flag)
 
 
+def _headless_native_user_agent(config: Config) -> Optional[str]:
+    """The reduced UA Chrome uses globally when headless has no explicit identity."""
+    version = profile_version.binary_version(str(getattr(config, "browser_executable_path", "") or ""))
+    if version is None:
+        return None
+    return reduced_user_agent(profile_version.text(version), native_family())
+
+
+def _apply_headless_native_user_agent(config: Config, headless: bool,
+                                      fingerprint: Optional[dict]) -> str:
+    """Set the process UA for worker scopes, or say why that protection was unavailable."""
+    if (not headless or (fingerprint or {}).get("user_agent")
+            or any((arg or "").startswith("--user-agent=") for arg in config.browser_args)):
+        return ""
+    native_ua = _headless_native_user_agent(config)
+    if native_ua:
+        config.add_argument(f"--user-agent={native_ua}")
+        return ""
+    return (" [identity: headless default UA was NOT replaced because Chrome's version could not "
+            "be read; SharedWorker and ServiceWorker may expose HeadlessChrome]")
+
+
 async def _launch_prepare_profile(req: _LaunchRequest, plan: _LaunchPlan) -> Optional[str]:
     """Pick the executable (the Dock icon's Beta or not), refuse it when it may not open the
     profile, prepare the cookie move, and check that vertical_tabs can be written (the write
@@ -4683,6 +4710,8 @@ async def _launch_prepare_profile(req: _LaunchRequest, plan: _LaunchPlan) -> Opt
         plan.launch_choice = _launch_choice(plan.profile_path, req.headless, plan.merged_extra_args,
                                             req.brave_executable)
     plan.dock_note = await _use_dock_icon_browser(config, req.headless, plan.launch_choice)
+    plan.dock_note += _apply_headless_native_user_agent(
+        config, req.headless, plan.effective_fingerprint)
     refused = _profile_version_refusal(plan.profile_path, config.browser_executable_path, req.product)
     if refused:
         await _remove_privacy_profile(plan.privacy_profile)

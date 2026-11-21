@@ -30,6 +30,22 @@ def strip_headless(user_agent: str) -> str:
     """Headless Chrome announces itself as HeadlessChrome/; the rest is identical."""
     return (user_agent or "").replace("HeadlessChrome/", "Chrome/")
 
+def reduced_user_agent(version: str, family: Optional[str] = None) -> str:
+    """Build Chrome's reduced native UA without the headless product marker."""
+    major = (version or "").split(".", 1)[0]
+    if not major.isdigit():
+        raise ValueError(f"invalid Chrome version: {version!r}")
+    family = family or native_family()
+    platform = {
+        "windows": "Windows NT 10.0; Win64; x64",
+        "mac": "Macintosh; Intel Mac OS X 10_15_7",
+        "linux": "X11; Linux x86_64",
+    }.get(family)
+    if platform is None:
+        raise ValueError(f"unsupported native platform family: {family!r}")
+    return (f"Mozilla/5.0 ({platform}) AppleWebKit/537.36 (KHTML, like Gecko) "
+            f"Chrome/{major}.0.0.0 Safari/537.36")
+
 
 def brand_list(major: int, version: Optional[str] = None,
                product: str = "Google Chrome") -> list[dict[str, str]]:

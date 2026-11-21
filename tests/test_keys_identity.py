@@ -27,6 +27,7 @@ from mcp_stealth_chrome.identity import (
     navigator_platform,
     os_family,
     strip_headless,
+    reduced_user_agent,
     ua_metadata_fields,
 )
 
@@ -80,6 +81,31 @@ def test_ua_helpers():
     assert "HeadlessChrome" not in strip_headless("x HeadlessChrome/156.0.1.2 y")
     assert os_family(WIN_UA) == "windows" and navigator_platform("windows") == "Win32"
     assert os_family(WIN_UA, "MacIntel") == "mac"  # an explicit platform wins
+def test_reduced_native_user_agent():
+    assert reduced_user_agent("157.0.8103.80", "mac").endswith("Chrome/157.0.0.0 Safari/537.36")
+    assert "HeadlessChrome" not in reduced_user_agent("157.0.8103.80", "linux")
+def test_unreadable_headless_binary_reports_worker_scope_risk(monkeypatch):
+    from mcp_stealth_chrome import server
+
+    class _Config:
+        browser_args = []
+        browser_executable_path = "/missing/chrome"
+
+    monkeypatch.setattr(server.profile_version, "binary_version", lambda _path: None)
+    note = server._apply_headless_native_user_agent(_Config(), True, {})
+    assert "version could not be read" in note
+    assert "SharedWorker" in note and "ServiceWorker" in note
+
+@E2E
+def test_browser_launch_reports_unreadable_binary_worker_risk(loop, browser, monkeypatch):
+    from mcp_stealth_chrome import server
+
+    monkeypatch.setattr(server.profile_version, "binary_version", lambda _path: None)
+    result = browser()
+    assert "version could not be read" in result
+    assert "SharedWorker" in result and "ServiceWorker" in result
+
+
 
 
 def test_metadata_agrees_with_the_ua_it_came_from():
@@ -491,6 +517,33 @@ def test_partial_override_leaves_the_rest_real(loop, browser, base_url, field, v
     assert re.search(r"Chrome/\d+", seen["ua"])
 
 
+
+@E2E
+def test_headless_identity_reaches_workers_service_workers_and_iframes(loop, browser, base_url):
+    """Native headless UA must propagate to every browser-created scope."""
+    browser()
+    run(loop, "navigate", f"{base_url}/ua_scopes.html")
+    deadline = time.monotonic() + 8
+    report = None
+    while time.monotonic() < deadline:
+        raw = run(loop, "evaluate", "window.__uaReport && JSON.stringify(window.__uaReport)")
+        if raw and raw not in ("null", "undefined"):
+            report = json.loads(raw)
+            break
+        loop.run_until_complete(asyncio.sleep(0.1))
+    assert report is not None, run(loop, "evaluate", "window.__uaError || ('stage=' + window.__uaStage)")
+    assert set(report) >= {"main", "dedicated", "nested", "shared", "service",
+                           "iframe_same", "iframe_cross", "iframe_about", "iframe_srcdoc", "popup"}
+    for scope, seen in report.items():
+        if not isinstance(seen, dict) or "ua" not in seen:
+            continue
+        assert "HeadlessChrome" not in seen["ua"], (scope, seen)
+        assert "Chrome/" in seen["ua"], (scope, seen)
+        assert all("HeadlessChrome" not in brand["brand"] for brand in (seen.get("ch") or []))
+        if "headers" in seen:
+            assert "HeadlessChrome" not in seen["headers"].get("user-agent", ""), (scope, seen)
+            assert "HeadlessChrome" not in seen["headers"].get("sec-ch-ua", ""), (scope, seen)
+
 @E2E
 def test_fingerprint_rotate_keeps_hints_in_step(loop, browser, base_url):
     browser()
@@ -685,6 +738,48 @@ def test_spawn_works_on_a_copied_multi_profile_browser(loop, tmp_path):
         run(loop, "switch_instance", "main")
 
 
+
+@E2E
+def test_spawn_headless_identity_reaches_worker_scopes(loop, base_url):
+    iid = f"ua_spawn_{os.getpid()}"
+    try:
+        out = run(loop, "spawn_browser", iid, headless=True, persistent=False,
+                  url=f"{base_url}/ua_scopes.html")
+        assert not out.startswith("Error:"), out
+        run(loop, "switch_instance", iid)
+        deadline = time.monotonic() + 8
+        report = None
+        while time.monotonic() < deadline:
+            raw = run(loop, "evaluate", "window.__uaReport && JSON.stringify(window.__uaReport)")
+            if raw and raw not in ("null", "undefined"):
+                report = json.loads(raw)
+                break
+            loop.run_until_complete(asyncio.sleep(0.1))
+        assert report is not None, run(loop, "evaluate", "window.__uaError || 'scope fixture did not finish'")
+        for scope, seen in report.items():
+            if isinstance(seen, dict) and "ua" in seen:
+                assert "HeadlessChrome" not in seen["ua"], (scope, seen)
+                if "headers" in seen:
+                    assert "HeadlessChrome" not in seen["headers"].get("user-agent", ""), (scope, seen)
+                    assert "HeadlessChrome" not in seen["headers"].get("sec-ch-ua", ""), (scope, seen)
+    finally:
+        run(loop, "close_instance", iid)
+        run(loop, "switch_instance", "main")
+
+@E2E
+def test_spawn_reports_unreadable_binary_worker_risk(loop, base_url, monkeypatch):
+    from mcp_stealth_chrome import server
+
+    iid = f"ua_spawn_note_{os.getpid()}"
+    monkeypatch.setattr(server.profile_version, "binary_version", lambda _path: None)
+    try:
+        result = run(loop, "spawn_browser", iid, headless=True, persistent=False,
+                     url=f"{base_url}/keys.html")
+        assert "version could not be read" in result
+        assert "SharedWorker" in result and "ServiceWorker" in result
+    finally:
+        run(loop, "close_instance", iid)
+        run(loop, "switch_instance", "main")
 @E2E
 def test_identity_survives_cross_site_navigation(loop, browser, base_url):
     """nodriver 0.50 opened a new CDP session per navigation, which dropped overrides."""
