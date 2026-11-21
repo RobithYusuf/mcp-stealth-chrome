@@ -26,7 +26,7 @@ from mcp_stealth_chrome.identity import (
     navigator_languages,
     navigator_platform,
     os_family,
-    strip_headless,
+    reduced_user_agent,
     ua_metadata_fields,
 )
 
@@ -74,12 +74,10 @@ def test_unknown_key_is_an_error_not_a_silent_no_op(bad):
         key_event_params(bad)
 
 
-def test_ua_helpers():
-    assert chrome_version(WIN_UA) == "140.0.7339.80"
-    assert chrome_version("Mozilla/5.0 (X11; rv:128.0) Gecko/20100101 Firefox/128.0") is None
-    assert "HeadlessChrome" not in strip_headless("x HeadlessChrome/156.0.1.2 y")
-    assert os_family(WIN_UA) == "windows" and navigator_platform("windows") == "Win32"
-    assert os_family(WIN_UA, "MacIntel") == "mac"  # an explicit platform wins
+def test_reduced_native_user_agent():
+    assert reduced_user_agent("157.0.8103.80", "mac").endswith("Chrome/157.0.0.0 Safari/537.36")
+    assert "HeadlessChrome" not in reduced_user_agent("157.0.8103.80", "linux")
+
 
 
 def test_metadata_agrees_with_the_ua_it_came_from():
@@ -494,7 +492,7 @@ def test_partial_override_leaves_the_rest_real(loop, browser, base_url, field, v
 
 @E2E
 def test_headless_identity_reaches_workers_service_workers_and_iframes(loop, browser, base_url):
-    """A page override alone leaves worker scopes announcing HeadlessChrome."""
+    """Native headless UA must propagate to every browser-created scope."""
     browser()
     run(loop, "navigate", f"{base_url}/ua_scopes.html")
     deadline = time.monotonic() + 8
@@ -507,13 +505,9 @@ def test_headless_identity_reaches_workers_service_workers_and_iframes(loop, bro
         loop.run_until_complete(asyncio.sleep(0.1))
     assert report is not None, run(loop, "evaluate", "window.__uaError || ('stage=' + window.__uaStage)")
     assert set(report) >= {"main", "dedicated", "nested", "shared", "service",
-                           "iframe_same", "iframe_about", "iframe_srcdoc"}
-    unfixable = {"shared", "service"}
+                           "iframe_same", "iframe_cross", "iframe_about", "iframe_srcdoc", "popup"}
     for scope, seen in report.items():
         if not isinstance(seen, dict) or "ua" not in seen:
-            continue
-        if scope in unfixable:
-            assert "HeadlessChrome" in seen["ua"], (scope, seen)
             continue
         assert "HeadlessChrome" not in seen["ua"], (scope, seen)
         assert "Chrome/" in seen["ua"], (scope, seen)
@@ -521,6 +515,7 @@ def test_headless_identity_reaches_workers_service_workers_and_iframes(loop, bro
         if "headers" in seen:
             assert "HeadlessChrome" not in seen["headers"].get("user-agent", ""), (scope, seen)
             assert "HeadlessChrome" not in seen["headers"].get("sec-ch-ua", ""), (scope, seen)
+
 @E2E
 def test_fingerprint_rotate_keeps_hints_in_step(loop, browser, base_url):
     browser()

@@ -55,6 +55,8 @@ from .identity import (
     navigator_platform,
     os_family,
     strip_headless,
+    reduced_user_agent,
+    native_family,
     ua_metadata_fields,
 )
 from .refs import (
@@ -77,7 +79,6 @@ from . import profile_gc
 from . import profile_version
 from . import presence
 from . import body_saver
-from . import identity_broker
 from . import cookie_migration
 from . import quit_watch
 from . import keep_alive as _keep_alive
@@ -479,7 +480,6 @@ def _socket_dropped(browser: Any) -> bool:
 
 async def _ensure_browser_dead(browser, profile_dir=None, grace: float = 1.5) -> dict:
     presence.stop(browser)  # its overlay goes first: nothing is left over a closing window
-    await _stop_identity_broker(browser)
     # Body saving ends before its browser: bodies whose loading finished are written first.
     await body_saver.stop_for(browser, "its browser was closed")
     """Stop a browser and VERIFY the OS process actually died.
@@ -1093,7 +1093,8 @@ async def _apply_fingerprint_to_tab(tab: Tab, fingerprint: dict[str, str]) -> No
     real_version = version[1].rsplit("/", 1)[-1]
     real = version[3]
     native = strip_headless(real)
-    needs_cleanup = not requested_ua and native != real
+    needs_cleanup = (not requested_ua and native != real) or bool(
+        getattr(getattr(getattr(tab, "browser", None), "config", None), "headless", False))
     if requested_ua or language or platform or needs_cleanup:
         # Brave lists itself as Brave, with reduced versions: an override naming Google Chrome
         # there contradicts navigator.brave, which no override can remove.
@@ -1297,25 +1298,6 @@ async def _remove_privacy_profile(profile_dir: Optional[Path]) -> bool:
     return False
 
 
-async def _start_identity_broker(browser: Any, fingerprint: dict[str, str], product: str) -> None:
-    """Hold every target of a headless launch long enough to apply its identity."""
-    websocket_url = getattr(browser, "websocket_url", None)
-    if not websocket_url:
-        raise RuntimeError("Chrome did not expose a browser websocket for identity setup")
-    broker = identity_broker.IdentityBroker(websocket_url, fingerprint, product)
-    # Set the attribute before start: a failed websocket handshake still has a socket
-    # to close in the common launch cleanup path.
-    setattr(browser, "_mcp_identity_broker", broker)
-    await broker.start()
-
-
-async def _stop_identity_broker(browser: Any) -> None:
-    broker = getattr(browser, "_mcp_identity_broker", None) if browser is not None else None
-    if broker is not None:
-        with contextlib.suppress(Exception):
-            await broker.stop()
-        with contextlib.suppress(Exception):
-            delattr(browser, "_mcp_identity_broker")
 
 
 async def _safe_stop_browser(browser: Optional[Browser]) -> None:
@@ -1323,7 +1305,6 @@ async def _safe_stop_browser(browser: Optional[Browser]) -> None:
     doesn't leak its profile lock."""
     if browser is None:
         return
-    await _stop_identity_broker(browser)
     presence.stop(browser)  # a launch that failed after its overlay started leaves none behind
     try:
         browser.stop()
@@ -4695,6 +4676,14 @@ def _launch_config(req: _LaunchRequest, plan: _LaunchPlan) -> None:
             config.add_argument(_flag)
 
 
+def _headless_native_user_agent(config: Config) -> Optional[str]:
+    """The reduced UA Chrome uses globally when headless has no explicit identity."""
+    version = profile_version.binary_version(str(getattr(config, "browser_executable_path", "") or ""))
+    if version is None:
+        return None
+    return reduced_user_agent(profile_version.text(version), native_family())
+
+
 async def _launch_prepare_profile(req: _LaunchRequest, plan: _LaunchPlan) -> Optional[str]:
     """Pick the executable (the Dock icon's Beta or not), refuse it when it may not open the
     profile, prepare the cookie move, and check that vertical_tabs can be written (the write
@@ -4706,6 +4695,11 @@ async def _launch_prepare_profile(req: _LaunchRequest, plan: _LaunchPlan) -> Opt
         plan.launch_choice = _launch_choice(plan.profile_path, req.headless, plan.merged_extra_args,
                                             req.brave_executable)
     plan.dock_note = await _use_dock_icon_browser(config, req.headless, plan.launch_choice)
+    if (req.headless and not (plan.effective_fingerprint or {}).get("user_agent")
+            and not any((arg or "").startswith("--user-agent=") for arg in config.browser_args)):
+        native_ua = _headless_native_user_agent(config)
+        if native_ua:
+            config.add_argument(f"--user-agent={native_ua}")
     refused = _profile_version_refusal(plan.profile_path, config.browser_executable_path, req.product)
     if refused:
         await _remove_privacy_profile(plan.privacy_profile)
@@ -4825,8 +4819,6 @@ async def _launch_start_chrome(req: _LaunchRequest, plan: _LaunchPlan) -> tuple:
         browser = await _start_chrome(plan.config)
         _mark_allow_origins(browser, plan.config)
         brave_mode.mark(browser, req.product)
-        if req.headless:
-            await _start_identity_broker(browser, plan.effective_fingerprint or {}, req.product)
         if not req.headless:
             await _open_background_window(browser, req.window_width, req.window_height)
     except asyncio.TimeoutError:

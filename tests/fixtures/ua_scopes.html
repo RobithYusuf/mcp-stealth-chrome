@@ -20,9 +20,17 @@ const read = async () => {
   window.__uaStage = 'same';
   const same = document.createElement('iframe'); same.src = '/ua_frame.html'; document.body.append(same); await new Promise(resolve => { same.onload = resolve; });
   out.iframe_same = await same.contentWindow.__ua();
+  window.__uaStage = 'cross';
+  const crossMessage = new Promise(resolve => { const fn = e => { if (e.data?.name === 'cross') { removeEventListener('message', fn); resolve(e.data); } }; addEventListener('message', fn); });
+  const cross = document.createElement('iframe'); cross.src = 'http://127.0.0.1:' + location.port + '/ua_cross.html'; document.body.append(cross);
+  out.iframe_cross = await crossMessage;
   window.__uaStage = 'about';
   const about = document.createElement('iframe'); about.src = 'about:blank'; document.body.append(about); await new Promise(resolve => setTimeout(resolve, 50));
   out.iframe_about = {ua: about.contentWindow.navigator.userAgent, ch: about.contentWindow.navigator.userAgentData?.brands};
+  window.__uaStage = 'popup';
+  const popupMessage = new Promise(resolve => { const fn = e => { if (e.data?.name === 'popup') { removeEventListener('message', fn); resolve(e.data); } }; addEventListener('message', fn); });
+  window.open('/ua_popup.html', 'ua-popup');
+  out.popup = await popupMessage;
   out.iframe_srcdoc = await srcdocMessage;
   window.__uaReport = out;
 }; read().catch(e => { window.__uaError = String(e && e.stack || e); });
