@@ -4270,3 +4270,38 @@ def test_no_refusal_tells_the_caller_to_end_processes_by_name():
              for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
              if "pkill" in line or "killall" in line]
     assert found == []
+
+
+def test_browser_escalation_preserves_cloudflare_block_evidence(monkeypatch):
+    import asyncio
+    from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import research
+
+    challenge = ("<title>Just a moment...</title><script>window._cf_chl_opt={};</script>"
+                 + ("<p>wait</p>" * 400))
+    async def fetch(*_args, **_kwargs):
+        return 403, "initial", {"cf-mitigated": "challenge", "server": "cloudflare"}
+    async def render(*_args, **_kwargs):
+        return challenge
+    monkeypatch.setattr(research, "_fetch_http", fetch)
+    monkeypatch.setattr(research, "_browser_render", render)
+    monkeypatch.setattr(server.BrowserState, "is_up", classmethod(lambda cls: True))
+    _active(monkeypatch, object())
+    data = json.loads(asyncio.run(_tool("smart_fetch")("https://x.test", force_browser=False)))
+    assert data["blocked"] is True and "403" in data["block_reason"]
+    assert "cf-mitigated" in data["block_reason"]
+
+
+def test_browser_escalation_does_not_block_cloudflare_article(monkeypatch):
+    import asyncio
+    from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import research
+
+    article = "<article>Just a moment and checking your browser are common phrases.</article>" * 20
+    async def render(*_args, **_kwargs):
+        return article
+    monkeypatch.setattr(research, "_browser_render", render)
+    monkeypatch.setattr(server.BrowserState, "is_up", classmethod(lambda cls: True))
+    _active(monkeypatch, object())
+    data = json.loads(asyncio.run(_tool("smart_fetch")("https://x.test", force_browser=True)))
+    assert data["blocked"] is False and data["block_reason"] is None
