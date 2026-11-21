@@ -3590,6 +3590,7 @@ async def _reattach_claimed(browser: Any, instance_id: str, profile: Path, recor
                 observed = await _observe_navigation(tab, url, disarm())
             finally:
                 disarm()
+            observed["_doc_state"] = doc_state
             tabs.append(tab)
             opened_now.add(_target_key(tab))
             select = len(tabs) - 1
@@ -3711,6 +3712,7 @@ async def _launch_by_reattach(profile: Path, verdict: dict, *, url: str, keep_al
                    f"free, but connecting to it failed: {_exc_text(e)}. It was left running as it "
                    f"was; browser_launch again to retry, or end it with Quit")
     owned = observed.pop("_owned", None)
+    doc_state = observed.pop("_doc_state", None)
     BrowserState.browser = browser
     if plan is not None:
         plan.browser, plan.adopted = browser, True
@@ -3748,7 +3750,7 @@ async def _launch_by_reattach(profile: Path, verdict: dict, *, url: str, keep_al
                                 headless=bool(record.get("headless")),
                                 persons_browser=_persons_browser(browser))
     action = "Loaded" if url and url != "about:blank" else "Selected tab shows"
-    trip = await _tripwire_after_navigation(tabs[select], observed,
+    trip = await _tripwire_after_navigation(tabs[select], observed, doc_state=doc_state,
                                             headless=bool(record.get("headless")))
     return _tripwire_render(trip, "browser_launch", _nav_result(
         f"{summary[0].upper()}{summary[1:]}. {action}", observed,
@@ -5087,9 +5089,10 @@ async def _launch_ready_browser(req: _LaunchRequest, plan: _LaunchPlan, browser:
 
 async def _launch_first_page(req: _LaunchRequest, plan: _LaunchPlan) -> tuple:
     """The identity goes on the first tab, and the caller's url loads there.
-
-    Returns (error result or None, the tab, what the load observed). On an error the browser
-    was ended and the privacy profile removed, or the result says why they were kept."""
+    Returns (error result or None, the tab, what the load observed, and its document response state).
+    On an error the browser was ended and the privacy profile removed, or the result says why they
+    were kept.
+    """
     try:
         await asyncio.sleep(0.5)
         main = await _first_live_tab(plan.browser)
@@ -5098,7 +5101,7 @@ async def _launch_first_page(req: _LaunchRequest, plan: _LaunchPlan) -> tuple:
             # The first document after startup still loads images despite the flag;
             # every later one obeys it.
             await asyncio.wait_for(main.get("about:blank"), timeout=BROWSER_NAV_TIMEOUT)
-        _doc_state, _disarm = await _arm_document_watch(main)
+        doc_state, _disarm = await _arm_document_watch(main)
         try:
             await asyncio.wait_for(main.get(req.url), timeout=BROWSER_NAV_TIMEOUT)
             await _wait_load_complete(main, 3)  # best effort; ready_state is reported
@@ -5113,15 +5116,15 @@ async def _launch_first_page(req: _LaunchRequest, plan: _LaunchPlan) -> tuple:
             f"initial nav timed out after {BROWSER_NAV_TIMEOUT}s — Chrome "
             f"started but couldn't load {req.url}. Check network/proxy."
             f"{_launch_end_note(reap, recorded)}{removal}"
-        ), None, None
+        ), None, None, None
     except asyncio.CancelledError:
         await _launch_cancelled(plan)
         raise
     except Exception as e:
         reap, recorded, removal = await _launch_end_started_browser(req, plan)
         return err(f"initial nav failed: {e}{_launch_end_note(reap, recorded)}"
-                   f"{removal}"), None, None
-    return None, main, _launch_observed
+                   f"{removal}"), None, None, None
+    return None, main, _launch_observed, doc_state
 
 
 def _launch_record_browser(req: _LaunchRequest, plan: _LaunchPlan, browser: Any, main: Any) -> None:
@@ -5542,7 +5545,7 @@ async def _launch_run(req: _LaunchRequest, launching: _Launching, session: str, 
             stop = await _launch_ready_browser(req, plan, started, ads_pending)
             if (stop := await _launch_settle(req, plan, launching, stop)) is not None:
                 return stop
-            stop, main, observed = await _launch_first_page(req, plan)
+            stop, main, observed, doc_state = await _launch_first_page(req, plan)
             if (stop := await _launch_settle(req, plan, launching, stop)) is not None:
                 return stop
 
@@ -5568,7 +5571,7 @@ async def _launch_run(req: _LaunchRequest, launching: _Launching, session: str, 
             # The first page as the tripwire sees it: a verification page the launch reached is
             # said as one, with the browser running on it (antibot_tripwire).
             trip = await _tripwire_after_navigation(main, observed, verify_suffix=verify_suffix,
-                                                    headless=req.headless)
+                                                    doc_state=doc_state, headless=req.headless)
 
             await _give_focus_back(plan.previous_app)
             if (stop := await _launch_settle(req, plan, launching, None)) is not None:

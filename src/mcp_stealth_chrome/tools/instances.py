@@ -292,8 +292,13 @@ async def _launch_browser_instance(
         await asyncio.sleep(0.5)
         main_tab = await _srv._first_live_tab(browser)
         await _srv._apply_fingerprint_to_tab(main_tab, effective_fingerprint)
-        await asyncio.wait_for(main_tab.get(url), timeout=_srv.BROWSER_NAV_TIMEOUT)
-        await _srv._wait_load_complete(main_tab, 3)
+        doc_state, disarm = await _srv._arm_document_watch(main_tab)
+        try:
+            await asyncio.wait_for(main_tab.get(url), timeout=_srv.BROWSER_NAV_TIMEOUT)
+            await _srv._wait_load_complete(main_tab, 3)
+            observed = await _srv._observe_navigation(main_tab, url, disarm())
+        finally:
+            disarm()
     except asyncio.TimeoutError:
         await _srv._safe_stop_browser(browser)
         await _srv._remove_privacy_profile(privacy_profile)
@@ -370,11 +375,12 @@ async def _launch_browser_instance(
     dock_note += _keep_note
     dock_note += _srv._allow_origins_note(browser)
     # The first page as the tripwire sees it (antibot_tripwire): spawn_browser observes no
-    # navigation, so the page is read once, and only when a url was asked for.
+    # auto-verify pass, so retain the document response and inspect the loaded page.
     trip = None
     if url and url != "about:blank":
         with contextlib.suppress(Exception):  # a look that failed leaves the launch's own result
-            trip = await _srv._tripwire_look(main_tab, headless=headless)
+            trip = await _srv._tripwire_after_navigation(
+                main_tab, observed, doc_state=doc_state, headless=headless)
     await _srv._give_focus_back(previous_app)
     return True, _srv._tripwire_render(trip, "spawn_browser", (
         f"instance {instance_id!r} launched (headless={headless}, "
@@ -399,6 +405,7 @@ async def _spawn_by_reattach(instance_id: str, profile: Path, verdict: dict, *, 
                        f"ours and free, but connecting to it failed: {_srv._exc_text(e)}. It was left "
                        f"running as it was")
     owned = observed.pop("_owned", None)
+    doc_state = observed.pop("_doc_state", None)
     owned = {BrowserState.COUNTED, *owned} if owned is not None else {_srv._target_key(t) for t in tabs}
     if _srv._persons_browser(browser) and idle_timeout:
         # The person's browser is theirs to Quit: never ended for the agent's idleness.
@@ -434,8 +441,8 @@ async def _spawn_by_reattach(instance_id: str, profile: Path, verdict: dict, *, 
     keep_text += await presence.attach(browser, _srv._browser_process_pid(browser), ask=agent_overlay,
                                  headless=bool(verdict["record"].get("headless")),
                                  persons_browser=_srv._persons_browser(browser))
-    trip = (await _srv._tripwire_after_navigation(tabs[select], observed,
-                                                  headless=bool(record.get("headless")))
+    trip = (await _srv._tripwire_after_navigation(
+                tabs[select], observed, doc_state=doc_state, headless=bool(record.get("headless")))
             if url and url != "about:blank" else None)
     return True, _srv._tripwire_render(trip, "spawn_browser", (
         f"instance {instance_id!r} {summary}{keep_text}\n"
