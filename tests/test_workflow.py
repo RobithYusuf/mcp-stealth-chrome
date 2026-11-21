@@ -152,20 +152,37 @@ def test_save_as_brackets_resume_keeps_previous_items_and_appends():
 @pytest.mark.parametrize("count,expect_omitted", [(100, False), (450, True)])
 def test_collected_vars_size_guard_is_explicit(count, expect_omitted):
     item = "x" * 2500
+    exporter = (lambda name, value: {"file": f"/tmp/{name}.json", "items": len(value),
+                                     "chars": len(json.dumps(value))}) if expect_omitted else None
     result, _ = run(
         [{"foreach": list(range(count)), "as": "item", "steps": [
             {"tool": "read", "args": {"value": "${item}"}, "save_as": "pages[]"}
         ]}],
-        {"read": lambda args: item}, output="summary")
+        {"read": lambda args: item}, output="summary", export_vars=exporter)
     assert "vars_warning" in result
     if expect_omitted:
-        assert "pages" not in result["vars"]
-        assert result["vars_omitted"][0]["name"] == "pages"
-        assert result["vars_omitted"][0]["characters"] > 1_000_000
-        assert "smaller" in result["vars_warning"]
+        assert result["vars"]["pages"]["file"] == "/tmp/pages.json"
+        assert result["vars"]["pages"]["items"] == count
+        assert result["vars"]["pages"]["chars"] > 1_000_000
+        assert "private export files" in result["vars_warning"]
     else:
         assert len(result["vars"]["pages"]) == count
         assert "vars_omitted" not in result
+
+
+def test_failed_large_collection_is_retained_for_resume():
+    item = "x" * 2500
+    steps = [
+        {"foreach": list(range(450)), "as": "item", "steps": [
+            {"tool": "read", "args": {"value": "${item}"}, "save_as": "pages[]"}
+        ]},
+        {"tool": "fail"},
+    ]
+    result, _ = run(steps, {"read": lambda args: item, "fail": "Error: stop"}, output="summary")
+    assert result["failed_at"] == 1
+    assert len(result["vars"]["pages"]) == 450
+    assert "retained whole" in result["vars_warning"]
+    assert "vars_omitted" not in result
 
 
 def test_foreach_with_if_fills_a_form_per_row():
@@ -406,7 +423,7 @@ from mcp_stealth_chrome.workflow import (  # noqa: E402
 
 _GOLDEN = pathlib.Path(__file__).parent / "fixtures" / "workflow_full.json"
 _LONG_TEXT = "Price: 10. " + "Long product description without separators. " * 20
-_CUT = re.compile(r" \.\.\. \[\+\d+ chars; the whole result is in vars when the step has save_as\]")
+_CUT = re.compile(r" \.\.\. \[\+\d+ chars; the whole result is (?:in vars when the step has save_as|retained in vars or a private export file when the step has save_as)\]")
 _GOLDEN_STEPS = [
     {"tool": "navigate", "args": {"url": "https://shop.test/${start}"}, "label": "open"},
     {"tool": "get_text", "args": {"selector": "#price"}, "save_as": "price"},
@@ -455,8 +472,16 @@ def test_full_output_is_the_old_report_but_for_the_cut_marker(monkeypatch):
         _GOLDEN_STEPS, start_at=report["failed_path"], vars=report["vars"], output="full"))
     texts = {"ok": succeeded, "fail": failed, "resume": resumed}
     for name, text in texts.items():
-        assert text == golden["now"][name], name
-        assert _CUT.sub("", text) == golden["at_5a6521b"][name], name
+        expected = golden["now"][name].replace(
+            "the whole result is in vars when the step has save_as",
+            "the whole result is retained in vars or a private export file when the step has save_as",
+        )
+        assert text == expected, name
+        expected_without_cut = golden["at_5a6521b"][name].replace(
+            "the whole result is in vars when the step has save_as",
+            "the whole result is retained in vars or a private export file when the step has save_as",
+        )
+        assert _CUT.sub("", text) == expected_without_cut, name
     assert len(_CUT.findall(succeeded)) == 1 and len(_CUT.findall(failed)) == 1  # not vacuous
 
 

@@ -26,7 +26,7 @@ MAX_LATE_FAILURES = 100
 RESULT_PREVIEW = 500
 # How far back from RESULT_PREVIEW a cut looks for a line break or ", " to end on.
 PREVIEW_BREAK_WINDOW = 80
-CUT_MARK = " ... [+{left} chars; the whole result is in vars when the step has save_as]"
+CUT_MARK = " ... [+{left} chars; the whole result is retained in vars or a private export file when the step has save_as]"
 VAR_LARGE_THRESHOLD = 200_000
 VAR_INLINE_LIMIT = 1_000_000
 
@@ -50,6 +50,7 @@ _WHOLE_REF = re.compile(r"^\$\{([^{}]+)\}$")
 _ANY_REF = re.compile(r"\$\{([^{}]+)\}")
 _SEGMENT = re.compile(r"([^.\[\]]+)|\[(-?\d+)\]")
 
+ExportVars = Callable[[str, Any], dict]
 Dispatch = Callable[[str, dict], Awaitable[Any]]
 # Awaited before each tool step with (the tool of the step before it in this call, or None, the
 # step's own tool): None to go on, a pause (text starting PAUSE_PREFIX) to stop before the step, or
@@ -223,9 +224,10 @@ class _Run:
     # a value (by index); and the last step, even when it fell past the cap.
     tally: dict[str, dict[str, int]] = field(default_factory=dict)
     saved: set[str] = field(default_factory=set)
-    # Names written through save_as="name[]". They are the values that may be omitted from
-    # an oversized report; ordinary input vars stay available for a caller's resume.
+    # Names written through save_as="name[]". They are the values that may be externalized from
+    # an oversized successful report; ordinary input vars stay available for a caller's resume.
     collected: set[str] = field(default_factory=set)
+    collected_entries: dict[str, str] = field(default_factory=dict)
     last: Optional[dict] = None
     # Failed or ignored entries past the cap (the first MAX_LATE_FAILURES), and how many more.
     late_failures: list[dict] = field(default_factory=list)
@@ -486,6 +488,7 @@ async def run_workflow(
     variables: Optional[dict] = None,
     output: str = "full",
     checkpoint: Optional[Checkpoint] = None,
+    export_vars: Optional[ExportVars] = None,
 ) -> dict:
     """Run steps and return {completed, total, vars, ...}, plus failed_at on failure, or status
     antibot_paused, paused_at and resume_with when the checkpoint or a step stopped it at a site's
@@ -513,7 +516,7 @@ async def run_workflow(
     if not run.stopped:
         # Only a resume needs it, and a resume only follows a failure or a pause.
         public_vars.pop(BRANCHES_VAR, None)
-    _guard_vars(result, public_vars, run)
+    _guard_vars(result, public_vars, run, retain=run.stopped, export_vars=export_vars)
     if public_vars:
         result["vars"] = public_vars
     if run.failure is not None:
@@ -586,8 +589,9 @@ def _vars_size(variables: dict) -> int:
     return len(text) if text is not None else len(repr(variables))
 
 
-def _guard_vars(result: dict, public_vars: dict, run: _Run) -> None:
-    """Annotate oversized vars, omitting only collected lists above the hard inline limit."""
+def _guard_vars(result: dict, public_vars: dict, run: _Run, *, retain: bool,
+                export_vars: Optional[ExportVars]) -> None:
+    """Warn at 200k; retain failed-run vars, or externalize a successful huge collection."""
     size = _vars_size(public_vars)
     if size <= VAR_LARGE_THRESHOLD:
         return
@@ -598,24 +602,31 @@ def _guard_vars(result: dict, public_vars: dict, run: _Run) -> None:
             "into smaller batches if the result is too large for the client."
         )
         return
-    omitted = []
+    if retain or export_vars is None:
+        result["vars_warning"] = (
+            f"vars exceed the {VAR_INLINE_LIMIT} character inline limit ({size} characters) "
+            "but are retained whole because this run needs resume; no collected value was cut."
+        )
+        return
+    exported = []
     for name in sorted(run.collected):
         if name not in public_vars:
             continue
-        value_text = _json_text(public_vars[name])
-        chars = len(value_text) if value_text is not None else len(repr(public_vars[name]))
-        public_vars.pop(name)
-        omitted.append({"name": name, "characters": chars})
-    if omitted:
-        result["vars_omitted"] = omitted
+        value = public_vars[name]
+        value_text = _json_text(value)
+        chars = len(value_text) if value_text is not None else len(repr(value))
+        metadata = export_vars(name, value)
+        public_vars[name] = metadata
+        exported.append({"name": name, "characters": chars, "items": len(value)})
+    if exported:
         result["vars_warning"] = (
-            f"vars exceed the {VAR_INLINE_LIMIT} character inline limit; collected values "
-            "were not cut and are not inlined. Run smaller foreach batches to return them."
+            f"vars exceed the {VAR_INLINE_LIMIT} character inline limit ({size} characters); "
+            "collected lists were written whole to private export files: "
+            + ", ".join(f"{item['name']} ({item['characters']} characters)" for item in exported)
         )
     else:
         result["vars_warning"] = (
-            f"vars are too large to inline ({size} characters); no collected value was cut. "
-            "Run smaller batches or pass fewer input vars."
+            f"vars are too large to inline ({size} characters); no collected value was cut."
         )
 
 
