@@ -6,7 +6,10 @@ tools can do. Kept free of browser and MCP imports so it is testable by itself.
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import math
+import random
 import re
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional
@@ -16,6 +19,22 @@ MAX_EXECUTED_STEPS = 2000
 MAX_FOREACH_ITEMS = 1000
 MAX_REPORTED_ENTRIES = 200
 RESULT_PREVIEW = 500
+
+# How much of a run the report shows. "full" is the report as it always was; the others are
+# made from it by _shorten and show nothing it does not, except a last step past the entry cap.
+OUTPUT_MODES = ("summary", "failures", "full")
+# Steps whose result is what the caller came for. A summary keeps their result without save_as:
+# "navigate, then read" is usually written without one, and dropping the read would lose it unsaid.
+READERS = ("get_text", "get_attribute", "get_url", "get_links", "get_html", "query_selector_all",
+           "extract_table", "extract_structured", "browser_snapshot", "describe_page", "search_page",
+           "evaluate")
+# The longest one sleep step may pause. The whole workflow is one MCP call, and a client stops
+# waiting for a call after its own time limit, so a long wait belongs between calls.
+SLEEP_CAP_SECONDS = 300
+# The sleep step is not an MCP tool, so this stands in for the schema its arguments are checked against.
+SLEEP_PARAMETERS = {"type": "object", "properties": {
+    "seconds": {"type": "number"}, "min": {"type": "number"}, "max": {"type": "number"}}}
+_pause = asyncio.sleep  # tests replace it, so no test waits for real
 
 _WHOLE_REF = re.compile(r"^\$\{([^{}]+)\}$")
 _ANY_REF = re.compile(r"\$\{([^{}]+)\}")
@@ -185,6 +204,11 @@ class _Run:
     executed: int = 0
     failure: Optional[dict] = None
     failed_paths: list[str] = field(default_factory=list)
+    # For the shorter reports: every step counted, also past the cap; the steps that stored
+    # a value (by index); and the last step, even when it fell past the cap.
+    tally: dict[str, dict[str, int]] = field(default_factory=dict)
+    saved: set[str] = field(default_factory=set)
+    last: Optional[dict] = None
 
 
 def _dotted(path: list[int]) -> str:
@@ -195,6 +219,11 @@ def _record(run: _Run, entry: dict) -> None:
     if not entry.get("ok") and not entry.get("ignored"):
         # Kept apart from the capped list, or a failure past the cap would vanish.
         run.failed_paths.append(str(entry.get("index")))
+    if "tool" in entry:  # a step, not the record of a branch taken
+        run.last = entry
+        name = entry["tool"] if isinstance(entry["tool"], str) else "(no tool)"
+        kind = "ok" if entry.get("ok") else "ignored" if entry.get("ignored") else "failed"
+        run.tally.setdefault(name, {"ok": 0, "failed": 0, "ignored": 0})[kind] += 1
     if len(run.entries) < MAX_REPORTED_ENTRIES:
         run.entries.append(entry)
     else:
@@ -240,10 +269,11 @@ async def _run_tool(run: _Run, step: dict, path: list[int]) -> None:
     failed = text.startswith("Error:")
     value = step_value(text)
     run.variables["last"] = {"ok": not failed, "value": value, "text": text}
-    if step.get("save_as"):
-        run.variables[str(step["save_as"])] = value
     entry = {"index": path[0] if len(path) == 1 else _dotted(path), "tool": tool,
              "label": step.get("label", ""), "ok": not failed, "result": text[:RESULT_PREVIEW]}
+    if step.get("save_as"):
+        run.variables[str(step["save_as"])] = value
+        run.saved.add(str(entry["index"]))
     if failed and step.get("continue_on_error"):
         entry["ignored"] = True
         _record(run, entry)
@@ -338,8 +368,12 @@ async def run_workflow(
     start_at: Any = 0,
     stop_on_error: bool = True,
     variables: Optional[dict] = None,
+    output: str = "full",
 ) -> dict:
-    """Run steps and return {completed, total, vars, ...}, plus failed_at on failure."""
+    """Run steps and return {completed, total, vars, ...}, plus failed_at on failure.
+    output="summary" or "failures" returns the shorter form _shorten makes of that report."""
+    if output not in OUTPUT_MODES:
+        raise WorkflowError(f"output must be one of {', '.join(OUTPUT_MODES)}, got {output!r}; nothing ran")
     run = _Run(dispatch=dispatch, allowed=allowed, stop_on_error=stop_on_error,
                variables=dict(variables or {}))
     start = parse_start(start_at)
@@ -371,4 +405,99 @@ async def run_workflow(
             "hint": "fix the underlying issue, then re-run with that start_at to retry "
                     "this step. Variables are not kept between calls, so pass vars back.",
         })
-    return result
+    return result if output == "full" else _shorten(result, run, output, variables or {})
+
+
+_NOTES = {
+    "summary": "a summary: counts, every failed or ignored step, and the result of each step with "
+               "save_as, each reader and the last step; vars only as this run set or changed them "
+               "(all of them after a failure). output=\"full\" lists every step.",
+    "failures": "failures only: counts and every failed or ignored step, no vars unless a resume "
+                "needs them. output=\"summary\" adds results, output=\"full\" lists every step.",
+}
+# What a resume needs, kept whole whatever the output: resume_with says to pass these vars back.
+_RESUME_KEYS = ("vars", "failed_at", "failed_path", "failure_context", "resume_with", "hint")
+
+
+def _shorten(full: dict, run: _Run, output: str, given: dict) -> dict:
+    """The summary or failures form of a full report. The one place that decides what a shorter
+    report keeps; it names its mode and counts what it leaves out."""
+    reported = full["completed"]
+
+    def kept(entry: dict) -> bool:
+        if not entry.get("ok"):  # failed or ignored
+            return True
+        if output == "failures" or "tool" not in entry:
+            return False
+        return (entry is run.last or entry["tool"] in READERS
+                or str(entry.get("index")) in run.saved)
+
+    shown = [entry for entry in reported if kept(entry)]
+    out: dict[str, Any] = {"output": output, "note": _NOTES[output], "total": full["total"],
+                           "counts": _counts(run.tally), "shown": shown}
+    if len(shown) < len(reported):
+        out["not_shown"] = len(reported) - len(shown)
+    if output == "summary" and run.last is not None and not any(e is run.last for e in reported):
+        shown.append(run.last)  # the last step ran past the report cap; a summary still shows it
+    for key in ("completed_omitted", "failed_count", "failed_paths"):
+        if key in full:
+            out[key] = full[key]
+    if "failed_at" in full:
+        out.update((key, full[key]) for key in _RESUME_KEYS if key in full)
+    elif output == "summary" and full.get("vars"):
+        changed = {k: v for k, v in full["vars"].items() if k not in given or given[k] != v}
+        if changed:
+            out["vars"] = changed
+        unchanged = [k for k in full["vars"] if k not in changed]
+        if unchanged:
+            out["vars_unchanged"] = unchanged  # named, so a reader knows they were not lost
+    return out
+
+
+def _counts(tally: dict[str, dict[str, int]]) -> dict:
+    totals = {kind: sum(c[kind] for c in tally.values()) for kind in ("ok", "failed", "ignored")}
+    by_tool = {name: {"ok": c["ok"], "failed": c["failed"],
+                      **({"ignored": c["ignored"]} if c["ignored"] else {})}
+               for name, c in tally.items()}
+    return {"steps": sum(totals.values()), **totals, "by_tool": by_tool}
+
+
+def _seconds(value: Any) -> Optional[float]:
+    """A finite number of seconds, or None. A numeric string counts: "${x}s"-style text is a string."""
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+async def sleep_step(seconds: Any = None, min: Any = None, max: Any = None) -> str:  # noqa: A002
+    """The sleep step of workflow_run and batch_actions: {"seconds": 3}, or {"min": 6, "max": 11}
+    for a uniform random pause in that range. Refused, with the reason, rather than guessed at."""
+    if seconds is not None and (min is not None or max is not None):
+        return "Error: sleep takes seconds, or min and max, not both; nothing was done"
+    if seconds is None and (min is None or max is None):
+        given = "only min" if min is not None else "only max" if max is not None else "neither"
+        return f"Error: sleep needs seconds, or both min and max; got {given}; nothing was done"
+    wanted = {"seconds": seconds} if seconds is not None else {"min": min, "max": max}
+    numbers = {}
+    for name, value in wanted.items():
+        number = _seconds(value)
+        if number is None:
+            return f"Error: sleep {name} must be a number of seconds, got {value!r}; nothing was done"
+        if number < 0:
+            return f"Error: sleep {name} must not be negative, got {value!r}; nothing was done"
+        if number > SLEEP_CAP_SECONDS:
+            return (f"Error: sleep {name}={value!r} is over the {SLEEP_CAP_SECONDS} s cap for one step "
+                    "(the whole workflow is one call, and a client gives up on a call after its own "
+                    "time limit); nothing was done")
+        numbers[name] = number
+    low, high = ((numbers["seconds"],) * 2 if "seconds" in numbers
+                 else (numbers["min"], numbers["max"]))
+    if low > high:
+        return f"Error: sleep min {min!r} is greater than max {max!r}; nothing was done"
+    pause = random.uniform(low, high) if high > low else low
+    await _pause(pause)
+    return json.dumps({"slept_seconds": round(pause, 3), "min": low, "max": high})

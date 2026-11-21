@@ -333,3 +333,312 @@ def test_last_describes_a_step_that_was_rejected(bad_step):
     _, calls = run(steps, stop_on_error=False)
     names = [c[0] for c in calls]
     assert "success_only" not in names and names[-1] == "cleanup"
+
+
+# ── output: summary (default of the tool), failures, full ──────────────────
+
+import inspect  # noqa: E402
+import pathlib  # noqa: E402
+
+from mcp_stealth_chrome import workflow  # noqa: E402
+from mcp_stealth_chrome.workflow import (  # noqa: E402
+    READERS,
+    SLEEP_CAP_SECONDS,
+    SLEEP_PARAMETERS,
+    sleep_step,
+)
+
+_GOLDEN = pathlib.Path(__file__).parent / "fixtures" / "workflow_full_0.26.0.json"
+_GOLDEN_STEPS = [
+    {"tool": "navigate", "args": {"url": "https://shop.test/${start}"}, "label": "open"},
+    {"tool": "get_text", "args": {"selector": "#price"}, "save_as": "price"},
+    {"tool": "scroll", "args": {"direction": "down"}, "continue_on_error": True},
+    {"foreach": "${rows}", "as": "row", "steps": [
+        {"tool": "fill", "args": {"selector": "#q", "value": "${row.name}"}},
+        {"if": {"value": "${row.go}", "truthy": True}, "then": [
+            {"tool": "click", "args": {"selector": "#go"}}]},
+    ]},
+]
+_GOLDEN_VARS = {"start": "a", "rows": [{"name": "x", "go": False}, {"name": "y", "go": True}]}
+
+
+def _fake(answer):
+    async def _fn(**kw):
+        return answer(kw) if callable(answer) else answer
+    return _fn
+
+
+def _install_fakes(monkeypatch, flaky_click):
+    from mcp_stealth_chrome import server
+    server._register_workflow_tools()
+    for name, answer in {
+        "navigate": lambda kw: json.dumps({"navigated": kw["url"], "status": 200}),
+        "get_text": "Price: 10",
+        "fill": lambda kw: f"filled {kw['selector']} with {kw['value']}",
+        "click": (lambda kw: "Error: boom") if flaky_click else "clicked",
+        "scroll": "Error: nothing to scroll",
+    }.items():
+        monkeypatch.setitem(server._WORKFLOW_TOOLS, name, _fake(answer))
+
+
+def test_full_output_is_the_0_26_0_report_byte_for_byte(monkeypatch):
+    """output="full" is the report every earlier version gave, through the tool, for a run that
+    succeeds, one that fails and the resume of that failure (the fixture was made at 5a6521b)."""
+    from mcp_stealth_chrome.tools import action_kit
+    golden = json.loads(_GOLDEN.read_text(encoding="utf-8"))
+    _install_fakes(monkeypatch, flaky_click=False)
+    succeeded = asyncio.run(action_kit.workflow_run(_GOLDEN_STEPS, vars=_GOLDEN_VARS, output="full"))
+    _install_fakes(monkeypatch, flaky_click=True)
+    failed = asyncio.run(action_kit.workflow_run(_GOLDEN_STEPS, vars=_GOLDEN_VARS, output="full"))
+    report = json.loads(failed[len("Error: "):])
+    _install_fakes(monkeypatch, flaky_click=False)
+    resumed = asyncio.run(action_kit.workflow_run(
+        _GOLDEN_STEPS, start_at=report["failed_path"], vars=report["vars"], output="full"))
+    assert succeeded == golden["ok"]
+    assert failed == golden["fail"]
+    assert resumed == golden["resume"]
+
+
+def test_the_tool_answers_with_a_summary_unless_asked_for_more(monkeypatch):
+    from mcp_stealth_chrome.tools import action_kit
+    _install_fakes(monkeypatch, flaky_click=False)
+    doc = json.loads(asyncio.run(action_kit.workflow_run(_GOLDEN_STEPS, vars=_GOLDEN_VARS)))
+    assert doc["output"] == "summary" and "completed" not in doc
+    assert inspect.signature(action_kit.workflow_run).parameters["output"].default == "summary"
+
+
+_MIXED = [
+    {"tool": "navigate"},                              # 0: plain success: not shown
+    {"tool": "get_text"},                              # 1: a reader, no save_as: shown
+    {"tool": "click", "save_as": "clicked"},           # 2: save_as: shown
+    {"tool": "scroll", "continue_on_error": True},     # 3: ignored failure: shown
+    {"tool": "press_key"},                             # 4: plain success: not shown
+    {"tool": "fill"},                                  # 5: the last step: shown
+]
+
+
+def test_summary_keeps_reads_saved_results_failures_and_the_last_step():
+    responses = {"get_text": "Price: 10", "scroll": "Error: no wheel"}
+    full, _ = run(_MIXED, responses)
+    summary, calls = run(_MIXED, responses, output="summary")
+    assert len(calls) == 6
+    assert summary["output"] == "summary" and summary["note"].startswith("a summary")
+    assert [e["index"] for e in summary["shown"]] == [1, 2, 3, 5]
+    assert summary["not_shown"] == 2
+    # A shown step is exactly its entry in the full report.
+    assert summary["shown"] == [full["completed"][i] for i in (1, 2, 3, 5)]
+    assert summary["counts"] == {
+        "steps": 6, "ok": 5, "failed": 0, "ignored": 1,
+        "by_tool": {"navigate": {"ok": 1, "failed": 0}, "get_text": {"ok": 1, "failed": 0},
+                    "click": {"ok": 1, "failed": 0}, "scroll": {"ok": 0, "failed": 0, "ignored": 1},
+                    "press_key": {"ok": 1, "failed": 0}, "fill": {"ok": 1, "failed": 0}},
+    }
+
+
+@pytest.mark.parametrize("reader", READERS)
+def test_summary_keeps_every_reader_without_save_as(reader):
+    """Agents run "navigate, then read" without save_as: dropping the read would lose it unsaid."""
+    summary, _ = run([{"tool": "navigate"}, {"tool": reader}, {"tool": "click"}], output="summary")
+    assert [e["tool"] for e in summary["shown"]] == [reader, "click"]
+
+
+def test_summary_vars_leave_out_input_the_run_did_not_change():
+    rows = [{"sku": i} for i in range(20)]
+    summary, _ = run(
+        [{"tool": "read", "save_as": "price"},
+         {"foreach": "${pages}", "as": "page", "steps": [{"tool": "navigate", "args": {"url": "${page}"}}]},
+         {"tool": "count", "save_as": "seen"}],
+        {"read": "10", "count": "3"},
+        variables={"rows": rows, "pages": ["a", "b"], "seen": 0}, output="summary",
+    )
+    assert summary["vars"]["seen"] == 3  # an input var the run changed is kept
+    assert set(summary["vars"]) == {"price", "page", "page_index", "last", "seen"}
+    assert summary["vars_unchanged"] == ["rows", "pages"]  # named, not repeated
+
+
+@pytest.mark.parametrize("output", ["summary", "failures"])
+def test_a_failure_keeps_everything_a_resume_needs(output):
+    steps = [{"tool": "read", "save_as": "items"},
+             {"foreach": "${items}", "as": "item", "steps": [
+                 {"tool": "first"}, {"tool": "second", "args": {"v": "${item}"}}]}]
+    given = {"rows": [{"sku": i} for i in range(20)]}
+
+    def second(args):
+        return "Error: boom" if args["v"] == 2 else "ok"
+
+    responses = {"read": "[1, 2, 3]", "second": second}
+    full, _ = run(steps, responses, variables=given)
+    short, _ = run(steps, responses, variables=given, output=output)
+    for key in ("vars", "failed_at", "failed_path", "failure_context", "resume_with", "hint",
+                "failed_count", "failed_paths"):
+        assert short[key] == full[key], key
+    assert short["vars"]["rows"] == given["rows"] and "vars_unchanged" not in short
+    resumed, calls = run(steps, {"second": "ok"}, start_at=short["failed_path"],
+                         variables=short["vars"], output=output)
+    assert "failed_at" not in resumed
+    assert calls == [("second", {"v": 2}), ("first", {}), ("second", {"v": 3})]
+
+
+def test_failures_output_keeps_counts_and_failed_or_ignored_steps_only():
+    steps = [{"tool": "get_text", "save_as": "t"}, {"tool": "a", "continue_on_error": True},
+             {"tool": "b"}, {"tool": "c"}]
+    result, _ = run(steps, {"a": "Error: no", "b": "Error: also no"}, output="failures",
+                    stop_on_error=False)
+    assert result["output"] == "failures"
+    assert [(e["index"], e.get("ignored", False)) for e in result["shown"]] == [(1, True), (2, False)]
+    assert result["not_shown"] == 2 and result["failed_paths"] == ["2"]
+    assert result["counts"]["ok"] == 2 and result["counts"]["failed"] == 1
+    assert result["counts"]["ignored"] == 1
+    assert "vars" not in result and "failed_at" not in result
+
+
+def test_counts_and_the_last_step_outlive_the_report_cap():
+    steps = [{"tool": "step"}] * 250 + [{"tool": "bad", "continue_on_error": True}, {"tool": "end"}]
+    full, _ = run(steps, {"bad": "Error: no", "end": "done"})
+    summary, _ = run(steps, {"bad": "Error: no", "end": "done"}, output="summary")
+    assert full["completed_omitted"] == summary["completed_omitted"] == 52
+    assert summary["counts"]["steps"] == 252 and summary["counts"]["by_tool"]["step"]["ok"] == 250
+    assert summary["counts"]["ignored"] == 1
+    # The last step ran past the cap, so even the full report leaves it out; a summary shows it.
+    assert summary["shown"][-1]["index"] == 251 and summary["shown"][-1]["result"] == "done"
+    assert summary["not_shown"] == 200
+
+
+def test_an_unknown_output_mode_is_refused_before_anything_runs(monkeypatch):
+    calls = []
+
+    async def dispatch(tool, args):
+        calls.append(tool)
+        return "ok"
+
+    with pytest.raises(WorkflowError, match="output must be one of summary, failures, full"):
+        asyncio.run(run_workflow([{"tool": "a"}], dispatch, lambda name: True, output="brief"))
+    assert calls == []
+    from mcp_stealth_chrome.tools import action_kit
+    _install_fakes(monkeypatch, flaky_click=False)
+    out = asyncio.run(action_kit.workflow_run([{"tool": "navigate", "args": {"url": "x"}}], output="all"))
+    assert out.startswith("Error: output must be one of") and "nothing ran" in out
+
+
+# ── the sleep step ──────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def pauses(monkeypatch):
+    seen = []
+
+    async def pause(seconds):
+        seen.append(seconds)
+
+    monkeypatch.setattr(workflow, "_pause", pause)
+    return seen
+
+
+def test_sleep_pauses_a_uniform_random_time_inside_the_range(pauses):
+    async def many():
+        return [await sleep_step(min=6, max=11) for _ in range(200)]
+
+    texts = asyncio.run(many())
+    assert all(6 <= p <= 11 for p in pauses) and len(set(pauses)) > 100
+    assert min(pauses) < 7 and max(pauses) > 10  # spread over the range, not one end of it
+    assert json.loads(texts[0]) == {"slept_seconds": round(pauses[0], 3), "min": 6, "max": 11}
+
+
+def test_sleep_seconds_pauses_exactly_that_long(pauses):
+    assert json.loads(asyncio.run(sleep_step(seconds=3))) == {"slept_seconds": 3, "min": 3, "max": 3}
+    assert json.loads(asyncio.run(sleep_step(seconds="1.5")))["slept_seconds"] == 1.5
+    assert pauses == [3, 1.5]
+
+
+def test_the_sleep_cap_is_300_seconds_and_300_is_allowed(pauses):
+    assert SLEEP_CAP_SECONDS == 300
+    assert not asyncio.run(sleep_step(seconds=300)).startswith("Error")
+    assert not asyncio.run(sleep_step(min=0, max=300)).startswith("Error")
+    assert pauses[0] == 300 and 0 <= pauses[1] <= 300
+
+
+@pytest.mark.parametrize("args,reason", [
+    ({"seconds": -1}, "seconds must not be negative"),
+    ({"min": -2, "max": 5}, "min must not be negative"),
+    ({"min": 9, "max": 6}, "min 9 is greater than max 6"),
+    ({"seconds": 3, "min": 1, "max": 2}, "not both"),
+    ({"seconds": 3, "max": 2}, "not both"),
+    ({}, "got neither"),
+    ({"min": 1}, "got only min"),
+    ({"max": 1}, "got only max"),
+    ({"seconds": 301}, "over the 300 s cap"),
+    ({"min": 1, "max": 300.5}, "max=300.5 is over the 300 s cap"),
+    ({"seconds": "soon"}, "must be a number of seconds"),
+    ({"seconds": True}, "must be a number of seconds"),
+    ({"seconds": float("nan")}, "must be a number of seconds"),
+    ({"min": 0, "max": float("inf")}, "must be a number of seconds"),
+])
+def test_sleep_refuses_with_the_reason_and_does_not_pause(pauses, args, reason):
+    text = asyncio.run(sleep_step(**args))
+    assert text.startswith("Error: sleep") and reason in text and "nothing was done" in text, text
+    assert pauses == []
+
+
+def test_a_sleep_step_runs_in_a_workflow_and_a_refused_one_fails_there(pauses):
+    from mcp_stealth_chrome.tools import action_kit
+    doc = json.loads(asyncio.run(action_kit.workflow_run([{"tool": "sleep", "args": {"min": 1, "max": 2}}])))
+    assert doc["counts"]["by_tool"] == {"sleep": {"ok": 1, "failed": 0}}
+    slept = json.loads(doc["shown"][0]["result"])  # the last step, shown with its result
+    assert 1 <= slept["slept_seconds"] <= 2 and (slept["min"], slept["max"]) == (1, 2)
+    out = asyncio.run(action_kit.workflow_run([{"tool": "sleep", "args": {"min": 5, "max": 1}},
+                                               {"tool": "sleep", "args": {"seconds": 1}}]))
+    assert out.startswith("Error:")
+    doc = json.loads(out[len("Error: "):])
+    assert doc["failed_at"] == 0 and "greater than max" in doc["failure_context"]["error"]
+    assert len(pauses) == 1  # the refused step and the one after it never paused
+
+
+def test_a_sleep_argument_it_does_not_take_is_refused_by_name(pauses):
+    """sleep is no MCP tool, so the check against an advertised schema found none and let any
+    name through; the step then died on a TypeError instead of the refusal every tool gives."""
+    from mcp_stealth_chrome.tools import action_kit, batch
+    out = asyncio.run(action_kit.workflow_run([{"tool": "sleep", "args": {"secs": 3}}]))
+    assert "sleep does not take 'secs'; nothing was done" in out and "did you mean 'seconds'" in out, out
+    out = asyncio.run(batch.batch_actions([{"type": "sleep", "secs": 3}, {"type": "sleep", "seconds": 1}]))
+    assert out.startswith("2 actions, 1 failed") and "sleep does not take 'secs'" in out, out
+    assert pauses == [1]
+
+
+def test_the_sleep_schema_is_the_sleep_steps_own_arguments():
+    assert set(SLEEP_PARAMETERS["properties"]) == set(inspect.signature(sleep_step).parameters)
+
+
+def test_every_step_name_has_its_arguments_checked():
+    from mcp_stealth_chrome import server
+    server._register_workflow_tools()
+    unchecked = [name for name in server._WORKFLOW_TOOLS
+                 if server._inner_arguments_error(name, {"no_such_argument": 1}) is None]
+    assert not unchecked
+    # sleep is a step, not a tool: the tool count does not change.
+    assert "sleep" in server._WORKFLOW_TOOLS and server.mcp._tool_manager.get_tool("sleep") is None
+
+
+def test_every_reader_a_summary_keeps_is_a_step():
+    from mcp_stealth_chrome import server
+    server._register_workflow_tools()
+    assert set(READERS) <= set(server._WORKFLOW_TOOLS)
+
+
+def test_mouse_drift_is_a_workflow_and_batch_step(monkeypatch):
+    from mcp_stealth_chrome import server
+    from mcp_stealth_chrome.tools import action_kit, batch
+    server._register_workflow_tools()
+    assert server._WORKFLOW_TOOLS["mouse_drift"] is server.mcp._tool_manager.get_tool("mouse_drift").fn
+    seen = []
+
+    async def drift(**kw):
+        seen.append(kw)
+        return "drifted"
+
+    monkeypatch.setitem(server._WORKFLOW_TOOLS, "mouse_drift", drift)
+    out = asyncio.run(action_kit.workflow_run(
+        [{"tool": "mouse_drift", "args": {"duration_seconds": 1.5, "segments": 3}}]))
+    assert not out.startswith("Error:"), out
+    out = asyncio.run(batch.batch_actions([{"type": "mouse_drift"}]))
+    assert out.startswith("1 actions OK"), out
+    assert seen == [{"duration_seconds": 1.5, "segments": 3}, {}]

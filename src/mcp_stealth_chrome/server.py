@@ -6874,8 +6874,11 @@ def _js_exception_text(details: Any) -> str:
 
 def _inner_arguments_error(tool: str, args: dict) -> Optional[str]:
     """The refusal a direct call would get for arguments `tool` does not take, for a step of
-    batch_actions or workflow_run, which call the function itself and so skip that check."""
+    batch_actions or workflow_run, which call the function itself and so skip that check.
+    A step that is no MCP tool (sleep) is checked against its own schema, not let through."""
     registered = mcp._tool_manager.get_tool(tool)
+    if registered is None and tool in _STEP_ONLY_TOOLS:
+        registered = _StepSchema(parameters=_STEP_ONLY_TOOLS[tool][1])
     if registered is None:
         return None
     return _app.unknown_arguments_error(tool, registered, args)
@@ -7707,6 +7710,20 @@ from .tools import profiles as _profiles  # noqa: F401  -- registers tools with 
 # the same thing in both.
 _WORKFLOW_TOOLS: dict[str, Any] = {}
 
+from . import workflow as _workflow  # noqa: E402
+
+# Steps that are no MCP tool: name -> (function, the schema _inner_arguments_error checks
+# their arguments against). Not advertised as tools, so the tool count does not change.
+_STEP_ONLY_TOOLS: dict[str, tuple[Any, dict]] = {
+    "sleep": (_workflow.sleep_step, _workflow.SLEEP_PARAMETERS),
+}
+
+
+@dataclass(frozen=True)
+class _StepSchema:
+    """What _app.unknown_arguments_error reads of a registered tool: its parameter schema."""
+    parameters: dict
+
 
 def _register_workflow_tools() -> None:
     """Late-bound registration so all tool defs above this point exist.
@@ -7726,11 +7743,10 @@ def _register_workflow_tools() -> None:
         "assert_text_present", "assert_url_matches", "assert_element_visible",
         "storage_snapshot", "storage_diff",
         "cookie_import", "storage_state_load",
-        "evaluate", "mouse_click_xy",
-        # Readers: a later step can branch on or iterate over what these return.
-        "get_text", "get_attribute", "get_url", "get_links", "get_html",
-        "query_selector_all", "extract_table", "extract_structured",
-        "browser_snapshot", "describe_page", "search_page",
+        "mouse_click_xy", "mouse_drift",
+        # Readers (evaluate among them): a later step can branch on or iterate over what these
+        # return, and a summary of the run keeps their result.
+        *_workflow.READERS,
         "hover", "paste_text", "fill_form", "wait_for_function", "wait_for_change",
         "wait_for_network_idle",
     ):
@@ -7741,6 +7757,8 @@ def _register_workflow_tools() -> None:
         elif name in g and callable(g[name]):
             fn = g[name]
             _WORKFLOW_TOOLS[name] = getattr(fn, "fn", fn) if hasattr(fn, "fn") else fn
+    for name, (fn, _schema) in _STEP_ONLY_TOOLS.items():
+        _WORKFLOW_TOOLS[name] = fn
 
 
 # ══════════════════════════════════════════════════════════════════════════

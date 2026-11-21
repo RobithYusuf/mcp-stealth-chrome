@@ -806,6 +806,7 @@ async def workflow_run(
     start_at: int | str = 0,
     stop_on_error: bool = True,
     vars: Optional[dict] = None,
+    output: Literal["summary", "failures", "full"] = "summary",
 ) -> str:
     """Run many tool steps in one call, with branching, loops and earlier results.
 
@@ -823,6 +824,10 @@ async def workflow_run(
     falsy; or {"exists": "${x.y}"}, {"all": [...]}, {"any": [...]}, {"not": {...}}. There is no expression
     language and nothing is evaluated as code on the server.
 
+    Pause: {"tool": "sleep", "args": {"seconds": 3}}, or {"min": 6, "max": 11} for a uniform random pause in
+    that range. At most 300 s a step: the whole workflow is one call, and a client gives up on a call after
+    its own time limit.
+
     Example, submitting a form once per row of data taken from the page:
       [{"tool": "evaluate", "args": {"expression": "JSON.stringify(window.rows)"}, "save_as": "rows"},
        {"foreach": "${rows}", "as": "row", "steps": [
@@ -838,17 +843,24 @@ async def workflow_run(
         stop_on_error: stop at the first failure (default). If False, keep going and report every result.
         vars: starting variables. Pass the `vars` of a failure report when resuming: nothing is kept between
             calls.
+        output: "summary" (default): counts per tool, every failed or ignored step, and the result of each
+            step with save_as, each reader (the get_* tools, query_selector_all, extract_*, browser_snapshot,
+            describe_page, search_page, evaluate) and the last step; vars only as this run set or changed
+            them. "failures": counts and failed or ignored steps only. "full": every step and every var.
+            After a failure every mode keeps the whole vars and what a resume needs.
 
-    Returns JSON with completed (capped at 200 entries, the rest counted), total and vars; on failure also
-    failed_at, failed_path, failure_context and resume_with. With stop_on_error=False, failed_count and
-    failed_paths list every failure even past that cap. Steps the failed step depended on are not re-run on
-    resume, so check that any state they left on the page still holds.
+    Returns JSON. full: completed (capped at 200 entries, the rest counted), total and vars. summary and
+    failures: output names the mode, shown holds the steps kept, not_shown counts the rest, vars_unchanged
+    names input vars left out. On failure also failed_at, failed_path, failure_context and resume_with. With
+    stop_on_error=False, failed_count and failed_paths list every failure even past that cap. Steps the
+    failed step depended on are not re-run on resume, so check that any state they left on the page still
+    holds.
 
     Tools: navigate, reload, go_back/forward, click, click_text, click_role, fill, fill_form, type_text,
     paste_text, press_key, select_option, check, uncheck, hover, scroll, scroll_to, mouse_click_xy,
-    smart_fill, wait_for*, screenshot, evaluate, get_text, get_attribute, get_url, get_links, get_html,
-    search_page, query_selector_all, extract_table, extract_structured, browser_snapshot, describe_page,
-    vision_locate, assert_*, storage_*, cookie_import, storage_state_load.
+    mouse_drift, smart_fill, wait_for*, screenshot, evaluate, get_text, get_attribute, get_url, get_links,
+    get_html, search_page, query_selector_all, extract_table, extract_structured, browser_snapshot,
+    describe_page, vision_locate, assert_*, storage_*, cookie_import, storage_state_load, and sleep.
     """
     _srv._register_workflow_tools()
     steps = parse_json(steps, None) if isinstance(steps, str) else steps
@@ -866,7 +878,7 @@ async def workflow_run(
     try:
         result = await run_workflow(
             steps, dispatch, lambda name: name in _srv._WORKFLOW_TOOLS,
-            start_at=start_at, stop_on_error=stop_on_error, variables=vars,
+            start_at=start_at, stop_on_error=stop_on_error, variables=vars, output=output,
         )
     except WorkflowError as e:
         return err(str(e))
