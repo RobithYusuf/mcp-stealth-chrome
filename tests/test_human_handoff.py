@@ -26,12 +26,14 @@ KEY = "HANDOFF-TAB"
 
 
 class Clock:
-    """The handoff's clock (navigation._now) and its pause (navigation._pause): a pause moves the
-    clock on at once, and a hook runs once the clock passes its time (a person pressing Done)."""
+    """The handoff's monotonic clock (navigation._clock) and its pause (navigation._pause): a pause
+    moves the clock on at once, and a hook runs once the clock passes its time (a person pressing
+    Done). It starts far from the wall clock on purpose; a wait that never ends stops loudly."""
 
     def __init__(self):
-        self.start = self.t = time.time()
+        self.start = self.t = 1000.0
         self.hooks: list = []
+        self.pauses = 0
 
     def __call__(self) -> float:
         return self.t
@@ -46,6 +48,9 @@ class Clock:
             hook[1]()
 
     async def pause(self, seconds: float) -> None:
+        self.pauses += 1
+        if self.pauses > 20000:
+            raise RuntimeError("the wait never ended on the handoff's clock")
         self.advance(seconds)
 
 
@@ -86,7 +91,7 @@ SLEEPER = [sys.executable, "-c", "import time; time.sleep(60)"]
 @pytest.fixture
 def clock(monkeypatch):
     clock = Clock()
-    monkeypatch.setattr(nav, "_now", clock)
+    monkeypatch.setattr(nav, "_clock", clock)
     monkeypatch.setattr(nav, "_pause", clock.pause)
     return clock
 
@@ -152,13 +157,13 @@ def test_shopee_a_redirect_inside_the_grace_is_no_handoff(handoff, clock):
     page = handoff((0, LOGIN, 400), (0.4, QR, 420))
     asked = ask()
     assert "weak evidence" in asked and f"{nav.HANDOFF_GRACE:g}s after this request" in asked, asked
-    requested_at = server._HUMAN_HELP[KEY]["requested_at"]
+    requested_at = server._HUMAN_HELP[KEY]["requested_clock"]
     clock.advance(0.1)  # the agent's next call
     result = wait(timeout=12)
     assert result.startswith("Error: timeout after 12"), result
     assert "completed" not in result and "no page change held" in result, result
     assert "The request for help stays pending" in result, result
-    assert server._HUMAN_HELP[KEY]["requested_at"] == requested_at  # the same request
+    assert server._HUMAN_HELP[KEY]["requested_clock"] == requested_at  # the same request
     page.selector_from = clock.elapsed() + 1.0
     result = wait(done_selector="#account", timeout=5)
     assert result.startswith("human handoff completed after"), result
@@ -234,6 +239,22 @@ def test_a_new_url_counts_once_it_held_though_its_content_still_moves(handoff, c
     assert clock.elapsed() < 7 + nav.HANDOFF_SETTLE + 1
 
 
+@pytest.mark.parametrize("jump", [3600.0, -3600.0])
+def test_a_wall_clock_jump_moves_neither_the_grace_nor_the_timeout(handoff, clock, monkeypatch, jump):
+    """The system time changes 0.2 s into the wait. On the wall clock a jump forward ended the
+    grace and the timeout at once (the redirect to /qr then counted); one back held both an hour."""
+    real = time.time
+    offset = [0.0]
+    monkeypatch.setattr(time, "time", lambda: real() + offset[0])
+    handoff((0, LOGIN, 400), (0.4, QR, 420))
+    ask()
+    clock.hooks.append((0.2, lambda: offset.__setitem__(0, jump)))
+    result = wait(timeout=12)
+    assert result.startswith("Error: timeout after 12"), result
+    assert "no page change held" in result, result
+    assert 12 <= clock.elapsed() < 12.5
+
+
 def test_a_content_change_names_what_was_measured(handoff, clock):
     handoff((0, LOGIN, 400), (8, LOGIN, 460))
     ask()
@@ -271,7 +292,7 @@ def test_a_new_request_replaces_the_pending_one(handoff, clock):
     ask("Confirm the code")
     second = server._HUMAN_HELP[KEY]
     assert second is not first and second["objective"] == "Confirm the code"
-    assert second["requested_at"] > first["requested_at"] and second["baseline"]["url"] == HOME
+    assert second["requested_clock"] > first["requested_clock"] and second["baseline"]["url"] == HOME
 
 
 def test_the_docstring_gives_the_constants_it_runs_on():

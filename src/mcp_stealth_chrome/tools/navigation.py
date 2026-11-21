@@ -144,7 +144,10 @@ async def _foreground_for_human(tab: Tab) -> list[str]:
 HANDOFF_GRACE = 5.0
 HANDOFF_SETTLE = 2.0
 HANDOFF_POLL = 0.25  # seconds between reads while wait_for_human waits
-_now = time.time      # the handoff's clock: tests replace it and _pause, and nothing sleeps
+# Durations (timeout, grace, settle, elapsed) run on one monotonic clock, so a change of the system
+# time moves none of them; tests replace it and _pause, and nothing sleeps. Wall-clock time.time is
+# kept for the stamps shared with the overlay process (asked_at, help_done, since).
+_clock = time.monotonic
 _pause = asyncio.sleep
 
 
@@ -173,7 +176,8 @@ async def request_human_help(objective: str, timeout: float = 300) -> str:
         record = {
             "objective": objective,
             "baseline": await _srv._page_sig(tab),
-            "requested_at": _now(),
+            "requested_at": time.time(),     # a stamp the overlay's answers are compared with
+            "requested_clock": _clock(),     # where the grace starts
             "timeout": max(0.0, float(timeout)),
         }
         _srv._HUMAN_HELP[key] = record  # a new request replaces the tab's earlier one
@@ -314,11 +318,12 @@ def _weak_change(request: dict, watch: _ChangeWatch, elapsed: float, unasked: st
 async def _wait_for_human_loop(tab, key, browser, request, unasked, timeout,
                                done_url_contains, done_selector) -> str:
     """wait_for_human's wait, while the bar says the agent is waiting."""
-    started = _now()
+    started = _clock()
     asked_at = request.get("asked_at")
-    asked_since = float(asked_at or request.get("requested_at") or started)
+    asked_since = float(asked_at or request.get("requested_at") or time.time())
+    grace_from = request.get("requested_clock")
     watch = None if done_url_contains or done_selector else _ChangeWatch(
-        request.get("baseline"), float(request.get("requested_at") or started) + HANDOFF_GRACE)
+        request.get("baseline"), (started if grace_from is None else grace_from) + HANDOFF_GRACE)
     selector_expr = (
         "(() => JSON.stringify({hit: !!document.querySelector(%s)}))()"
         % json.dumps(done_selector)
@@ -331,8 +336,8 @@ async def _wait_for_human_loop(tab, key, browser, request, unasked, timeout,
         presence.end_help(browser)
         return ok(text)
 
-    while _now() - started < max(0.0, timeout):
-        elapsed = round(_now() - started, 2)
+    while _clock() - started < max(0.0, timeout):
+        elapsed = round(_clock() - started, 2)
         answer = presence.answered(browser, asked_since)
         if answer:
             return done(f"human handoff completed after {elapsed}s: the person pressed "
@@ -355,7 +360,7 @@ async def _wait_for_human_loop(tab, key, browser, request, unasked, timeout,
         # While the bar shows the request the person has its Done button, so a page change is
         # no answer: the page may move by itself, and the person's own steps change it.
         if watch is not None and not presence.shows_request(browser, asked_at):
-            if watch.changed(await _srv._page_sig(tab), _now()):
+            if watch.changed(await _srv._page_sig(tab), _clock()):
                 return _weak_change(request, watch, elapsed, unasked)
         await _pause(HANDOFF_POLL)
     # The request stays pending: the person may still be at it, a Done pressed later is still
