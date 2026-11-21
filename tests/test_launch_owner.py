@@ -71,6 +71,33 @@ async def _call(name, arguments):
     return _text(await asyncio.wait_for(asyncio.ensure_future(server.mcp.call_tool(name, arguments)), 10))
 
 
+class _Recover:
+    """browser_recover as a client sends it beside a launch: in a task of its own, never awaited
+    by the launch (a recover waits for the launch it asked to stop). start() returns once the
+    recover has asked the launch to stop, or has ended; said() is its result."""
+
+    def __init__(self):
+        self.task = None
+
+    async def start(self):
+        self.task = asyncio.ensure_future(_call("browser_recover", {}))
+        entry = server._LAUNCHING.get(server.BrowserState.session_key())
+        for _ in range(1000):
+            if self.task.done() or (entry is not None and entry.ended_by):
+                break
+            await asyncio.sleep(0)
+        return self
+
+    async def said(self):
+        return await asyncio.wait_for(self.task, 20)
+
+
+async def _beside(launch, recover):
+    """The launch's result, then the recover's."""
+    out = await launch
+    return out, await recover.said()
+
+
 class _At:
     """Runs `act` once, when the launch reaches `point`."""
 
@@ -293,12 +320,13 @@ def test_a_browser_recover_at_every_await_cuts_the_launch_short_and_records_noth
     instance) and says it cut the launch short; the launch ends as an error saying so, ends the
     browser it had started, once, removes its privacy profile, and records nothing more: no
     handle, no tabs."""
-    at = _At(point, lambda: _call("browser_recover", {}))
+    recover = _Recover()
+    at = _At(point, recover.start)
     _instrument(monkeypatch, at)
 
-    out = asyncio.run(_launch_with(owner))
+    out, said = asyncio.run(_beside(_launch_with(owner), recover))
     assert point in at.seen, at.seen
-    assert "browser_launch of instance 'main' was still running" in at.result, at.result
+    assert "browser_launch of instance 'main' was still running: asked to stop, it ended" in said, said
     assert out.startswith("Error") and out.count(_RECOVERED) == 1, out
     # Looked at after every await: the step it was in finishes, and no later one starts.
     later = at.seen[at.seen.index(point) + 1:]
@@ -320,9 +348,10 @@ def test_a_browser_recover_at_every_await_cuts_the_launch_short_and_records_noth
 def test_after_a_recover_the_next_launch_starts_afresh(owner, monkeypatch, point):
     """Before and after the launch recorded its browser: nothing it left behind is reused, the
     next browser_launch starts a browser of its own."""
-    at = _At(point, lambda: _call("browser_recover", {}))
+    recover = _Recover()
+    at = _At(point, recover.start)
     _instrument(monkeypatch, at)
-    out = asyncio.run(_launch_with(owner))
+    out, _said = asyncio.run(_beside(_launch_with(owner), recover))
     assert _RECOVERED in out, out
     again = asyncio.run(server.mcp._tool_manager._tools["browser_launch"].fn(auto_verify=False, headless=True))
     assert "Browser launched" in again and "reusing" not in again, again
@@ -331,22 +360,18 @@ def test_after_a_recover_the_next_launch_starts_afresh(owner, monkeypatch, point
 
 def test_a_recover_during_the_close_of_a_failed_launch_keeps_its_error_and_says_so(owner, monkeypatch):
     """A step that already failed closes its browser. A browser_recover sent through the call
-    wrapper during that close does not wait for it (_app.RUNS_DURING_A_CLOSE): it marks the
-    launch and resets the instance. The launch keeps the step's own error first, with what
+    wrapper during that close does not wait for the close (_app.RUNS_DURING_A_CLOSE): it asks
+    the launch to stop and waits for it. The launch keeps the step's own error first, with what
     happened after it; the browser is closed once, not again by the cut-short launch, and
     nothing is recorded."""
     async def broken(_browser, _path, tab=None):
         raise ValueError("no cookies key in the file")
 
     monkeypatch.setattr(server, "_apply_storage_state", broken)
-    said = {}
-
-    async def recover_meanwhile():
-        said["recover"] = await _call("browser_recover", {})
-
-    owner.during_close = recover_meanwhile
-    out = asyncio.run(_launch_with(owner))
-    assert "recovered:" in said["recover"] and "was still running" in said["recover"], said
+    recover = _Recover()
+    owner.during_close = recover.start
+    out, said = asyncio.run(_beside(_launch_with(owner), recover))
+    assert "recovered:" in said and "was still running: asked to stop, it ended" in said, said
     assert out == f"Error: storage_state load failed: no cookies key in the file. {_RECOVERED}", out
     assert [b for b, _p in owner.closes] == owner.started
     assert server.BrowserState.browser is None and _privacy_folders(owner) == []
@@ -354,17 +379,29 @@ def test_a_recover_during_the_close_of_a_failed_launch_keeps_its_error_and_says_
 
 def test_a_browser_that_a_cut_short_launch_could_not_end_keeps_a_handle(owner, monkeypatch):
     """Absence of a handle is for a browser that ended: one still running after the cut is kept on
-    the instance the recover emptied, naming its profile, so browser_close can reach it."""
+    its instance, naming its profile, so browser_close can reach it. The recover, which began on
+    that same browser, then resets it as it resets any browser it could not end (a limit the
+    guide names): its own result says so."""
     from test_launch_cleanup import _ALIVE
     owner.close_report = dict(_ALIVE)
-    at = _At("after:_launch_first_page", lambda: _call("browser_recover", {}))
+    recover = _Recover()
+    at = _At("after:_launch_first_page", recover.start)
     _instrument(monkeypatch, at)
-    out = asyncio.run(_launch_with(owner))
+    seen = {}
+
+    async def run():
+        out = await _launch_with(owner)
+        current = server.BrowserState
+        seen.update(browser=current.browser, tabs=list(current.tabs), profile=current.current_profile_dir,
+                    privacy=current.current_privacy)
+        return out, await recover.said()
+
+    out, said = asyncio.run(run())
     assert _RECOVERED in out and "could not be ended" in out and "call browser_close to try again" in out, out
-    current = server.BrowserState
-    assert current.browser is owner.started[0] and current.tabs == []
+    assert seen["browser"] is owner.started[0] and seen["tabs"] == []
     folders = _privacy_folders(owner)
-    assert len(folders) == 1 and current.current_profile_dir == folders[0] and current.current_privacy
+    assert len(folders) == 1 and seen["profile"] == folders[0] and seen["privacy"]
+    assert "recovered:" in said and "state reset" in said, said
 
 
 # ── The reattach ───────────────────────────────────────────────────────────────────────────
@@ -403,15 +440,16 @@ def test_a_recover_while_a_kept_browser_is_being_taken_over_gives_it_back(owner,
     may be the person's, opened from the launcher): its record names its old server again,
     nothing ended it, and the instance holds nothing of it."""
     real = server._observe_navigation
-    sent = {}
+    recover = _Recover()
 
     async def observe(*a, **kw):
-        sent.setdefault("recover", await _call("browser_recover", {}))
+        if recover.task is None:
+            await recover.start()
         return await real(*a, **kw)
 
     monkeypatch.setattr(server, "_observe_navigation", observe)
-    out = asyncio.run(_launch_kept())
-    assert "was still running" in sent["recover"], sent
+    out, said = asyncio.run(_beside(_launch_kept(), recover))
+    assert "was still running: asked to stop, it ended" in said, said
     assert "could not be taken over safely: this browser_launch was cut short" in out and _RECOVERED in out, out
     assert (keep_alive.read(kept.profile) or {}).get("server_pid") == 424242, "the record was not given back"
     assert owner.closes == [], "the kept browser was ended"
@@ -423,15 +461,16 @@ def test_a_recover_after_a_kept_browser_was_taken_over_ends_it(owner, kept, monk
     (it is not the person's, which a recover leaves alone while it answers): the cut-short launch
     verifies that end as for one it started, and records nothing more."""
     real = presence.attach
-    sent = {}
+    recover = _Recover()
 
     async def attach(*a, **kw):
-        sent.setdefault("recover", await _call("browser_recover", {}))
+        if recover.task is None:
+            await recover.start()
         return await real(*a, **kw)
 
     monkeypatch.setattr(presence, "attach", attach)
-    out = asyncio.run(_launch_kept())
-    assert "was still running" in sent["recover"], sent
+    out, said = asyncio.run(_beside(_launch_kept(), recover))
+    assert "was still running: asked to stop, it ended" in said, said
     assert out.startswith("Error: browser_launch of instance 'main' did not finish.") and _RECOVERED in out, out
     assert [b for b, _p in owner.closes] == [kept.browser]
     assert server.BrowserState.browser is None and server.BrowserState.tabs == []
@@ -477,33 +516,120 @@ def test_a_cancelled_launch_leaves_no_mark_and_no_handle(owner, monkeypatch):
     assert server.BrowserState.instances.get("main") is None, "the cancelled launch's browser was kept"
 
 
-def test_a_launch_cancelled_after_a_recover_stops_its_own_browser(owner, monkeypatch):
-    """The recover reset the instance, so what is current is no longer the launch's browser: the
-    cancel stops the browser the launch started (plan.browser), not the empty current one."""
+@pytest.mark.parametrize("where", ["_first_live_tab", "_reopen_saved_tabs"])
+def test_a_launch_cancelled_after_another_browser_took_its_instance_stops_its_own(owner, monkeypatch, where):
+    """What is current is no longer the launch's browser (a call that was already running when the
+    launch began published another): the cancel stops the browser the launch started
+    (plan.browser), not the current one, and leaves that one where it is. In the first page's
+    own cancel path, and in a phase with none (the saved tabs, after the record)."""
     stopped = []
+    theirs = SimpleNamespace(tabs=[_Tab()], stopped=False, config=None)
 
     async def safe_stop(browser):
         stopped.append(browser)
 
-    async def hang(_browser):
-        await _call("browser_recover", {})
+    async def hang(*_a, **_kw):
+        server.BrowserState.browser = theirs
         await asyncio.Event().wait()
 
     monkeypatch.setattr(server, "_safe_stop_browser", safe_stop)
-    monkeypatch.setattr(server, "_first_live_tab", hang)
+    monkeypatch.setattr(server, where, hang)
 
     async def run():
         task = asyncio.ensure_future(_launch_with(owner))
-        while server.BrowserState.browser is not None or not owner.started:
+        while server.BrowserState.browser is not theirs:
             await asyncio.sleep(0.01)
-        await asyncio.sleep(0.05)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
 
     asyncio.run(run())
     assert stopped == owner.started, stopped
-    assert _no_mark() and server.BrowserState.browser is None
+    assert _no_mark() and server.BrowserState.browser is theirs
+
+
+_HUNG = {}
+
+
+async def _never(_browser):
+    """An await that never returns: the reviewer's send(get_targets()) with no timeout."""
+    _HUNG["in"] = True
+    await asyncio.get_running_loop().create_future()
+
+
+async def _until_hung():
+    for _ in range(500):
+        if _HUNG.pop("in", False):
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("the launch never reached the await that hangs")
+
+
+def test_browser_recover_cancels_a_launch_hung_on_an_await_that_never_returns(owner, monkeypatch):
+    """No cancel from the test: the recover asks the launch to stop, waits, then cancels it. The
+    launch answers that it was cancelled, its cancel path stops its browser and removes its
+    privacy profile, and the mark is gone, so the session is not refused any more."""
+    monkeypatch.setattr(server, "_RECOVER_LAUNCH_WAIT", 1.0)  # the cancel path removes a folder
+    monkeypatch.setattr(server, "_first_live_tab", _never)
+    stopped = []
+
+    async def safe_stop(browser):
+        stopped.append(browser)
+
+    monkeypatch.setattr(server, "_safe_stop_browser", safe_stop)
+
+    async def run():
+        launch = asyncio.ensure_future(_launch_with(owner))
+        await _until_hung()
+        said = await _call("browser_recover", {})
+        out = await asyncio.wait_for(launch, 5)
+        return said, out, _no_mark(), await _call("switch_instance", {"instance_id": "other"})
+
+    said, out, no_mark, switched = asyncio.run(run())
+    assert "was still running: asked to stop, it was still waiting after 1 s and was cancelled" in said, said
+    assert out == ("Error: browser_launch of instance 'main' did not finish: browser_recover asked it to stop, "
+                   "and it was cancelled at the step it was waiting on. Its browser was asked to stop; that it "
+                   "ended was not checked."), out
+    assert no_mark, "the cancelled launch kept its mark"
+    assert "switched to 'other'" in switched, switched
+    assert stopped == owner.started and _privacy_folders(owner) == []
+    server.BrowserState.switch_to("main")
+
+
+def test_a_launch_that_ignores_the_cancel_no_longer_holds_the_instance(owner, monkeypatch):
+    """A launch that swallows the cancel and keeps waiting: the recover says it had not ended, and
+    its mark refuses nothing (a switch goes through). When it wakes it is cut short and touches
+    nothing of the instance switched in."""
+    monkeypatch.setattr(server, "_RECOVER_LAUNCH_WAIT", 0.2)
+    release = {}
+
+    async def deaf(_browser):
+        release["event"] = asyncio.Event()
+        _HUNG["in"] = True
+        while not release["event"].is_set():
+            with contextlib.suppress(asyncio.CancelledError):
+                await release["event"].wait()
+        raise RuntimeError("woke up after the recover")
+
+    monkeypatch.setattr(server, "_first_live_tab", deaf)
+
+    async def run():
+        launch = asyncio.ensure_future(_launch_with(owner))
+        await _until_hung()
+        said = await _call("browser_recover", {})
+        switched = await _call("switch_instance", {"instance_id": "other"})
+        pending = not launch.done()
+        release["event"].set()
+        return said, switched, pending, await asyncio.wait_for(launch, 5)
+
+    said, switched, pending, out = asyncio.run(run())
+    assert "asked to stop and cancelled, it had still not ended 0.2 s later" in said, said
+    assert pending and "switched to 'other'" in switched, switched
+    assert out.startswith("Error: initial nav failed: woke up after the recover") and _RECOVERED in out, out
+    current = server.BrowserState
+    assert current.current_instance_id == "other" and current.browser is owner.other_browser
+    assert [b for b, _p in owner.closes] == owner.started
+    server.BrowserState.switch_to("main")
 
 
 def test_a_mark_whose_task_is_done_refuses_nothing(owner):

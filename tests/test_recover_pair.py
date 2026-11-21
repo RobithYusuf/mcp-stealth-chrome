@@ -131,18 +131,20 @@ def test_a_switch_while_browser_recover_waits_leaves_the_instance_switched_in_al
     server.BrowserState.switch_to("main")
 
 
-def test_a_handle_a_cut_short_launch_kept_while_browser_recover_waits_is_not_dropped(owner, stale_pid, monkeypatch):
+def test_a_handle_a_cut_short_launch_kept_while_browser_recover_waits_is_not_dropped(owner, monkeypatch):
     """The edge named in A6: a recover begins while a launch's browser is started but not yet
-    the instance's; during the recover's own await the launch, cut short, cannot end that
-    browser and keeps a handle on the instance the recover found empty. The recover's reset
-    then dropped the only handle on a live Chrome. Now it resets nothing and says so."""
+    the instance's (it finds the instance empty) and waits for the launch it asked to stop. The
+    launch, cut short, cannot end that browser and keeps a handle on the empty instance. The
+    recover's reset then dropped the only handle on a live Chrome. Now it resets nothing and
+    says so."""
+    from test_launch_owner import _Recover
     owner.close_report = dict(_ALIVE)
     real_start = server._start_chrome
-    recover = {}
+    recover = _Recover()
 
     async def start(config):
         browser = await real_start(config)
-        recover["task"] = await _recover_in_the_background(stale_pid)
+        await recover.start()
         return browser
 
     monkeypatch.setattr(server, "_start_chrome", start)
@@ -150,7 +152,7 @@ def test_a_handle_a_cut_short_launch_kept_while_browser_recover_waits_is_not_dro
     async def run():
         fn = server.mcp._tool_manager._tools["browser_launch"].fn
         out = await fn(auto_verify=False, headless=True, privacy=True)
-        return out, await recover["task"]
+        return out, await recover.said()
 
     out, recovered = asyncio.run(run())
     assert _RECOVERED in out and "its handle and profile were kept: call browser_close to try again" in out, out

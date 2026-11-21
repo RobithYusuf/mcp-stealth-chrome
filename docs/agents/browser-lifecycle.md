@@ -162,16 +162,29 @@ Part of the agent guide: [AGENTS.md](../../AGENTS.md) says when to read this. It
   `restore_from`, `release_instance`) and fails on one that is neither in `_REFUSED_DURING_LAUNCH` nor in
   `_ALLOWED_DURING_LAUNCH` with its reason. A new such tool goes into one of the two. None of them may become
   a workflow tool: `batch_actions` and `workflow_run` call tools without the gates.
-- `browser_recover` is never refused: it is the way out of a stuck state, and a launch hung on an await
-  nobody bounded would otherwise leave the session no exit but a restart. It does what it did (stops the
-  current browser, signals its profile's PIDs, resets), marks the launch (`ended_by`) before it stops or
-  resets anything, and its result says the launch was still running. After every await `browser_launch` looks
+- `browser_recover` is never refused by the launch gate or the closing wait: it is the way out of a stuck
+  state, and a launch hung on an await nobody bounded would otherwise leave the session no exit but a
+  restart. The overlay's gate still refuses it while the person holds the browser (Take over), on purpose:
+  that browser is theirs, and recover also leaves a browser the person opened from the launcher alone while
+  it answers. It does what it did (stops the current browser, signals its profile's PIDs, resets), and first
+  marks the launch (`ended_by`) before it stops or resets anything. After every await `browser_launch` looks
   (`_launch_settle`): a launch cut short ends as an error naming `browser_recover`, ends the browser it
   started or took over through `_ensure_browser_dead`, once, removes its privacy profile, and records
   nothing more: no handle for a browser that ended, no tabs, no watcher, no keep_alive record. An error the
   step had already reached stays first; a success it reached does not count. The start does not begin once
-  the launch is cut short. A browser that could not be ended keeps a handle on the instance the recover
-  emptied, naming its profile, as every close path keeps one.
+  the launch is cut short. A browser that could not be ended keeps a handle on its instance, naming its
+  profile, as every close path keeps one. Known limit: a recover that began on that same browser then
+  resets it, as it resets any browser it could not end, after signalling that browser's PIDs.
+- A launch hung on an await that never returns never reaches its next look. So the recover gives the
+  launch it marked `_RECOVER_LAUNCH_WAIT` (2 s) to end by itself, then cancels its task and waits as long
+  again; its result says which. The cancel paths stop the launch's browser (`_launch_cancelled`: stop()
+  without a verified end, the instance reset only while it holds that browser, the privacy profile
+  removed), and the launch answers that it was cancelled. The launch runs in a task of its own
+  (`_launch_run`), not the request's: FastMCP runs a session's requests in one anyio task group, and a task
+  cancelled from outside the group cancels its siblings (measured: the recover's own call was cancelled
+  too). A client's cancel of the launch still reaches that task. A mark whose task was cancelled counts as
+  absent even while the task has not ended, so the session is not refused after the recover; a launch lock
+  such a task holds stays held until it ends, and the recover says so.
 - `browser_recover` waits for nothing that can be stuck: it skips the wait for a close of the current
   instance (`_app.RUNS_DURING_A_CLOSE`, with `server_status`, which only reads; every other tool still
   waits). A close that never ended answered every call "still being closed ... or browser_recover if it never

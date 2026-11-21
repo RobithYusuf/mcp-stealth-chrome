@@ -11,6 +11,7 @@ import asyncio
 from collections import Counter
 import base64
 import contextlib
+import contextvars
 import fnmatch
 import json
 import os
@@ -816,14 +817,22 @@ _SPAWNING: dict[str, str] = {}
 class _Launching:
     """A browser_launch under way in a session: the instance it launches and the task running it.
     browser_recover sets `ended_by`, and the launch then ends as an error that records nothing
-    more."""
+    more; should it not end by itself, recover cancels the task (`cancelled`)."""
     instance_id: str
     task: Any
     ended_by: str = ""
+    cancelled: bool = False
+    plan: Any = None  # the launch's _LaunchPlan, once it has one
 
 
 # session -> the browser_launch under way there; read through _launching().
 _LAUNCHING: dict[str, _Launching] = {}
+# The launch the running task carries out (set in _launch_run), so a step deep in it can ask
+# whether its own launch was cut short; another task that copied this context is not it.
+_THIS_LAUNCH: contextvars.ContextVar = contextvars.ContextVar("mcp_this_launch", default=None)
+# How long browser_recover waits for a launch it asked to stop to end by itself, and again
+# after cancelling one that did not.
+_RECOVER_LAUNCH_WAIT = float(os.environ.get("MCP_STEALTH_RECOVER_LAUNCH_WAIT", "2"))
 
 # A launch awaits between its steps, and a call that changed the current instance or its
 # browser meanwhile had the launch's later steps, and its cleanup, act on another instance.
@@ -849,18 +858,20 @@ _ALLOWED_DURING_LAUNCH = {
 
 def _launching() -> Optional[_Launching]:
     """The browser_launch under way in the calling session, or None. One whose task is done
-    counts as absent, so a marker that was somehow left behind refuses nothing."""
+    counts as absent, so a marker that was somehow left behind refuses nothing; so does one
+    browser_recover cancelled that has not ended yet, or a launch hung on an await that ignores
+    the cancel would keep the session refused after the recover."""
     entry = _LAUNCHING.get(BrowserState.session_key())
-    if entry is None or entry.task is None or entry.task.done():
+    if entry is None or entry.task is None or entry.task.done() or entry.cancelled:
         return None
     return entry
 
 
 def _launch_cut_reason() -> str:
-    """Why the browser_launch running in this very task was cut short (browser_recover reset its
-    instance), or "". A reattach asks before it takes a kept browser over, so a launch that was
+    """Why the browser_launch running in this very task was cut short (browser_recover asked it
+    to stop), or "". A reattach asks before it takes a kept browser over, so a launch that was
     cut short gives that browser back as it was instead of recording it."""
-    entry = _launching()
+    entry = _THIS_LAUNCH.get()
     if entry is None or entry.task is not asyncio.current_task() or not entry.ended_by:
         return ""
     # Who cut it short is said once, by the launch's own result (_launch_settle).
@@ -4189,6 +4200,7 @@ class _LaunchPlan:
     browser: Any = None  # browser_launch, from _launch_start_chrome; _launch_by_reattach
     adopted: bool = False  # _launch_ready_browser made it BrowserState.browser
     ended: bool = False  # _launch_end_started_browser ran: no later step ends the browser again
+    cancel_note: str = ""  # _launch_cancelled: the privacy profile it could not remove
 
 
 def _launch_check_arguments(browser: str, vertical_tabs: Optional[str], user_data_dir: Optional[str],
@@ -4868,12 +4880,25 @@ async def _launch_end_started_browser(req: _LaunchRequest, plan: _LaunchPlan) ->
 async def _launch_cancelled(plan: _LaunchPlan) -> None:
     """A launch cancelled past the start: its own browser is stopped (a cancel cannot wait for a
     verified end), the instance reset only while it still holds that browser, and the privacy
-    profile removed."""
+    profile removed (plan.cancel_note says when it could not be)."""
+    plan.ended = True
     await _safe_stop_browser(plan.browser)
     if (BrowserState.current_instance_id == plan.launching.instance_id
             and BrowserState.browser is plan.browser):
         BrowserState.reset()
-    await _remove_privacy_profile(plan.privacy_profile)
+    if not await _remove_privacy_profile(plan.privacy_profile):
+        plan.cancel_note = (f" Its privacy profile could not be removed: {plan.privacy_profile}"
+                            f"{_removal_failure(plan.privacy_profile)}.")
+
+
+def _launch_recover_cancelled(launching: _Launching) -> str:
+    """The result of a launch browser_recover cancelled: it had not ended by itself when asked."""
+    plan = launching.plan
+    text = (f"browser_launch of instance {launching.instance_id!r} did not finish: browser_recover "
+            f"asked it to stop, and it was cancelled at the step it was waiting on.")
+    if plan is not None and plan.browser is not None:
+        text += " Its browser was asked to stop; that it ended was not checked."
+    return err(text + (plan.cancel_note if plan is not None else ""))
 
 
 def _launch_end_note(reap: dict, recorded: bool) -> str:
@@ -5287,11 +5312,35 @@ async def browser_launch(
     # cancel too). While it is set, _launch_gate refuses what would change this instance or its
     # browser, and the sweeps leave the instance alone. Only browser_recover may still end it:
     # after every await _launch_settle looks, and a launch cut short records nothing more.
-    launching = _Launching(BrowserState.current_instance_id, asyncio.current_task())
+    launching = _Launching(BrowserState.current_instance_id, None)
     if _launching() is not None:
         return err("another launch is already in progress — wait for it to finish")
     session = BrowserState.session_key()
+    # The launch runs in a task of its own, which browser_recover cancels when the launch hangs
+    # on an await that never returns. Not this call's own task: FastMCP runs a session's
+    # requests in one anyio task group, and a task cancelled from outside the group cancels its
+    # siblings, browser_recover's own call among them. A client's cancel of this call still
+    # reaches the launch (awaiting a task passes a cancel on to it).
+    run = asyncio.ensure_future(_launch_run(req, launching, session, persistent))
+    launching.task = run
     _LAUNCHING[session] = launching
+    try:
+        return await run
+    except asyncio.CancelledError:
+        if not (launching.cancelled and run.cancelled() and asyncio.current_task().cancelling() == 0):
+            raise
+        return _launch_recover_cancelled(launching)
+    finally:
+        if _LAUNCHING.get(session) is launching and run.done():
+            del _LAUNCHING[session]
+
+
+async def _launch_run(req: _LaunchRequest, launching: _Launching, session: str, persistent: Any) -> str:
+    """browser_launch's steps, in their own task (see browser_launch). After every await
+    _launch_settle looks whether the launch still holds its instance. A cancel ends the browser
+    it started (_launch_cancelled) and goes on up; the mark is released however it ends."""
+    _THIS_LAUNCH.set(launching)
+    plan: Optional[_LaunchPlan] = None
     try:
         # No early "already running" return here. It short-circuited the reuse path
         # below — the one that probes CDP and honours the caller's url — so a launch
@@ -5304,8 +5353,8 @@ async def browser_launch(
         if _LAUNCH_LOCK.locked():
             return err("another launch is already in progress — wait for it to finish")
 
-        _reserved = _launch_reservation(BrowserState.current_instance_id, product, persistent=bool(persistent),
-                                        privacy=privacy, explicit=user_data_dir, extra_args=extra_args)
+        _reserved = _launch_reservation(BrowserState.current_instance_id, req.product, persistent=bool(persistent),
+                                        privacy=req.privacy, explicit=req.user_data_dir, extra_args=req.extra_args)
         async with _LAUNCH_LOCK, launch_lock.reserve(_reserved, BROWSER_LAUNCH_TIMEOUT) as _busy:
             if (stop := await _launch_settle(req, None, launching, err(_busy) if _busy else None)) is not None:
                 return stop
@@ -5315,14 +5364,14 @@ async def browser_launch(
 
             ensure_dirs()
 
-            plan = _LaunchPlan(persistent=persistent, merged_extra_args=list(extra_args or []),
-                               launching=launching)
+            plan = launching.plan = _LaunchPlan(persistent=persistent, merged_extra_args=list(req.extra_args or []),
+                                                launching=launching)
             if (stop := _launch_privacy_and_identity(req, plan)) is not None:
                 return stop
             # The launch choice and every refusal come before anything writes to the profile.
             # If the user passed user_data_dir explicitly, that takes precedence over
             # both `persistent` and any --user-data-dir already in extra_args.
-            if user_data_dir:
+            if req.user_data_dir:
                 stop = await _launch_explicit_profile(req, plan)
             else:
                 stop = await _launch_kept_browser(req, plan)
@@ -5335,8 +5384,8 @@ async def browser_launch(
                     resolved_profile, profile_info = _resolve_launch_profile(
                         launching.instance_id,
                         persistent=bool(plan.persistent),
-                        profile_conflict=profile_conflict,
-                        browser=product,
+                        profile_conflict=req.profile_conflict,
+                        browser=req.product,
                     )
                     stop = _launch_server_profile(req, plan, resolved_profile, profile_info)
             if (stop := await _launch_settle(req, plan, launching, stop)) is not None:
@@ -5391,6 +5440,11 @@ async def browser_launch(
             return _launch_result(req, plan, observed, suffix=suffix, verify_suffix=verify_suffix,
                                   health_suffix=health_suffix, place_suffix=place_suffix,
                                   restore_suffix=restore_suffix)
+    except asyncio.CancelledError:
+        # A phase with no cancel path of its own: the browser it started still goes.
+        if plan is not None and plan.browser is not None and not plan.ended:
+            await _launch_cancelled(plan)
+        raise
     finally:
         if _LAUNCHING.get(session) is launching:
             del _LAUNCHING[session]
@@ -5505,6 +5559,30 @@ async def _browser_close_now(forget_tabs: bool) -> str:
               else f"{head}.{_kill_note(_kill)}{tabs_note}")
 
 
+async def _recover_stops_launch(launching: _Launching) -> str:
+    """browser_recover's step for a launch of its instance still running, once marked to stop.
+    It is given _RECOVER_LAUNCH_WAIT to end by itself (its next look cuts it short and ends its
+    browser with a verified end); one still running then, hung on an await that never returns,
+    is cancelled (its cancel path stops its browser) and given the same time again. One that
+    has still not ended no longer holds the instance (_launching), and the step says so."""
+    head = f"browser_launch of instance {launching.instance_id!r} was still running"
+    task = launching.task
+    if task is None or task.done() or task is asyncio.current_task():
+        return f"{head}: asked to stop"
+    await asyncio.wait({task}, timeout=_RECOVER_LAUNCH_WAIT)
+    if task.done():
+        return f"{head}: asked to stop, it ended as an error that records nothing more"
+    launching.cancelled = True
+    task.cancel()
+    await asyncio.wait({task}, timeout=_RECOVER_LAUNCH_WAIT)
+    if task.done():
+        return (f"{head}: asked to stop, it was still waiting after {_RECOVER_LAUNCH_WAIT:g} s and was "
+                f"cancelled; its browser was asked to stop")
+    return (f"{head}: asked to stop and cancelled, it had still not ended {_RECOVER_LAUNCH_WAIT:g} s "
+            f"later. Instance {launching.instance_id!r} is no longer held for it, so other tools are "
+            f"not refused; a launch lock it holds stays held until it ends")
+
+
 @mcp.tool()
 async def browser_recover() -> str:
     """Force-recover from a stuck browser state.
@@ -5550,8 +5628,7 @@ async def browser_recover() -> str:
     launching = _launching()
     if launching is not None and launching.instance_id == target_iid:
         launching.ended_by = "browser_recover"
-        steps.append(f"browser_launch of instance {launching.instance_id!r} was still running: it "
-                     f"ends as an error and records nothing more")
+        steps.append(await _recover_stops_launch(launching))
 
     # 1. Best-effort stop. The profile dir was taken above, so step 2 can
     #    target only Chrome PIDs that belong to this profile.
