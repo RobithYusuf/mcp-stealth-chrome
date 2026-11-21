@@ -725,7 +725,12 @@ def test_reuse_preserves_the_new_tabs_outcome(monkeypatch, tab_result):
         return tab_result
     monkeypatch.setattr(nav, 'tab_new', opened)
     out = asyncio.run(server._reuse_without_an_agent_tab('not ours', FIELD_URL, None, None, None))
-    assert out.startswith(tab_result) and 'could not be opened' not in out
+    if tab_result.startswith('Error: antibot_paused:'):
+        assert out.startswith('Error: antibot_paused: browser is running and stays open; ')
+        assert 'tab_new reached a verification page' in out
+    else:
+        assert "Opened tab [2]" in out and "could not be opened" not in out
+    assert 'could not be opened' not in out
 
 
 def test_fallback_launch_pause_keeps_profile_warning(page):
