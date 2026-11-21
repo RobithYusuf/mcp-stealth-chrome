@@ -304,24 +304,23 @@ def test_checks_takeover_before_tripwire_checkpoint(monkeypatch, runner):
                       if runner == "batch" else workflow_run([{"tool": "navigate", "args": {"url": "https://example.test"}}]))
     assert "the person took over" in out
     assert checks == []
-def test_workflow_rejects_disallowed_step_before_checkpoint(monkeypatch):
+
+
+def test_workflow_rejects_disallowed_step_before_checkpoint(monkeypatch, page):
     from mcp_stealth_chrome.tools.action_kit import workflow_run
-    checks = []
+    tab = page("https://example.test/", overlay=True)
+    bar = presence._handle(tab.browser)
 
-    async def checkpoint(*_args):
-        checks.append("read")
-        return None
+    async def take_over():
+        bar.control_file.write_text(json.dumps({"holder": "person"}))
+        return tab.url
 
-    async def refusal(*_args):
-        return "Error: the person took over"
-
-    monkeypatch.setattr(server, "_WORKFLOW_TOOLS", {"get_url": lambda **_: "ok"})
-    monkeypatch.setattr(server, "_inner_arguments_error", lambda *_args: None)
-    monkeypatch.setattr(batch.presence, "refusal", refusal)
-    monkeypatch.setattr(server, "_tripwire_step", checkpoint)
-    out = asyncio.run(workflow_run([{"tool": "server_status", "args": {}}]))
+    monkeypatch.setattr(server, "_register_workflow_tools", lambda: None)
+    monkeypatch.setattr(server, "_WORKFLOW_TOOLS", {"get_url": take_over})
+    out = asyncio.run(workflow_run([{"tool": "get_url"}, {"tool": "server_status"}]))
     assert "unknown or non-allowlisted tool: server_status" in out
-    assert checks == []
+    assert presence.holds(tab.browser)
+    assert tab.probes == 1  # Only the first step, before Take over.
 
 
 def test_late_text_probe_rechecks_takeover(monkeypatch, page):
