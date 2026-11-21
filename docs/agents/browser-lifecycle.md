@@ -34,8 +34,10 @@ Part of the agent guide: [AGENTS.md](../../AGENTS.md) says when to read this. It
   still clears Chrome's own copy, the cure for the corrupt-placement invisible-window bug.
 - A `browser_launch` refused after it made its privacy profile removes that profile on every path, the last
   `_cookie_preflight` before the start included (it returned and left the folder; `test_launch_cleanup.py`).
-  After the start it goes only once the browser is verified gone: a cookie move left unfinished whose browser
-  could not be ended keeps the handle, naming the profile, so `browser_close` or the next launch ends it first.
+  After the start it goes only once the browser is verified gone. A failed storage_state or first page ends the
+  browser through `_ensure_browser_dead` (`_launch_end_started_browser`), not `stop()` alone; one that could not
+  be ended (there, or after a cookie move left unfinished) keeps the handle, naming the profile, so
+  `browser_close` or the next launch ends it first, and the result says so. A cancelled launch still uses `stop()`.
 
 ## Closing: never report a close that did not happen
 

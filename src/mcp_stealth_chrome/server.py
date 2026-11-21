@@ -4654,6 +4654,22 @@ async def _launch_start_chrome(req: _LaunchRequest, plan: _LaunchPlan) -> tuple:
     return None, browser, ads_pending
 
 
+async def _launch_end_started_browser(req: _LaunchRequest, plan: _LaunchPlan) -> str:
+    """A launch that failed after the start ends its browser as every close path does
+    (`_ensure_browser_dead`: stop() can return while Chrome runs on) and removes the privacy
+    profile once that browser is verified gone; returns "". A browser that could not be ended
+    keeps its handle, naming its profile so browser_close or the next launch ends it, and the
+    returned note says so for the result."""
+    reap = await _ensure_browser_dead(BrowserState.browser, plan.profile_path)
+    if _close_incomplete(reap):
+        BrowserState.current_profile_dir, BrowserState.current_privacy = plan.profile_path, req.privacy
+        return (f" The browser could not be ended ({_close_failure(reap)}); its handle and profile "
+                f"were kept: browser_close ends it.")
+    BrowserState.reset()
+    await _remove_privacy_profile(plan.privacy_profile)
+    return ""
+
+
 async def _launch_ready_browser(req: _LaunchRequest, plan: _LaunchPlan, browser: Any,
                                 ads_pending: Any) -> Optional[str]:
     """The started browser becomes this instance's, and what must be in place before its first
@@ -4691,10 +4707,8 @@ async def _launch_ready_browser(req: _LaunchRequest, plan: _LaunchPlan, browser:
             await _remove_privacy_profile(plan.privacy_profile)
             raise
         except Exception as e:
-            await _safe_stop_browser(BrowserState.browser)
-            BrowserState.reset()
-            await _remove_privacy_profile(plan.privacy_profile)
-            return err(f"storage_state load failed: {e}")
+            ended = await _launch_end_started_browser(req, plan)
+            return err(f"storage_state load failed: {e}{ended}")
     return None
 
 
@@ -4702,7 +4716,7 @@ async def _launch_first_page(req: _LaunchRequest, plan: _LaunchPlan) -> tuple:
     """The identity goes on the first tab, and the caller's url loads there.
 
     Returns (error result or None, the tab, what the load observed). On an error the browser
-    was stopped and the privacy profile removed."""
+    was ended and the privacy profile removed, or the result says why they were kept."""
     try:
         await asyncio.sleep(0.5)
         main = await _first_live_tab(BrowserState.browser)
@@ -4721,12 +4735,10 @@ async def _launch_first_page(req: _LaunchRequest, plan: _LaunchPlan) -> tuple:
         finally:
             _disarm()
     except asyncio.TimeoutError:
-        await _safe_stop_browser(BrowserState.browser)
-        BrowserState.reset()
-        await _remove_privacy_profile(plan.privacy_profile)
+        ended = await _launch_end_started_browser(req, plan)
         return err(
             f"initial nav timed out after {BROWSER_NAV_TIMEOUT}s — Chrome "
-            f"started but couldn't load {req.url}. Check network/proxy."
+            f"started but couldn't load {req.url}. Check network/proxy.{ended}"
         ), None, None
     except asyncio.CancelledError:
         await _safe_stop_browser(BrowserState.browser)
@@ -4734,10 +4746,8 @@ async def _launch_first_page(req: _LaunchRequest, plan: _LaunchPlan) -> tuple:
         await _remove_privacy_profile(plan.privacy_profile)
         raise
     except Exception as e:
-        await _safe_stop_browser(BrowserState.browser)
-        BrowserState.reset()
-        await _remove_privacy_profile(plan.privacy_profile)
-        return err(f"initial nav failed: {e}"), None, None
+        ended = await _launch_end_started_browser(req, plan)
+        return err(f"initial nav failed: {e}{ended}"), None, None
     return None, main, _launch_observed
 
 

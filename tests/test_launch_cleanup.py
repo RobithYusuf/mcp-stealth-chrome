@@ -121,3 +121,61 @@ def test_a_browser_left_running_by_an_unfinished_move_keeps_its_privacy_profile_
     assert server.BrowserState.browser is env.started[0], "the only handle on a live Chrome was dropped"
     assert server.BrowserState.current_profile_dir == folders[0] and server.BrowserState.current_privacy, \
         "the kept handle does not name its profile, so nothing would remove it"
+
+
+class _TabThatCannotLoad:
+    target = SimpleNamespace(target_id="t1")
+    browser = None
+
+    def __init__(self, exc):
+        self.exc = exc
+
+    async def get(self, *_a, **_kw):
+        raise self.exc
+
+    async def evaluate(self, *_a, **_kw):
+        return "complete"
+
+    async def send(self, *_a, **_kw):
+        return None
+
+
+def _fail_after_the_start(monkeypatch, where):
+    """Make the launch fail after Chrome started; returns the text the result must carry."""
+    if where == "storage_state":
+        async def broken(_browser, _path):
+            raise ValueError("no cookies key in the file")
+        monkeypatch.setattr(server, "_apply_storage_state", broken)
+        return "storage_state load failed: no cookies key in the file"
+    exc = asyncio.TimeoutError() if where == "navigation timeout" else RuntimeError("net::ERR_NAME_NOT_RESOLVED")
+
+    async def first_tab(_browser):
+        return _TabThatCannotLoad(exc)
+
+    monkeypatch.setattr(server, "_first_live_tab", first_tab)
+    return ("initial nav timed out after" if where == "navigation timeout"
+            else "initial nav failed: net::ERR_NAME_NOT_RESOLVED")
+
+
+@pytest.mark.parametrize("where", ["storage_state", "navigation", "navigation timeout"])
+def test_a_launch_that_fails_after_the_start_ends_its_browser_as_every_close_does(env, monkeypatch, where):
+    """_ensure_browser_dead, not stop() alone: stop() can return while Chrome keeps running."""
+    said = _fail_after_the_start(monkeypatch, where)
+    out = _launch(privacy=True, storage_state_path="/nowhere/state.json" if where == "storage_state" else None)
+    assert said in out and "could not be ended" not in out, out
+    assert [b for b, _p in env.closes] == env.started, "the browser was not ended through _ensure_browser_dead"
+    assert env.closes[0][1].parent == env.privacy_root, env.closes
+    assert server.BrowserState.browser is None
+    assert _privacy_folders(env) == []
+
+
+@pytest.mark.parametrize("where", ["storage_state", "navigation"])
+def test_a_browser_that_could_not_be_ended_after_a_failed_start_is_kept_and_said(env, monkeypatch, where):
+    said = _fail_after_the_start(monkeypatch, where)
+    env.close_report = dict(_ALIVE)
+    out = _launch(privacy=True, storage_state_path="/nowhere/state.json" if where == "storage_state" else None)
+    assert said in out and "could not be ended" in out and "4321" in out, out
+    folders = _privacy_folders(env)
+    assert len(folders) == 1, "a privacy profile was deleted under a Chrome still running"
+    assert server.BrowserState.browser is env.started[0], "the only handle on a live Chrome was dropped"
+    assert server.BrowserState.current_profile_dir == folders[0] and server.BrowserState.current_privacy
