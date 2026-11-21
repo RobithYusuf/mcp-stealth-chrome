@@ -100,6 +100,9 @@ conclusions. Each rule below replaced a real lie.
 - `fill_form` fails when a field fails, and then does not click submit. `batch_actions` counts failures by the `Error:`
   prefix, so a failure reported through `ok()` counts as success. Non-list or empty input is an error, not
   `0 actions OK`; a non-object item is a counted failure.
+- A cut preview says it was cut. A `workflow_run` step's `result` was `text[:500]` with no mark, often mid-key
+  (`redirect_c`), and read as the whole result. `workflow._preview` ends a longer one at the last line break or `, `
+  in the final 80 characters (else at 500) and appends ` ... [+N chars; ...]`; a short result is unchanged.
 - `server_status` measures `os_cursor` on a thread started with the server and says `still being measured`
   (`available: null`) until done: a cold Quartz and AppKit import takes seconds while profile_gc and the Dock check run,
   and a timed wait answered `not measured (TimeoutError)` on the first call.

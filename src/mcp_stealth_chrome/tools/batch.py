@@ -22,7 +22,8 @@ async def batch_actions(actions: list[dict]) -> str:
 
     Each action: {type: click|fill|type|wait|press|navigate, ...params}, or the name
     of any workflow_run tool with its arguments alongside, such as
-    {"type": "select_option", "selector": "#c", "value": "x"}.
+    {"type": "select_option", "selector": "#c", "value": "x"}, or
+    {"type": "sleep", "seconds": 2} ({"min": 6, "max": 11} pauses a random time in that range, at most 300 s).
     The six short names (click, fill, type, press, wait, navigate) pass every other key on
     to their tool, and a key the tool does not take fails that action by name.
     Add "stop_on_error": true to an action to stop there if it fails.
