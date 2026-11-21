@@ -352,7 +352,8 @@ def test_without_an_overlay_a_change_that_holds_counts_after_the_grace(handoff, 
     result = wait(timeout=30)
     assert result.startswith("page changed after"), result
     assert f"the URL went from {QR!r} to {HOME!r}" in result, result
-    assert f"held {nav.HANDOFF_SETTLE:g}s" in result and "weak evidence" in result
+    assert f", and it held {nav.HANDOFF_SETTLE:g}s" in result and "weak evidence" in result
+    assert "the content did not" not in result  # the whole page held
     assert "can be the page itself" in result and "completed" not in result
     assert clock.elapsed() >= 7 + nav.HANDOFF_SETTLE
     # The request stays, and the next wait measures from the page as reported.
@@ -373,6 +374,8 @@ def test_a_new_url_counts_once_it_held_though_its_content_still_moves(handoff, c
     result = wait(timeout=30)
     assert result.startswith("page changed after"), result
     assert f"the URL went from {LOGIN!r} to {HOME!r}" in result, result
+    assert "the URL held 2s but the content did not (it kept changing)" in result, result
+    assert "and it held" not in result
     assert clock.elapsed() < 7 + nav.HANDOFF_SETTLE + 1
 
 

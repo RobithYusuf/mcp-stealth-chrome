@@ -272,14 +272,17 @@ def _page_key(sig: dict) -> tuple:
 class _ChangeWatch:
     """wait_for_human's page-change rule, used when nothing stronger can answer. Until
     `grace_until` the baseline follows the page. After it, a page that differs from the baseline
-    counts once it stayed the same for HANDOFF_SETTLE: its URL when that changed (a page that
-    loaded goes on drawing), else its content."""
+    counts once it stayed the same for HANDOFF_SETTLE: its URL when that changed (a page the
+    person reached may go on drawing, a feed or a clock, and would otherwise never count), else
+    its content. `content_moved` says the content did not hold while the URL did, and the result
+    says so: only the URL held then."""
 
     def __init__(self, baseline: Optional[dict], grace_until: float):
         self.baseline = baseline or None
         self.grace_until = grace_until
         self.current: dict = {}
-        self.pending: Optional[tuple] = None  # (what has to hold, since when)
+        self.pending: Optional[tuple] = None  # (what has to hold, since when, the page then)
+        self.content_moved = False
         self.read_once = False
         self.differed_at_first_read = False
 
@@ -298,7 +301,9 @@ class _ChangeWatch:
         held = (("url", sig.get("url")) if sig.get("url") != self.baseline.get("url")
                 else ("content",) + _page_key(sig))
         if self.pending is None or self.pending[0] != held:
-            self.pending = (held, now)
+            self.pending, self.content_moved = (held, now, _page_key(sig)), False
+        elif _page_key(sig) != self.pending[2]:
+            self.content_moved = True
         self.current = sig
         return now - self.pending[1] >= HANDOFF_SETTLE
 
@@ -331,9 +336,10 @@ def _weak_change(request: dict, watch: _ChangeWatch, elapsed: float, unasked: st
     else:
         what = (f"the page's content changed at {after.get('url')!r} (elements {before.get('nodes')} "
                 f"to {after.get('nodes')}, HTML length {before.get('len')} to {after.get('len')})")
-    text = (f"page changed after {elapsed}s, weak evidence only: {what}, and it held "
-            f"{HANDOFF_SETTLE:g}s{unasked}. That can be the page itself (a redirect, a timer, an "
-            "ad), not the person.")
+    held = (f"; the URL held {HANDOFF_SETTLE:g}s but the content did not (it kept changing)"
+            if watch.content_moved else f", and it held {HANDOFF_SETTLE:g}s")
+    text = (f"page changed after {elapsed}s, weak evidence only: {what}{held}{unasked}. That can "
+            "be the page itself (a redirect, a timer, an ad), not the person.")
     if watch.differed_at_first_read:
         text += " It already differed at this wait's first read, so when it changed is not known."
     if bar_ended:

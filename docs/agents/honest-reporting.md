@@ -107,7 +107,8 @@ conclusions. Each rule below replaced a real lie.
   the first mismatched payload, so captures come back empty and look like a quiet page.
 - A page change is weak evidence that a person finished. Without the overlay's Done and without a selector or URL,
   `wait_for_human` counts one only `HANDOFF_GRACE` (5 s) after `request_human_help` or the call, the baseline
-  following the page until then, and once it held `HANDOFF_SETTLE` (2 s). Its result never says completed: it names
+  following the page until then, and once it held `HANDOFF_SETTLE` (2 s): a new URL once the URL held, since a page
+  that keeps drawing would never count, and then the result says the content did not. It never says completed: it names
   what changed (the URL from what to what, or the content's counts), says the page may have done it, and leaves the
   request pending, as a timeout does. Dropping it made the next wait say request_human_help had not been called.
   Only the bar's answer, the selector or the URL close a request.
