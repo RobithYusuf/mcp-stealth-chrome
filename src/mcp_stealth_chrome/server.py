@@ -114,7 +114,8 @@ from .state import (
 # Hard ceiling on `nodriver.start()` — without this a locked profile or hung
 # Chrome subprocess hangs the entire MCP session. Override via env var.
 BROWSER_LAUNCH_TIMEOUT = int(os.environ.get("BROWSER_LAUNCH_TIMEOUT", "45"))
-BROWSER_NAV_TIMEOUT = int(os.environ.get("BROWSER_NAV_TIMEOUT", "20"))
+NAV_COMMIT_TIMEOUT = float(os.environ.get("BROWSER_NAV_TIMEOUT", "30"))
+BROWSER_NAV_TIMEOUT = NAV_COMMIT_TIMEOUT
 # Per-tool CDP action ceiling. Pages with stuck JS / blocked service workers
 # can keep CDP commands waiting indefinitely otherwise — this ensures each
 # tool call either succeeds or returns a clean timeout error within N seconds.
@@ -5315,6 +5316,9 @@ async def browser_launch(
 ) -> str:
     """Launch stealth Chrome via nodriver, on a persistent profile by default.
 
+    The initial navigation commit is bounded by 30 seconds by default without stopping the tab;
+    a timeout reports its observed URL and ready_state. Load completion remains best-effort.
+
     The result names the profile actually used (actual_profile, session_state_source) and what the first load
     observed (final_url, redirect_chain, status, ready_state). After a redirect, read final_url.
 
@@ -6073,6 +6077,7 @@ async def _observe_navigation(
     tab: Tab,
     requested_url: Optional[str],
     doc_state: dict,
+    probe_timeout: float = 5,
 ) -> dict:
     """Read back where the tab ACTUALLY ended up, after the navigation."""
     final_url = ""
@@ -6081,7 +6086,7 @@ async def _observe_navigation(
     try:
         probe = await _wait(
             evaluate_isolated(tab, "JSON.stringify([window.location.href, document.readyState])"),
-            timeout=5,
+            timeout=probe_timeout,
             what="navigation postcondition probe",
         )
         final_url, ready_state = json.loads(probe)
@@ -6171,6 +6176,20 @@ def _nav_result(
         f"{suffix}\n{body}"
     )
 
+def _nav_commit_timeout(action: str, observed: dict) -> str:
+    """Report a navigation whose commit did not answer, without stopping its load."""
+    observed = dict(observed)
+    observed["commit_timeout_seconds"] = NAV_COMMIT_TIMEOUT
+    observed["tab_may_still_be_loading"] = True
+    body = json.dumps(observed, indent=2, default=str)
+    shown_url = repr(observed.get("final_url") or "(unmeasured)")
+    ready = observed.get("ready_state") or "unmeasured"
+    return err(
+        f"{action}: the page did not answer within {NAV_COMMIT_TIMEOUT:g}s; "
+        f"observed URL {shown_url}, ready_state {ready}. The tab may still be "
+        "loading; use wait_for_url or wait_for, or navigate again.\n" + body
+    )
+
 
 # How long navigate waits for the load event. It reports ready_state either way, because a
 # page with one stuck subresource is still a page the caller can use.
@@ -6204,6 +6223,10 @@ async def navigate(
 ) -> str:
     """Navigate the active tab to url. wait_until: load|none.
 
+    The navigation commit is bounded by 30 seconds (the page is not stopped); a timeout says
+    the observed URL and ready_state and that the tab may still be loading. wait_until=load then
+    waits for readyState=complete up to 15 seconds after the commit.
+
     Reports the OBSERVED postconditions: requested_url, final_url, redirect_chain, status, ready_state. After
     a redirect, read final_url.
 
@@ -6228,7 +6251,7 @@ async def navigate(
         await _watch_dialogs(tab)
     doc_state, disarm = await _arm_document_watch(tab)
     try:
-        await tab.get(url)
+        await asyncio.wait_for(tab.get(url), timeout=NAV_COMMIT_TIMEOUT)
         if wait_until != "none":
             await _wait_load_complete(tab, NAV_LOAD_WAIT)
         if focus:
@@ -6251,6 +6274,9 @@ async def navigate(
             "Navigated", observed,
             expect_url=expect_url, expect_status=expect_status, suffix=verify_suffix,
         )
+    except asyncio.TimeoutError:
+        observed = await _observe_navigation(tab, url, disarm())
+        return _nav_commit_timeout("navigate", observed)
     except Exception as e:
         return err(str(e))
     finally:

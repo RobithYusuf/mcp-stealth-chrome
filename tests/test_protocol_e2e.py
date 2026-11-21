@@ -117,6 +117,9 @@ class _Fixture(http.server.SimpleHTTPRequestHandler):
             time.sleep(0.3)
             _Fixture.loads += 1
             return self._reply(200, f"<!doctype html><title>Count</title><p id=n>{_Fixture.loads}</p>".encode())
+        if path == "/hang":
+            time.sleep(40)
+            return self._reply(200, b"late")
         if path == "/img.png":
             return self._reply(200, _png(), "image/png")
         if path == "/slow.png":
@@ -771,6 +774,16 @@ def test_reopening_the_same_url_reads_the_new_document(page, base):
     for reply in (first, second):
         assert '"status": 200' in reply.text and '"ready_state": "complete"' in reply.text, reply.text
     assert second.seconds >= 0.3, second.seconds
+
+def test_navigation_commit_timeout_reports_observation_and_leaves_tab_usable(page, base):
+    reply = page.call("navigate", url=f"{base}/hang", _timeout=40)
+    assert reply.failed, reply.text
+    assert "did not answer within 30s" in reply.text
+    assert "observed URL" in reply.text and "ready_state" in reply.text
+    assert "tab may still be loading" in reply.text
+    recovered = page.call("navigate", url=f"{base}/page2.html", _timeout=20)
+    assert not recovered.failed, recovered.text
+    assert f'"final_url": "{base}/page2.html"' in recovered.text, recovered.text
 
 
 @pytest.mark.skipif(os.environ.get("GITHUB_ACTIONS") == "true", reason=(
