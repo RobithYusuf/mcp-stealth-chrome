@@ -29,6 +29,7 @@ PAUSE_PREFIX = f"Error: {PAUSED}:"
 # and the field run's failed workflow said it four times (8 KB).
 PATH_SHOWN = 120
 QUERY_SHOWN = 48
+URL_MATCH_LENGTH = 8192  # cap input to a person's regex; Python's re has no timeout
 # The workflow steps that look at the page they reach themselves. Before a call's first step the
 # page is not looked at when the step is one of these: it leaves the page.
 NAVIGATION_TOOLS = frozenset({"navigate", "reload", "go_back", "go_forward"})
@@ -148,8 +149,10 @@ def url_verdict(url: Optional[str], rules: Iterable[Rule]) -> Optional[Verdict]:
     lead = ""
     for rule in rules_for(host, rules):
         hits: list = []
+        path_for_match = parts.path[:URL_MATCH_LENGTH]
+        target_for_match = (parts.path + (f"?{parts.query}" if parts.query else ""))[:URL_MATCH_LENGTH]
         for pattern in rule.path:
-            if re.search(pattern, parts.path):
+            if re.search(pattern, path_for_match):
                 hits.append(f"path {cut(parts.path, 60)}")
                 break
         if rule.query:
@@ -159,9 +162,8 @@ def url_verdict(url: Optional[str], rules: Iterable[Rule]) -> Optional[Verdict]:
                 if value is not None:
                     hits.append(f"query {name}={cut(value, 40)}")
         if rule.url:
-            target = parts.path + (f"?{parts.query}" if parts.query else "")
             for pattern in rule.url:
-                if re.search(pattern, target):
+                if re.search(pattern, target_for_match):
                     hits.append(f"url pattern {pattern!r}")
         if hits:
             if not found:

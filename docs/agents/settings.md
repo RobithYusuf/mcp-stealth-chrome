@@ -36,5 +36,4 @@ Part of the agent guide: [AGENTS.md](../../AGENTS.md) says when to read this. It
   wrong (an unknown key, an empty list, a regex that does not compile, more than 50 hosts, 20 patterns a list or 200
   characters a pattern): a rule taken in half would stop runs, or miss pages, in ways nobody asked for. `settings
   list` shows it as "N hosts"; the overlay's menu does not show it.
-- A person's regex runs on every URL of its host and Python's `re` has no time limit: a pattern with nested
-  repetition can be slow on a long URL. That is the person's own rule; nothing checks it for that.
+- A person's regex is matched only against the first 8192 characters of path+query. Python's `re` has no time limit; this bound limits the input cost, but does not make pathological patterns safe on every shorter input.

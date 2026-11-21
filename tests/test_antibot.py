@@ -77,6 +77,19 @@ def test_a_persons_rules_search_path_and_query_never_the_host():
     assert antibot.url_verdict("https://example.com/a?b=verify", rules) is None
     assert antibot.text_words(rules) == {"example.com": ["verify to continue"]}
 
+def test_person_url_regex_input_is_bounded(monkeypatch):
+    seen = []
+    real_search = antibot.re.search
+
+    def search(pattern, target):
+        seen.append(target)
+        return real_search(pattern, target)
+
+    monkeypatch.setattr(antibot.re, "search", search)
+    rules = (antibot.Rule("example.com", url=("^/never",)),)
+    assert antibot.url_verdict("https://example.com/" + "x" * 10000, rules) is None
+    assert seen and max(map(len, seen)) <= antibot.URL_MATCH_LENGTH
+
 
 def test_the_cloudflare_verdict_names_its_marks():
     v = antibot.cloudflare_verdict("https://x.test/a", "its challenge script (_cf_chl_opt)", "challenge")
