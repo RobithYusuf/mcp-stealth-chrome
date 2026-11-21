@@ -3578,9 +3578,10 @@ async def _reattach_claimed(browser: Any, instance_id: str, profile: Path, recor
                     await _wait(_keep_painting_behind(tab), timeout=5, what="focus emulation")
             doc_state, disarm = await _arm_document_watch(tab)
             try:
-                await asyncio.wait_for(tab.get(url), timeout=BROWSER_NAV_TIMEOUT)
-                await _wait_load_complete(tab, 3)
-                observed = await _observe_navigation(tab, url, disarm())
+                observed = await _commit_navigation(tab, url, doc_state)
+                if observed is None:
+                    await _wait_load_complete(tab, 3)
+                    observed = await _observe_navigation(tab, url, disarm())
             finally:
                 disarm()
             tabs.append(tab)
@@ -3740,6 +3741,8 @@ async def _launch_by_reattach(profile: Path, verdict: dict, *, url: str, keep_al
     ads_note += await presence.attach(browser, _browser_process_pid(browser), ask=agent_overlay,
                                 headless=bool(record.get("headless")),
                                 persons_browser=_persons_browser(browser))
+    if "commit_timeout_seconds" in observed:
+        return err(_nav_commit_timeout_message(summary, observed))
     action = "Loaded" if url and url != "about:blank" else "Selected tab shows"
     return _nav_result(f"{summary[0].upper()}{summary[1:]}. {action}", observed,
                        expect_url=expect_url, expect_status=expect_status,
@@ -4386,16 +4389,13 @@ async def _launch_reuse_running(req: _LaunchRequest) -> Optional[str]:
         _doc_state, _disarm = await _arm_document_watch(_tab)
         try:
             if req.url and req.url != "about:blank":
-                # Honour the caller's url. Returning "already running" while
-                # silently ignoring it left them on the wrong page believing
-                # the navigation had happened.
-                await _wait(_tab.get(req.url), what="reuse navigate")
+                timeout = await _commit_navigation(_tab, req.url, _doc_state)
+                if timeout is not None:
+                    return err(_nav_commit_timeout_message(reuse_head, timeout))
                 try:
                     await _wait(_tab.wait(), timeout=10, what="reuse settle")
                 except Exception:
                     pass
-            # The reuse path is a navigation too: its redirects were
-            # exactly as invisible as a fresh launch's.
             _observed = await _observe_navigation(_tab, req.url, _disarm())
         finally:
             _disarm()
@@ -5082,25 +5082,16 @@ async def _launch_first_page(req: _LaunchRequest, plan: _LaunchPlan) -> tuple:
         main = await _first_live_tab(plan.browser)
         await _apply_fingerprint_to_tab(main, plan.effective_fingerprint)
         if req.profile_mode == "light" or req.testing_mode:
-            # The first document after startup still loads images despite the flag;
-            # every later one obeys it.
-            await asyncio.wait_for(main.get("about:blank"), timeout=BROWSER_NAV_TIMEOUT)
+            await asyncio.wait_for(main.get("about:blank"), timeout=NAV_COMMIT_TIMEOUT)
         _doc_state, _disarm = await _arm_document_watch(main)
         try:
-            await asyncio.wait_for(main.get(req.url), timeout=BROWSER_NAV_TIMEOUT)
-            await _wait_load_complete(main, 3)  # best effort; ready_state is reported
-            # Saying "Loaded /admin" after a redirect to /login leaves the caller
-            # reading a page it never asked for, and expect_* went unchecked.
+            timeout = await _commit_navigation(main, req.url, _doc_state)
+            if timeout is not None:
+                return None, main, timeout
+            await _wait_load_complete(main, 3)
             _launch_observed = await _observe_navigation(main, req.url, _disarm())
         finally:
             _disarm()
-    except asyncio.TimeoutError:
-        reap, recorded, removal = await _launch_end_started_browser(req, plan)
-        return err(
-            f"initial nav timed out after {BROWSER_NAV_TIMEOUT}s — Chrome "
-            f"started but couldn't load {req.url}. Check network/proxy."
-            f"{_launch_end_note(reap, recorded)}{removal}"
-        ), None, None
     except asyncio.CancelledError:
         await _launch_cancelled(plan)
         raise
@@ -5539,6 +5530,10 @@ async def _launch_run(req: _LaunchRequest, launching: _Launching, session: str, 
             # recover meanwhile stops the steps that would record more.
             _launch_record_browser(req, plan, started, main)
             suffix = _launch_keep_alive(req, plan, started)
+            if "commit_timeout_seconds" in observed:
+                await _give_focus_back(plan.previous_app)
+                return await _launch_settle(req, plan, launching, err(_nav_commit_timeout_message(
+                    f"Browser is running{suffix}; first page", observed)))
             health_suffix = await _launch_window_health(req, main)
             if (stop := await _launch_settle(req, plan, launching, None)) is not None:
                 return stop
@@ -6176,19 +6171,35 @@ def _nav_result(
         f"{suffix}\n{body}"
     )
 
-def _nav_commit_timeout(action: str, observed: dict) -> str:
-    """Report a navigation whose commit did not answer, without stopping its load."""
+
+async def _commit_navigation(tab, url: str, doc_state: dict) -> Optional[dict]:
+    """Wait for Chrome to commit, not for load. On timeout read the current document only."""
+    try:
+        await asyncio.wait_for(tab.get(url), timeout=NAV_COMMIT_TIMEOUT)
+    except asyncio.TimeoutError:
+        observed = await _observe_navigation(tab, url, doc_state, probe_timeout=0.5)
+        observed["commit_timeout_seconds"] = NAV_COMMIT_TIMEOUT
+        return observed
+    return None
+
+
+def _nav_commit_timeout_message(action: str, observed: dict) -> str:
+    """Describe a commit timeout with observations and no claim that loading stopped."""
     observed = dict(observed)
     observed["commit_timeout_seconds"] = NAV_COMMIT_TIMEOUT
     observed["tab_may_still_be_loading"] = True
     body = json.dumps(observed, indent=2, default=str)
     shown_url = repr(observed.get("final_url") or "(unmeasured)")
     ready = observed.get("ready_state") or "unmeasured"
-    return err(
-        f"{action}: the page did not answer within {NAV_COMMIT_TIMEOUT:g}s; "
-        f"observed URL {shown_url}, ready_state {ready}. The tab may still be "
-        "loading; use wait_for_url or wait_for, or navigate again.\n" + body
+    return (
+        f"{action}: the page did not answer within {NAV_COMMIT_TIMEOUT:g}s; observed URL "
+        f"{shown_url}, ready_state {ready}. The tab may still be loading; use "
+        f"wait_for_url or wait_for, or navigate again.\n{body}"
     )
+
+
+def _nav_commit_timeout(action: str, observed: dict) -> str:
+    return err(_nav_commit_timeout_message(action, observed))
 
 
 # How long navigate waits for the load event. It reports ready_state either way, because a
@@ -6251,7 +6262,9 @@ async def navigate(
         await _watch_dialogs(tab)
     doc_state, disarm = await _arm_document_watch(tab)
     try:
-        await asyncio.wait_for(tab.get(url), timeout=NAV_COMMIT_TIMEOUT)
+        timeout = await _commit_navigation(tab, url, doc_state)
+        if timeout is not None:
+            return _nav_commit_timeout("navigate", timeout)
         if wait_until != "none":
             await _wait_load_complete(tab, NAV_LOAD_WAIT)
         if focus:
@@ -6274,9 +6287,6 @@ async def navigate(
             "Navigated", observed,
             expect_url=expect_url, expect_status=expect_status, suffix=verify_suffix,
         )
-    except asyncio.TimeoutError:
-        observed = await _observe_navigation(tab, url, disarm())
-        return _nav_commit_timeout("navigate", observed)
     except Exception as e:
         return err(str(e))
     finally:

@@ -514,11 +514,11 @@ def test_fill_reports_fields_that_are_not_editable(page):
           '<div id="ce-false" contenteditable="false">STATIC</div>');
         return 1;
     })()""")
-    for selector, name, value in (("#readonly-fill", "readonly", "changed"),
-                                  ("#disabled-fill", "disabled", "changed"),
-                                  ("#ce-false", "contenteditable=false", "changed")):
-        reply = page.call("fill", selector=selector, value=value)
-        assert reply.failed and name in reply.text and "after the attempt" in reply.text, reply.text
+    for selector, name, held in (("#readonly-fill", "readonly", "FIXED-123"),
+                                  ("#disabled-fill", "disabled", "LOCKED"),
+                                  ("#ce-false", "contenteditable=false", "STATIC")):
+        reply = page.call("fill", selector=selector, value="changed")
+        assert reply.failed and name in reply.text and repr(held) in reply.text, reply.text
     assert page.evaluate("document.getElementById('readonly-fill').value") == "FIXED-123"
     assert page.evaluate("document.getElementById('disabled-fill').value") == "LOCKED"
     assert page.evaluate("document.getElementById('ce-false').textContent") == "STATIC"
@@ -784,6 +784,42 @@ def test_navigation_commit_timeout_reports_observation_and_leaves_tab_usable(pag
     recovered = page.call("navigate", url=f"{base}/page2.html", _timeout=20)
     assert not recovered.failed, recovered.text
     assert f'"final_url": "{base}/page2.html"' in recovered.text, recovered.text
+
+
+@pytest.mark.parametrize("path", ["fresh", "reuse", "spawn", pytest.param("reattach", marks=
+                         pytest.mark.skipif(os.name != "posix", reason="keep_alive is POSIX only"))])
+def test_first_page_timeout_keeps_the_browser_usable(base, path, tmp_path):
+    env = {"BROWSER_NAV_TIMEOUT": "1", "TOOL_ACTION_TIMEOUT": "15",
+           "MCP_STEALTH_DATA_DIR": str(tmp_path / "data"), "MCP_STEALTH_KEEP_ALIVE_DIR": str(tmp_path / "keep")}
+    client = Client(env=env)
+    try:
+        if path == "reuse":
+            assert not launch(client, f"{base}/protocol.html").failed
+        url = f"{base}/hang?{path}"
+        args = dict(url=url, headless=True, persistent=False, extra_args=SAFE_ARGS)
+        if path == "reattach":
+            args["persistent"] = True
+            kept = client.call("browser_launch", **{**args, "url": "about:blank"}, keep_alive=True)
+            assert not kept.failed, kept.text
+            client.close()
+            client = Client(env=env)
+        if path == "spawn":
+            reply = client.call("spawn_browser", instance_id="slow", **args, _timeout=15)
+            assert "'slow'" in reply.text, reply.text
+            assert not client.call("switch_instance", instance_id="slow").failed
+        else:
+            reply = client.call("browser_launch", **args, _timeout=15)
+            if path == "reattach":
+                assert "reattached" in reply.text.lower(), reply.text
+        assert reply.failed and "running" in reply.text.lower(), reply.text
+        assert "did not answer within 1s" in reply.text and "tab may still be loading" in reply.text
+        assert "wait_for_url" in reply.text and "ready_state" in reply.text and "observed URL" in reply.text
+        assert client.call("server_status").json()["browser_running"]
+        again = client.call("navigate", url=f"{base}/page2.html", _timeout=15)
+        assert not again.failed and client.evaluate("document.title") == "Page Two", again.text
+    finally:
+        client.call("close_all_instances", _timeout=40)
+        client.close()
 
 
 @pytest.mark.skipif(os.environ.get("GITHUB_ACTIONS") == "true", reason=(
