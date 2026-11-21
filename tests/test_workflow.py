@@ -825,13 +825,43 @@ def test_an_input_var_changed_in_place_by_a_step_is_reported_as_changed():
     assert summary["vars_unchanged"] == ["other"]
 
 
-def test_vars_that_cannot_be_copied_are_never_called_unchanged():
-    class Uncopyable:
-        def __deepcopy__(self, memo):
-            raise TypeError("no")
+class _Weird:
+    """The re-review's object: deepcopy works, and comparing it raises."""
 
-    summary, _ = run([{"tool": "a"}], variables={"odd": Uncopyable()}, output="summary")
+    def __deepcopy__(self, memo):
+        return _Weird()
+
+    def __ne__(self, other):
+        raise RuntimeError("bad eq")
+
+    __eq__ = __ne__
+
+
+def test_an_object_that_cannot_be_compared_is_shown_not_a_crash():
+    """Comparing input objects with != raised out of the summary for this one."""
+    summary, _ = run([{"tool": "a"}], variables={"odd": _Weird(), "plain": [1]}, output="summary")
+    assert "odd" in summary["vars"] and summary["vars_unchanged"] == ["plain"]
+
+
+@pytest.mark.parametrize("value", [
+    {1: "a", "b": 2},          # json.dumps(sort_keys=True) cannot order these keys
+    object(),                  # no JSON data: written only through repr, which proves nothing
+])
+def test_a_value_its_json_text_cannot_prove_is_never_called_unchanged(value):
+    summary, _ = run([{"tool": "a"}], variables={"odd": value}, output="summary")
     assert "odd" in summary["vars"] and "vars_unchanged" not in summary
+
+
+def test_the_input_text_is_taken_before_the_first_step():
+    """Changed in place by the first step, and its text taken afterwards, a var reads unchanged."""
+    async def dispatch(tool, args):
+        args["rows"].append({"sku": 2})
+        return "ok"
+
+    summary = asyncio.run(run_workflow([{"tool": "grow", "args": {"rows": "${rows}"}}], dispatch,
+                                       lambda name: True, variables={"rows": [{"sku": 1}]},
+                                       output="summary"))
+    assert summary["vars"]["rows"] == [{"sku": 1}, {"sku": 2}] and "vars_unchanged" not in summary
 
 
 def test_branch_records_stay_internal_in_a_successful_summary_and_whole_after_a_failure():

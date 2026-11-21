@@ -7,7 +7,6 @@ tools can do. Kept free of browser and MCP imports so it is testable by itself.
 from __future__ import annotations
 
 import asyncio
-import copy
 import json
 import math
 import random
@@ -408,7 +407,9 @@ async def run_workflow(
         raise WorkflowError(f"output must be one of {', '.join(OUTPUT_MODES)}, got {output!r}; nothing ran")
     # Taken before any step runs: a step may change in place an object it was handed (a whole
     # ${ref} passes the object itself), and the run's vars then compare equal to the caller's.
-    given = _snapshot(variables) if output != "full" else None
+    given = _snapshot(variables) if output != "full" else {}
+    # Input objects reach steps by reference, so a step may change the caller's own object. Left
+    # so on purpose: over MCP each call parses its own JSON, and no caller keeps that object.
     run = _Run(dispatch=dispatch, allowed=allowed, stop_on_error=stop_on_error,
                variables=dict(variables or {}))
     start = parse_start(start_at)
@@ -443,13 +444,36 @@ async def run_workflow(
     return result if output == "full" else _shorten(result, run, output, given)
 
 
-def _snapshot(variables: Optional[dict]) -> Optional[dict]:
-    """A deep copy of the input vars (JSON data), or None when they cannot be copied: then no var
-    is called unchanged, since nothing proves it."""
+def _json_text(value: Any) -> Optional[str]:
+    """value written as canonical JSON text, or None when that proves nothing: it could not be
+    written (an exception: a cycle, mixed key types) or it needed repr, being no JSON data (an
+    in-process caller's object, whose repr may stay the same while it changes)."""
+    needed_repr = False
+
+    def _repr(obj: Any) -> str:
+        nonlocal needed_repr
+        needed_repr = True
+        return repr(obj)
+
     try:
-        return copy.deepcopy(dict(variables or {}))
+        text = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                          default=_repr)
     except Exception:
         return None
+    return None if needed_repr else text
+
+
+def _snapshot(variables: Optional[dict]) -> dict[str, Optional[str]]:
+    """Each input var's JSON text before the run, to tell later which ones the run changed. The
+    input is in memory once already; this adds its text once (one string per key), not a second
+    object tree. Over MCP vars are JSON, so the comparison is exact; None never compares equal."""
+    return {key: _json_text(value) for key, value in dict(variables or {}).items()}
+
+
+def _unchanged(key: str, value: Any, given: dict[str, Optional[str]]) -> bool:
+    """Proved unchanged: an input var whose JSON text after the run is the one it had before."""
+    before = given.get(key)
+    return before is not None and _json_text(value) == before
 
 
 _NOTES = {
@@ -465,7 +489,7 @@ _NOTES = {
 _RESUME_KEYS = ("vars", "failed_at", "failed_path", "failure_context", "resume_with", "hint")
 
 
-def _shorten(full: dict, run: _Run, output: str, given: Optional[dict]) -> dict:
+def _shorten(full: dict, run: _Run, output: str, given: dict[str, Optional[str]]) -> dict:
     """The summary or failures form of a full report. The one place that decides what a shorter
     report keeps; it names its mode and counts what it leaves out."""
     reported = full["completed"]
@@ -501,8 +525,7 @@ def _shorten(full: dict, run: _Run, output: str, given: Optional[dict]) -> dict:
     if "failed_at" in full:
         out.update((key, full[key]) for key in _RESUME_KEYS if key in full)
     elif output == "summary" and full.get("vars"):
-        changed = {k: v for k, v in full["vars"].items()
-                   if given is None or k not in given or given[k] != v}
+        changed = {k: v for k, v in full["vars"].items() if not _unchanged(k, v, given)}
         # Any failed or ignored step, with or without a stop (failed_at): last stays whole.
         troubled = any(c["failed"] or c["ignored"] for c in run.tally.values())
         if isinstance(changed.get("last"), dict) and not troubled:

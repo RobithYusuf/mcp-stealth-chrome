@@ -852,12 +852,12 @@ async def workflow_run(
 
     Returns JSON. full: completed (capped at 200 entries, the rest counted), total and vars. summary and
     failures: output names the mode, shown holds the steps kept, not_shown counts the rest, vars_unchanged
-    names input vars left out; past the 200 cap they still show failed or ignored steps (the first 100,
-    the rest counted in failed_or_ignored_not_shown). A step's result over 500 characters is cut, at a line break where one is
-    near, and ends with how much was left out. On failure also failed_at, failed_path, failure_context and resume_with. With
-    stop_on_error=False, failed_count and failed_paths list every failure even past that cap. Steps the
-    failed step depended on are not re-run on resume, so check that any state they left on the page still
-    holds.
+    names input vars left out; past the 200 cap they still show failed or ignored steps (the first 100, the
+    rest counted in failed_or_ignored_not_shown). A step's result over 500 characters is cut, at a line break
+    where one is near, and ends with how much was left out. On failure also failed_at, failed_path,
+    failure_context and resume_with. With stop_on_error=False, failed_count counts every failure, also past
+    that cap, and failed_paths lists the first 100. Steps the failed step depended on are not re-run on
+    resume, so check that any state they left on the page still holds.
 
     Tools: navigate, reload, go_back/forward, click, click_text, click_role, fill, fill_form, type_text,
     paste_text, press_key, select_option, check, uncheck, hover, scroll, scroll_to, mouse_click_xy,
