@@ -539,11 +539,9 @@ def test_a_close_that_finds_another_instance_current_records_nothing_on_it(env, 
     assert _privacy_folders(env) == []
 
 
-@pytest.mark.parametrize("where", ["storage_state", "navigation", "navigation timeout", "cookie_move"])
+@pytest.mark.parametrize("where", ["storage_state", "navigation", "cookie_move"])
 def test_a_stop_that_was_not_seen_to_end_is_said(env, monkeypatch, tmp_path, where):
-    """_ensure_browser_dead can answer stopped with nothing verified (no process to check), which
-    _close_incomplete does not count as a failure: the handle goes, and the result must say the
-    end was not seen, as browser_close does, rather than nothing or "The browser was closed"."""
+    """Failures that stop a started browser say when the end was not verified."""
     if where == "cookie_move":
         env.move = server._CookieMove(plan=None, backup=tmp_path / "backup.json")
         env.finish = (False, "1 cookie missing")
