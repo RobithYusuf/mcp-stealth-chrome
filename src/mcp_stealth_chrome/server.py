@@ -812,6 +812,83 @@ async def _first_live_tab(browser: Any, attempts: int = 8) -> Any:
 _SPAWNING: dict[str, str] = {}
 
 
+@dataclass
+class _Launching:
+    """A browser_launch under way in a session: the instance it launches and the task running it.
+    browser_recover sets `ended_by`, and the launch then ends as an error that records nothing
+    more."""
+    instance_id: str
+    task: Any
+    ended_by: str = ""
+
+
+# session -> the browser_launch under way there; read through _launching().
+_LAUNCHING: dict[str, _Launching] = {}
+
+# A launch awaits between its steps, and a call that changed the current instance or its
+# browser meanwhile had the launch's later steps, and its cleanup, act on another instance.
+# These tools are refused while a launch of the same session runs (_launch_gate), and
+# close_instance only for the launching instance. Every tool that can change the current
+# instance or its browser is either here or in _ALLOWED_DURING_LAUNCH, with its reason
+# (tests/test_launch_owner.py fails on one that is in neither). batch_actions and workflow_run
+# call tools without the gate, so none of these may become a workflow tool.
+_REFUSED_DURING_LAUNCH = frozenset({"switch_instance", "attach_to_chrome", "detach", "browser_close",
+                                    "close_all_instances", "spawn_browser"})
+_ALLOWED_DURING_LAUNCH = {
+    "browser_recover": "the way out of a stuck state must not depend on what is stuck: it ends the "
+                       "browser as before, and the launch it cut short ends as an error that "
+                       "records nothing more",
+    "browser_launch": "a second launch in the same session is refused by browser_launch itself "
+                      "(another launch is already in progress)",
+    "close_instance": "refused for the launching instance only; closing another instance acts on its "
+                      "stored snapshot and leaves the launch alone",
+    "instance_release": "refuses the current instance by itself, and the launching instance stays "
+                        "the current one for the whole launch (switch_instance is refused)",
+}
+
+
+def _launching() -> Optional[_Launching]:
+    """The browser_launch under way in the calling session, or None. One whose task is done
+    counts as absent, so a marker that was somehow left behind refuses nothing."""
+    entry = _LAUNCHING.get(BrowserState.session_key())
+    if entry is None or entry.task is None or entry.task.done():
+        return None
+    return entry
+
+
+def _launch_cut_reason() -> str:
+    """Why the browser_launch running in this very task was cut short (browser_recover reset its
+    instance), or "". A reattach asks before it takes a kept browser over, so a launch that was
+    cut short gives that browser back as it was instead of recording it."""
+    entry = _launching()
+    if entry is None or entry.task is not asyncio.current_task() or not entry.ended_by:
+        return ""
+    # Who cut it short is said once, by the launch's own result (_launch_settle).
+    return "this browser_launch was cut short before it took the browser over"
+
+
+def _being_launched(instance_id: str) -> bool:
+    """A browser_launch of this session is launching that instance; a sweep leaves it alone."""
+    entry = _launching()
+    return entry is not None and entry.instance_id == instance_id
+
+
+def _launch_gate(name: str) -> Optional[str]:
+    """CALL_GATES: refuse a tool that would change the current instance or its browser while a
+    browser_launch of this session runs. Cheap and never awaits."""
+    entry = _launching()
+    if entry is None:
+        return None
+    if name == "close_instance":
+        refused = (_app_module.CALL_ARGUMENTS.get() or {}).get("instance_id") == entry.instance_id
+    else:
+        refused = name in _REFUSED_DURING_LAUNCH
+    if not refused:
+        return None
+    return err(f"browser_launch of instance {entry.instance_id!r} is in progress in this session; "
+               f"{name} was not done. Call it again once the launch has returned.")
+
+
 _FINGERPRINT_FIELDS = ("user_agent", "accept_language", "platform", "timezone")
 
 
@@ -3431,6 +3508,12 @@ async def _reattach_claimed(browser: Any, instance_id: str, profile: Path, recor
     else:
         # Nothing navigated: read back the page the selected tab shows.
         observed = await _observe_navigation(tabs[select], None, {"armed": False})
+    # The last await is behind: a browser_launch that browser_recover cut short meanwhile takes
+    # nothing over, and the browser is given back as it was (_reattach_connected), never ended:
+    # it may be the person's, opened from the launcher.
+    cut = _launch_cut_reason()
+    if cut:
+        raise _ReattachAborted(cut)
     if not headless:
         _watch_windows(browser)  # replaced below when keep_alive stays on
     # Left unset, a reattach keeps what the browser had: whoever kept it wanted it kept. An
@@ -3511,9 +3594,14 @@ async def _block_ads_on_reattach(block_ads: bool, browser: Any, instance_id: str
 async def _launch_by_reattach(profile: Path, verdict: dict, *, url: str, keep_alive: Optional[bool],
                              ignored: list[str], expect_url: Optional[str],
                              expect_status: Optional[int], block_ads: bool = False,
-                             agent_overlay: Optional[bool] = None) -> str:
-    """browser_launch's reattach: the kept browser becomes the calling session's current one."""
-    iid = BrowserState.current_instance_id
+                             agent_overlay: Optional[bool] = None,
+                             plan: Optional["_LaunchPlan"] = None) -> str:
+    """browser_launch's reattach: the kept browser becomes the calling session's current one.
+
+    Once it is recorded, it is the launch's browser (plan.browser): should browser_recover cut
+    the launch short during the awaits that follow, the launch ends it as it ends one it
+    started. A cut before it is recorded gives it back instead (_reattach_claimed)."""
+    iid = plan.launching.instance_id if plan is not None else BrowserState.current_instance_id
     record = verdict["record"]
     ignored = [item for item in ignored if item != f"headless={bool(record.get('headless'))!r}"]
     try:
@@ -3532,6 +3620,9 @@ async def _launch_by_reattach(profile: Path, verdict: dict, *, url: str, keep_al
                    f"was; browser_launch again to retry, or end it with Quit")
     owned = observed.pop("_owned", None)
     BrowserState.browser = browser
+    if plan is not None:
+        plan.browser, plan.adopted = browser, True
+        plan.profile_path = Path(_keep_alive.profile_key(profile))
     BrowserState.tabs = tabs
     BrowserState.owned_targets = ({BrowserState.COUNTED, *owned} if owned is not None
                                   else {_target_key(t) for t in tabs})
@@ -3864,6 +3955,7 @@ def _overlay_note(session_key: str, result: str) -> str:
 
 
 for _hooks, _hook in ((_app_module.CALL_GATES, _overlay_gate),
+                      (_app_module.CALL_GATES, _launch_gate),
                       (_app_module.BEFORE_TOOL_HOOKS, _overlay_before_tool),
                       (_app_module.AFTER_TOOL_HOOKS, _overlay_after_tool),
                       (_app_module.RESULT_FILTERS, _overlay_note)):
@@ -4090,6 +4182,13 @@ class _LaunchPlan:
     # The tidy-up ran (clean_profile_state, the window-state wipe). Kept apart from `written`:
     # either can change nothing, and the wipe's own failure is suppressed.
     tidied: bool = False  # _launch_commit_profile
+    # Who owns the launch: its marker (instance id, task) and the browser it started or took
+    # over. Every step after the start, and every cleanup, acts on that pair, never on what is
+    # current by then.
+    launching: Any = None  # browser_launch
+    browser: Any = None  # browser_launch, from _launch_start_chrome; _launch_by_reattach
+    adopted: bool = False  # _launch_ready_browser made it BrowserState.browser
+    ended: bool = False  # _launch_end_started_browser ran: no later step ends the browser again
 
 
 def _launch_check_arguments(browser: str, vertical_tabs: Optional[str], user_data_dir: Optional[str],
@@ -4298,7 +4397,7 @@ async def _launch_explicit_profile(req: _LaunchRequest, plan: _LaunchPlan) -> Op
                 explicit_udd, kept, url=req.url, keep_alive=req.keep_alive,
                 ignored=_reattach_ignored(vars(req)), expect_url=req.expect_url,
                 expect_status=req.expect_status,
-                block_ads=req.block_ads, agent_overlay=req.agent_overlay)
+                block_ads=req.block_ads, agent_overlay=req.agent_overlay, plan=plan)
         return err(
             f"user_data_dir {explicit_udd} is currently in use by Chrome PID {holder_pid}. "
             "Close that Chrome window first (a single Chrome process locks the whole "
@@ -4346,19 +4445,20 @@ async def _launch_kept_browser(req: _LaunchRequest, plan: _LaunchPlan) -> Option
     # A browser a previous server of ours kept alive on the profile this launch asks
     # for is taken over, not raced: falling back would hide its tabs and logins.
     if plan.persistent:
-        _own_folder = _server_profile_for(BrowserState.current_instance_id, req.product)
-        for _candidate in _kept_candidates(BrowserState.current_instance_id, req.product):
+        # The launch's own instance, never read again after an await (_Launching).
+        iid = plan.launching.instance_id
+        _own_folder = _server_profile_for(iid, req.product)
+        for _candidate in _kept_candidates(iid, req.product):
             # Only the folder the server chose itself: a caller's --user-data-dir that
             # became main's affinity after a custom reattach is never taken as an orphan.
-            _adopt = (BrowserState.current_instance_id
-                      if _keep_alive.profile_key(_candidate) == _own_folder else None)
+            _adopt = iid if _keep_alive.profile_key(_candidate) == _own_folder else None
             _kept = _kept_verdict(_candidate, req.product, adopt_orphan_for=_adopt)
             if _kept and _kept.get("ok"):
                 _taken = await _launch_by_reattach(
                     _candidate, _kept, url=req.url, keep_alive=req.keep_alive,
                     ignored=_reattach_ignored(vars(req)), expect_url=req.expect_url,
                     expect_status=req.expect_status,
-                    block_ads=req.block_ads, agent_overlay=req.agent_overlay)
+                    block_ads=req.block_ads, agent_overlay=req.agent_overlay, plan=plan)
                 if not (_taken.startswith("Error") and _orphan_given_back(_candidate, _kept)):
                     return _taken
                 # An orphan that could not be taken over: the launch goes on as it did
@@ -4599,6 +4699,8 @@ async def _launch_start_chrome(req: _LaunchRequest, plan: _LaunchPlan) -> tuple:
     refused = await _cookie_preflight(plan.profile_path, plan.cookie_move, written=_launch_written(plan))
     if refused:
         return err(refused + await _launch_remove_privacy(plan)), None, None
+    if plan.launching is not None and not _launch_owned(None, plan.launching):
+        return None, None, None  # cut short during the last look: nothing starts (_launch_settle)
     ads_pending = (_adblock_module().begin(req.block_ads, plan.config.browser_executable_path)
                    if req.block_ads else None)
     browser: Optional[Browser] = None
@@ -4659,13 +4761,67 @@ async def _launch_start_chrome(req: _LaunchRequest, plan: _LaunchPlan) -> tuple:
     return None, browser, ads_pending
 
 
+def _launch_owned(plan: Optional[_LaunchPlan], launching: _Launching) -> bool:
+    """The launch still holds its instance: nothing cut it short (browser_recover), the
+    launching instance is still the current one, and its browser, once adopted, is still the
+    current browser."""
+    if launching.ended_by or BrowserState.current_instance_id != launching.instance_id:
+        return False
+    return plan is None or not plan.adopted or BrowserState.browser is plan.browser
+
+
+def _launch_lost_note(launching: _Launching) -> str:
+    """Who took the launch's instance from it, for the result of the launch it cut short."""
+    iid = launching.instance_id
+    if launching.ended_by:
+        return f" {launching.ended_by} reset instance {iid!r} while this launch ran."
+    return (f" Instance {iid!r} stopped being the current one, or its browser was replaced, while "
+            f"this launch ran; the current instance was left as it was.")
+
+
+def _sentence(text: str) -> str:
+    return text if text.endswith(".") else text + "."
+
+
+async def _launch_settle(req: _LaunchRequest, plan: Optional[_LaunchPlan], launching: _Launching,
+                         stop: Optional[str]) -> Optional[str]:
+    """What a step's answer becomes, checked after every await of browser_launch. While the
+    launch still holds its instance (_launch_owned): the step's own answer, or None to go on.
+
+    Once it does not, the launch is cut short. browser_recover, which is never refused, is
+    what does that (a change that went round _launch_gate would too). An error the step had
+    reached stays, with who cut the launch short after it; a success it had reached does not
+    count. The browser the launch started or took over is ended, once
+    (_launch_end_started_browser), its privacy profile removed, and nothing more is recorded:
+    no handle for a browser that ended, no tabs, no watcher, no keep_alive record."""
+    if _launch_owned(plan, launching):
+        return stop
+    if stop is not None and stop.startswith("Error"):
+        text = stop
+    else:
+        text = err(f"browser_launch of instance {launching.instance_id!r} did not finish.")
+    text = _sentence(text) + _launch_lost_note(launching)
+    if plan is None or plan.ended:
+        return text
+    if plan.browser is None:
+        return text + await _launch_remove_privacy(plan)
+    reap, kept, removal = await _launch_end_started_browser(req, plan)
+    if _close_incomplete(reap):
+        text += f" Its browser could not be ended ({_close_failure(reap)})"
+        text += "; its handle and profile were kept: call browser_close to try again." if kept else "."
+    else:
+        ended = "was ended" if reap.get("verified") else "was asked to stop"
+        text += f" Its browser {ended}{_kill_note(reap)}."
+    return text + removal
+
+
 async def _launch_remove_privacy(plan: _LaunchPlan) -> str:
     """Remove this launch's privacy profile, if it made one; "" once it is gone. One that cannot
     be removed (a process list that cannot be read, a file still held) stays recorded on the
     instance, as browser_close keeps it, so the next browser_launch (its stale-privacy step) or
     browser_close removes it; the returned note says so, with the reason. Recorded only while
     the instance is still the current one: its removal awaits."""
-    iid = BrowserState.current_instance_id
+    iid = plan.launching.instance_id if plan.launching is not None else BrowserState.current_instance_id
     if await _remove_privacy_profile(plan.privacy_profile):
         return ""
     note = (f" The privacy profile could not be removed: {plan.privacy_profile}"
@@ -4678,43 +4834,58 @@ async def _launch_remove_privacy(plan: _LaunchPlan) -> str:
 
 
 async def _launch_end_started_browser(req: _LaunchRequest, plan: _LaunchPlan) -> tuple[dict, bool, str]:
-    """A launch that failed after the start ends its browser as every close path does
-    (`_ensure_browser_dead`: stop() can return while Chrome runs on). Once that browser is
-    verified gone the instance is reset and the privacy profile removed. One that could not be
-    ended keeps its handle, naming its profile so browser_close or the next launch ends it.
+    """A launch that failed after the start, or was cut short, ends the browser it started or
+    took over as every close path does (`_ensure_browser_dead`: stop() can return while Chrome
+    runs on). Once that browser is verified gone the instance is reset (if it still holds it)
+    and the privacy profile removed. One that could not be ended keeps its handle, naming its
+    profile so browser_close or the next launch ends it: on its instance while that still
+    holds it, or once browser_recover emptied it meanwhile (its reset dropped the handle).
 
-    The instance and the browser are taken before the first await and the close is registered
-    for that instance (_closing_in_background), so a call on it, switch_instance among them,
-    waits for the close. Whatever it found is then recorded on that instance only: should it
-    no longer be the current one all the same, nothing is recorded and nothing of the current
-    instance is touched. Returns (the close report, whether it was recorded, a note when the
-    privacy profile could not be removed)."""
-    iid, browser = BrowserState.current_instance_id, BrowserState.browser
+    The instance and the browser are the launch's own (plan.launching, plan.browser), never what
+    is current by then, and the close is registered for that instance (_closing_in_background),
+    so a call on it waits for the close. Nothing is recorded on another instance, and nothing
+    of the current instance is touched once it holds another browser. Returns (the close
+    report, whether the instance was reset by it or holds its handle, a note when the privacy
+    profile could not be removed)."""
+    iid, browser = plan.launching.instance_id, plan.browser
+    plan.ended = True
     with _closing_in_background(iid):
         reap = await _ensure_browser_dead(browser, plan.profile_path)
-        if not (BrowserState.current_instance_id == iid and BrowserState.browser is browser):
-            return reap, False, ""
+        current = BrowserState.current_instance_id == iid
+        held = current and BrowserState.browser is browser
         if _close_incomplete(reap):
+            if not (held or (current and BrowserState.browser is None)):
+                return reap, False, ""
+            BrowserState.browser = browser
             BrowserState.current_profile_dir, BrowserState.current_privacy = plan.profile_path, req.privacy
             return reap, True, ""
+        if held:
+            BrowserState.reset()
+            plan.adopted = False  # the launch ended its browser itself: no longer the current browser
+        return reap, held, await _launch_remove_privacy(plan)
+
+
+async def _launch_cancelled(plan: _LaunchPlan) -> None:
+    """A launch cancelled past the start: its own browser is stopped (a cancel cannot wait for a
+    verified end), the instance reset only while it still holds that browser, and the privacy
+    profile removed."""
+    await _safe_stop_browser(plan.browser)
+    if (BrowserState.current_instance_id == plan.launching.instance_id
+            and BrowserState.browser is plan.browser):
         BrowserState.reset()
-        return reap, True, await _launch_remove_privacy(plan)
+    await _remove_privacy_profile(plan.privacy_profile)
 
 
-def _launch_unrecorded_note(iid: str) -> str:
-    return (f" Instance {iid!r} stopped being the current one during the close, so what it found "
-            f"could not be recorded on it; the current instance was left as it was.")
-
-
-def _launch_end_note(reap: dict, recorded: bool, iid: str) -> str:
+def _launch_end_note(reap: dict, recorded: bool) -> str:
     """What the result adds after a failure past the start, from the close report. A stop that
-    was asked for but not seen to end says so (_kill_note), as browser_close does."""
+    was asked for but not seen to end says so (_kill_note), as browser_close does. A launch that
+    lost its instance meanwhile is then cut short, and _launch_settle says so after this."""
     if _close_incomplete(reap):
         note = f" The browser could not be ended ({_close_failure(reap)})"
         note += "; its handle and profile were kept: call browser_close to try again." if recorded else "."
     else:
         note = _kill_note(reap)
-    return note + ("" if recorded else _launch_unrecorded_note(iid))
+    return note
 
 
 async def _launch_ready_browser(req: _LaunchRequest, plan: _LaunchPlan, browser: Any,
@@ -4724,10 +4895,11 @@ async def _launch_ready_browser(req: _LaunchRequest, plan: _LaunchPlan, browser:
 
     Returns an error result (the browser closed or stopped first), or None to go on."""
     BrowserState.browser = browser
+    plan.adopted = True
     # Before the first navigation, so its own requests are already looked at.
     if ads_pending is not None:
         plan.dock_note += await _adblock_module().attach(
-            ads_pending, browser, BrowserState.current_instance_id, BrowserState.session_key())
+            ads_pending, browser, plan.launching.instance_id, BrowserState.session_key())
     plan.dock_note += await presence.attach(browser, _browser_process_pid(browser), ask=req.agent_overlay,
                                             headless=req.headless)
 
@@ -4736,31 +4908,28 @@ async def _launch_ready_browser(req: _LaunchRequest, plan: _LaunchPlan, browser:
         if not moved:
             # Left running, the next browser_launch reuses it and never tries the move again.
             # Ended or kept is read from the close report, never from which browser is current.
-            iid = BrowserState.current_instance_id
             reap, recorded, removal = await _launch_end_started_browser(req, plan)
             if _close_incomplete(reap):
-                closed = (f"The browser could not be closed ({_close_failure(reap)}): call "
-                          f"browser_close to try again, then launch again, which resumes the move")
+                closed = f"The browser could not be closed ({_close_failure(reap)})"
+                if recorded:
+                    closed += ": call browser_close to try again, then launch again, which resumes the move"
             else:
                 # Asked to stop is not seen to end: without a process to check, it says so.
                 ended = "was closed" if reap.get("verified") else "was asked to stop"
                 closed = f"The browser {ended}; launch again, which resumes the move{_kill_note(reap)}"
-            return err(f"its cookies were not all moved: {moved_text}. {closed}"
-                       f"{'' if recorded else _launch_unrecorded_note(iid)}{removal}")
+            return err(f"its cookies were not all moved: {moved_text}. {closed}{removal}")
         plan.dock_note += moved_text
 
     if req.storage_state_path:
         try:
-            await _apply_storage_state(BrowserState.browser, req.storage_state_path)
+            await _apply_storage_state(browser, req.storage_state_path)
         except asyncio.CancelledError:
-            await _safe_stop_browser(BrowserState.browser)
-            BrowserState.reset()
-            await _remove_privacy_profile(plan.privacy_profile)
+            await _launch_cancelled(plan)
             raise
         except Exception as e:
-            iid = BrowserState.current_instance_id
             reap, recorded, removal = await _launch_end_started_browser(req, plan)
-            return err(f"storage_state load failed: {e}{_launch_end_note(reap, recorded, iid)}{removal}")
+            return err(f"storage_state load failed: {e}{_launch_end_note(reap, recorded)}"
+                       f"{removal}")
     return None
 
 
@@ -4771,7 +4940,7 @@ async def _launch_first_page(req: _LaunchRequest, plan: _LaunchPlan) -> tuple:
     was ended and the privacy profile removed, or the result says why they were kept."""
     try:
         await asyncio.sleep(0.5)
-        main = await _first_live_tab(BrowserState.browser)
+        main = await _first_live_tab(plan.browser)
         await _apply_fingerprint_to_tab(main, plan.effective_fingerprint)
         if req.profile_mode == "light" or req.testing_mode:
             # The first document after startup still loads images despite the flag;
@@ -4787,22 +4956,19 @@ async def _launch_first_page(req: _LaunchRequest, plan: _LaunchPlan) -> tuple:
         finally:
             _disarm()
     except asyncio.TimeoutError:
-        iid = BrowserState.current_instance_id
         reap, recorded, removal = await _launch_end_started_browser(req, plan)
         return err(
             f"initial nav timed out after {BROWSER_NAV_TIMEOUT}s — Chrome "
             f"started but couldn't load {req.url}. Check network/proxy."
-            f"{_launch_end_note(reap, recorded, iid)}{removal}"
+            f"{_launch_end_note(reap, recorded)}{removal}"
         ), None, None
     except asyncio.CancelledError:
-        await _safe_stop_browser(BrowserState.browser)
-        BrowserState.reset()
-        await _remove_privacy_profile(plan.privacy_profile)
+        await _launch_cancelled(plan)
         raise
     except Exception as e:
-        iid = BrowserState.current_instance_id
         reap, recorded, removal = await _launch_end_started_browser(req, plan)
-        return err(f"initial nav failed: {e}{_launch_end_note(reap, recorded, iid)}{removal}"), None, None
+        return err(f"initial nav failed: {e}{_launch_end_note(reap, recorded)}"
+                   f"{removal}"), None, None
     return None, main, _launch_observed
 
 
@@ -4919,7 +5085,7 @@ async def _launch_place_window(req: _LaunchRequest, plan: _LaunchPlan, main: Any
             asked = ((req.window_width, req.window_height)
                      if (req.window_width, req.window_height) != _DEFAULT_WINDOW else None)
             placed = await _restore_window_bounds(
-                BrowserState.current_instance_id, main, size=asked)
+                plan.launching.instance_id, main, size=asked)
             if placed.get("restored"):
                 act = placed.get("actual") or {}
                 place_suffix = (
@@ -4935,13 +5101,17 @@ async def _launch_place_window(req: _LaunchRequest, plan: _LaunchPlan, main: Any
 async def _launch_restore_tabs(req: _LaunchRequest, plan: _LaunchPlan, browser: Any, main: Any,
                                observed: dict) -> tuple:
     """restore_tabs: the saved tabs reopen beside the first one. Returns (the note, what the
-    launch observed, with the restore's report added when it ran)."""
+    launch observed, with the restore's report added when it ran). The tabs are recorded only
+    while the launch still holds its instance: after a browser_recover meanwhile, the launch is
+    cut short (_launch_settle) and records nothing more."""
     restore_suffix = ""
     if req.restore_tabs:
         try:
             _all_tabs, _select, _report, restore_suffix = await _reopen_saved_tabs(
-                BrowserState.current_instance_id, browser, main, plan.profile_path, req.privacy,
+                plan.launching.instance_id, browser, main, plan.profile_path, req.privacy,
                 req.headless, plan.effective_fingerprint, req.url, req.window_width, req.window_height)
+            if not _launch_owned(plan, plan.launching):
+                return restore_suffix, observed
             BrowserState.tabs = _all_tabs
             BrowserState.own(BrowserState.tabs)  # opened or taken over by this server
             BrowserState.active_tab_index = _select
@@ -5113,81 +5283,117 @@ async def browser_launch(
         keep_alive=keep_alive, vertical_tabs=vertical_tabs, block_ads=block_ads,
         brave_lean=brave_lean, agent_overlay=agent_overlay, product=product,
         brave_executable=brave_executable)
-    # No early "already running" return here. It short-circuited the reuse path
-    # below — the one that probes CDP and honours the caller's url — so a launch
-    # against a live browser answered "already running" and left the caller on
-    # whatever page happened to be open, believing the navigation had happened.
-    if (stop := await _launch_end_stale_browser()) is not None:
-        return stop
-
-    if _LAUNCH_LOCK.locked():
+    # The launch's owner: set before the first await, cleared however it ends (a raise and a
+    # cancel too). While it is set, _launch_gate refuses what would change this instance or its
+    # browser, and the sweeps leave the instance alone. Only browser_recover may still end it:
+    # after every await _launch_settle looks, and a launch cut short records nothing more.
+    launching = _Launching(BrowserState.current_instance_id, asyncio.current_task())
+    if _launching() is not None:
         return err("another launch is already in progress — wait for it to finish")
-
-    _reserved = _launch_reservation(BrowserState.current_instance_id, product, persistent=bool(persistent),
-                                    privacy=privacy, explicit=user_data_dir, extra_args=extra_args)
-    async with _LAUNCH_LOCK, launch_lock.reserve(_reserved, BROWSER_LAUNCH_TIMEOUT) as _busy:
-        if _busy:
-            return err(_busy)
-        if (stop := await _launch_reuse_running(req)) is not None:
+    session = BrowserState.session_key()
+    _LAUNCHING[session] = launching
+    try:
+        # No early "already running" return here. It short-circuited the reuse path
+        # below — the one that probes CDP and honours the caller's url — so a launch
+        # against a live browser answered "already running" and left the caller on
+        # whatever page happened to be open, believing the navigation had happened.
+        stop = await _launch_end_stale_browser()
+        if (stop := await _launch_settle(req, None, launching, stop)) is not None:
             return stop
 
-        ensure_dirs()
+        if _LAUNCH_LOCK.locked():
+            return err("another launch is already in progress — wait for it to finish")
 
-        plan = _LaunchPlan(persistent=persistent, merged_extra_args=list(extra_args or []))
-        if (stop := _launch_privacy_and_identity(req, plan)) is not None:
-            return stop
-        # The launch choice and every refusal come before anything writes to the profile.
-        # If the user passed user_data_dir explicitly, that takes precedence over
-        # both `persistent` and any --user-data-dir already in extra_args.
-        if user_data_dir:
-            stop = await _launch_explicit_profile(req, plan)
-        else:
-            stop = await _launch_kept_browser(req, plan)
-            if stop is None:
-                # Each instance has one deterministic profile, and a conflict over it is
-                # settled by the caller's profile_conflict. Only "main" takes part in
-                # process affinity: a second HTTP session must not repoint it, or the
-                # primary's next launch lands on a different cookie jar and its logins
-                # look wiped.
-                resolved_profile, profile_info = _resolve_launch_profile(
-                    BrowserState.current_instance_id,
-                    persistent=bool(plan.persistent),
-                    profile_conflict=profile_conflict,
-                    browser=product,
-                )
-                stop = _launch_server_profile(req, plan, resolved_profile, profile_info)
-        if stop is not None:
-            return stop
+        _reserved = _launch_reservation(BrowserState.current_instance_id, product, persistent=bool(persistent),
+                                        privacy=privacy, explicit=user_data_dir, extra_args=extra_args)
+        async with _LAUNCH_LOCK, launch_lock.reserve(_reserved, BROWSER_LAUNCH_TIMEOUT) as _busy:
+            if (stop := await _launch_settle(req, None, launching, err(_busy) if _busy else None)) is not None:
+                return stop
+            stop = await _launch_reuse_running(req)
+            if (stop := await _launch_settle(req, None, launching, stop)) is not None:
+                return stop
 
-        _launch_config(req, plan)
-        if (stop := await _launch_prepare_profile(req, plan)) is not None:
-            return stop
-        await _launch_keep_keyboard(req, plan)
-        # The cookie move: prepared above, then preflight, commit, the vertical tabs and lean
-        # settings, tidy-up, preflight, start.
-        if (stop := await _launch_commit_profile(req, plan)) is not None:
-            return stop
-        stop, started, ads_pending = await _launch_start_chrome(req, plan)
-        if stop is not None:
-            return stop
-        if (stop := await _launch_ready_browser(req, plan, started, ads_pending)) is not None:
-            return stop
-        stop, main, observed = await _launch_first_page(req, plan)
-        if stop is not None:
-            return stop
+            ensure_dirs()
 
-        _launch_record_browser(req, plan, started, main)
-        suffix = _launch_keep_alive(req, plan, started)
-        health_suffix = await _launch_window_health(req, main)
-        verify_suffix = await _launch_auto_verify(req, main)
-        place_suffix = await _launch_place_window(req, plan, main)
-        restore_suffix, observed = await _launch_restore_tabs(req, plan, started, main, observed)
-        await _record_tabs_at_launch(BrowserState.current_instance_id)
+            plan = _LaunchPlan(persistent=persistent, merged_extra_args=list(extra_args or []),
+                               launching=launching)
+            if (stop := _launch_privacy_and_identity(req, plan)) is not None:
+                return stop
+            # The launch choice and every refusal come before anything writes to the profile.
+            # If the user passed user_data_dir explicitly, that takes precedence over
+            # both `persistent` and any --user-data-dir already in extra_args.
+            if user_data_dir:
+                stop = await _launch_explicit_profile(req, plan)
+            else:
+                stop = await _launch_kept_browser(req, plan)
+                if stop is None:
+                    # Each instance has one deterministic profile, and a conflict over it is
+                    # settled by the caller's profile_conflict. Only "main" takes part in
+                    # process affinity: a second HTTP session must not repoint it, or the
+                    # primary's next launch lands on a different cookie jar and its logins
+                    # look wiped.
+                    resolved_profile, profile_info = _resolve_launch_profile(
+                        launching.instance_id,
+                        persistent=bool(plan.persistent),
+                        profile_conflict=profile_conflict,
+                        browser=product,
+                    )
+                    stop = _launch_server_profile(req, plan, resolved_profile, profile_info)
+            if (stop := await _launch_settle(req, plan, launching, stop)) is not None:
+                return stop
 
-        await _give_focus_back(plan.previous_app)
-        return _launch_result(req, plan, observed, suffix=suffix, verify_suffix=verify_suffix,
-                              health_suffix=health_suffix, place_suffix=place_suffix,
-                              restore_suffix=restore_suffix)
+            _launch_config(req, plan)
+            stop = await _launch_prepare_profile(req, plan)
+            if (stop := await _launch_settle(req, plan, launching, stop)) is not None:
+                return stop
+            await _launch_keep_keyboard(req, plan)
+            if (stop := await _launch_settle(req, plan, launching, None)) is not None:
+                return stop
+            # The cookie move: prepared above, then preflight, commit, the vertical tabs and lean
+            # settings, tidy-up, preflight, start.
+            stop = await _launch_commit_profile(req, plan)
+            if (stop := await _launch_settle(req, plan, launching, stop)) is not None:
+                return stop
+            stop, started, ads_pending = await _launch_start_chrome(req, plan)
+            plan.browser = started
+            if (stop := await _launch_settle(req, plan, launching, stop)) is not None:
+                return stop
+            stop = await _launch_ready_browser(req, plan, started, ads_pending)
+            if (stop := await _launch_settle(req, plan, launching, stop)) is not None:
+                return stop
+            stop, main, observed = await _launch_first_page(req, plan)
+            if (stop := await _launch_settle(req, plan, launching, stop)) is not None:
+                return stop
+
+            # From here on the launch records its browser; after each await it checks again, so a
+            # recover meanwhile stops the steps that would record more.
+            _launch_record_browser(req, plan, started, main)
+            suffix = _launch_keep_alive(req, plan, started)
+            health_suffix = await _launch_window_health(req, main)
+            if (stop := await _launch_settle(req, plan, launching, None)) is not None:
+                return stop
+            verify_suffix = await _launch_auto_verify(req, main)
+            if (stop := await _launch_settle(req, plan, launching, None)) is not None:
+                return stop
+            place_suffix = await _launch_place_window(req, plan, main)
+            if (stop := await _launch_settle(req, plan, launching, None)) is not None:
+                return stop
+            restore_suffix, observed = await _launch_restore_tabs(req, plan, started, main, observed)
+            if (stop := await _launch_settle(req, plan, launching, None)) is not None:
+                return stop
+            await _record_tabs_at_launch(launching.instance_id)
+            if (stop := await _launch_settle(req, plan, launching, None)) is not None:
+                return stop
+
+            await _give_focus_back(plan.previous_app)
+            if (stop := await _launch_settle(req, plan, launching, None)) is not None:
+                return stop
+            return _launch_result(req, plan, observed, suffix=suffix, verify_suffix=verify_suffix,
+                                  health_suffix=health_suffix, place_suffix=place_suffix,
+                                  restore_suffix=restore_suffix)
+    finally:
+        if _LAUNCHING.get(session) is launching:
+            del _LAUNCHING[session]
 
 
 def _forget_tabs_note(instance_id: str, profile: Any, privacy: bool) -> str:
@@ -5328,6 +5534,16 @@ async def browser_recover() -> str:
             return err("browser_recover did not end this browser: the person opened it from the "
                        "launcher and it answers, so it is not stuck. tab_new opens a tab of the "
                        "agent's; tab_select picks one of the person's on purpose; the person quits it.")
+
+    # Never refused during a launch: the way out of a stuck state must not depend on what is
+    # stuck. A browser_launch of this instance still running ends as an error and records
+    # nothing more (_launch_settle looks after each of its awaits). Marked before the first
+    # await here, so the launch cannot record what this recover is about to reset.
+    launching = _launching()
+    if launching is not None and launching.instance_id == BrowserState.current_instance_id:
+        launching.ended_by = "browser_recover"
+        steps.append(f"browser_launch of instance {launching.instance_id!r} was still running: it "
+                     f"ends as an error and records nothing more")
 
     # 1. Best-effort stop. Capture profile dir BEFORE reset so step 2 can
     #    target only Chrome PIDs that belong to this profile.
@@ -7514,8 +7730,8 @@ def _idle_closed_note(iid: str, timeout: int) -> str:
 async def _sweep_idle_instances() -> None:
     """Close the calling session's instances that are past their idle timeout."""
     for iid, snap in list(BrowserState.instances.items()):
-        if not _still_held(iid, snap, snap.browser) or _being_closed(iid):
-            continue  # switched in while an earlier one was being closed, or closing already
+        if not _still_held(iid, snap, snap.browser) or _being_closed(iid) or _being_launched(iid):
+            continue  # switched in while an earlier one was being closed, closing or launching
         if snap.is_running() and snap.is_idle_expired():
             BrowserState.window_closed[iid] = _idle_closed_note(iid, snap.idle_timeout)
             if not await _end_stored_instance(iid, snap, "idle timeout"):
@@ -7524,6 +7740,7 @@ async def _sweep_idle_instances() -> None:
     if (BrowserState.is_up()
         and BrowserState.current_idle_timeout > 0
         and not _being_closed(BrowserState.current_instance_id)
+        and not _being_launched(BrowserState.current_instance_id)
         and not _app_module.calls_in_flight(BrowserState.session_key())
         and (time.time() - BrowserState.current_last_active) > BrowserState.current_idle_timeout):
         iid = BrowserState.current_instance_id
@@ -7625,8 +7842,8 @@ async def _sweep_windowless() -> set[int]:
         if browser is None:
             continue
         held.add(id(browser))
-        if _being_closed(iid):
-            continue  # a tool or another sweep is closing it
+        if _being_closed(iid) or _being_launched(iid):
+            continue  # a tool or another sweep is closing it, or a launch is not done with it
         entry = _WINDOW_WATCH.get(id(browser))
         if entry is None or entry["browser"] is not browser:
             continue

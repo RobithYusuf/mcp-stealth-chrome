@@ -440,7 +440,10 @@ def test_a_switch_during_the_close_of_a_failed_launch_leaves_the_other_instance_
         env, monkeypatch, tmp_path, where, report):
     """The close of a failed launch awaits; a switch_instance sent meanwhile used to go through,
     and the close then reset the instance switched in (verified) or gave it this launch's profile
-    (not ended). Registered as closing, the instance makes the switch wait for the close."""
+    (not ended). Registered as closing, the instance makes the switch wait for the close, and the
+    launch returns before the switch runs on: it is not refused (_launch_gate) but comes after
+    the launch, and finds both instances as they should be. A switch sent at any other await of
+    the launch is refused: tests/test_launch_owner.py."""
     from mcp_stealth_chrome.state import InstanceSnapshot
     from test_focus_restore import _Tab
     other_browser = SimpleNamespace(tabs=[_Tab()], stopped=False, config=None)
@@ -488,9 +491,10 @@ def test_a_switch_during_the_close_of_a_failed_launch_leaves_the_other_instance_
 
 
 def test_a_close_that_finds_another_instance_current_records_nothing_on_it(env, monkeypatch, tmp_path):
-    """Should the instance change all the same (a switch that does not go through a tool call),
-    the close resets nothing and writes nothing onto the instance that is current by then, and
-    the result says its outcome could not be recorded."""
+    """Should the instance change all the same (a switch that does not go through a tool call,
+    so no gate sees it), the launch resets nothing and writes nothing onto the instance that is
+    current by then, keeps its own error, and says what happened to its instance. Its browser
+    is closed once, and its privacy profile goes with it."""
     from mcp_stealth_chrome.state import InstanceSnapshot
     from test_focus_restore import _Tab
     other_browser = SimpleNamespace(tabs=[_Tab()], stopped=False, config=None)
@@ -504,9 +508,13 @@ def test_a_close_that_finds_another_instance_current_records_nothing_on_it(env, 
 
     env.during_close = switch_directly
     out = _launch(privacy=True, storage_state_path="/nowhere/state.json")
-    assert "storage_state load failed" in out and "could not be recorded on it" in out, out
+    assert out == ("Error: storage_state load failed: no cookies key in the file. Instance 'main' stopped "
+                   "being the current one, or its browser was replaced, while this launch ran; the current "
+                   "instance was left as it was."), out
     assert server.BrowserState.browser is other_browser
     assert server.BrowserState.current_profile_dir == other_profile
+    assert [b for b, _p in env.closes] == env.started, env.closes
+    assert _privacy_folders(env) == []
 
 
 @pytest.mark.parametrize("where", ["storage_state", "navigation", "navigation timeout", "cookie_move"])
