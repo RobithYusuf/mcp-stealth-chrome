@@ -194,9 +194,9 @@ def test_the_overlay_follows_the_window_and_only_its_button_hands_over():
 
 def test_an_idle_agent_unlocks_the_page_and_a_take_over_says_what_the_agent_knows():
     """Past IDLE_AFTER with no call the lock goes and the bar stays; a call brings the lock back.
-    After Take over the note line shows above the bar, a refused call marks the agent as told,
-    and wait_for_human marks it as waiting. (The note's text is typed only with the keyboard,
-    which a test here cannot take: tests/test_agent_overlay.py covers its way to the agent.)"""
+    After Take over a refused call marks the agent as told, and wait_for_human marks it as
+    waiting. The bar is one line: talking to the agent happens in its chat (the note line above
+    the bar was taken out at the person's request)."""
     pytest.importorskip("Quartz")
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(_Quiet, directory=FIXTURES))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -228,7 +228,8 @@ def test_an_idle_agent_unlocks_the_page_and_a_take_over_says_what_the_agent_know
 
         os.kill(overlay_pid, signal.SIGUSR2)  # Take over
         assert _wait(lambda: _read(control_file).get("holder") == "person", 5)
-        assert _wait(note_line, 5), _windows(overlay_pid)
+        time.sleep(0.6)
+        assert _bar_shown(overlay_pid) and not note_line(), _windows(overlay_pid)
         since = float(_read(control_file)["since"])
         assert float(_read(agent_file).get("told_at") or 0) < since
         refused = client.call("click", selector="#inc")
@@ -244,17 +245,18 @@ def test_an_idle_agent_unlocks_the_page_and_a_take_over_says_what_the_agent_know
         waiter.join(30)
         assert "pressed Resume agent" in answer.get("text", ""), answer
         assert _read(agent_file).get("waiting_human") is False
-        assert _wait(lambda: not note_line(), 5), "the note line stayed after Resume agent"
 
-        # Done pressed while the agent is not waiting: the bar stops asking and the note line
-        # goes (it kept the keyboard: the next key went into it, not the page), the next call
-        # is told, and a wait started afterwards returns at once.
+        # Done pressed while the agent is not waiting: the bar stops asking (it went on asking
+        # until a call came), the next call is told, and a wait started afterwards returns at once.
         asked = client.call("request_human_help", objective="Tick Agree", timeout=30)
         assert not asked.failed, asked.text
-        assert _wait(note_line, 5), _windows(overlay_pid)
+        assert _wait(lambda: _read(agent_file).get("help") == "Tick Agree", 5)
+        time.sleep(0.6)  # the overlay reads it at its next tick; a press before that is a Take over
+        assert _bar_shown(overlay_pid) and not note_line(), _windows(overlay_pid)
         os.kill(overlay_pid, signal.SIGUSR2)  # Done
-        assert _wait(lambda: not note_line(), 3), "the note line stayed after Done"
-        assert _bar_shown(overlay_pid), "the bar went with it: nothing confirms the Done"
+        assert _wait(lambda: float(_read(control_file).get("help_done") or 0) > 0, 3)
+        time.sleep(0.6)
+        assert _bar_shown(overlay_pid), "the bar went: nothing confirms the Done"
         assert _read(agent_file).get("help") == "Tick Agree"  # no call took it yet
         told = client.call("get_text")
         assert "the person pressed Done on the request for help" in told.text, told.text

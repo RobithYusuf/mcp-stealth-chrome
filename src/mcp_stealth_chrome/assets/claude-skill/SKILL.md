@@ -59,7 +59,7 @@ Read a whole page per call, not one element per call. On a marketplace price che
 | `the first text match was unreachable (...), so a reachable element with the same text was clicked` | Another element than the first match was clicked. Check it was the one you meant. |
 | `the person took over this browser` | The person pressed Take over. Stop, say so in chat, and `wait_for_human()` or ask them. Do not carry on in another browser or over HTTP. |
 | `[agent_overlay: the person holds this browser ...]` | A tool that works without the browser ran while they hold it. Go on only with what they asked for. |
-| `[agent_overlay: the person left a note ...]` | The person's own words, typed above the bar. Follow them. |
+| `[agent_overlay: the person pressed Done on the request for help ...]` | They finished what you asked. Read the page and go on; ask in chat if unsure. |
 | `[agent_overlay: while the agent was idle the person clicked ...]` | They used the page while you were away. Read it again before acting. |
 | `[agent_overlay: the person typed in the browser ...]` | Their keys reached the page too. Re-read the field before going on. |
 | `auto-verify: ... challenge gone` | A Cloudflare widget was handled during the load. |

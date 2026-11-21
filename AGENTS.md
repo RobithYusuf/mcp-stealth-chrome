@@ -416,6 +416,24 @@ conclusions. Each rule below replaced a real lie.
   this browser's PID is frontmost, about 130 ms measured, so keys typed in that moment still reach Chrome. It compares the
   PID, because a person's own Chrome has the same bundle path. `tests/test_headed_focus.py` measures all this, with
   `MCP_HEADED=1`, and counts this browser's PID so the person's other apps cannot skew it.
+- Focus moves by PID, never by application. `request_human_help`, the focus return after a launch and the one
+  after a popup ran `open -a <bundle>`, which names an application: with several Chromes running from one bundle
+  (the person's own, another project's browser, this server's) macOS chose among them. Measured on 0.25.17 with
+  another project's browser running: after `request_human_help` the app in front was that browser (its PID), while
+  the result said "in the foreground ... macOS app activated" (the person: "the focus is wrong, another project's
+  window comes forward"). `_activate_pid` brings one process to the front with ctypes, no PyObjC: first the Process
+  Manager (`_front_process`: `GetProcessForPID`, `SetFrontProcessWithOptions`), then AppKit's
+  `NSRunningApplication activateWithOptions:`. AppKit alone was not enough: it is a request macOS sat on for about
+  a second when Chrome had just come to the front by a popup (1033 and 1039 ms in front in `test_headed_focus`, the
+  limit is 500, and `open -a` passed), while the Process Manager took the front back within the limit. From a
+  background process it takes 17 to 21 ms either way (`open -a`: 21 to 29 ms, after its own start).
+  `_win_focus_back_from_popup` hands the front back until it has stayed away for `_FOCUS_STAYED` (0.4 s), since
+  Chrome takes it again while the popup opens.
+  `_give_focus_back` and `_win_focus_back_from_popup` take the PID that had the front (`_frontmost_pid`, one
+  lsappinfo read per input where two were made). `_foreground_for_human` relies on `Page.bringToFront`, which
+  raises its own process, checks `_frontmost_pid`, activates its own PID when another app is still in front, and
+  says `NOT the app in front` when that did not work. `tests/test_focus_restore.py` fails if `"open", "-a"` comes
+  back into server.py or tools/navigation.py.
 - The Dock icon is opt-in: only the `dock_icon` setting turns it on (`MCP_STEALTH_DOCK_ICON=1`, or true, yes, on, or the
   settings file; see Settings). Off changes nothing: Google
   Chrome as before, nothing in the launch result, nothing written to Chrome Beta, and `dock_icon: off` in `server_status`,
@@ -1332,21 +1350,15 @@ the person (the same target events as Cmd+T, a followed link, a closed tab).
   told (a refusal or a stopped input writes `told_at`), going on without the browser (a tool in `presence.OUTSIDE`
   while they hold it writes `outside_at`, and its result says they hold it), or waiting (`waiting_human`, set while
   `wait_for_human` runs). Before, the bar said "The agent is paused" whatever the agent was doing.
-- A line above the bar takes a note for the agent while the person holds the browser or is asked for help (`Note`, a
-  `KeyPanel` that can take the keyboard without activating the overlay: it does only when its field is clicked). It is
-  saved with Resume agent or Done (Enter in it presses that button), at most 500 characters, and reaches the agent
-  once: in `wait_for_human`'s answer (`note_for`) or in its next call's result (`take_note`). Measured with real input:
-  the click gave the overlay the keyboard while the browser stayed the app in front, and the typed text reached
-  `wait_for_human`. A line holding the keyboard is ordered out at once rather than faded, which is AppKit's way to
-  hand the keys back to the app in front; that the next key then reaches the page is NOT measured (the person's
-  windows and another session's browser covered the test browser, and the hit-tested clicks were refused).
+- A note line above the bar (0.25.15 to 0.25.17: a text field for the person, sent with Resume agent or Done) was
+  taken out at the person's request (21 Nov 2026): it made the bar busy, and they talk to the agent in its chat. The
+  bar carries buttons only. Do not add a text field to it again without asking.
 - A request the person answered with Done is `noted` (`choose_mode(answered=)`: `help_done` at or after the request's
   `asked_at`) until a call of the agent takes it. Before, the bar went on asking for help with its Done button and the
-  note line stayed, holding the keyboard: on 0.25.16 a key typed after Done did not reach the page (the input still
-  held 1 character), and nothing told an agent that read the page instead of calling `wait_for_human`. Now the note
-  line goes, the bar says "Done, the agent goes on at its next step", and the first result of any tool says the
-  person pressed Done and closes the request (`_done_pressed` in `result_note`); `wait_for_human` started afterwards
-  returns at once (0.0 s, with the note). The headed test presses Done by signal and reads the windows.
+  note line stayed, holding the keyboard, and nothing told an agent that read the page instead of calling
+  `wait_for_human`. Now the bar says "Done, the agent goes on at its next step", and the first result of any tool says
+  the person pressed Done and closes the request (`_done_pressed` in `result_note`); `wait_for_human` started
+  afterwards returns at once (0.0 s). The headed test presses Done by signal and reads the windows.
 - A window whose alpha falls under 0.5 is closing and is never followed again until it is gone or back at 0.95
   (`closing`): it stays listed and on screen for its 0.3 s close animation, and the same tick took it back and showed
   the overlay over it again. Measured: last seen 0.03 s after the close, never again.

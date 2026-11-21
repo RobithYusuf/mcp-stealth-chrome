@@ -2127,51 +2127,107 @@ def _frontmost_pid() -> Optional[int]:
     return int(found.group(1)) if found else None
 
 
-async def _win_focus_back_from_popup(browser_pid: int, app: str, seconds: float = 1.5) -> None:
+def _front_process(pid: int) -> bool:
+    """The Process Manager's way to the front, by PID. AppKit's activateWithOptions is a request
+    macOS sits on for about a second when another app has just come to the front by itself (a
+    popup): Chrome stayed in front 1033 and 1039 ms where `open -a` took it back at once."""
+    try:
+        import ctypes
+
+        class _PSN(ctypes.Structure):
+            _fields_ = [("high", ctypes.c_uint32), ("low", ctypes.c_uint32)]
+
+        services = ctypes.cdll.LoadLibrary(
+            "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices")
+        psn = _PSN()
+        if services.GetProcessForPID(ctypes.c_int(pid), ctypes.byref(psn)) != 0:
+            return False
+        return services.SetFrontProcessWithOptions(ctypes.byref(psn), ctypes.c_uint32(0)) == 0
+    except Exception:
+        return False
+
+
+def _activate_pid(pid: Optional[int]) -> bool:
+    """macOS: bring ONE process to the front, by PID, through the Objective-C runtime (no PyObjC).
+
+    Focus used to move with `open -a <bundle>`, which names an application, not a process. With
+    several Chromes running from one bundle (the person's own, another project's browser, this
+    server's) macOS chose among them: request_human_help left another project's browser in
+    front (seen on 21 Nov 2026: the app in front afterwards was that browser's PID), and focus
+    "given back" to a person who was using a Chrome could land on a different one. Measured from
+    a background process: a test browser came to the front by PID and the person's app got the
+    front back by PID. True when macOS took the request; callers check `_frontmost_pid`."""
+    if sys.platform != "darwin" or not pid:
+        return False
+    if _front_process(int(pid)):
+        return True
+    try:
+        import ctypes
+        import ctypes.util
+        objc = ctypes.cdll.LoadLibrary(ctypes.util.find_library("objc"))
+        ctypes.cdll.LoadLibrary("/System/Library/Frameworks/AppKit.framework/AppKit")
+        objc.objc_getClass.restype = ctypes.c_void_p
+        objc.objc_getClass.argtypes = [ctypes.c_char_p]
+        objc.sel_registerName.restype = ctypes.c_void_p
+        objc.sel_registerName.argtypes = [ctypes.c_char_p]
+        send = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)(("objc_msgSend", objc))
+        by_pid = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                                  ctypes.c_int)(("objc_msgSend", objc))
+        activate = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p,
+                                    ctypes.c_ulong)(("objc_msgSend", objc))
+        sel = objc.sel_registerName
+        pool = send(send(objc.objc_getClass(b"NSAutoreleasePool"), sel(b"alloc")), sel(b"init"))
+        try:
+            app = by_pid(objc.objc_getClass(b"NSRunningApplication"),
+                         sel(b"runningApplicationWithProcessIdentifier:"), int(pid))
+            # 2: NSApplicationActivateIgnoringOtherApps
+            return bool(app) and bool(activate(app, sel(b"activateWithOptions:"), 2))
+        finally:
+            send(pool, sel(b"drain"))
+    except Exception:
+        return False
+
+
+_FOCUS_STAYED = 0.4  # seconds the front must stay away from this browser before the watch ends
+
+
+async def _win_focus_back_from_popup(browser_pid: int, back_to: int, seconds: float = 1.5) -> None:
     """window.open activates Chrome, and no flag or CDP call prevents that. So after input on
     a headed browser, watch briefly and give focus straight back if this Chrome took it.
 
     Only this browser's own process counts, so a person switching to any other app, their own
-    Chrome included, is left alone. Keys typed in the moment before it returns still reach
-    Chrome: this narrows that window and does not close it.
+    Chrome included, is left alone, and focus goes back to the very process that had it
+    (`back_to`, a PID), never to "the application". Keys typed in the moment before it returns
+    still reach Chrome: this narrows that window and does not close it.
     """
     deadline = time.monotonic() + seconds
+    returned_at = None
     try:
         while time.monotonic() < deadline:
-            if await asyncio.to_thread(_frontmost_pid) == browser_pid:
-                await asyncio.to_thread(subprocess.run, ["open", "-a", app],
-                                        capture_output=True, timeout=3, check=False)
+            front = await asyncio.to_thread(_frontmost_pid)
+            if front == browser_pid:
+                # Chrome is still opening its popup when the front first changes, and takes the
+                # front again after one hand-back (656 and 1057 ms in front, measured, where the
+                # limit is 500): keep handing it back until it has stayed away.
+                await asyncio.to_thread(_activate_pid, back_to)
+                returned_at = time.monotonic()
+            elif returned_at is not None and time.monotonic() - returned_at >= _FOCUS_STAYED:
                 return
             await asyncio.sleep(0.02)
     except Exception:
         pass
 
 
-def _frontmost_app() -> Optional[str]:
-    """The foreground app's bundle path on macOS. None anywhere else, or if it can't be read."""
-    if sys.platform != "darwin":
-        return None
-    try:
-        front = subprocess.run(["lsappinfo", "front"], capture_output=True, text=True,
-                               timeout=2, check=False).stdout.strip()
-        info = subprocess.run(["lsappinfo", "info", "-only", "bundlepath", front], capture_output=True,
-                              text=True, timeout=2, check=False).stdout
-    except Exception:
-        return None
-    found = re.search(r'"LSBundlePath"="([^"]+)"', info)
-    return found.group(1) if found else None
-
-
-async def _give_focus_back(app: Optional[str]) -> None:
+async def _give_focus_back(previous: Optional[int]) -> None:
     """A headed Chrome takes the foreground when its window opens, away from whatever the
-    person was using. Best effort: a launch must never fail over this."""
-    if not app:
+    person was using: give it back to that process (a PID). Best effort: a launch must never
+    fail over this."""
+    if not previous:
         return
     try:
         await asyncio.sleep(0.3)  # the window activates a moment after CDP answers
-        if await asyncio.to_thread(_frontmost_app) not in (None, app):
-            await asyncio.to_thread(subprocess.run, ["open", "-a", app],
-                                    capture_output=True, timeout=3, check=False)
+        if await asyncio.to_thread(_frontmost_pid) not in (None, previous):
+            await asyncio.to_thread(_activate_pid, previous)
     except Exception:
         pass
 
@@ -4545,7 +4601,7 @@ async def browser_launch(
                        f"started: {_exc_text(e)}")
         dock_note += _apply_brave_lean(config, product, brave_lean, server_chosen=explicit_udd is None)
         # Read before Chrome starts, while the person's app is still the frontmost one.
-        previous_app = None if headless else await asyncio.to_thread(_frontmost_app)
+        previous_app = None if headless else await asyncio.to_thread(_frontmost_pid)
         if not headless:
             for _flag in _BACKGROUND_WINDOW_FLAGS:
                 config.add_argument(_flag)
@@ -6056,9 +6112,9 @@ async def _dispatch_input(tab, press) -> None:
     key = _target_key(tab)
     if not BrowserState.current_headless:
         pid = _browser_process_pid(BrowserState.browser)
-        app = await asyncio.to_thread(_frontmost_app) if pid else None
-        if app and await asyncio.to_thread(_frontmost_pid) != pid:
-            _spawn_background(_win_focus_back_from_popup(pid, app))
+        front = await asyncio.to_thread(_frontmost_pid) if pid else None
+        if front and front != pid:
+            _spawn_background(_win_focus_back_from_popup(pid, front))
     # The task copies the context here, so the gesture it runs sees this flag and no other.
     gesture = Gesture()
     bound = CURRENT_GESTURE.set(gesture)
@@ -8894,7 +8950,7 @@ async def _launch_browser_instance(
                        f"started: {_exc_text(e)}")
     dock_note += _apply_brave_lean(config, product, brave_lean,
                                    server_chosen=not profile_dir_override)
-    previous_app = None if headless else await asyncio.to_thread(_frontmost_app)
+    previous_app = None if headless else await asyncio.to_thread(_frontmost_pid)
     if not headless:
         for _flag in _BACKGROUND_WINDOW_FLAGS:
             config.add_argument(_flag)

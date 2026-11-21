@@ -9,67 +9,96 @@ from types import SimpleNamespace
 from mcp_stealth_chrome import identity, server
 
 
-def test_frontmost_app_is_read_from_lsappinfo(monkeypatch):
-    calls = []
-
-    def fake_run(cmd, **_kw):
-        calls.append(cmd)
-        out = "ASN:0x0-0x1:\n" if cmd[1] == "front" else '"LSBundlePath"="/Applications/Orca.app"\n'
-        return SimpleNamespace(stdout=out)
-
-    monkeypatch.setattr(server.sys, "platform", "darwin")
-    monkeypatch.setattr(server.subprocess, "run", fake_run)
-    assert server._frontmost_app() == "/Applications/Orca.app"
-    assert calls[1][-1] == "ASN:0x0-0x1:"
+def _record_activate(monkeypatch, front):
+    activated = []
+    monkeypatch.setattr(server, "_frontmost_pid", lambda: front)
+    monkeypatch.setattr(server, "_activate_pid", lambda pid: activated.append(pid) or True)
+    return activated
 
 
-def test_frontmost_app_is_nothing_off_macos_or_on_failure(monkeypatch):
-    monkeypatch.setattr(server.sys, "platform", "linux")
-    assert server._frontmost_app() is None
-    monkeypatch.setattr(server.sys, "platform", "darwin")
-
-    def boom(*_a, **_kw):
-        raise subprocess.TimeoutExpired("lsappinfo", 2)
-
-    monkeypatch.setattr(server.subprocess, "run", boom)
-    assert server._frontmost_app() is None
-
-
-def _record_open(monkeypatch, front):
-    opened = []
-
-    def fake_run(cmd, **_kw):
-        opened.append(cmd)
-        return SimpleNamespace(returncode=0)
-
-    monkeypatch.setattr(server, "_frontmost_app", lambda: front)
-    monkeypatch.setattr(server.subprocess, "run", fake_run)
-    return opened
-
-
-def test_focus_goes_back_when_chrome_took_it(monkeypatch):
-    opened = _record_open(monkeypatch, "/Applications/Google Chrome.app")
-    asyncio.run(server._give_focus_back("/Applications/Orca.app"))
-    assert opened == [["open", "-a", "/Applications/Orca.app"]]
+def test_focus_goes_back_to_the_process_that_had_it(monkeypatch):
+    """By PID: `open -a <bundle>` named an application, and with several Chromes running macOS
+    brought another project's browser to the front instead of the one the person was using."""
+    activated = _record_activate(monkeypatch, 777)       # this server's Chrome took the front
+    asyncio.run(server._give_focus_back(4242))
+    assert activated == [4242]
 
 
 def test_focus_is_left_alone_when_nothing_took_it(monkeypatch):
-    opened = _record_open(monkeypatch, "/Applications/Orca.app")
-    asyncio.run(server._give_focus_back("/Applications/Orca.app"))
-    assert opened == []
-    opened = _record_open(monkeypatch, None)
-    asyncio.run(server._give_focus_back("/Applications/Orca.app"))
+    activated = _record_activate(monkeypatch, 4242)
+    asyncio.run(server._give_focus_back(4242))
+    assert activated == []
+    activated = _record_activate(monkeypatch, None)       # unreadable is not "taken"
+    asyncio.run(server._give_focus_back(4242))
     asyncio.run(server._give_focus_back(None))
-    assert opened == []
+    assert activated == []
 
 
 def test_a_failure_giving_focus_back_never_fails_the_launch(monkeypatch):
-    def boom(*_a, **_kw):
-        raise OSError("no open")
+    def boom(_pid):
+        raise OSError("no AppKit")
 
-    monkeypatch.setattr(server, "_frontmost_app", lambda: "/Applications/Chrome.app")
-    monkeypatch.setattr(server.subprocess, "run", boom)
-    asyncio.run(server._give_focus_back("/Applications/Orca.app"))
+    monkeypatch.setattr(server, "_frontmost_pid", lambda: 777)
+    monkeypatch.setattr(server, "_activate_pid", boom)
+    asyncio.run(server._give_focus_back(4242))
+
+
+def test_activation_names_a_process_never_an_application(monkeypatch):
+    """Nothing that moves focus may run `open -a`: it cannot tell one Chrome from another."""
+    from mcp_stealth_chrome.tools import navigation
+    for module in (server, navigation):
+        source = inspect.getsource(module)
+        assert '"open", "-a"' not in source, module.__name__
+    monkeypatch.setattr(server.sys, "platform", "linux")
+    assert server._activate_pid(4242) is False
+    monkeypatch.setattr(server.sys, "platform", "darwin")
+    assert server._activate_pid(None) is False
+
+
+def test_the_process_manager_path_says_no_for_a_process_that_ended():
+    """It is asked first: AppKit's activateWithOptions was sat on for about a second after a
+    popup brought Chrome to the front (1033 and 1039 ms in front, the limit is 500)."""
+    import sys
+    gone = subprocess.Popen([sys.executable, "-c", "pass"])
+    gone.wait()
+    assert server._front_process(gone.pid) is False
+
+
+class _Hand:
+    """What _foreground_for_human needs of a tab."""
+
+    async def activate(self):
+        return None
+
+    async def bring_to_front(self):
+        return None
+
+
+def _hand_over(monkeypatch, fronts, pid=777):
+    from mcp_stealth_chrome.tools import navigation
+    activated = []
+    seq = iter(fronts)
+    monkeypatch.setattr(navigation.sys, "platform", "darwin")
+    monkeypatch.setattr(server, "_browser_process_pid", lambda _browser: pid)
+    monkeypatch.setattr(server, "_frontmost_pid", lambda: next(seq, fronts[-1]))
+    monkeypatch.setattr(server, "_activate_pid", lambda p: activated.append(p) or True)
+    actions = asyncio.run(navigation._foreground_for_human(_Hand()))
+    return actions, activated, navigation
+
+
+def test_a_hand_over_brings_only_this_browser_to_the_front(monkeypatch):
+    """request_human_help ran `open -a "Google Chrome.app"` and another project's browser came
+    to the front (the person: "the focus is wrong")."""
+    actions, activated, _nav = _hand_over(monkeypatch, [777])            # already in front
+    assert activated == [] and "this browser is the app in front" in actions
+    actions, activated, _nav = _hand_over(monkeypatch, [4242, 777])      # another app was
+    assert activated == [777] and "this browser is the app in front" in actions
+
+
+def test_a_hand_over_that_did_not_reach_the_front_says_so(monkeypatch):
+    actions, activated, nav = _hand_over(monkeypatch, [4242, 4242])
+    assert activated == [777] and nav.NOT_IN_FRONT in actions
+    assert "this browser is the app in front" not in actions
 
 
 class _Tab:
@@ -103,8 +132,8 @@ def _fake_launch(monkeypatch):
         order.append(("flags", list(config.browser_args)))
         return SimpleNamespace(tabs=[_Tab()], stopped=False, config=None)
 
-    async def give_back(app):
-        order.append(("give_back", app))
+    async def give_back(previous):
+        order.append(("give_back", previous))
 
     async def noop(*_a, **_kw):
         return None
@@ -118,7 +147,7 @@ def _fake_launch(monkeypatch):
     async def observe(*_a, **_kw):
         return {"final_url": "about:blank", "status": None}
 
-    monkeypatch.setattr(server, "_frontmost_app", lambda: order.append("read") or "/Applications/Orca.app")
+    monkeypatch.setattr(server, "_frontmost_pid", lambda: order.append("read") or 4242)
     monkeypatch.setattr(server, "_give_focus_back", give_back)
     async def background_window(_browser, _width=None, _height=None):
         order.append("background_window")
@@ -147,7 +176,7 @@ def test_headed_launch_reads_the_app_first_and_gives_focus_back_last(monkeypatch
     out = _launch(headless=False)
     assert "launched" in out, out
     assert order[0] == "read" and order[1] == "start"
-    assert order[-1] == ("give_back", "/Applications/Orca.app")
+    assert order[-1] == ("give_back", 4242)  # the process the person was using, by PID
 
 
 def test_headed_launch_never_opens_a_foreground_window(monkeypatch):
@@ -305,30 +334,47 @@ def test_frontmost_pid_is_read_from_lsappinfo(monkeypatch):
     assert server._frontmost_pid() is None
 
 
-def _popup_watch(monkeypatch, fronts):
-    opened = []
+def _popup_watch(monkeypatch, fronts, sticks=True):
+    """`fronts`: the app in front at each look. With `sticks`, a hand-back holds: the process
+    activated stays in front from then on, as it does once Chrome has finished its popup."""
+    activated = []
     seq = iter(fronts)
+    held = []
 
-    def fake_run(cmd, **_kw):
-        opened.append(cmd)
-        return SimpleNamespace(returncode=0)
+    def front():
+        return held[-1] if held else next(seq, fronts[-1])
 
-    monkeypatch.setattr(server, "_frontmost_pid", lambda: next(seq, fronts[-1]))
-    monkeypatch.setattr(server.subprocess, "run", fake_run)
-    return opened
+    def activate(pid):
+        activated.append(pid)
+        if sticks:
+            held.append(pid)
+        return True
+
+    monkeypatch.setattr(server, "_frontmost_pid", front)
+    monkeypatch.setattr(server, "_activate_pid", activate)
+    return activated
 
 
 def test_a_popup_taking_focus_gets_it_sent_back(monkeypatch):
-    opened = _popup_watch(monkeypatch, [111, 111, 777])
-    asyncio.run(server._win_focus_back_from_popup(777, "/Applications/Orca.app", seconds=1))
-    assert opened == [["open", "-a", "/Applications/Orca.app"]]
+    """To the process that had it (111), which may itself be a Chrome: never "the application"."""
+    activated = _popup_watch(monkeypatch, [111, 111, 777])
+    asyncio.run(server._win_focus_back_from_popup(777, 111, seconds=1))
+    assert activated == [111]
+
+
+def test_the_popup_watch_hands_focus_back_until_it_stays(monkeypatch):
+    """Chrome takes the front again while its popup opens: one hand-back was not enough."""
+    activated = _popup_watch(monkeypatch, [111, 777, 111, 777, 111], sticks=False)
+    monkeypatch.setattr(server, "_FOCUS_STAYED", 0.05)
+    asyncio.run(server._win_focus_back_from_popup(777, 111, seconds=1))
+    assert activated == [111, 111]
 
 
 def test_a_person_switching_apps_is_left_alone(monkeypatch):
     """Their own Chrome has another PID, so only this browser's process counts."""
-    opened = _popup_watch(monkeypatch, [111, 222, 333])
-    asyncio.run(server._win_focus_back_from_popup(777, "/Applications/Orca.app", seconds=0.1))
-    assert opened == []
+    activated = _popup_watch(monkeypatch, [111, 222, 333])
+    asyncio.run(server._win_focus_back_from_popup(777, 111, seconds=0.1))
+    assert activated == []
 
 
 def test_browser_process_pid_of_an_attached_browser_is_none():

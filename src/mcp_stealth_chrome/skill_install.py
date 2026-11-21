@@ -29,6 +29,7 @@ NAME = "stealth-chrome"
 SHIPPED = {
     "11cef8e6829d86f2659cb40b7f7939404f1aa49e607bdc3a8d1a5e1475ed9472",  # 0.25.11
     "c1cf3b05784dcb4dcf0c25c8aebe08ecf87e8360bab86b858dc53103048a3008",  # 0.25.12 to 0.25.14
+    "bacb72dddab1b30e54f5dfbbfff7f0ff6ffa38789ae4f999142e5c60209434de",  # 0.25.15 to 0.25.17
 }
 
 

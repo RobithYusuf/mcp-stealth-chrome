@@ -158,7 +158,6 @@ HIDE_AFTER = float(CONFIG.get("hide_after", 90.0))  # no word for this long: eve
 # measured run, median 4.3 s). The lock goes, so the person can use the page without Take over,
 # and what they do there is passed to the agent's next call.
 IDLE_AFTER = float(CONFIG.get("idle_after", 20.0))
-NOTE_MAX = 500      # characters of a note for the agent
 STYLE = CONFIG.get("style") or {}  # presence.style(): the person's choice of bar, light and lock
 BAR_MODES = ("full", "compact", "hover", "off")
 BAR_MODE = STYLE.get("bar", "full") if STYLE.get("bar") in BAR_MODES else "full"
@@ -447,8 +446,7 @@ def near(b, want, slack=4.0):
 def choose_mode(help_text, holder, quiet, waiting, answered=False):
     """help and the person's hold first: their buttons are the only way back, so they outlast any
     quiet. A request the person answered with Done is `noted` until the agent's next call takes
-    it: the bar kept asking for help after Done, and the note line kept the keyboard, so the
-    next key went into it instead of the page (measured). Then, by the seconds since the agent's
+    it: the bar kept asking for help after Done (measured). Then, by the seconds since the agent's
     last call (0 while one runs): idle past HIDE_AFTER (all faded), resting past IDLE_AFTER (the
     lock is off, the page is the person's), thinking past QUIET_AFTER, else working."""
     if help_text and not answered:
@@ -560,29 +558,6 @@ def panel(frame, takes_clicks, shadow=False):
     # for a third of a second after the browser had gone): the overlay goes when the window goes.
     p.setAnimationBehavior_(2)  # NSWindowAnimationBehaviorNone
     return p
-
-
-class KeyPanel(Panel):
-    """A panel that can take the keyboard (a borderless one cannot), without activating this
-    process: only when its text field is clicked (becomesKeyOnlyIfNeeded)."""
-
-    def canBecomeKeyWindow(self):
-        return True
-
-
-def key_panel(frame):
-    k = KeyPanel.alloc().initWithContentRect_styleMask_backing_defer_(
-        frame, BORDERLESS | NONACTIVATING, BUFFERED, False)
-    k.setOpaque_(False)
-    k.setBackgroundColor_(NSColor.clearColor())
-    k.setHasShadow_(True)
-    k.setIgnoresMouseEvents_(False)
-    k.setHidesOnDeactivate_(False)
-    k.setBecomesKeyOnlyIfNeeded_(True)
-    k.setCollectionBehavior_(ALL_SPACES | IGNORES_CYCLE | FULLSCREEN_AUX)
-    k.setReleasedWhenClosed_(False)
-    k.setAnimationBehavior_(2)  # NSWindowAnimationBehaviorNone
-    return k
 
 
 def layered(p, size):
@@ -1224,83 +1199,6 @@ class Bar:
         self.panel.animator().setAlphaValue_(1.0 if on else 0.0)
 
 
-class Note:
-    """A line above the bar for a note to the agent, while the person holds the browser or the
-    agent asked for help. It goes with Resume agent or Done (Enter presses that button), in the
-    result of the agent's wait_for_human or of its next call."""
-
-    H = 32.0
-
-    def __init__(self, target):
-        self.panel = key_panel(NSMakeRect(0, 0, 400, self.H))
-        self.panel.setAlphaValue_(0.0)
-        view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, 400, self.H))
-        view.setWantsLayer_(True)
-        view.layer().setBackgroundColor_(cg((0.07, 0.08, 0.11, 1.0)))
-        view.layer().setCornerRadius_(self.H / 2)
-        view.layer().setBorderWidth_(0.5)
-        view.layer().setBorderColor_(cg((1, 1, 1, 0.16)))
-        self.panel.setContentView_(view)
-        self.view = view
-        self.field = NSTextField.alloc().initWithFrame_(NSMakeRect(16, (self.H - 18) / 2, 360, 18))
-        self.field.setBezeled_(False)
-        self.field.setDrawsBackground_(False)
-        self.field.setEditable_(True)
-        self.field.setSelectable_(True)
-        self.field.setFocusRingType_(1)  # none: the rounded line is the field
-        self.field.setFont_(NSFont.systemFontOfSize_(13))
-        self.field.setTextColor_(ns(WHITE))
-        self.field.cell().setLineBreakMode_(TRUNCATE_TAIL)
-        self.field.cell().setScrollable_(True)
-        self.field.setTarget_(target)
-        self.field.setAction_("onNoteEnter:")
-        view.addSubview_(self.field)
-        self.prompt = None
-        self.width = None
-        self.origin = None
-        self.visible = False
-        self.hide_at = None
-
-    def ask(self, prompt):
-        if prompt == self.prompt:
-            return
-        self.prompt = prompt
-        self.field.setPlaceholderAttributedString_(attributed([(prompt, 13, 0.0, MUTED)]))
-
-    def fit(self, width):
-        if width == self.width:
-            return
-        self.width = width
-        f = self.panel.frame()
-        self.panel.setFrame_display_(NSMakeRect(f.origin.x, f.origin.y, width, self.H), True)
-        self.view.setFrame_(NSMakeRect(0, 0, width, self.H))
-        self.field.setFrame_(NSMakeRect(16, (self.H - 18) / 2, width - 32, 18))
-        self.origin = None
-
-    def place(self, x_ns, y_ns):
-        origin = (round(x_ns), round(y_ns))
-        if origin != self.origin:
-            self.panel.setFrameOrigin_(origin)
-            self.origin = origin
-
-    def take(self):
-        """The note typed, at most NOTE_MAX characters, and an empty line for the next one."""
-        text = " ".join(str(self.field.stringValue() or "").split())[:NOTE_MAX]
-        self.field.setStringValue_("")
-        return text
-
-    def release(self):
-        """Holding the keyboard, the line goes at once rather than fading: ordered out, it hands
-        the keys back to the app in front (measured: the next key reached that app's field)."""
-        if self.panel.isKeyWindow():
-            self.panel.orderOut_(None)
-            return True
-        return False
-
-    def fade(self, on):
-        self.panel.animator().setAlphaValue_(1.0 if on else 0.0)
-
-
 class Overlay:
     def __init__(self, target, show_cursor):
         self.control = {"holder": "agent", "since": time.time(), "reason": "start",
@@ -1320,13 +1218,11 @@ class Overlay:
         self.pointer = Pointer(scale)
         self.ripples = Ripples()
         self.bar = Bar(target, still)
-        self.note = Note(target)
         # Fully transparent, yet it takes every click: ignoresMouseEvents is set to False
         # explicitly (checked with windowNumberAtPoint: such a window is the one a click hits).
         self.shield = panel(NSMakeRect(0, 0, 400, 300), takes_clicks=True)
         self.shield.setContentView_(Shield.alloc().initWithFrame_(NSMakeRect(0, 0, 400, 300)))
-        self.panels = (self.shield, *self.glow.panels, self.ripples.panel, self.pointer.panel, self.bar.panel,
-                       self.note.panel)
+        self.panels = (self.shield, *self.glow.panels, self.ripples.panel, self.pointer.panel, self.bar.panel)
         self.shield_on = False
         self.shield_rect = None
         self.frame = None
@@ -1473,8 +1369,6 @@ class Overlay:
             out.append(self.pointer.panel)
         if self.bar.visible:
             out.append(self.bar.panel)
-        if self.note.visible:
-            out.append(self.note.panel)
         return out
 
     def order(self, stack, wid):
@@ -1787,32 +1681,6 @@ class Overlay:
             self.bar.panel.orderOut_(None)
             self.bar.visible = False
             self.bar.hide_at = None
-        # The note line: over the bar while the person holds the browser or is asked for help.
-        want_note = want_bar and mode in ("person", "help")
-        if want_note:
-            self.note.ask("Note for the agent (optional), sent with " + ("Done" if mode == "help" else "Resume agent"))
-            self.note.fit(self.bar.width)
-            if self.bar.origin is not None:
-                self.note.place(self.bar.origin[0], self.bar.origin[1] + self.bar.H + 6)
-        if want_note and not self.note.visible:
-            self.note.visible = True
-            self.note.hide_at = None
-            self.note.fade(True)
-            restack = True
-        elif not want_note and self.note.visible and self.note.hide_at is None:
-            if self.note.release():
-                self.note.panel.setAlphaValue_(0.0)
-                self.note.visible = False
-            else:
-                self.note.fade(False)
-                self.note.hide_at = now + 0.35
-        if want_note and self.note.hide_at is not None:
-            self.note.hide_at = None
-            self.note.fade(True)
-        if self.note.hide_at is not None and now >= self.note.hide_at:
-            self.note.panel.orderOut_(None)
-            self.note.visible = False
-            self.note.hide_at = None
         # While nothing covers the browser, sit in the floating level: the browser coming to the
         # front then cannot cover the overlay, not even for a frame. Covered, sit just above it.
         level = FLOATING_LEVEL if self.floating else NORMAL_LEVEL
@@ -1837,10 +1705,6 @@ class Overlay:
         if self.mode in WORKING or self.mode in ("resting", "noted"):
             self.control.update(holder="person", since=now, reason="button")
         elif self.mode in ("person", "help"):
-            note = self.note.take()
-            if note:
-                self.control.update(note=note, note_at=now,
-                                    note_with="Done" if self.mode == "help" else "Resume agent")
             if self.mode == "person":
                 self.control.update(holder="agent", since=now, reason="button")
             else:
@@ -1898,8 +1762,7 @@ class Overlay:
             # The level the others are at: a new panel starts at the normal level, and while the
             # overlay floats it sat under the (transparent) lock, which then took its clicks.
             self.bar.panel.setLevel_(self.level)
-            self.panels = (self.shield, *self.glow.panels, self.ripples.panel, self.pointer.panel, self.bar.panel,
-                       self.note.panel)
+            self.panels = (self.shield, *self.glow.panels, self.ripples.panel, self.pointer.panel, self.bar.panel)
             if self.frame is not None:
                 self.bar.fit(self.frame[2])
         if light_was and not LIGHT_ON:
@@ -2015,14 +1878,6 @@ class Target(NSObject):
     def onButton_(self, _sender):
         try:
             OVERLAY.button()
-        except Exception:
-            traceback.print_exc()
-
-    def onNoteEnter_(self, _sender):
-        """Enter in the note line: the same as the bar's button (Resume agent or Done)."""
-        try:
-            if OVERLAY.mode in ("person", "help") and str(OVERLAY.note.field.stringValue() or "").strip():
-                OVERLAY.button()
         except Exception:
             traceback.print_exc()
 

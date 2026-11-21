@@ -245,8 +245,7 @@ class Overlay:
         self.hide_after = HIDE_AFTER
         self.follow_task: Any = None
         self.in_flight = 0  # tool calls running on this browser
-        self.used_seen = 0.0  # the person's use of the page, and their note, already passed on
-        self.note_seen = 0.0
+        self.used_seen = 0.0  # the person's use of the page already passed on
         self.write()
 
     def write(self, **kw: Any) -> None:
@@ -586,20 +585,6 @@ def _done_pressed(overlay: Optional["Overlay"]) -> Optional[str]:
             "wait_for_human would now return at once.")
 
 
-def take_note(overlay: Optional["Overlay"], since: float) -> Optional[str]:
-    """The note the person left with Resume agent or Done after `since`, once."""
-    if overlay is None:
-        return None
-    control = overlay.read_control()
-    note_at = float(control.get("note_at") or 0)
-    text = str(control.get("note") or "").strip()
-    if not text or note_at <= overlay.note_seen or note_at < since:
-        return None
-    overlay.note_seen = note_at
-    return (f"the person left a note with {control.get('note_with') or 'the bar'} at {_clock(note_at)}: "
-            f"{json.dumps(text, ensure_ascii=False)}")
-
-
 def after_tool(browser: Any, tab: Any = None) -> None:
     """The call has ended: not busy any more (once no other call of it runs), and the window and
     page read again now, since the call may have opened, moved to or resized the agent's tab
@@ -651,11 +636,9 @@ def refusal(name: str, browser: Any) -> Optional[str]:
     since = overlay.read_control().get("since")
     when = time.strftime(" at %H:%M:%S", time.localtime(since)) if since else ""
     overlay.write(told_at=time.time(), told_tool=name)  # the bar tells the person it was told
-    note = take_note(overlay, 0.0)  # a refusal skips every later hook: their note goes with it
     return ("Error: the person took over this browser (Take over in the bar over its window"
             f"{when}). {name} did nothing. The agent may neither act on nor read the page until "
-            "they press Resume agent: call wait_for_human to wait for that, or ask them."
-            + (f" [agent_overlay: {note}]" if note else ""))
+            "they press Resume agent: call wait_for_human to wait for that, or ask them.")
 
 
 def describe(name: str, args: Optional[dict]) -> str:
@@ -693,16 +676,13 @@ def _note(text: str) -> None:
 
 
 def result_note(session_key: str, result: str, browser: Any = None) -> str:
-    """The notes for this call's result, and the person's own note if one waits: every result
-    passes here, also those of tools that skip the before-hooks (wait_for_human, web_search)."""
+    """The notes for this call's result, and a Done no wait took: every result passes here, also
+    those of tools that skip the before-hooks (wait_for_human, web_search)."""
     notes = list(_NOTES.pop(session_key, None) or [])
     overlay = _handle(browser) if browser is not None else None
     done = _done_pressed(overlay)
     if done:
         notes.append(done)
-    note = take_note(overlay, 0.0)
-    if note:
-        notes.append(note)
     if not notes:
         return result
     return f"{result} [agent_overlay: {' '.join(notes)}]"
@@ -781,13 +761,6 @@ def answered(browser: Any, since: float) -> Optional[str]:
             and float(control.get("since") or 0) >= since:
         return "resumed"
     return None
-
-
-def note_for(browser: Any, since: float = 0.0) -> str:
-    """". The person left a note ..." for a result, when a note of theirs was not passed on yet:
-    one left before the wait began counts too (it reached no call in between)."""
-    note = take_note(_handle(browser), since)
-    return f". {note[0].upper()}{note[1:]}" if note else ""
 
 
 def waiting_for_person(browser: Any, waiting: bool) -> None:

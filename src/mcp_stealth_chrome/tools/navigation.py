@@ -9,10 +9,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-import subprocess
 import sys
 import time
-from pathlib import Path
 from typing import Optional
 
 from nodriver import Tab
@@ -100,6 +98,9 @@ async def tab_focus() -> str:
         return err(str(e))
 
 
+NOT_IN_FRONT = "NOT the app in front: another app still is, so the person has to switch to this window"
+
+
 async def _foreground_for_human(tab: Tab) -> list[str]:
     """Best-effort CDP + OS foregrounding for a local headed browser."""
     actions: list[str] = []
@@ -114,20 +115,20 @@ async def _foreground_for_human(tab: Tab) -> list[str]:
     except Exception:
         pass
     if sys.platform == "darwin":
-        try:
-            executable = Path(str(BrowserState.browser.config.browser_executable_path))
-            app = next((p for p in executable.parents if p.suffix == ".app"), None)
-            if app is not None:
-                completed = subprocess.run(
-                    ["open", "-a", str(app)],
-                    capture_output=True,
-                    timeout=3,
-                    check=False,
-                )
-                if completed.returncode == 0:
-                    actions.append("macOS app activated")
-        except Exception:
-            pass
+        # Only this browser's own process, and checked: `open -a <Chrome.app>` activated whichever
+        # Chrome macOS chose, and another project's browser came to the front instead.
+        pid = _srv._browser_process_pid(BrowserState.browser)
+        if pid:
+            with contextlib.suppress(Exception):
+                front = await asyncio.to_thread(_srv._frontmost_pid)
+                if front is not None and front != pid:
+                    await asyncio.to_thread(_srv._activate_pid, pid)
+                    await asyncio.sleep(0.3)
+                    front = await asyncio.to_thread(_srv._frontmost_pid)
+                if front == pid:
+                    actions.append("this browser is the app in front")
+                elif front is not None:
+                    actions.append(NOT_IN_FRONT)
     return actions
 
 
@@ -162,8 +163,10 @@ async def request_human_help(objective: str, timeout: float = 300) -> str:
         shown = presence.ask(BrowserState.browser, objective)
         bar = ("\nThe overlay's bar shows the request with a Done button; wait_for_human ends "
                "when the person presses it." if shown is not None else "")
+        lead = ("Browser window raised, but it is not in the foreground" if NOT_IN_FRONT in actions
+                else "Browser is visible and in the foreground")
         return ok(
-            f"Browser is visible and in the foreground ({', '.join(actions) or 'focus requested'}).\n"
+            f"{lead} ({', '.join(actions) or 'focus requested'}).\n"
             f"Human: {objective}\n"
             "When finished, leave the page in its completed state. The agent must call "
             "wait_for_human(done_url_contains=... or done_selector=...); without a "
@@ -242,8 +245,7 @@ async def _wait_for_human_loop(tab, key, browser, unasked, timeout, baseline, as
             presence.end_help(browser)
             return ok(f"human handoff completed after {elapsed}s: the person pressed "
                       + ("Done in the overlay's bar" if answer == "done"
-                         else "Resume agent in the overlay's bar, handing the browser back")
-                      + presence.note_for(browser))
+                         else "Resume agent in the overlay's bar, handing the browser back"))
         if presence.holds(browser):
             await asyncio.sleep(0.25)
             continue
