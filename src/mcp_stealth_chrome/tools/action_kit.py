@@ -16,6 +16,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import re
+import time
+from pathlib import Path
 from typing import Any, Literal, Optional, Union
 
 from nodriver.cdp import runtime as cdp_runtime
@@ -23,11 +26,12 @@ from nodriver.cdp import runtime as cdp_runtime
 from .. import presence
 from .._app import mcp
 from ..helpers import (
-    BODY_REVEAL_NOTE, err, get_title, is_secret_name, mask_request_entry, ok, parse_json, reveal_mode,
+    BODY_REVEAL_NOTE, confined_output_path, err, get_title, is_secret_name, mask_request_entry,
+    ok, parse_json, reveal_mode, write_private,
 )
 from ..identity import key_event_params
 from ..refs import new_object_group, resolve_ref
-from ..state import PRIMARY_SESSION, SESSION_GONE_HOOKS, BrowserState
+from ..state import EXPORT_DIR, PRIMARY_SESSION, SESSION_GONE_HOOKS, BrowserState
 from ..workflow import WorkflowError, run_workflow
 from .. import server as _srv
 
@@ -798,6 +802,17 @@ async def storage_diff(name: str = "default", reveal_values: bool = False) -> st
         return err(str(e))
 
 
+def _export_workflow_var(name: str, value: Any) -> dict:
+    """Persist a large collected list as a private managed export artifact."""
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._-") or "var"
+    filename = f"workflow-{safe}-{int(time.time() * 1000)}.json"
+    _srv.ensure_dirs()
+    path = confined_output_path(EXPORT_DIR, filename)
+    text = json.dumps(value, indent=2, ensure_ascii=False, default=str)
+    write_private(path, text)
+    return {"file": str(path), "items": len(value), "chars": len(text)}
+
+
 # ── workflow_run (resumable) ───────────────────────────────────────────────
 
 @mcp.tool()
@@ -816,6 +831,11 @@ async def workflow_run(
     as ${x}, ${x.field} or ${x[0].name}; a string that is exactly one reference keeps its type. ${last.ok},
     ${last.value} and ${last.text} describe the previous step. A reference to something undefined fails the
     step and lists what is defined.
+    To collect across a loop, use `save_as: "name[]"`: each result is appended to a list created on
+    first use, parsed as JSON like plain save_as. An existing non-list `name` is a step error.
+    Collected lists support `${name}` and `${name[0].field}` references. Vars above 200,000
+    characters are reported as large; a successful collection above 1,000,000 characters is written
+    whole to a private export file and replaced in vars by its file, item count and character count.
 
     Loop: {"foreach": "${rows}", "as": "row", "steps": [...]} sets ${row} and ${row_index} for each item.
 
@@ -897,7 +917,7 @@ async def workflow_run(
         result = await run_workflow(
             steps, dispatch, lambda name: name in _srv._WORKFLOW_TOOLS,
             start_at=start_at, stop_on_error=stop_on_error, variables=vars, output=output,
-            checkpoint=checkpoint,
+            checkpoint=checkpoint, export_vars=_export_workflow_var,
         )
     except WorkflowError as e:
         return err(str(e))

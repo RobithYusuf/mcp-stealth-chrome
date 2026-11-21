@@ -35,6 +35,17 @@ def tool(name):
 
 class _Handler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
+        path = self.path.split("?")[0]
+        if path.startswith("/collect/"):
+            number = path.rsplit("/", 1)[-1]
+            paragraph = f"article {number}: " + ("A whole paragraph from the local fixture. " * 20)
+            body = (f"<!doctype html><title>Article {number}</title><p>{paragraph}</p>").encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if self.path.split("?")[0] == "/frames_main.html":
             host, port = self.server.server_address
             body = (FIXTURES / "frames_main.html").read_text().replace(
@@ -348,6 +359,24 @@ def test_workflow_fills_a_form_per_row_from_page_data(page):
     assert not out.startswith("Error:"), out
     saved = json.loads(page_value(page, "JSON.stringify(window.saved)"))
     assert saved == [{"name": "ann", "ticked": True}, {"name": "bob", "ticked": False}]
+
+
+def test_workflow_collects_whole_long_page_results_in_summary(page, server_url):
+    base = server_url.rsplit("/", 1)[0]
+    urls = [f"{base}/collect/{i}" for i in range(3)]
+    steps = [
+        {"tool": "evaluate", "args": {"expression": json.dumps(json.dumps(urls))}, "save_as": "urls"},
+        {"foreach": "${urls}", "as": "url", "steps": [
+            {"tool": "navigate", "args": {"url": "${url}"}},
+            {"tool": "evaluate", "args": {"expression": "JSON.stringify({title: document.title, paragraph: document.querySelector('p').textContent})"}, "save_as": "pages[]"},
+        ]},
+    ]
+    out = run(page, "workflow_run", steps, output="summary")
+    assert not out.startswith("Error:"), out
+    pages = json.loads(out)["vars"]["pages"]
+    assert len(pages) == 3
+    assert all(len(page["paragraph"]) > 500 for page in pages)
+    assert [page["title"] for page in pages] == ["Article 0", "Article 1", "Article 2"]
 
 
 def test_workflow_failure_can_be_resumed_with_start_at(page):
