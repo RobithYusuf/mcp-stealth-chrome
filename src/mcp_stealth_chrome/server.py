@@ -6275,8 +6275,13 @@ def _nav_timeout_recovered(requested_url: Optional[str], observed: dict) -> bool
     ready = observed.get("ready_state")
     final = str(observed.get("final_url") or "")
     requested = str(requested_url or "")
-    if status is None or ready not in ("interactive", "complete") or not final:
+    if ready not in ("interactive", "complete") or not final or observed.get("load_failure"):
         return False
+    if status is None:
+        # A ready HTTP page can be the old document while its reload is pending.
+        # Local documents have no HTTP response to wait for. Match their URL verbatim:
+        # stripping a trailing slash would change a data URL's payload.
+        return final == requested and requested.startswith(("about:", "data:", "blob:", "file:"))
 
     def same_document(left: str, right: str) -> bool:
         return left.split("#", 1)[0].rstrip("/") == right.split("#", 1)[0].rstrip("/")

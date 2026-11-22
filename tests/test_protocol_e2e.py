@@ -833,7 +833,10 @@ def test_first_page_timeout_keeps_the_browser_usable(base, path, tmp_path):
 def test_navigation_timeout_that_loaded_is_success(base):
     client = Client(env={"BROWSER_NAV_TIMEOUT": "0.1"})
     try:
-        assert not launch(client, "about:blank").failed
+        # The stdio server reads its bound at startup. A blank launch needs no HTTP reply.
+        blank = launch(client, "about:blank", auto_verify=False)
+        assert not blank.failed, blank.text
+        assert '"final_url": "about:blank"' in blank.text, blank.text
         reply = client.call("navigate", url=f"{base}/late-commit", auto_verify=False, _timeout=15)
         assert not reply.failed, reply.text
         assert "status 200" in reply.text and "ready_state complete" in reply.text, reply.text
