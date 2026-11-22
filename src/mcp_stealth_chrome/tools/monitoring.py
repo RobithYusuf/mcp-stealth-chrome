@@ -400,6 +400,7 @@ async def _start_capture(capture_bodies: bool, keep_bodies: bool) -> str:
                     max_resource_buffer_size=_srv.CAPTURE_BODY_MAX_BYTES))
             else:
                 await tab.send(cdp_network.enable())
+            _srv._mark_network_enabled(tab)
         except Exception as exc:
             BrowserState.capture_network = False
             return err(f"network capture NOT started, Network.enable failed: {_srv._exc_text(exc)}")

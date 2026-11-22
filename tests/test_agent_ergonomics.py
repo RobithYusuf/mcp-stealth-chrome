@@ -1723,6 +1723,94 @@ class _CdpTab:
         return [r["method"] for r in self.sent]
 
 
+def test_document_watch_network_enable_cache_tracks_cdp_reconnect():
+    import asyncio
+
+    from mcp_stealth_chrome import server
+
+    tab = _CdpTab()
+
+    async def scenario():
+        first, disarm_first = await server._arm_document_watch(tab)
+        disarm_first()
+        second, disarm_second = await server._arm_document_watch(tab)
+        disarm_second()
+        same_session = tab.methods().count("Network.enable")
+        tab._websocket = object()
+        third, disarm_third = await server._arm_document_watch(tab)
+        disarm_third()
+        return first, second, third, same_session, tab.methods().count("Network.enable")
+
+    first, second, third, same_session, total = asyncio.run(scenario())
+    assert first["armed"] and second["armed"] and third["armed"]
+    assert same_session == 1 and total == 2
+
+
+def test_navigation_timeout_reports_stop_failure_as_still_loading():
+    from mcp_stealth_chrome import server
+
+    result = server._nav_commit_timeout_message("navigate", {
+        "final_url": "http://example.test/hang",
+        "ready_state": "interactive",
+        "status": None,
+        "loading_stopped": False,
+    })
+    assert "tab may still be loading" in result
+    assert '"loading_stopped": false' in result
+    assert '"tab_may_still_be_loading": true' in result
+
+
+def test_target_attr_supports_dict_and_targetinfo():
+    from types import SimpleNamespace
+    from mcp_stealth_chrome import server
+
+    assert server._target_attr({"target_id": "dict", "type": "page"}, "target_id") == "dict"
+    assert server._target_attr({"type": "page"}, "type_") == "page"
+    assert server._target_attr(SimpleNamespace(target_id="object", type_="page"), "target_id") == "object"
+
+
+def test_target_attr_reads_camelcase_target_payloads():
+    from mcp_stealth_chrome import server
+
+    target = {"targetId": "T1", "type": "page", "url": "https://x",
+              "openerId": "OPEN", "browserContextId": "CTX"}
+    assert server._target_attr(target, "target_id") == "T1"
+    assert server._target_attr(target, "type_") == "page"
+    assert server._target_attr(target, "opener_id") == "OPEN"
+    assert server._target_attr(target, "browser_context_id") == "CTX"
+
+
+def test_own_pages_opened_by_ours_reads_camelcase_opener(monkeypatch):
+    from mcp_stealth_chrome import server
+
+    class Tab:
+        def __init__(self, target_id, opener=None):
+            self.target = {"targetId": target_id, "openerId": opener}
+
+    root, popup = Tab("ROOT"), Tab("POP", "ROOT")
+    monkeypatch.setattr(server.BrowserState, "tabs", [root, popup])
+    monkeypatch.setattr(server.BrowserState, "owned_targets", {"ROOT"})
+    server._own_pages_opened_by_ours()
+    assert "POP" in server.BrowserState.owned_targets
+
+
+def test_server_and_helpers_target_keys_match_all_target_shapes():
+    from types import SimpleNamespace
+    from mcp_stealth_chrome import helpers, server
+
+    class Tab:
+        def __init__(self, target):
+            self.target = target
+
+    tabs = [
+        Tab({"targetId": "camel"}),
+        Tab(SimpleNamespace(target_id="v048")),
+        Tab(SimpleNamespace(target_id="v050", type_="page")),
+    ]
+    for tab in tabs:
+        assert server._target_key(tab) == helpers.target_key(tab)
+
+
 def _active(monkeypatch, tab):
     from mcp_stealth_chrome import server
 

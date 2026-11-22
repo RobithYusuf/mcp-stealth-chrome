@@ -45,6 +45,7 @@ from .helpers import (
     ok,
     PageReadError,
     parse_json,
+    target_attr,
     target_key,
     transport_lost,
 )
@@ -154,6 +155,21 @@ def _trim_index(index: dict) -> None:
 # these sizes and drops the oldest past the total; nothing runs per request on our side.
 CAPTURE_BODY_BUFFER_BYTES = int(os.environ.get("CAPTURE_BODY_BUFFER_BYTES", str(64 * 2**20)))
 CAPTURE_BODY_MAX_BYTES = int(os.environ.get("CAPTURE_BODY_MAX_BYTES", str(10 * 2**20)))
+
+def _network_session_key(tab: Any) -> tuple[int, int | None]:
+    """Identify the live CDP session, which changes when a tab reconnects."""
+    connection = getattr(tab, "connection", None) or tab
+    websocket = getattr(connection, "_websocket", None)
+    return id(connection), id(websocket) if websocket is not None else None
+
+
+def _network_enabled_session(tab: Any) -> Optional[tuple[int, int | None]]:
+    return getattr(tab, "_mcp_network_enabled_session", None)
+
+
+def _mark_network_enabled(tab: Any) -> None:
+    with contextlib.suppress(Exception):
+        setattr(tab, "_mcp_network_enabled_session", _network_session_key(tab))
 
 
 def _resource_type(event: Any) -> str:
@@ -788,6 +804,11 @@ async def _page_facts_for_report(tab: Any) -> tuple[str, str]:
         return f"(unreadable: {exc})", "(unreadable)"
 
 
+def _target_attr(target: Any, name: str, default: Any = None) -> Any:
+    """Read CDP target fields through the shared snake/camel compatibility helper."""
+    return target_attr(target, name, default)
+
+
 async def _first_live_tab(browser: Any, attempts: int = 8) -> Any:
     """A page target that actually answers.
 
@@ -804,9 +825,10 @@ async def _first_live_tab(browser: Any, attempts: int = 8) -> Any:
             # A Browser has .connection up to 0.48 and is itself a Connection from 0.50.
             infos = await (getattr(browser, "connection", None) or browser).send(
                 cdp_target.get_targets())
-            live = {str(t.target_id) for t in infos if t.type_ == "page"}
+            live = {str(_target_attr(t, "target_id")) for t in infos
+                    if _target_attr(t, "type_") == "page" or _target_attr(t, "type") == "page"}
             for candidate in browser.tabs:
-                if str(candidate.target.target_id) not in live:
+                if str(_target_attr(candidate.target, "target_id")) not in live:
                     continue
                 try:
                     await asyncio.wait_for(candidate.send(cdp_rt.evaluate("1")), timeout=3)
@@ -1805,7 +1827,7 @@ def _own_pages_opened_by_ours() -> None:
         key = _target_key(tab)
         if key in BrowserState.owned_targets:
             continue
-        opener = getattr(getattr(tab, "target", None), "opener_id", None)
+        opener = _target_attr(getattr(tab, "target", None), "opener_id")
         if opener and str(opener) in BrowserState.owned_targets:
             BrowserState.owned_targets.add(key)
 
@@ -2216,7 +2238,7 @@ async def _open_background_window(browser: Any, width: Optional[int] = None,
     ))
     await browser.update_targets()
     for tab in browser.tabs:
-        if str(tab.target.target_id) == str(target_id):
+        if str(_target_attr(tab.target, "target_id")) == str(target_id):
             return tab
     raise RuntimeError("Chrome did not list the window it was asked to open")
 
@@ -2233,7 +2255,7 @@ async def _open_background_tab(browser: Any) -> Any:
     ))
     await browser.update_targets()
     for tab in browser.tabs:
-        if str(tab.target.target_id) == str(target_id):
+        if str(_target_attr(tab.target, "target_id")) == str(target_id):
             return tab
     raise RuntimeError("Chrome did not list the tab it was asked to open")
 
@@ -3604,10 +3626,14 @@ async def _reattach_claimed(browser: Any, instance_id: str, profile: Path, recor
                     await _wait(_keep_painting_behind(tab), timeout=5, what="focus emulation")
             doc_state, disarm = await _arm_document_watch(tab)
             try:
-                observed = await _commit_navigation(tab, url, doc_state)
-                if observed is None:
+                timeout_observation = await _commit_navigation(tab, url, doc_state)
+                if (timeout_observation is None or
+                        timeout_observation.get("_commit_timeout_recovered")):
                     await _wait_load_complete(tab, 3)
-                    observed = await _observe_navigation(tab, url, disarm())
+                    observed = _carry_nav_timeout_recovery(
+                        await _observe_navigation(tab, url, disarm()), timeout_observation)
+                else:
+                    observed = timeout_observation
             finally:
                 disarm()
             observed["_doc_state"] = doc_state
@@ -3773,7 +3799,7 @@ async def _launch_by_reattach(profile: Path, verdict: dict, *, url: str, keep_al
     ads_note += await presence.attach(browser, _browser_process_pid(browser), ask=agent_overlay,
                                 headless=bool(record.get("headless")),
                                 persons_browser=_persons_browser(browser))
-    if "commit_timeout_seconds" in observed:
+    if "commit_timeout_seconds" in observed and not observed.get("_commit_timeout_recovered"):
         return err(_nav_commit_timeout_message(summary, observed))
     action = "Loaded" if url and url != "about:blank" else "Selected tab shows"
     trip = (await _tripwire_after_navigation(tabs[select], observed, doc_state=doc_state,
@@ -3846,8 +3872,8 @@ async def _page_targets(browser: Any) -> list[tuple[str, str]]:
     """(target id, url) of every page, in the order Chrome lists them."""
     from nodriver.cdp import target as cdp_target
     infos = await (getattr(browser, "connection", None) or browser).send(cdp_target.get_targets())
-    return [(str(info.target_id), info.url or "") for info in infos
-            if getattr(info, "type_", "") == "page"]
+    return [(str(_target_attr(info, "target_id")), _target_attr(info, "url", "") or "")
+            for info in infos if _target_attr(info, "type_") == "page" or _target_attr(info, "type") == "page"]
 
 
 async def _record_tabs_before_close(instance_id: str, browser: Any, tabs: list, active_index: int,
@@ -4424,15 +4450,18 @@ async def _launch_reuse_running(req: _LaunchRequest) -> Optional[str]:
             persons_browser=_persons_browser(BrowserState.browser))
         _doc_state, _disarm = await _arm_document_watch(_tab)
         try:
+            timeout_observation = None
             if req.url and req.url != "about:blank":
-                timeout = await _commit_navigation(_tab, req.url, _doc_state)
-                if timeout is not None:
-                    return err(_nav_commit_timeout_message(reuse_head, timeout))
+                timeout_observation = await _commit_navigation(_tab, req.url, _doc_state)
+                if (timeout_observation is not None and
+                        not timeout_observation.get("_commit_timeout_recovered")):
+                    return err(_nav_commit_timeout_message(reuse_head, timeout_observation))
                 try:
                     await _wait(_tab.wait(), timeout=10, what="reuse settle")
                 except Exception:
                     pass
-            _observed = await _observe_navigation(_tab, req.url, _disarm())
+            _observed = _carry_nav_timeout_recovery(
+                await _observe_navigation(_tab, req.url, _disarm()), timeout_observation)
         finally:
             _disarm()
         _observed["profile"] = {
@@ -5151,11 +5180,12 @@ async def _launch_first_page(req: _LaunchRequest, plan: _LaunchPlan) -> tuple:
             await asyncio.wait_for(main.get("about:blank"), timeout=NAV_COMMIT_TIMEOUT)
         doc_state, _disarm = await _arm_document_watch(main)
         try:
-            timeout = await _commit_navigation(main, req.url, doc_state)
-            if timeout is not None:
-                return None, main, timeout, doc_state
+            timeout_observation = await _commit_navigation(main, req.url, doc_state)
+            if timeout_observation is not None and not timeout_observation.get("_commit_timeout_recovered"):
+                return None, main, timeout_observation, doc_state
             await _wait_load_complete(main, 3)
-            _launch_observed = await _observe_navigation(main, req.url, _disarm())
+            _launch_observed = _carry_nav_timeout_recovery(
+                await _observe_navigation(main, req.url, _disarm()), timeout_observation)
         finally:
             _disarm()
     except asyncio.CancelledError:
@@ -5379,8 +5409,10 @@ async def browser_launch(
 ) -> str:
     """Launch stealth Chrome via nodriver, on a persistent profile by default.
 
-    The initial navigation commit is bounded by 30 seconds by default without stopping the tab;
-    a timeout reports its observed URL and ready_state. Load completion remains best-effort.
+    The initial navigation commit is bounded by 30 seconds by default. If the page has not committed,
+    the server stops the load and says whether that stop was confirmed; if it cannot confirm the stop,
+    the result says the tab may still be loading. A response that arrives just after the bound and is
+    proved loaded is reported as success with a note. Load completion remains best-effort.
 
     The result names the profile actually used (actual_profile, session_state_source) and what the first load
     observed (final_url, redirect_chain, status, ready_state). After a redirect, read final_url.
@@ -5603,7 +5635,7 @@ async def _launch_run(req: _LaunchRequest, launching: _Launching, session: str, 
             # recover meanwhile stops the steps that would record more.
             _launch_record_browser(req, plan, started, main)
             suffix = _launch_keep_alive(req, plan, started)
-            if "commit_timeout_seconds" in observed:
+            if "commit_timeout_seconds" in observed and not observed.get("_commit_timeout_recovered"):
                 await _give_focus_back(plan.previous_app)
                 return await _launch_settle(req, plan, launching, err(_nav_commit_timeout_message(
                     f"Browser is running{suffix}; first page", observed)))
@@ -5993,6 +6025,9 @@ async def _arm_document_watch(tab: Tab) -> tuple[dict, Any]:
     """
     from nodriver.cdp import network as cdp_network
 
+    previous_navigation_stopped = bool(getattr(tab, "_mcp_navigation_stopped_after_timeout", False))
+    with contextlib.suppress(Exception):
+        delattr(tab, "_mcp_navigation_stopped_after_timeout")
     state: dict[str, Any] = {
         "armed": False,
         "arm_error": None,
@@ -6002,6 +6037,7 @@ async def _arm_document_watch(tab: Tab) -> tuple[dict, Any]:
         "status_text": "",
         "document_url": None,
         "failure": None,
+        "previous_navigation_stopped": previous_navigation_stopped,
     }
     # In Chrome the main frame's id IS the page target id, so this filters out
     # iframe documents without an extra Page.getFrameTree round-trip.
@@ -6074,11 +6110,21 @@ async def _arm_document_watch(tab: Tab) -> tuple[dict, Any]:
         (cdp_network.ResponseReceived, on_response),
         (cdp_network.LoadingFailed, on_failed),
     )
-    try:
-        await _wait(tab.send(cdp_network.enable()), timeout=5, what="Network.enable")
+    # Network.enable is session-scoped and idempotent, but a cancelled navigation can leave
+    # nodriver waiting on the next command while Chrome finishes the old one.  Do not send a
+    # second enable on the same CDP session: the first successful enable already covers every
+    # later document, and its event handlers are scoped by `state` below.
+    session_key = _network_session_key(tab)
+    if (_network_enabled_session(tab) == session_key and
+            not getattr(tab, "closed", False)):
         state["armed"] = True
-    except Exception as exc:
-        state["arm_error"] = f"{type(exc).__name__}: {exc}"
+    else:
+        try:
+            await _wait(tab.send(cdp_network.enable()), timeout=5, what="Network.enable")
+            state["armed"] = True
+            _mark_network_enabled(tab)
+        except Exception as exc:
+            state["arm_error"] = f"{type(exc).__name__}: {exc}"
     if state["armed"]:
         for event_type, handler in handlers:
             tab.add_handler(event_type, handler)
@@ -6112,6 +6158,8 @@ def _build_nav_observation(
         "status": status,
         "ready_state": ready_state or None,
     }
+    if doc_state.get("previous_navigation_stopped"):
+        observed["navigation_note"] = "the earlier navigation was stopped after its commit timeout"
     if doc_state.get("status_text"):
         observed["status_text"] = doc_state["status_text"]
     if doc_state.get("failure"):
@@ -6221,6 +6269,47 @@ def _nav_expectation_failures(
     return failures
 
 
+def _nav_timeout_recovered(requested_url: Optional[str], observed: dict) -> bool:
+    """Whether a commit timeout still produced proof of the requested document."""
+    status = observed.get("status")
+    ready = observed.get("ready_state")
+    final = str(observed.get("final_url") or "")
+    requested = str(requested_url or "")
+    if status is None or ready not in ("interactive", "complete") or not final:
+        return False
+
+    def same_document(left: str, right: str) -> bool:
+        return left.split("#", 1)[0].rstrip("/") == right.split("#", 1)[0].rstrip("/")
+
+    if not requested:
+        return True
+    if requested and same_document(final, requested):
+        return True
+    redirects = observed.get("redirect_chain") or []
+    return bool(redirects and requested and same_document(
+        str(redirects[0].get("url") or ""), requested))
+
+
+def _carry_nav_timeout_recovery(observed: dict, timeout_observation: Optional[dict]) -> dict:
+    """Keep the successful-after-timeout note when a later load probe rebuilds observation."""
+    if timeout_observation and timeout_observation.get("_commit_timeout_recovered"):
+        observed["commit_timeout_seconds"] = timeout_observation.get("commit_timeout_seconds")
+        observed["_commit_timeout_recovered"] = True
+    return observed
+
+
+async def _stop_navigation_after_timeout(tab: Tab) -> Optional[bool]:
+    """Stop a timed-out load, returning True, False, or None when it cannot be measured."""
+    from nodriver.cdp import page as cdp_page
+    try:
+        await _wait(tab.send(cdp_page.stop_loading()), timeout=5, what="Page.stopLoading")
+    except Exception:
+        return False
+    with contextlib.suppress(Exception):
+        setattr(tab, "_mcp_navigation_stopped_after_timeout", True)
+    return True
+
+
 def _nav_result(
     action: str,
     observed: dict,
@@ -6236,7 +6325,13 @@ def _nav_result(
     hops = len(observed.get("redirect_chain") or [])
     redirect_part = f", {hops} redirect(s)" if hops else ""
     ready = observed.get("ready_state") or "unmeasured"
-    body = json.dumps(observed, indent=2, default=str)
+    if observed.get("_commit_timeout_recovered"):
+        suffix += (f" (answer arrived after {observed.get('commit_timeout_seconds', NAV_COMMIT_TIMEOUT):g}s "
+                   "bound)")
+    if observed.get("navigation_note"):
+        suffix += f" ({observed['navigation_note']})"
+    body_observed = {key: value for key, value in observed.items() if not key.startswith("_")}
+    body = json.dumps(body_observed, indent=2, default=str)
     failures = _nav_expectation_failures(observed, expect_url, expect_status)
     if failures:
         return err(
@@ -6256,28 +6351,40 @@ def _nav_result(
 
 
 async def _commit_navigation(tab, url: str, doc_state: dict) -> Optional[dict]:
-    """Wait for Chrome to commit, not for load. On timeout read the current document only."""
+    """Wait for Chrome to commit, recovering a loaded document when the bound was crossed."""
     try:
         await asyncio.wait_for(tab.get(url), timeout=NAV_COMMIT_TIMEOUT)
     except asyncio.TimeoutError:
         observed = await _observe_navigation(tab, url, doc_state, probe_timeout=0.5)
         observed["commit_timeout_seconds"] = NAV_COMMIT_TIMEOUT
+        if _nav_timeout_recovered(url, observed):
+            observed["_commit_timeout_recovered"] = True
+        else:
+            stopped = await _stop_navigation_after_timeout(tab)
+            observed["loading_stopped"] = stopped is True
+            if stopped is False:
+                observed["loading_stop_error"] = "Page.stopLoading failed"
         return observed
     return None
 
 
 def _nav_commit_timeout_message(action: str, observed: dict) -> str:
-    """Describe a commit timeout with observations and no claim that loading stopped."""
+    """Describe a commit timeout and whether the unfinished load was stopped."""
     observed = dict(observed)
     observed["commit_timeout_seconds"] = NAV_COMMIT_TIMEOUT
-    observed["tab_may_still_be_loading"] = True
+    stopped = observed.get("loading_stopped") is True
+    observed["loading_stopped"] = stopped
+    observed["tab_may_still_be_loading"] = not stopped
+    if stopped:
+        detail = "The earlier navigation was stopped; use navigate again to load a page."
+    else:
+        detail = "The tab may still be loading; use wait_for_url or wait_for, or navigate again."
     body = json.dumps(observed, indent=2, default=str)
     shown_url = repr(observed.get("final_url") or "(unmeasured)")
     ready = observed.get("ready_state") or "unmeasured"
     return (
         f"{action}: the page did not answer within {NAV_COMMIT_TIMEOUT:g}s; observed URL "
-        f"{shown_url}, ready_state {ready}. The tab may still be loading; use "
-        f"wait_for_url or wait_for, or navigate again.\n{body}"
+        f"{shown_url}, ready_state {ready}. {detail}\n{body}"
     )
 
 
@@ -6826,9 +6933,10 @@ async def navigate(
 ) -> str:
     """Navigate the active tab to url. wait_until: load|none.
 
-    The navigation commit is bounded by 30 seconds (the page is not stopped); a timeout says
-    the observed URL and ready_state and that the tab may still be loading. wait_until=load then
-    waits for readyState=complete up to 15 seconds after the commit.
+    The navigation commit is bounded by 30 seconds. If the page has not committed, the server stops
+    the load and says whether that stop was confirmed; if it cannot confirm the stop, the result says
+    the tab may still be loading. A response that arrives just after the bound and is proved loaded is
+    reported as success with a note. wait_until=load then waits for readyState=complete up to 15 seconds.
 
     Reports the OBSERVED postconditions: requested_url, final_url, redirect_chain, status, ready_state. After
     a redirect, read final_url.
@@ -6857,9 +6965,9 @@ async def navigate(
         await _watch_dialogs(tab)
     doc_state, disarm = await _arm_document_watch(tab)
     try:
-        timeout = await _commit_navigation(tab, url, doc_state)
-        if timeout is not None:
-            return _nav_commit_timeout("navigate", timeout)
+        timeout_observation = await _commit_navigation(tab, url, doc_state)
+        if timeout_observation is not None and not timeout_observation.get("_commit_timeout_recovered"):
+            return _nav_commit_timeout("navigate", timeout_observation)
         if wait_until != "none":
             await _wait_load_complete(tab, NAV_LOAD_WAIT)
         if focus:
@@ -6878,7 +6986,8 @@ async def navigate(
             except Exception:
                 verify_suffix = ""
         doc = disarm()
-        observed = await _observe_navigation(tab, url, doc)
+        observed = _carry_nav_timeout_recovery(
+            await _observe_navigation(tab, url, doc), timeout_observation)
         result = _nav_result(
             "Navigated", observed,
             expect_url=expect_url, expect_status=expect_status, suffix=verify_suffix,
