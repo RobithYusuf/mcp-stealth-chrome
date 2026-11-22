@@ -373,7 +373,11 @@ def test_workflow_collects_whole_long_page_results_in_summary(page, server_url):
     ]
     out = run(page, "workflow_run", steps, output="summary")
     assert not out.startswith("Error:"), out
-    pages = json.loads(out)["vars"]["pages"]
+    report = json.loads(out)
+    pages = report["vars"]["pages"]
+    assert [e["result"] for e in report["shown"] if e["index"] != 0] == [
+        "pages[0]", "pages[1]", "pages[2]"]
+    assert report["vars"]["last"] == {"ok": True}
     assert len(pages) == 3
     assert all(len(page["paragraph"]) > 500 for page in pages)
     assert [page["title"] for page in pages] == ["Article 0", "Article 1", "Article 2"]

@@ -1092,6 +1092,33 @@ def test_compat_patch_status_is_visible():
     assert "client_security_state" in st["applied"]
 
 
+@pytest.mark.parametrize("requested,final,ready,recovered", [
+    ("about:blank", "about:blank", "complete", True),
+    ("data:text/plain,ready", "data:text/plain,ready", "interactive", True),
+    ("data:text/plain,a/", "data:text/plain,a", "complete", False),
+    ("about:blank", "about:blank", "loading", False),
+    ("https://example.test/", "https://example.test/", "complete", False),
+])
+def test_late_navigation_without_a_response(monkeypatch, requested, final, ready, recovered):
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from mcp_stealth_chrome import server
+
+    tab = SimpleNamespace(get=AsyncMock(side_effect=asyncio.TimeoutError))
+    observation = {"status": None, "final_url": final, "ready_state": ready}
+    monkeypatch.setattr(server, "_observe_navigation", AsyncMock(return_value=observation))
+    stop = AsyncMock(return_value=True)
+    monkeypatch.setattr(server, "_stop_navigation_after_timeout", stop)
+    result = asyncio.run(server._commit_navigation(tab, requested, {}))
+    assert bool(result.get("_commit_timeout_recovered")) is recovered
+    assert result["status"] is None
+    if recovered:
+        stop.assert_not_awaited()
+    else:
+        stop.assert_awaited_once_with(tab)
+
+
 @POSIX_PROCESS_CHECKS
 def test_close_kills_the_process_when_cdp_cannot(monkeypatch):
     """A dead CDP socket must not turn into an orphaned Chrome.

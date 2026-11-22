@@ -653,15 +653,11 @@ async def _ensure_browser_dead(browser, profile_dir=None, grace: float = 1.5) ->
             if not _process_exists(target):
                 continue
             # Windows has no SIGKILL; os.kill with any other signal is TerminateProcess there.
-            if not _verified(target, getattr(_signal, "SIGKILL", _signal.SIGTERM)):
-                report["still_alive"].append(target)
-        # SIGKILL takes a moment, and the verdict below decides whether the handle is kept.
-        for _ in range(20):
-            if not any(_process_exists(target) for target in report["killed"]):
-                break
-            await asyncio.sleep(0.1)
+            _verified(target, getattr(_signal, "SIGKILL", _signal.SIGTERM))
+        # A refused signal is not proof of life: it can race with the process exiting.
+        await _all_gone(report["killed"], 3.0)
     for target in candidates:
-        if _process_exists(target) and target not in report["still_alive"]:
+        if _process_exists(target):
             if target in unidentified and _identify(target, browser) == "different" and target == pid:
                 continue  # it ended and its number went to another program meanwhile
             report["still_alive"].append(target)
@@ -6275,8 +6271,13 @@ def _nav_timeout_recovered(requested_url: Optional[str], observed: dict) -> bool
     ready = observed.get("ready_state")
     final = str(observed.get("final_url") or "")
     requested = str(requested_url or "")
-    if status is None or ready not in ("interactive", "complete") or not final:
+    if ready not in ("interactive", "complete") or not final or observed.get("load_failure"):
         return False
+    if status is None:
+        # A ready HTTP page can be the old document while its reload is pending.
+        # Local documents have no HTTP response to wait for. Match their URL verbatim:
+        # stripping a trailing slash would change a data URL's payload.
+        return final == requested and requested.startswith(("about:", "data:", "blob:", "file:"))
 
     def same_document(left: str, right: str) -> bool:
         return left.split("#", 1)[0].rstrip("/") == right.split("#", 1)[0].rstrip("/")
@@ -8586,7 +8587,9 @@ async def _reap_failed_start(config: Config) -> dict:
     registered = nodriver.core.util.get_registered_instances()
     for instance in [b for b in registered if b.config is config]:
         registered.discard(instance)
-        report = await _ensure_browser_dead(instance, None, grace=0.3)
+        # Give an exiting child the normal stop grace, including when it can no longer
+        # be identified safely enough for another signal.
+        report = await _ensure_browser_dead(instance, None)
     return report
 
 
