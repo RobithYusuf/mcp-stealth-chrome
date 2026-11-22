@@ -732,7 +732,7 @@ def _target_key(tab) -> str:
     pending human handoffs), which is why it lives here rather than inside any
     one of them.
     """
-    return target_key(tab)
+    return str(_target_attr(getattr(tab, "target", None), "target_id") or id(tab))
 
 
 async def _wait(coro, timeout: Optional[float] = None, what: str = "operation"):
@@ -803,11 +803,27 @@ async def _page_facts_for_report(tab: Any) -> tuple[str, str]:
         return f"(unreadable: {exc})", "(unreadable)"
 
 
+_TARGET_ATTR_ALIASES = {
+    "target_id": ("target_id", "targetId"),
+    "type_": ("type_", "type"),
+    "opener_id": ("opener_id", "openerId"),
+    "browser_context_id": ("browser_context_id", "browserContextId"),
+}
+
+
 def _target_attr(target: Any, name: str, default: Any = None) -> Any:
-    """Read CDP targets from nodriver 0.48 dicts or 0.50 TargetInfo objects."""
+    """Read CDP targets from snake/camel dicts and nodriver TargetInfo objects."""
+    aliases = _TARGET_ATTR_ALIASES.get(name, (name,))
     if isinstance(target, dict):
-        return target.get(name, default)
-    return getattr(target, name, default)
+        for alias in aliases:
+            if alias in target:
+                return target[alias]
+        return default
+    for alias in aliases:
+        value = getattr(target, alias, default)
+        if value is not default:
+            return value
+    return default
 
 
 async def _first_live_tab(browser: Any, attempts: int = 8) -> Any:
@@ -1828,7 +1844,7 @@ def _own_pages_opened_by_ours() -> None:
         key = _target_key(tab)
         if key in BrowserState.owned_targets:
             continue
-        opener = getattr(getattr(tab, "target", None), "opener_id", None)
+        opener = _target_attr(getattr(tab, "target", None), "opener_id")
         if opener and str(opener) in BrowserState.owned_targets:
             BrowserState.owned_targets.add(key)
 

@@ -1765,8 +1765,33 @@ def test_target_attr_supports_dict_and_targetinfo():
     from mcp_stealth_chrome import server
 
     assert server._target_attr({"target_id": "dict", "type": "page"}, "target_id") == "dict"
-    assert server._target_attr({"type": "page"}, "type_") is None
+    assert server._target_attr({"type": "page"}, "type_") == "page"
     assert server._target_attr(SimpleNamespace(target_id="object", type_="page"), "target_id") == "object"
+
+
+def test_target_attr_reads_camelcase_target_payloads():
+    from mcp_stealth_chrome import server
+
+    target = {"targetId": "T1", "type": "page", "url": "https://x",
+              "openerId": "OPEN", "browserContextId": "CTX"}
+    assert server._target_attr(target, "target_id") == "T1"
+    assert server._target_attr(target, "type_") == "page"
+    assert server._target_attr(target, "opener_id") == "OPEN"
+    assert server._target_attr(target, "browser_context_id") == "CTX"
+
+
+def test_own_pages_opened_by_ours_reads_camelcase_opener(monkeypatch):
+    from mcp_stealth_chrome import server
+
+    class Tab:
+        def __init__(self, target_id, opener=None):
+            self.target = {"targetId": target_id, "openerId": opener}
+
+    root, popup = Tab("ROOT"), Tab("POP", "ROOT")
+    monkeypatch.setattr(server.BrowserState, "tabs", [root, popup])
+    monkeypatch.setattr(server.BrowserState, "owned_targets", {"ROOT"})
+    server._own_pages_opened_by_ours()
+    assert "POP" in server.BrowserState.owned_targets
 
 
 def _active(monkeypatch, tab):
