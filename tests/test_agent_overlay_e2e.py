@@ -203,6 +203,8 @@ def test_an_idle_agent_unlocks_the_page_and_a_take_over_says_what_the_agent_know
     data = pathlib.Path(tempfile.mkdtemp(prefix="mcp-agent-overlay-idle-"))
     overlays = data / "overlay"
     client = Client(env={"MCP_STEALTH_DATA_DIR": str(data), "MCP_STEALTH_OVERLAY_DIR": str(overlays),
+                         "MCP_STEALTH_OVERLAY_BAR": "full", "MCP_STEALTH_OVERLAY_LIGHT": "1",
+                         "MCP_STEALTH_OVERLAY_LOCK": "1",
                          "MCP_STEALTH_OVERLAY_HIDE_AFTER": "60", "MCP_STEALTH_OVERLAY_IDLE_AFTER": "3"})
     try:
         launched = client.call("browser_launch", _timeout=90, headless=False, persistent=False,
@@ -216,20 +218,23 @@ def test_an_idle_agent_unlocks_the_page_and_a_take_over_says_what_the_agent_know
         def lock():
             return any(b[2] > 300 and b[3] > 200 for _layer, b in _windows(overlay_pid))
 
-        def note_line():
-            return any(b[3] == 32 and b[2] >= 200 for _layer, b in _windows(overlay_pid))
+        def unlocked_bar(*, lit=False):
+            # Read one WindowServer snapshot. Help has four light strips and the bar but
+            # no lock; resting, holding and confirming Done show just the bar after fade.
+            boxes = [b for _, b in _windows(overlay_pid)]
+            return (len(boxes) == (5 if lit else 1) and any(b[3] == 40 for b in boxes)
+                    and not any((b[2] > 300 and b[3] > 200) or (b[3] == 32 and b[2] >= 200)
+                                for b in boxes))
 
         assert not client.call("get_text").failed
         assert _wait(lock, 5), _windows(overlay_pid)
-        assert _wait(lambda: not lock(), 8), "the lock stayed past IDLE_AFTER"
-        assert _bar_shown(overlay_pid) and not note_line()
+        assert _wait(unlocked_bar, 8), _windows(overlay_pid)
         assert not client.call("get_text").failed
         assert _wait(lock, 5), "a call did not bring the lock back"
 
         os.kill(overlay_pid, signal.SIGUSR2)  # Take over
         assert _wait(lambda: _read(control_file).get("holder") == "person", 5)
-        time.sleep(0.6)
-        assert _bar_shown(overlay_pid) and not note_line(), _windows(overlay_pid)
+        assert _wait(unlocked_bar, 5), _windows(overlay_pid)
         since = float(_read(control_file)["since"])
         assert float(_read(agent_file).get("told_at") or 0) < since
         refused = client.call("click", selector="#inc")
@@ -251,12 +256,11 @@ def test_an_idle_agent_unlocks_the_page_and_a_take_over_says_what_the_agent_know
         asked = client.call("request_human_help", objective="Tick Agree", timeout=30)
         assert not asked.failed, asked.text
         assert _wait(lambda: _read(agent_file).get("help") == "Tick Agree", 5)
-        time.sleep(0.6)  # the overlay reads it at its next tick; a press before that is a Take over
-        assert _bar_shown(overlay_pid) and not note_line(), _windows(overlay_pid)
+        # agent.json is the server's request, not proof that the button now means Done.
+        assert _wait(lambda: unlocked_bar(lit=True), 5), _windows(overlay_pid)
         os.kill(overlay_pid, signal.SIGUSR2)  # Done
         assert _wait(lambda: float(_read(control_file).get("help_done") or 0) > 0, 3)
-        time.sleep(0.6)
-        assert _bar_shown(overlay_pid), "the bar went: nothing confirms the Done"
+        assert _wait(unlocked_bar, 5), "the overlay did not show the Done confirmation"
         assert _read(agent_file).get("help") == "Tick Agree"  # no call took it yet
         told = client.call("get_text")
         assert "the person pressed Done on the request for help" in told.text, told.text
