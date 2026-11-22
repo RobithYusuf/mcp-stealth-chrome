@@ -1760,6 +1760,15 @@ def test_navigation_timeout_reports_stop_failure_as_still_loading():
     assert '"tab_may_still_be_loading": true' in result
 
 
+def test_target_attr_supports_dict_and_targetinfo():
+    from types import SimpleNamespace
+    from mcp_stealth_chrome import server
+
+    assert server._target_attr({"target_id": "dict", "type": "page"}, "target_id") == "dict"
+    assert server._target_attr({"type": "page"}, "type_") is None
+    assert server._target_attr(SimpleNamespace(target_id="object", type_="page"), "target_id") == "object"
+
+
 def _active(monkeypatch, tab):
     from mcp_stealth_chrome import server
 

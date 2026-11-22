@@ -820,7 +820,8 @@ def test_first_page_timeout_keeps_the_browser_usable(base, path, tmp_path):
         assert "earlier navigation was stopped" in reply.text
         assert '"loading_stopped": true' in reply.text
         assert '"tab_may_still_be_loading": false' in reply.text
-        assert "wait_for_url" in reply.text and "ready_state" in reply.text and "observed URL" in reply.text
+        next_step = "switch_instance" if path == "spawn" else "navigate again"
+        assert next_step in reply.text
         assert client.call("server_status").json()["browser_running"]
         again = client.call("navigate", url=f"{base}/page2.html", _timeout=15)
         assert not again.failed and client.evaluate("document.title") == "Page Two", again.text

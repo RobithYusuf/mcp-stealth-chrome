@@ -803,6 +803,13 @@ async def _page_facts_for_report(tab: Any) -> tuple[str, str]:
         return f"(unreadable: {exc})", "(unreadable)"
 
 
+def _target_attr(target: Any, name: str, default: Any = None) -> Any:
+    """Read CDP targets from nodriver 0.48 dicts or 0.50 TargetInfo objects."""
+    if isinstance(target, dict):
+        return target.get(name, default)
+    return getattr(target, name, default)
+
+
 async def _first_live_tab(browser: Any, attempts: int = 8) -> Any:
     """A page target that actually answers.
 
@@ -819,9 +826,10 @@ async def _first_live_tab(browser: Any, attempts: int = 8) -> Any:
             # A Browser has .connection up to 0.48 and is itself a Connection from 0.50.
             infos = await (getattr(browser, "connection", None) or browser).send(
                 cdp_target.get_targets())
-            live = {str(t.target_id) for t in infos if t.type_ == "page"}
+            live = {str(_target_attr(t, "target_id")) for t in infos
+                    if _target_attr(t, "type_") == "page" or _target_attr(t, "type") == "page"}
             for candidate in browser.tabs:
-                if str(candidate.target.target_id) not in live:
+                if str(_target_attr(candidate.target, "target_id")) not in live:
                     continue
                 try:
                     await asyncio.wait_for(candidate.send(cdp_rt.evaluate("1")), timeout=3)
@@ -2231,7 +2239,7 @@ async def _open_background_window(browser: Any, width: Optional[int] = None,
     ))
     await browser.update_targets()
     for tab in browser.tabs:
-        if str(tab.target.target_id) == str(target_id):
+        if str(_target_attr(tab.target, "target_id")) == str(target_id):
             return tab
     raise RuntimeError("Chrome did not list the window it was asked to open")
 
@@ -2248,7 +2256,7 @@ async def _open_background_tab(browser: Any) -> Any:
     ))
     await browser.update_targets()
     for tab in browser.tabs:
-        if str(tab.target.target_id) == str(target_id):
+        if str(_target_attr(tab.target, "target_id")) == str(target_id):
             return tab
     raise RuntimeError("Chrome did not list the tab it was asked to open")
 
@@ -3865,8 +3873,8 @@ async def _page_targets(browser: Any) -> list[tuple[str, str]]:
     """(target id, url) of every page, in the order Chrome lists them."""
     from nodriver.cdp import target as cdp_target
     infos = await (getattr(browser, "connection", None) or browser).send(cdp_target.get_targets())
-    return [(str(info.target_id), info.url or "") for info in infos
-            if getattr(info, "type_", "") == "page"]
+    return [(str(_target_attr(info, "target_id")), _target_attr(info, "url", "") or "")
+            for info in infos if _target_attr(info, "type_") == "page" or _target_attr(info, "type") == "page"]
 
 
 async def _record_tabs_before_close(instance_id: str, browser: Any, tabs: list, active_index: int,
