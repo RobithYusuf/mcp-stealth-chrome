@@ -8,6 +8,8 @@ reattached keep_alive Chrome was signalled directly ("CDP stop did not end the p
 import asyncio
 import types
 
+import pytest
+
 from mcp_stealth_chrome import server
 
 
@@ -77,3 +79,65 @@ def test_a_failed_send_on_a_live_socket_is_not_asked():
             raise RuntimeError("refused")
 
     assert asyncio.run(server._request_browser_close(Refusing())) is False
+
+
+@pytest.mark.parametrize("lifetime,survives", [(0.6, False), (float("inf"), True)])
+def test_failed_start_waits_for_an_exiting_process(monkeypatch, lifetime, survives):
+    # An exiting child can still occupy its PID after its command line is unreadable.
+    # Advance virtual time only while the reaper yields. No real process is probed or signalled.
+    elapsed = 0.0
+
+    async def sleep(delay):
+        nonlocal elapsed
+        elapsed += delay
+        assert elapsed < 10, "the reaper did not bound its wait"
+
+    class Exiting:
+        config = object()
+        _process_pid = 12345
+
+        def stop(self):
+            pass
+
+    child = Exiting()
+    monkeypatch.setattr(server.nodriver.core.util, "get_registered_instances", lambda: {child})
+    monkeypatch.setattr(server.quit_watch, "pid_start", lambda *_: None)
+    monkeypatch.setattr(server, "_identify", lambda *_: "unknown")
+    monkeypatch.setattr(server, "_process_exists", lambda pid: elapsed < lifetime)
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    report = asyncio.run(server._reap_failed_start(child.config))
+    assert report["still_alive"] == ([child._process_pid] if survives else [])
+    assert report["verified"] is not survives
+    assert not report["killed"]
+
+
+def test_an_exit_during_signal_verification_is_not_reported_alive(monkeypatch):
+    class Browser:
+        _process_pid = 12345
+        config = types.SimpleNamespace(user_data_dir="/test-profile")
+
+        def stop(self):
+            pass
+
+    alive = True
+    signalled = False
+
+    def signal_verified(*_args):
+        nonlocal alive, signalled
+        if signalled:
+            alive = False  # gone between the liveness check and signal verification
+            return False
+        signalled = True
+        return True
+
+    async def no_wait(_):
+        pass
+
+    monkeypatch.setattr(server, "_identify", lambda *_: "same")
+    monkeypatch.setattr(server.quit_watch, "pid_start", lambda *_: None)
+    monkeypatch.setattr(server, "_descendant_pids", lambda *_: [])
+    monkeypatch.setattr(server, "_process_exists", lambda pid: alive)
+    monkeypatch.setattr(server, "_signal_verified", signal_verified)
+    monkeypatch.setattr(asyncio, "sleep", no_wait)
+    report = asyncio.run(server._ensure_browser_dead(Browser()))
+    assert report["verified"] and not report["still_alive"], report
