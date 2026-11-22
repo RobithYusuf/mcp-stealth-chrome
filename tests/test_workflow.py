@@ -123,6 +123,35 @@ def test_save_as_brackets_appends_parsed_results_in_nested_foreach():
     assert result["vars"]["pages"] == [{"value": 1}, {"value": {"x": 2}}, {"value": 3}]
 
 
+def test_summary_points_to_each_collected_item_and_keeps_full_unchanged():
+    text = json.dumps({"article": "long paragraph " * 60})
+    steps = [{"foreach": [1, 2], "steps": [{"tool": "read", "save_as": "pages[]"}]}]
+    summary, _ = run(steps, {"read": text}, variables={"pages": ["earlier"]}, output="summary")
+    assert [e["result"] for e in summary["shown"]] == ["pages[1]", "pages[2]"]
+    assert summary["vars"]["pages"] == ["earlier", json.loads(text), json.loads(text)]
+    assert summary["vars"]["last"] == {"ok": True}
+    full, _ = run(steps, {"read": text}, variables={"pages": ["earlier"]}, output="full")
+    assert all("long paragraph" in entry["result"] for entry in full["completed"])
+    assert full["vars"]["last"] == {"ok": True, "value": json.loads(text), "text": text}
+
+
+def test_summary_does_not_point_into_an_overwritten_collection():
+    steps = [{"tool": "old", "save_as": "rows[]"}, {"tool": "reset", "save_as": "rows"},
+             {"tool": "new", "save_as": "rows[]"}, {"tool": "end"}]
+    result, _ = run(steps, {"old": "first", "reset": "[]", "new": "second", "end": "done"},
+                    output="summary")
+    assert [e["result"] for e in result["shown"]] == ["first", "[]", "rows[0]", "done"]
+    assert result["vars"]["last"] == {"ok": True, "value": "done"}
+
+
+@pytest.mark.parametrize("last,same", [('{"a": true}', True), ('{"a": 1}', False)])
+def test_summary_drops_only_a_last_value_equal_as_json(last, same):
+    steps = [{"tool": "collect", "save_as": "rows[]"}, {"tool": "read"}]
+    result, _ = run(steps, {"collect": '{"a":true}', "read": last}, output="summary")
+    expected = {"ok": True} if same else {"ok": True, "value": json.loads(last)}
+    assert result["vars"]["last"] == expected
+
+
 def test_save_as_brackets_rejects_an_existing_non_list():
     result, calls = run([{"tool": "read", "save_as": "pages[]"}], {"read": "ok"},
                         variables={"pages": {"old": True}})

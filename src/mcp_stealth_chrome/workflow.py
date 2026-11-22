@@ -227,7 +227,9 @@ class _Run:
     # Names written through save_as="name[]". They are the values that may be externalized from
     # an oversized successful report; ordinary input vars stay available for a caller's resume.
     collected: set[str] = field(default_factory=set)
-    collected_entries: dict[str, str] = field(default_factory=dict)
+    # Summary only: step index -> (list name, item index, parsed value). A later step may
+    # replace the list; never point to an item the returned collection no longer holds.
+    collected_entries: Optional[dict[str, tuple[str, int, Any]]] = None
     last: Optional[dict] = None
     # Failed or ignored entries past the cap (the first MAX_LATE_FAILURES), and how many more.
     late_failures: list[dict] = field(default_factory=list)
@@ -362,6 +364,7 @@ async def _run_tool(run: _Run, step: dict, path: list[int]) -> None:
     failed = text.startswith("Error:")
     value = step_value(text)
     save_as = step.get("save_as")
+    index = path[0] if len(path) == 1 else _dotted(path)
     if save_as:
         try:
             save_name = str(save_as)
@@ -380,17 +383,19 @@ async def _run_tool(run: _Run, step: dict, path: list[int]) -> None:
                     )
                 existing.append(value)
                 run.collected.add(name)
+                if run.collected_entries is not None:
+                    run.collected_entries[str(index)] = (name, len(existing) - 1, value)
             else:
                 run.variables[save_name] = value
                 run.collected.discard(save_name)
-            run.saved.add(str(path[0] if len(path) == 1 else _dotted(path)))
+            run.saved.add(str(index))
         except WorkflowError as exc:
             text = f"Error: {exc}"
             failed = True
             value = step_value(text)
             _note_failure(run, text)
     run.variables["last"] = {"ok": not failed, "value": value, "text": text}
-    entry = {"index": path[0] if len(path) == 1 else _dotted(path), "tool": tool,
+    entry = {"index": index, "tool": tool,
              "label": step.get("label", ""), "ok": not failed, "result": _preview(text)}
     if failed and step.get("continue_on_error"):
         entry["ignored"] = True
@@ -502,7 +507,8 @@ async def run_workflow(
     # Input objects reach steps by reference, so a step may change the caller's own object. Left
     # so on purpose: over MCP each call parses its own JSON, and no caller keeps that object.
     run = _Run(dispatch=dispatch, allowed=allowed, stop_on_error=stop_on_error,
-               variables=dict(variables or {}), checkpoint=checkpoint)
+               variables=dict(variables or {}), checkpoint=checkpoint,
+               collected_entries={} if output == "summary" else None)
     start = parse_start(start_at)
     await _run_block(run, steps, [], start)
     result: dict[str, Any] = {"completed": run.entries, "total": len(steps)}
@@ -632,9 +638,9 @@ def _guard_vars(result: dict, public_vars: dict, run: _Run, *, retain: bool,
 
 _NOTES = {
     "summary": "a summary: counts, every failed or ignored step, and the result of each step with "
-               "save_as, each reader and the last step; vars only as this run set or changed them, "
-               "last without the text its value holds unless a step failed or was ignored (after "
-               "a stop at a failure: all vars, whole). "
+               "save_as, each reader and the last step. Collected results point to their list items. "
+               "Only changed vars are shown; successful runs omit duplicate last text and collected "
+               "values (after a stop at a failure: all vars, whole). "
                "output=\"full\" lists the steps (the first 200).",
     "failures": "failures only: counts and every failed or ignored step, no vars unless a resume "
                 "needs them. output=\"summary\" adds results, output=\"full\" lists the steps (the first 200).",
@@ -704,6 +710,29 @@ def _shorten(full: dict, run: _Run, output: str, given: dict[str, Optional[str]]
         unchanged = [k for k in full["vars"] if k not in changed]
         if unchanged:
             out["vars_unchanged"] = unchanged  # named, so a reader knows they were not lost
+    if run.collected_entries:
+        variables = out.get("vars", {})
+
+        def available(name: str, index: int, value: Any) -> bool:
+            # Check the live list even when the public var describes a private export.
+            items = run.variables.get(name)
+            return (name in variables and isinstance(items, list) and index < len(items)
+                    and items[index] is value)
+
+        for entry in shown:
+            item = run.collected_entries.get(str(entry["index"]))
+            if entry.get("ok") and item and available(*item):
+                entry["result"] = f"{item[0]}[{item[1]}]"
+
+        last_var = variables.get("last")
+        # Only _last_once shortened this to ok/value. Errors and resume vars stay whole.
+        if isinstance(last_var, dict) and last_var.keys() == {"ok", "value"} and last_var["ok"]:
+            name, offset, value = next(reversed(run.collected_entries.values()))
+            if available(name, offset, value) and offset == len(run.variables[name]) - 1:
+                last_value = last_var["value"]
+                if (last_value is value or (type(last_value) is type(value)
+                        and (encoded := _json_text(last_value)) is not None and encoded == _json_text(value))):
+                    variables["last"] = {"ok": True}
     return out
 
 
