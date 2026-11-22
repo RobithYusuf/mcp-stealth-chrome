@@ -463,10 +463,33 @@ def short_url(url: Any, max_len: int = 200) -> str:
     return f"{text[:max_len]}… ({len(text) - max_len} more chars; list_frames(max_url_len=0))"
 
 
+_TARGET_ATTR_ALIASES = {
+    "target_id": ("target_id", "targetId"),
+    "type_": ("type_", "type"),
+    "opener_id": ("opener_id", "openerId"),
+    "browser_context_id": ("browser_context_id", "browserContextId"),
+}
+
+
+def target_attr(target: Any, name: str, default: Any = None) -> Any:
+    """Read CDP target fields from snake/camel dicts and nodriver objects."""
+    aliases = _TARGET_ATTR_ALIASES.get(name, (name,))
+    if isinstance(target, dict):
+        for alias in aliases:
+            if alias in target:
+                return target[alias]
+        return default
+    for alias in aliases:
+        value = getattr(target, alias, default)
+        if value is not default:
+            return value
+    return default
+
+
 def target_key(tab: Any) -> str:
     """Stable per-tab identity backed by the CDP target id when available."""
     target = getattr(tab, "target", None)
-    return str(getattr(target, "target_id", None) or id(tab))
+    return str(target_attr(target, "target_id") or id(tab))
 
 
 # Native dialogs open right now, per tab. A dialog blocks the renderer: input never gets its

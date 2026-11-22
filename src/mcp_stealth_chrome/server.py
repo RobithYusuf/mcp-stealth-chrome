@@ -45,6 +45,7 @@ from .helpers import (
     ok,
     PageReadError,
     parse_json,
+    target_attr,
     target_key,
     transport_lost,
 )
@@ -732,7 +733,7 @@ def _target_key(tab) -> str:
     pending human handoffs), which is why it lives here rather than inside any
     one of them.
     """
-    return str(_target_attr(getattr(tab, "target", None), "target_id") or id(tab))
+    return target_key(tab)
 
 
 async def _wait(coro, timeout: Optional[float] = None, what: str = "operation"):
@@ -803,27 +804,9 @@ async def _page_facts_for_report(tab: Any) -> tuple[str, str]:
         return f"(unreadable: {exc})", "(unreadable)"
 
 
-_TARGET_ATTR_ALIASES = {
-    "target_id": ("target_id", "targetId"),
-    "type_": ("type_", "type"),
-    "opener_id": ("opener_id", "openerId"),
-    "browser_context_id": ("browser_context_id", "browserContextId"),
-}
-
-
 def _target_attr(target: Any, name: str, default: Any = None) -> Any:
-    """Read CDP targets from snake/camel dicts and nodriver TargetInfo objects."""
-    aliases = _TARGET_ATTR_ALIASES.get(name, (name,))
-    if isinstance(target, dict):
-        for alias in aliases:
-            if alias in target:
-                return target[alias]
-        return default
-    for alias in aliases:
-        value = getattr(target, alias, default)
-        if value is not default:
-            return value
-    return default
+    """Read CDP target fields through the shared snake/camel compatibility helper."""
+    return target_attr(target, name, default)
 
 
 async def _first_live_tab(browser: Any, attempts: int = 8) -> Any:

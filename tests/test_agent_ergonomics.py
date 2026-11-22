@@ -1794,6 +1794,23 @@ def test_own_pages_opened_by_ours_reads_camelcase_opener(monkeypatch):
     assert "POP" in server.BrowserState.owned_targets
 
 
+def test_server_and_helpers_target_keys_match_all_target_shapes():
+    from types import SimpleNamespace
+    from mcp_stealth_chrome import helpers, server
+
+    class Tab:
+        def __init__(self, target):
+            self.target = target
+
+    tabs = [
+        Tab({"targetId": "camel"}),
+        Tab(SimpleNamespace(target_id="v048")),
+        Tab(SimpleNamespace(target_id="v050", type_="page")),
+    ]
+    for tab in tabs:
+        assert server._target_key(tab) == helpers.target_key(tab)
+
+
 def _active(monkeypatch, tab):
     from mcp_stealth_chrome import server
 
